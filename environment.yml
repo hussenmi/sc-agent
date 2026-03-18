@@ -1,0 +1,26 @@
+name: scagent
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - scanpy>=1.9
+  - anndata>=0.8
+  - numpy>=1.21
+  - pandas>=1.4
+  - scipy>=1.8
+  - matplotlib>=3.5
+  - seaborn>=0.12
+  - leidenalg>=0.9
+  - python-igraph>=0.10
+  - scrublet>=0.2.3
+  - scanorama>=1.7
+  - harmonypy>=0.0.9
+  - h5py>=3.7
+  - pip
+  - pip:
+    - anthropic>=0.18
+    - celltypist>=1.6
+    - phenograph>=1.5
+    - scimilarity

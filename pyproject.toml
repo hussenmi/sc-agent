@@ -1,0 +1,76 @@
+[project]
+name = "scagent"
+version = "0.1.0"
+description = "Single-cell RNA-seq Analysis Agent - Lab's standardized analysis toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Hussen Mohammed Ibrahim", email = "ibrahih3@mskcc.org" }
+]
+keywords = ["single-cell", "scRNA-seq", "bioinformatics", "scanpy", "agent"]
+
+dependencies = [
+    "scanpy>=1.9",
+    "anndata>=0.8",
+    "numpy>=1.21",
+    "pandas>=1.4",
+    "scipy>=1.8",
+    "matplotlib>=3.5",
+    "seaborn>=0.12",
+    "leidenalg>=0.9",
+    "python-igraph>=0.10",
+    "scrublet>=0.2.3",
+    "scanorama>=1.7",
+    "harmonypy>=0.0.9",
+    "celltypist>=1.6",
+    "phenograph>=1.5",
+    "h5py>=3.7",
+    "scikit-misc>=0.3",  # Required for seurat_v3 HVG selection
+]
+
+[project.optional-dependencies]
+agent = [
+    "anthropic>=0.18",
+]
+scimilarity = [
+    "scimilarity",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+all = [
+    "scagent[agent,scimilarity,dev]",
+]
+
+[project.scripts]
+scagent = "scagent.cli:main"
+
+[project.urls]
+Repository = "https://github.com/mskcc/scagent"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scagent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=scagent"
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

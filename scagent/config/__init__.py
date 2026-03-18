@@ -1,0 +1,21 @@
+"""Configuration module for scagent."""
+
+from .defaults import (
+    QC_DEFAULTS,
+    HVG_DEFAULTS,
+    DIMRED_DEFAULTS,
+    CLUSTERING_DEFAULTS,
+    CELLTYPIST_DEFAULTS,
+    SCIMILARITY_DEFAULTS,
+    BATCH_DEFAULTS,
+)
+
+__all__ = [
+    "QC_DEFAULTS",
+    "HVG_DEFAULTS",
+    "DIMRED_DEFAULTS",
+    "CLUSTERING_DEFAULTS",
+    "CELLTYPIST_DEFAULTS",
+    "SCIMILARITY_DEFAULTS",
+    "BATCH_DEFAULTS",
+]
