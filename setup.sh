@@ -14,7 +14,7 @@
 #   - Configures paths for scagent and dependencies
 # =============================================================================
 
-set -e
+# Don't use 'set -e' in sourced scripts - it can kill the parent shell!
 
 SCAGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_SW_DIR="/usersoftware/peerd/${USER}"

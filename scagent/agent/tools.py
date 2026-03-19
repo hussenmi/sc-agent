@@ -138,6 +138,60 @@ def get_tools() -> List[Dict[str, Any]]:
         },
     ]
 
+    # Meta tools (agent control)
+    meta_tools = [
+        {
+            "name": "ask_user",
+            "description": "Ask the user a question and wait for their response. Use this when you need clarification about: data type (cells vs nuclei), batch structure, which annotation model to use, gene ID format, or any ambiguous situation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask the user"},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices"},
+                    "default": {"type": "string", "description": "Default answer if user just presses enter"}
+                },
+                "required": ["question"]
+            }
+        },
+        {
+            "name": "run_code",
+            "description": "Execute custom Python code on the AnnData object. Use this for operations not covered by other tools, like: gene ID conversion, custom filtering, subsetting, merging datasets, plotting, or any data manipulation. The code has access to 'adata', 'sc' (scanpy), 'plt' (matplotlib), 'np', 'pd'. For plots, save to a file path.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python code to execute. Has access to adata, sc, plt, np, pd."},
+                    "description": {"type": "string", "description": "Brief description of what the code does"},
+                    "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
+                },
+                "required": ["code", "description"]
+            }
+        },
+        {
+            "name": "web_search",
+            "description": "Search the web for information. Use for: looking up gene functions, pathway databases (MSigDB, GO, KEGG), troubleshooting errors, finding best practices, or referencing papers. Returns relevant snippets.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "site": {"type": "string", "description": "Optional site filter (e.g., 'msigdb.gsea-msigdb.org', 'pubmed.ncbi.nlm.nih.gov')"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "install_package",
+            "description": "Request installation of a Python package. Requires user approval. Use when you need a package that isn't installed (e.g., gseapy, mygene, biomart).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "package": {"type": "string", "description": "Package name (pip format)"},
+                    "reason": {"type": "string", "description": "Why this package is needed"}
+                },
+                "required": ["package", "reason"]
+            }
+        },
+    ]
+
     # Inspection tools (read-only)
     inspection_tools = [
         {
@@ -213,7 +267,49 @@ def get_tools() -> List[Dict[str, Any]]:
         },
     ]
 
-    return action_tools + inspection_tools
+    return action_tools + meta_tools + inspection_tools
+
+
+def get_openai_tools() -> List[Dict[str, Any]]:
+    """
+    Get OpenAI-format tool definitions.
+
+    OpenAI uses a different schema format than Anthropic.
+    """
+    anthropic_tools = get_tools()
+    openai_tools = []
+
+    for tool in anthropic_tools:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
+            }
+        })
+
+    return openai_tools
+
+
+def encode_image_base64(image_path: str) -> str:
+    """Encode an image file to base64 for vision API."""
+    import base64
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def get_image_mime_type(image_path: str) -> str:
+    """Get MIME type for image."""
+    ext = image_path.lower().split(".")[-1]
+    mime_types = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }
+    return mime_types.get(ext, "image/png")
 
 
 def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) -> tuple:
@@ -253,8 +349,176 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
         }
 
     try:
+        # ===== META TOOLS =====
+        if tool_name == "ask_user":
+            # This is handled specially by the agent loop - just return the question
+            return json.dumps({
+                "status": "needs_input",
+                "tool": "ask_user",
+                "question": tool_input["question"],
+                "options": tool_input.get("options", []),
+                "default": tool_input.get("default", ""),
+            }, indent=2), adata
+
+        elif tool_name == "run_code":
+            # Execute custom Python code on adata
+            import scanpy as sc
+            import pandas as pd
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+
+            code = tool_input["code"]
+            description = tool_input["description"]
+            save_to = tool_input.get("save_to")
+
+            # Security: basic checks (not foolproof, but helps)
+            forbidden = ["import os", "import sys", "subprocess", "eval(",
+                        "__import__", "rm -rf", "shutil.rmtree", "requests."]
+            for f in forbidden:
+                if f in code:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "run_code",
+                        "message": f"Forbidden operation: {f}"
+                    }, indent=2), adata
+
+            # Load data if needed
+            if adata is None and "data_path" in tool_input:
+                adata = load_data(tool_input["data_path"])
+
+            # Execute in controlled namespace
+            namespace = {
+                "adata": adata,
+                "sc": sc,
+                "np": np,
+                "pd": pd,
+                "plt": plt,
+                "scanpy": sc,
+                "matplotlib": matplotlib,
+            }
+
+            # Capture stdout so LLM can see print outputs
+            import io
+            import sys
+            stdout_capture = io.StringIO()
+            old_stdout = sys.stdout
+
+            # Capture any figures created
+            plt.close('all')
+
+            try:
+                sys.stdout = stdout_capture
+                exec(code, namespace)
+            finally:
+                sys.stdout = old_stdout
+
+            captured_output = stdout_capture.getvalue()
+            adata = namespace.get("adata", adata)
+
+            # Check if any figures were created
+            figures_saved = []
+            if plt.get_fignums():
+                # There are open figures - check if code saved them
+                pass
+
+            if save_to:
+                adata.write_h5ad(save_to)
+
+            # Save code to file if output directory exists
+            code_file = None
+            if "output_dir" in tool_input:
+                import os
+                code_dir = os.path.join(tool_input["output_dir"], "code")
+                os.makedirs(code_dir, exist_ok=True)
+
+                # Create filename from description
+                safe_desc = "".join(c if c.isalnum() or c in "_ " else "_" for c in description)
+                safe_desc = safe_desc.replace(" ", "_")[:50]
+                code_file = os.path.join(code_dir, f"{safe_desc}.py")
+
+                with open(code_file, "w") as f:
+                    f.write(f'"""\n{description}\n\nAuto-generated by scagent\n"""\n\n')
+                    f.write("import scanpy as sc\n")
+                    f.write("import numpy as np\n")
+                    f.write("import pandas as pd\n")
+                    f.write("import matplotlib.pyplot as plt\n\n")
+                    f.write("# Load data (adjust path as needed)\n")
+                    f.write("# adata = sc.read_h5ad('path/to/data.h5ad')\n\n")
+                    f.write("# Generated code:\n")
+                    f.write(code)
+
+            result = {
+                "status": "ok",
+                "tool": "run_code",
+                "description": description,
+            }
+            if adata is not None:
+                result["shape"] = {"n_cells": adata.n_obs, "n_genes": adata.n_vars}
+            if save_to:
+                result["saved_to"] = save_to
+            if code_file:
+                result["code_file"] = code_file
+            if captured_output:
+                # Truncate if too long
+                result["output"] = captured_output[:2000]
+                if len(captured_output) > 2000:
+                    result["output_truncated"] = True
+
+            return json.dumps(result, indent=2), adata
+
+        elif tool_name == "web_search":
+            # Web search using DuckDuckGo (no API key needed)
+            query = tool_input["query"]
+            site = tool_input.get("site", "")
+
+            if site:
+                query = f"site:{site} {query}"
+
+            try:
+                from duckduckgo_search import DDGS
+
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=5))
+
+                snippets = []
+                for r in results:
+                    snippets.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("href", ""),
+                        "snippet": r.get("body", "")[:300]
+                    })
+
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "web_search",
+                    "query": query,
+                    "results": snippets
+                }, indent=2), adata
+
+            except ImportError:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "web_search",
+                    "message": "duckduckgo-search not installed. Use install_package tool first.",
+                    "install_command": "pip install duckduckgo-search"
+                }, indent=2), adata
+
+        elif tool_name == "install_package":
+            # Request package installation - requires user approval
+            package = tool_input["package"]
+            reason = tool_input["reason"]
+
+            return json.dumps({
+                "status": "needs_approval",
+                "tool": "install_package",
+                "package": package,
+                "reason": reason,
+                "message": f"Agent wants to install '{package}': {reason}"
+            }, indent=2), adata
+
         # ===== INSPECTION TOOLS =====
-        if tool_name == "inspect_data":
+        elif tool_name == "inspect_data":
             adata = load_data(tool_input["data_path"])
             state = inspect_data(adata)
             goal = tool_input.get("goal")
@@ -267,6 +531,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "state": make_state(adata),
                 "embeddings": [k for k in adata.obsm.keys()],
                 "layers": list(adata.layers.keys()),
+                "genes": {
+                    "format": state.gene_id_format,
+                    "has_symbols": state.has_gene_symbols,
+                    "has_ensembl": state.has_ensembl_ids,
+                    "sample": state.sample_gene_names,
+                    "var_columns": list(adata.var.columns)[:10],
+                },
                 "clustering": {
                     "has_clusters": state.has_clusters,
                     "cluster_key": state.cluster_key,
@@ -548,6 +819,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             output_path = tool_input["output_path"]
             color_by = tool_input.get("color_by", "leiden")
             genes = tool_input.get("genes", [])
+            include_image = tool_input.get("include_image", True)
 
             fig, ax = plt.subplots(figsize=(10, 8))
 
@@ -557,18 +829,27 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 sc.pl.violin(adata, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
             elif plot_type == "dotplot" and genes:
                 sc.pl.dotplot(adata, var_names=genes, groupby=color_by, show=False)
+            elif plot_type == "heatmap" and genes:
+                sc.pl.heatmap(adata, var_names=genes, groupby=color_by, show=False)
 
             plt.tight_layout()
             plt.savefig(output_path, dpi=150, bbox_inches='tight')
             plt.close()
 
-            return json.dumps({
+            result = {
                 "status": "ok",
                 "tool": "generate_figure",
                 "output_path": output_path,
                 "plot_type": plot_type,
-                "color_by": color_by
-            }, indent=2), adata
+                "color_by": color_by,
+            }
+
+            # Include base64 image for vision models
+            if include_image:
+                result["image_base64"] = encode_image_base64(output_path)
+                result["image_mime"] = get_image_mime_type(output_path)
+
+            return json.dumps(result, indent=2), adata
 
         else:
             return json.dumps({

@@ -32,6 +32,9 @@ dependencies = [
 [project.optional-dependencies]
 agent = [
     "anthropic>=0.18",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "duckduckgo-search>=6.0",  # For web search capability
 ]
 scimilarity = [
     "scimilarity",
