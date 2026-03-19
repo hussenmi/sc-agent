@@ -37,6 +37,7 @@ These are the validated default parameters from our single-cell workshop:
 
 ### Cell Type Annotation
 - CellTypist: CRITICAL - requires target_sum=10000 normalization
+- CellTypist with majority_voting: REQUIRES clustering (leiden) first!
 - Scimilarity: Also uses target_sum=10000
 
 ### Batch Correction
@@ -63,6 +64,18 @@ These are the validated default parameters from our single-cell workshop:
 
 ## Workflow Logic
 
+**Standard analysis order (follow this sequence):**
+1. QC (metrics, doublets, filtering)
+2. Normalize + log transform (preserve raw_counts first!)
+3. Select HVGs (4000 genes)
+4. PCA (30 components)
+5. Compute neighbors (k=30)
+6. Compute UMAP
+7. Clustering (Leiden) ← MUST come before CellTypist!
+8. Cell type annotation (CellTypist)
+9. DEG analysis (uses raw counts layer)
+10. GSEA / pathway analysis
+
 When analyzing data, first inspect its current state:
 - Check if raw counts are preserved
 - Check what processing has been done
@@ -76,10 +89,39 @@ Always ask the user if you're unsure about:
 
 ## Response Format
 
+**IMPORTANT: Before each tool call, briefly explain your reasoning:**
+- What did you observe from the previous step?
+- Why are you choosing this next step?
+- What do you expect to find/achieve?
+
+Example:
+"The data has 11,769 cells and no QC has been done yet (no MT metrics). I'll run QC first to filter low-quality cells. Based on the median gene count, this looks like a standard 10X dataset."
+
+Then call the tool.
+
 When reporting results:
 - Show key statistics (cell counts, gene counts, cluster counts)
 - Mention any warnings or quality issues
 - Suggest next steps when appropriate
+
+**When things fail or need adjustment:**
+- Explain what went wrong
+- Describe your revised approach
+- Then proceed with the fix
+
+## File Saving Guidelines
+
+**Minimize intermediate h5ad files** - only save when necessary:
+- Save after QC filtering (important checkpoint for reproducibility)
+- Save final result at end of analysis
+- Do NOT save after every step (normalization, PCA, UMAP, etc.)
+- The in-memory AnnData persists between tool calls
+
+When to save intermediate files:
+- After significant filtering that reduces cell count
+- Before a step that might fail (e.g., batch correction)
+- When user explicitly requests a checkpoint
+- At natural analysis milestones (QC complete, clustering complete)
 """
 
 QC_PROMPT = """Analyze the quality of this single-cell dataset.

@@ -91,6 +91,24 @@ result = agent.analyze("""
     4. Generate UMAP colored by MT%
     5. Provide synthesis with quality concerns
 """, data_path="pbmc.h5")
+
+# Interactive follow-up (continues conversation with loaded data)
+result = agent.analyze(
+    "Now show me DEG for cluster 5 vs all others",
+    continue_conversation=True  # Keeps conversation history
+)
+```
+
+### CLI Interactive Mode
+
+```bash
+# Start interactive session
+scagent analyze --data pbmc.h5 --interactive
+
+# After initial analysis completes, continue with follow-ups:
+# > What are the top markers for cluster 3?
+# > Generate a heatmap of these genes
+# > done  (to exit)
 ```
 
 ### Agent Capabilities
@@ -120,6 +138,23 @@ Agent: "Cluster 13 has highest MT% (mean 15.14%) and its markers
 | **Research** | `research_findings` (PubMed literature search with citations), `web_search` |
 | **Meta** | `ask_user`, `run_code`, `install_package` |
 
+## Standard Analysis Order
+
+The agent follows this pipeline sequence:
+
+```
+1. QC (metrics, doublets, filtering)
+2. Normalize + log transform (preserve raw_counts first!)
+3. Select HVGs (4000 genes)
+4. PCA (30 components)
+5. Compute neighbors (k=30)
+6. Compute UMAP
+7. Clustering (Leiden) ← MUST come before CellTypist!
+8. Cell type annotation (CellTypist)
+9. DEG analysis (uses raw counts layer)
+10. GSEA / pathway analysis
+```
+
 ## Lab Parameters (Best Practices)
 
 | Parameter | Value | Notes |
@@ -145,6 +180,7 @@ The agent automatically follows these best practices:
 - **Batch Correction**: After Harmony/Scanorama, automatically recomputes neighbors and UMAP on the corrected embedding.
 - **GSEA**: Uses DEG scores for prerank GSEA with GSEApy. Returns top up/downregulated pathways with NES scores, FDR values, and leading edge genes. Supports KEGG, GO, Reactome, MSigDB Hallmark databases.
 - **Literature Research**: After GSEA, uses PubMed E-utilities API to find recent papers about enriched pathways. Returns PMIDs, titles, abstracts, and journal info for citation.
+- **File Management**: Minimizes intermediate h5ad files - only saves after QC filtering and at end of analysis. Data persists in memory between tool calls.
 
 ## Run Output Structure
 

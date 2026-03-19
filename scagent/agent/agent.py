@@ -85,6 +85,7 @@ class SCAgent:
         verbose: bool = True,
         create_run_dir: bool = True,
         output_dir: str = ".",
+        save_checkpoints: bool = False,
     ):
         # Use environment defaults if not specified
         if provider is None:
@@ -96,9 +97,11 @@ class SCAgent:
         self.verbose = verbose
         self.create_run_dir = create_run_dir
         self.output_dir = output_dir
+        self.save_checkpoints = save_checkpoints
         self.adata = None
         self.run_manager: Optional[RunManager] = None
         self._pending_image: Optional[Dict[str, str]] = None  # For vision support
+        self._conversation_history: List[Dict[str, Any]] = []  # For interactive mode
 
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
@@ -156,6 +159,7 @@ class SCAgent:
         data_path: Optional[str] = None,
         run_name: Optional[str] = None,
         max_iterations: int = 20,
+        continue_conversation: bool = False,
     ) -> str:
         """
         Analyze single-cell data based on a natural language request.
@@ -173,18 +177,25 @@ class SCAgent:
             Natural language description of the analysis to perform.
         data_path : str, optional
             Path to the input data file (h5ad or 10X h5).
+            If None and self.adata exists, uses already-loaded data.
         run_name : str, optional
             Name for the run directory.
         max_iterations : int, default 20
             Maximum number of tool calls.
+        continue_conversation : bool, default False
+            If True, continue from previous conversation history.
+            Useful for interactive follow-up questions.
 
         Returns
         -------
         str
             Summary of the analysis performed.
         """
-        # Create run directory
-        if self.create_run_dir:
+        # Determine if this is a follow-up (data already loaded)
+        is_followup = data_path is None and self.adata is not None
+
+        # Create run directory only for first analysis
+        if self.create_run_dir and self.run_manager is None:
             self.run_manager = create_run(
                 base_dir=self.output_dir,
                 run_name=run_name,
@@ -203,11 +214,21 @@ class SCAgent:
 
             if data_path:
                 self.run_manager.add_input(data_path)
+        elif is_followup and self.run_manager:
+            # Log follow-up request in existing manifest
+            self.run_manager.log_step(
+                tool="follow_up",
+                parameters={"request": request},
+                result={"status": "starting"}
+            )
 
         # Build initial message
         user_message = request
         if data_path:
             user_message += f"\n\nData file: {data_path}"
+        elif is_followup:
+            # Inform agent that data is already loaded
+            user_message += f"\n\n[Data already loaded in memory: {self.adata.n_obs} cells x {self.adata.n_vars} genes]"
         if self.run_manager:
             user_message += f"\nOutput directory: {self.run_manager.run_dir}"
 
@@ -216,13 +237,19 @@ class SCAgent:
 
         # Route to provider-specific implementation
         if self.provider == "anthropic":
-            return self._analyze_anthropic(user_message, max_iterations)
+            return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
         else:
-            return self._analyze_openai(user_message, max_iterations)
+            return self._analyze_openai(user_message, max_iterations, continue_conversation)
 
-    def _analyze_anthropic(self, user_message: str, max_iterations: int) -> str:
+    def _analyze_anthropic(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using Anthropic API."""
-        messages = [{"role": "user", "content": user_message}]
+        if continue_conversation and self._conversation_history:
+            # Continue from previous conversation
+            messages = self._conversation_history.copy()
+            messages.append({"role": "user", "content": user_message})
+        else:
+            # Start fresh
+            messages = [{"role": "user", "content": user_message}]
         final_result = ""
 
         try:
@@ -243,7 +270,7 @@ class SCAgent:
                         if content.type == "text":
                             assistant_content.append(content)
                             if self.verbose:
-                                self._print(f"\n{content.text}")
+                                self._print(f"\n💭 Agent: {content.text}")
 
                         elif content.type == "tool_use":
                             assistant_content.append(content)
@@ -279,11 +306,17 @@ class SCAgent:
                         self._pending_image = None
 
                 elif response.stop_reason == "end_turn":
+                    # Add final assistant message to history
+                    messages.append({"role": "assistant", "content": response.content})
+
                     for content in response.content:
                         if hasattr(content, "text"):
                             final_result = content.text
                             self._print("\n" + "-" * 50)
                             self._print(final_result)
+
+                    # Save conversation history for potential follow-ups
+                    self._conversation_history = messages
 
                     if self.run_manager:
                         self.run_manager.complete(summary=final_result)
@@ -304,12 +337,18 @@ class SCAgent:
 
         return final_result
 
-    def _analyze_openai(self, user_message: str, max_iterations: int) -> str:
+    def _analyze_openai(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using OpenAI API."""
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
+        if continue_conversation and self._conversation_history:
+            # Continue from previous conversation
+            messages = self._conversation_history.copy()
+            messages.append({"role": "user", "content": user_message})
+        else:
+            # Start fresh
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ]
         final_result = ""
 
         try:
@@ -330,9 +369,9 @@ class SCAgent:
                     # Add assistant message with tool calls
                     messages.append(message)
 
-                    # Print any text content
+                    # Print any reasoning/text content from the agent
                     if message.content:
-                        self._print(f"\n{message.content}")
+                        self._print(f"\n💭 Agent: {message.content}")
 
                     # Process each tool call
                     for tool_call in message.tool_calls:
@@ -364,9 +403,15 @@ class SCAgent:
                         self._pending_image = None
 
                 elif choice.finish_reason == "stop":
+                    # Add final assistant message to history
+                    messages.append({"role": "assistant", "content": message.content})
+
                     final_result = message.content or ""
                     self._print("\n" + "-" * 50)
                     self._print(final_result)
+
+                    # Save conversation history for potential follow-ups
+                    self._conversation_history = messages
 
                     if self.run_manager:
                         self.run_manager.complete(summary=final_result)
@@ -617,6 +662,28 @@ class SCAgent:
             self.adata
         )
         return json.loads(result_json)
+
+    def reset_conversation(self):
+        """
+        Clear conversation history to start a fresh conversation.
+
+        Useful when switching to a completely different analysis topic.
+        Note: This does NOT unload the data - call reset() for that.
+        """
+        self._conversation_history = []
+        self._print("Conversation history cleared.")
+
+    def reset(self):
+        """
+        Reset agent state completely.
+
+        Clears conversation history, loaded data, and run manager.
+        """
+        self._conversation_history = []
+        self.adata = None
+        self.run_manager = None
+        self._pending_image = None
+        self._print("Agent state reset.")
 
     def recommend(self, goal: str) -> List[str]:
         """

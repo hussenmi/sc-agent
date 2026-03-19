@@ -1,10 +1,12 @@
+#!/usr/bin/env python
 """
 Command-line interface for scagent.
 
 Usage:
-    scagent inspect <data_path>
-    scagent qc <data_path> <output_path>
-    scagent analyze <request> --data <data_path>
+    scagent analyze "your request" --data path/to/data.h5
+    scagent analyze --data path/to/data.h5  # Auto-analyze
+    scagent inspect path/to/data.h5ad
+    scagent chat "question about single-cell analysis"
 """
 
 import argparse
@@ -13,24 +15,129 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(
-        description="scagent: Single-cell RNA-seq Analysis Agent",
+        description="scagent - Autonomous single-cell RNA-seq analysis agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full analysis with custom request
+  scagent analyze "QC, cluster, and annotate cell types" --data pbmc.h5
+
+  # Auto-analyze (agent decides what to do)
+  scagent analyze --data pbmc.h5
+
+  # Just inspect data state
+  scagent inspect clustered_data.h5ad
+
+  # Ask a question
+  scagent chat "What's the best way to handle batch effects?"
+
+  # Use specific provider/model
+  scagent analyze --data pbmc.h5 --provider openai --model gpt-4o
+        """
     )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    parser.add_argument("--version", action="store_true", help="Show version")
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-    # Inspect command
-    inspect_parser = subparsers.add_parser("inspect", help="Inspect data state")
-    inspect_parser.add_argument("data_path", help="Path to h5ad or 10X h5 file")
+    # === analyze command ===
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="Run autonomous analysis on single-cell data"
+    )
+    analyze_parser.add_argument(
+        "request",
+        nargs="?",
+        default=None,
+        help="What to analyze (e.g., 'QC and cluster'). If omitted, agent auto-analyzes."
+    )
+    analyze_parser.add_argument(
+        "--data", "-d",
+        required=True,
+        help="Path to input data file (h5ad or 10X h5)"
+    )
+    analyze_parser.add_argument(
+        "--output", "-o",
+        default=".",
+        help="Output directory (default: current directory)"
+    )
+    analyze_parser.add_argument(
+        "--name", "-n",
+        default=None,
+        help="Run name for output directory"
+    )
+    analyze_parser.add_argument(
+        "--provider", "-p",
+        choices=["openai", "anthropic"],
+        default=None,
+        help="LLM provider (default: from .env or anthropic)"
+    )
+    analyze_parser.add_argument(
+        "--model", "-m",
+        default=None,
+        help="Model name (default: provider default)"
+    )
+    analyze_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=20,
+        help="Max tool call iterations (default: 20)"
+    )
+    analyze_parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Less verbose output"
+    )
+    analyze_parser.add_argument(
+        "--interactive", "-i",
+        action="store_true",
+        help="Interactive mode - continue conversation after analysis"
+    )
+    analyze_parser.add_argument(
+        "--checkpoints",
+        action="store_true",
+        help="Save intermediate h5ad files (default: only save final)"
+    )
 
-    # QC command
-    qc_parser = subparsers.add_parser("qc", help="Run QC pipeline")
+    # === inspect command ===
+    inspect_parser = subparsers.add_parser(
+        "inspect",
+        help="Inspect data state without running analysis"
+    )
+    inspect_parser.add_argument(
+        "data",
+        help="Path to h5ad file"
+    )
+    inspect_parser.add_argument(
+        "--goal", "-g",
+        choices=["qc", "cluster", "annotate", "deg", "batch_correct"],
+        default=None,
+        help="Get recommendations for a specific goal"
+    )
+
+    # === qc command (direct, no agent) ===
+    qc_parser = subparsers.add_parser(
+        "qc",
+        help="Run QC pipeline directly (no agent)"
+    )
     qc_parser.add_argument("data_path", help="Input data path")
     qc_parser.add_argument("output_path", help="Output h5ad path")
     qc_parser.add_argument("--mt-threshold", type=float, help="MT percentage threshold")
 
-    # Version
-    parser.add_argument("--version", action="store_true", help="Show version")
+    # === chat command ===
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="Ask a question (no data analysis)"
+    )
+    chat_parser.add_argument(
+        "question",
+        help="Question to ask"
+    )
+    chat_parser.add_argument(
+        "--provider", "-p",
+        choices=["openai", "anthropic"],
+        default=None,
+        help="LLM provider"
+    )
 
     args = parser.parse_args()
 
@@ -43,23 +150,143 @@ def main():
         parser.print_help()
         return 0
 
-    if args.command == "inspect":
-        from scagent.core import load_data, inspect_data
-        from scagent.core.inspector import summarize_state
+    # Handle commands
+    if args.command == "analyze":
+        return run_analyze(args)
+    elif args.command == "inspect":
+        return run_inspect(args)
+    elif args.command == "qc":
+        return run_qc(args)
+    elif args.command == "chat":
+        return run_chat(args)
 
-        adata = load_data(args.data_path)
-        state = inspect_data(adata)
-        print(summarize_state(state))
-        return 0
+    return 0
 
-    if args.command == "qc":
-        from scagent.core import load_data, run_qc_pipeline
 
-        adata = load_data(args.data_path)
-        run_qc_pipeline(adata, mt_threshold=args.mt_threshold)
-        adata.write_h5ad(args.output_path)
-        print(f"Saved to {args.output_path}")
-        return 0
+def run_analyze(args):
+    """Run autonomous analysis."""
+    from scagent.agent import SCAgent
+
+    # Build request
+    if args.request:
+        request = args.request
+    else:
+        # Auto-analyze: let agent decide
+        request = (
+            "Analyze this single-cell data. First inspect it to understand what processing "
+            "has been done. Then run appropriate analysis steps based on the data state and "
+            "what would be most useful. Include QC if needed, clustering, and cell type "
+            "annotation. Provide a summary of your findings."
+        )
+
+    # Create agent
+    agent = SCAgent(
+        provider=args.provider,
+        model=args.model,
+        verbose=not args.quiet,
+        output_dir=args.output,
+        save_checkpoints=args.checkpoints,
+    )
+
+    print(f"Data: {args.data}")
+    print(f"Provider: {agent.provider}:{agent.model}")
+    print(f"Mode: {'interactive' if args.interactive else 'single-run'}")
+    print(f"Checkpoints: {'enabled' if args.checkpoints else 'final only'}")
+    print(f"Request: {request[:100]}{'...' if len(request) > 100 else ''}")
+    print("-" * 50)
+
+    # First analysis
+    result = agent.analyze(
+        request=request,
+        data_path=args.data,
+        run_name=args.name,
+        max_iterations=args.max_iterations,
+    )
+
+    # Interactive mode - continue conversation
+    if args.interactive:
+        print("\n" + "=" * 50)
+        print("INTERACTIVE MODE - Enter follow-up requests or 'done' to exit")
+        print("=" * 50)
+
+        while True:
+            try:
+                user_input = input("\n> ").strip()
+
+                if user_input.lower() in ['done', 'exit', 'quit', 'q']:
+                    print("Exiting interactive mode.")
+                    break
+
+                if not user_input:
+                    continue
+
+                # Continue analysis with the same agent (preserves state and conversation)
+                result = agent.analyze(
+                    request=user_input,
+                    data_path=None,  # Use existing loaded data
+                    max_iterations=args.max_iterations,
+                    continue_conversation=True,  # Keep conversation history
+                )
+
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting interactive mode.")
+                break
+
+    return 0
+
+
+def run_inspect(args):
+    """Inspect data state."""
+    from scagent.core import load_data, inspect_data, recommend_next_steps
+    from scagent.core.inspector import summarize_state
+
+    print(f"Inspecting: {args.data}")
+    print("-" * 50)
+
+    adata = load_data(args.data)
+    state = inspect_data(adata)
+
+    print(summarize_state(state))
+
+    if args.goal:
+        print(f"\nRecommended steps for '{args.goal}':")
+        steps = recommend_next_steps(state, args.goal)
+        for i, step in enumerate(steps, 1):
+            print(f"  {i}. {step}")
+
+    return 0
+
+
+def run_qc(args):
+    """Run QC directly without agent."""
+    from scagent.core import load_data, run_qc_pipeline
+
+    print(f"Running QC on: {args.data_path}")
+
+    adata = load_data(args.data_path)
+    n_before = adata.n_obs
+
+    run_qc_pipeline(adata, mt_threshold=args.mt_threshold)
+
+    adata.write_h5ad(args.output_path)
+    print(f"Filtered: {n_before} -> {adata.n_obs} cells")
+    print(f"Saved to: {args.output_path}")
+
+    return 0
+
+
+def run_chat(args):
+    """Chat with the agent."""
+    from scagent.agent import SCAgent
+
+    agent = SCAgent(
+        provider=args.provider,
+        create_run_dir=False,
+        verbose=False,
+    )
+
+    response = agent.chat(args.question)
+    print(response)
 
     return 0
 
