@@ -30,12 +30,12 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - only save at key checkpoints)"},
                     "mt_threshold": {"type": "number", "description": "Max MT% (default: auto-detect)"},
                     "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
                     "batch_key": {"type": "string", "description": "Batch column for per-batch doublet detection"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": ["data_path"]
             }
         },
         {
@@ -45,10 +45,10 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": ["data_path"]
             }
         },
         {
@@ -58,11 +58,11 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_pcs": {"type": "integer", "description": "Number of PCs (default: 30)"},
                     "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": ["data_path"]
             }
         },
         {
@@ -72,11 +72,11 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": ["data_path"]
             }
         },
         {
@@ -86,11 +86,24 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "model": {"type": "string", "description": "Model name (default: Immune_All_Low.pkl)"},
                     "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": ["data_path"]
+            }
+        },
+        {
+            "name": "run_scimilarity",
+            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Different from CellTypist - use when you want embedding-based annotation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
+                    "model_path": {"type": "string", "description": "Path to Scimilarity model (default: lab model)"}
+                },
+                "required": ["data_path"]
             }
         },
         {
@@ -100,11 +113,11 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
                     "batch_key": {"type": "string", "description": "Batch column name"},
                     "method": {"type": "string", "enum": ["harmony", "scanorama"], "description": "Method (default: harmony)"}
                 },
-                "required": ["data_path", "output_path", "batch_key"]
+                "required": ["data_path", "batch_key"]
             }
         },
         {
@@ -114,11 +127,11 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
                     "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": ["data_path"]
             }
         },
         {
@@ -380,6 +393,17 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             "has_celltypes": state.has_celltypist or state.has_scimilarity,
         }
 
+    def get_adata(tool_input, existing_adata):
+        """Get adata from memory or load from disk."""
+        data_path = tool_input.get("data_path")
+        # If adata is already in memory and no specific path given, use it
+        if existing_adata is not None and (data_path is None or data_path == "memory"):
+            return existing_adata
+        # Otherwise load from disk
+        if data_path and data_path != "memory":
+            return load_data(data_path)
+        raise ValueError("No data available. Provide data_path or load data first.")
+
     try:
         # ===== META TOOLS =====
         if tool_name == "ask_user":
@@ -417,7 +441,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             # Load data if needed
             if adata is None and "data_path" in tool_input:
-                adata = load_data(tool_input["data_path"])
+                adata = get_adata(tool_input, adata)
 
             # Execute in controlled namespace
             namespace = {
@@ -500,13 +524,54 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps(result, indent=2), adata
 
         elif tool_name == "web_search":
-            # Web search using DuckDuckGo (no API key needed)
+            # Web search - uses Google if configured, falls back to DuckDuckGo
+            import os
+            import requests
+
             query = tool_input["query"]
             site = tool_input.get("site", "")
 
             if site:
                 query = f"site:{site} {query}"
 
+            # Try Google Custom Search first (more reliable, 100 free/day)
+            google_api_key = os.environ.get("GOOGLE_API_KEY")
+            google_cx = os.environ.get("GOOGLE_CX")
+
+            if google_api_key and google_cx:
+                try:
+                    url = "https://www.googleapis.com/customsearch/v1"
+                    params = {
+                        "key": google_api_key,
+                        "cx": google_cx,
+                        "q": query,
+                        "num": 5
+                    }
+                    resp = requests.get(url, params=params, timeout=10)
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    snippets = []
+                    for item in data.get("items", []):
+                        snippets.append({
+                            "title": item.get("title", ""),
+                            "url": item.get("link", ""),
+                            "snippet": item.get("snippet", "")[:300]
+                        })
+
+                    return json.dumps({
+                        "status": "ok",
+                        "tool": "web_search",
+                        "backend": "google",
+                        "query": query,
+                        "results": snippets
+                    }, indent=2), adata
+
+                except Exception as e:
+                    # Fall through to DuckDuckGo if Google fails
+                    pass
+
+            # Fall back to DuckDuckGo (no API key needed)
             try:
                 from duckduckgo_search import DDGS
 
@@ -524,6 +589,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 return json.dumps({
                     "status": "ok",
                     "tool": "web_search",
+                    "backend": "duckduckgo",
                     "query": query,
                     "results": snippets
                 }, indent=2), adata
@@ -532,8 +598,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 return json.dumps({
                     "status": "error",
                     "tool": "web_search",
-                    "message": "duckduckgo-search not installed. Use install_package tool first.",
-                    "install_command": "pip install duckduckgo-search"
+                    "message": "No search backend available. Set GOOGLE_API_KEY + GOOGLE_CX, or install duckduckgo-search.",
                 }, indent=2), adata
 
         elif tool_name == "research_findings":
@@ -692,7 +757,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
         # ===== INSPECTION TOOLS =====
         elif tool_name == "inspect_data":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             state = inspect_data(adata)
             goal = tool_input.get("goal")
 
@@ -727,7 +792,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps(result, indent=2), adata
 
         elif tool_name == "get_cluster_sizes":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             key = tool_input.get("cluster_key", "leiden")
             if key not in adata.obs:
                 return json.dumps({"status": "error", "message": f"No cluster column '{key}'"}), adata
@@ -742,7 +807,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "get_top_markers":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             cluster = tool_input["cluster"]
             n_genes = tool_input.get("n_genes", 10)
 
@@ -757,7 +822,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "summarize_qc_metrics":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
 
             metrics = {}
             for col in ['total_counts', 'n_genes_by_counts', 'pct_counts_mt', 'doublet_score']:
@@ -785,7 +850,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "get_celltypes":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
 
             # Find annotation column
             key = tool_input.get("annotation_key")
@@ -830,7 +895,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "list_obs_columns":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             return json.dumps({
                 "status": "ok",
                 "tool": "list_obs_columns",
@@ -840,7 +905,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
         # ===== ACTION TOOLS =====
         elif tool_name == "run_qc":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             n_before, g_before = adata.n_obs, adata.n_vars
 
             warnings = []
@@ -859,13 +924,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 remove_ribo=tool_input.get("remove_ribo", True),
                 batch_key=batch_key,
             )
-            adata.write_h5ad(tool_input["output_path"])
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_qc",
                 "input_path": tool_input["data_path"],
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "before": {"n_cells": n_before, "n_genes": g_before},
                 "after": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "metrics": {
@@ -879,34 +947,42 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "normalize_and_hvg":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             normalize_data(adata)
             n_hvg = tool_input.get("n_hvg", 4000)
             select_hvg(adata, n_top_genes=n_hvg)
-            adata.write_h5ad(tool_input["output_path"])
+
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "normalize_and_hvg",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "n_hvg": int(adata.var['highly_variable'].sum()),
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_dimred":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             n_pcs = tool_input.get("n_pcs", 30)
             n_neighbors = tool_input.get("n_neighbors", 30)
 
             run_pca(adata, n_comps=n_pcs)
             compute_neighbors(adata, n_neighbors=n_neighbors)
             compute_umap(adata)
-            adata.write_h5ad(tool_input["output_path"])
+
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_dimred",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "n_pcs": n_pcs,
                 "n_neighbors": n_neighbors,
                 "variance_explained": float(adata.uns['pca']['variance_ratio'].sum()),
@@ -914,7 +990,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_clustering":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             method = tool_input.get("method", "leiden")
             resolution = tool_input.get("resolution", 1.0)
 
@@ -925,13 +1001,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 run_phenograph(adata, resolution=resolution)
                 cluster_key = "pheno_leiden"
 
-            adata.write_h5ad(tool_input["output_path"])
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
             sizes = adata.obs[cluster_key].value_counts().to_dict()
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_clustering",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "method": method,
                 "resolution": resolution,
                 "n_clusters": len(sizes),
@@ -940,12 +1019,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_celltypist":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             model = tool_input.get("model", "Immune_All_Low.pkl")
             majority = tool_input.get("majority_voting", True)
 
             run_celltypist(adata, model=model, majority_voting=majority)
-            adata.write_h5ad(tool_input["output_path"])
+
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             # Get detailed type breakdown
             key = 'celltypist_majority_voting' if majority and 'celltypist_majority_voting' in adata.obs else 'celltypist_predicted_labels'
@@ -963,7 +1045,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps({
                 "status": "ok",
                 "tool": "run_celltypist",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "model": model,
                 "majority_voting": majority,
                 "total_cells": total_cells,
@@ -973,8 +1056,51 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "state": make_state(adata)
             }, indent=2), adata
 
+        elif tool_name == "run_scimilarity":
+            adata = get_adata(tool_input, adata)
+            model_path = tool_input.get("model_path")
+
+            # Only pass model_path if specified, otherwise use default
+            if model_path:
+                run_scimilarity(adata, model_path=model_path)
+            else:
+                run_scimilarity(adata)
+
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
+
+            # Get detailed type breakdown
+            key = 'scimilarity_predictions_unconstrained'
+            if key not in adata.obs:
+                key = 'scimilarity_representative_prediction'
+
+            all_counts = adata.obs[key].value_counts() if key in adata.obs else {}
+            total_cells = adata.n_obs
+
+            # Build detailed breakdown with counts and percentages
+            type_breakdown = {}
+            for ct, count in all_counts.items():
+                type_breakdown[str(ct)] = {
+                    "count": int(count),
+                    "percent": round(100.0 * count / total_cells, 1)
+                }
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "run_scimilarity",
+                "output_path": output_path,
+                "saved": output_path is not None,
+                "total_cells": total_cells,
+                "n_types": len(all_counts),
+                "annotation_key": key,
+                "has_embeddings": "X_scimilarity" in adata.obsm,
+                "cell_type_breakdown": type_breakdown,
+                "state": make_state(adata)
+            }, indent=2), adata
+
         elif tool_name == "run_batch_correction":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             method = tool_input.get("method", "harmony")
             batch_key = tool_input["batch_key"]
 
@@ -992,12 +1118,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
             compute_umap(adata)
 
-            adata.write_h5ad(tool_input["output_path"])
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_batch_correction",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "method": method,
                 "batch_key": batch_key,
                 "n_batches": len(batch_sizes),
@@ -1009,13 +1138,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_deg":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             groupby = tool_input.get("groupby", "leiden")
             method = tool_input.get("method", "wilcoxon")
 
             # Best practice: use raw counts for DEG
             run_differential_expression(adata, groupby=groupby, method=method, use_raw=True)
-            adata.write_h5ad(tool_input["output_path"])
+
+            output_path = tool_input.get("output_path")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             # Get top 5 markers per cluster for immediate insight
             groups = list(adata.obs[groupby].unique())
@@ -1037,7 +1169,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps({
                 "status": "ok",
                 "tool": "run_deg",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "groupby": groupby,
                 "method": method,
                 "n_groups": len(groups),
@@ -1051,7 +1184,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             import os
             import scanpy as sc
 
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             output_dir = tool_input["output_dir"]
             cluster = tool_input["cluster"]
             gene_sets = tool_input.get("gene_sets", "KEGG_2021_Human")
@@ -1162,7 +1295,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             import matplotlib.pyplot as plt
             import scanpy as sc
 
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             plot_type = tool_input["plot_type"]
             output_path = tool_input["output_path"]
             color_by = tool_input.get("color_by", "leiden")

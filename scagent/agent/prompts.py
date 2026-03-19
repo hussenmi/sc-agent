@@ -81,10 +81,23 @@ When analyzing data, first inspect its current state:
 - Check what processing has been done
 - Determine what steps are needed to reach the user's goal
 
-Always ask the user if you're unsure about:
+## When to Ask the User
+
+**Always use lab default parameters unless you detect a problem.** If defaults don't fit the data, ASK before changing:
+
+| Situation | Default | Ask Before Changing |
+|-----------|---------|---------------------|
+| MT threshold | 25% (cells) | "MT% is very low (median 2%), this looks like nuclei. Use 5% threshold instead?" |
+| MT threshold | 5% (nuclei) | Only if user said it's nuclei data |
+| Batch correction | Don't correct | "I see multiple batches. Should I run Harmony/Scanorama?" |
+| Clustering resolution | 1.0 | "Found only 5 clusters. Try higher resolution?" |
+| Cell type model | Immune_All_Low | "This doesn't look like immune cells. Which model?" |
+
+**Never silently change parameters.** The user should always know when you deviate from lab defaults.
+
+Also ask if you're unsure about:
 - Data type (cells vs nuclei)
 - Whether to remove ribosomal genes
-- Batch structure and whether to correct
 - Which cell type annotation model to use
 
 ## Response Format
@@ -111,17 +124,28 @@ When reporting results:
 
 ## File Saving Guidelines
 
-**Minimize intermediate h5ad files** - only save when necessary:
-- Save after QC filtering (important checkpoint for reproducibility)
-- Save final result at end of analysis
-- Do NOT save after every step (normalization, PCA, UMAP, etc.)
-- The in-memory AnnData persists between tool calls
+**The output_path parameter is OPTIONAL for most tools.** Data persists in memory between tool calls.
 
-When to save intermediate files:
-- After significant filtering that reduces cell count
-- Before a step that might fail (e.g., batch correction)
-- When user explicitly requests a checkpoint
-- At natural analysis milestones (QC complete, clustering complete)
+**Only provide output_path when you want to save:**
+- After QC filtering (important checkpoint - cells are removed)
+- At end of analysis (final result with all annotations)
+- When user explicitly requests a save
+
+**Do NOT provide output_path for:**
+- normalize_and_hvg (no data lost, just transformed)
+- run_dimred (just adds embeddings)
+- run_clustering (just adds labels)
+- run_celltypist / run_scimilarity (just adds annotations)
+- run_deg (just adds results to adata.uns)
+
+**Example - full analysis should only save TWICE:**
+1. run_qc(..., output_path="qc_filtered.h5ad")  ← Save: cells removed
+2. normalize_and_hvg(...)  ← No save
+3. run_dimred(...)  ← No save
+4. run_clustering(...)  ← No save
+5. run_celltypist(...)  ← No save
+6. run_deg(...)  ← No save
+7. At end: save final with all results
 """
 
 QC_PROMPT = """Analyze the quality of this single-cell dataset.

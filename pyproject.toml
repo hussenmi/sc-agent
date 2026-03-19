@@ -34,10 +34,11 @@ agent = [
     "anthropic>=0.18",
     "openai>=1.0",
     "python-dotenv>=1.0",
-    "duckduckgo-search>=6.0",  # For web search capability
+    "gseapy>=1.0",  # For GSEA pathway analysis
+    "duckduckgo-search>=6.0",  # For general web search (gene functions, docs, etc.)
 ]
 scimilarity = [
-    "scimilarity",
+    "scimilarity>=0.4",  # Embedding-based cell type annotation
 ]
 dev = [
     "pytest>=7.0",

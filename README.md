@@ -111,6 +111,62 @@ scagent analyze --data pbmc.h5 --interactive
 # > done  (to exit)
 ```
 
+## Two Modes of Operation
+
+scagent offers two ways to run analyses:
+
+### 1. Agent Mode (LLM-Guided)
+
+The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation.
+
+```bash
+# CLI
+scagent analyze "QC and cluster this data" --data pbmc.h5
+
+# Python
+agent = SCAgent()
+agent.analyze("QC and cluster", data_path="pbmc.h5")
+```
+
+**Pros:** Adapts to unexpected data, handles errors gracefully, provides insights
+**Cons:** Requires API key, costs money, slower (LLM round-trips)
+
+**Best for:** Exploratory analysis, unfamiliar data, when you want interpretation
+
+### 2. Direct Mode (No LLM)
+
+Call core functions directly - fast, free, deterministic, but no adaptation.
+
+```bash
+# CLI (limited commands)
+scagent qc data.h5 output.h5ad --mt-threshold 25
+scagent inspect data.h5ad
+
+# Python (full control)
+from scagent.core import load_data, run_qc_pipeline, run_clustering_pipeline
+
+adata = load_data("data.h5")
+run_qc_pipeline(adata, mt_threshold=25)
+run_clustering_pipeline(adata)
+adata.write_h5ad("result.h5ad")
+```
+
+**Pros:** Free, fast, reproducible, scriptable
+**Cons:** Fails on unexpected data, no reasoning, no interpretation
+
+**Best for:** Batch processing, known-good data, scripting, CI/CD pipelines
+
+### Comparison
+
+| | Agent Mode | Direct Mode |
+|---|---|---|
+| LLM involved | Yes | No |
+| Cost | API calls | Free |
+| Speed | Slower | Fast |
+| Error handling | Reasons and adapts | Crashes |
+| Interpretation | Yes ("cluster 5 looks like T cells") | No |
+| Scripting | Adaptable but grounded | Deterministic |
+
 ### Agent Capabilities
 
 The agent can:
@@ -128,11 +184,11 @@ Agent: "Cluster 13 has highest MT% (mean 15.14%) and its markers
         cell population, not a real immune cell type."
 ```
 
-## Available Tools (20 total)
+## Available Tools (21 total)
 
 | Category | Tools |
 |----------|-------|
-| **Analysis** | `run_qc`, `normalize_and_hvg`, `run_dimred`, `run_clustering`, `run_celltypist`, `run_batch_correction`, `run_deg`, `run_gsea` |
+| **Analysis** | `run_qc`, `normalize_and_hvg`, `run_dimred`, `run_clustering`, `run_celltypist`, `run_scimilarity`, `run_batch_correction`, `run_deg`, `run_gsea` |
 | **Visualization** | `generate_figure` (UMAP, violin, dotplot, heatmap) |
 | **Inspection** | `inspect_data`, `get_cluster_sizes`, `get_top_markers`, `summarize_qc_metrics`, `get_celltypes`, `list_obs_columns` |
 | **Research** | `research_findings` (PubMed literature search with citations), `web_search` |
@@ -171,6 +227,16 @@ The agent follows this pipeline sequence:
 | **CellTypist target_sum** | **10000** | CRITICAL |
 | Scanorama dimred/knn | 30 | |
 
+### Parameter Handling
+
+The agent follows a **"lab defaults + ask before changing"** approach:
+
+1. **Uses lab-validated defaults** for all parameters (MT=25%, k=30, etc.)
+2. **Detects when defaults don't fit** (e.g., very low MT% suggests nuclei data)
+3. **Asks user before deviating** ("MT% is very low, use 5% threshold instead?")
+
+This ensures the pipeline is **predictable** (always starts with validated parameters) and **transparent** (user approves any changes). The agent will never silently change parameters.
+
 ### Automatic Best Practices
 
 The agent automatically follows these best practices:
@@ -181,6 +247,24 @@ The agent automatically follows these best practices:
 - **GSEA**: Uses DEG scores for prerank GSEA with GSEApy. Returns top up/downregulated pathways with NES scores, FDR values, and leading edge genes. Supports KEGG, GO, Reactome, MSigDB Hallmark databases.
 - **Literature Research**: After GSEA, uses PubMed E-utilities API to find recent papers about enriched pathways. Returns PMIDs, titles, abstracts, and journal info for citation.
 - **File Management**: Minimizes intermediate h5ad files - only saves after QC filtering and at end of analysis. Data persists in memory between tool calls.
+
+### Where Results Are Stored
+
+All results accumulate in a single AnnData object:
+
+| Analysis | Columns/Keys | Location |
+|----------|--------------|----------|
+| QC | `total_counts`, `n_genes_by_counts`, `pct_counts_mt`, `pct_counts_ribo` | `adata.obs` |
+| Doublets | `predicted_doublet`, `doublet_score` | `adata.obs` |
+| Clustering | `leiden` or `pheno_leiden` | `adata.obs` |
+| CellTypist | `celltypist_predicted_labels`, `celltypist_conf_score`, `celltypist_majority_voting` | `adata.obs` |
+| Scimilarity | `scimilarity_predictions_unconstrained`, `scimilarity_representative_prediction` | `adata.obs` |
+| PCA | `X_pca` | `adata.obsm` |
+| UMAP | `X_umap` | `adata.obsm` |
+| Scimilarity embeddings | `X_scimilarity` | `adata.obsm` |
+| HVG | `highly_variable`, `means`, `dispersions` | `adata.var` |
+| Raw counts | `raw_counts` | `adata.layers` |
+| DEG | `rank_genes_groups` | `adata.uns` |
 
 ## Run Output Structure
 
@@ -200,6 +284,25 @@ run_2026_03_18_230927_full_analysis/
 ├── pbmc_qc.h5ad
 ├── pbmc_clustered.h5ad
 └── ...
+```
+
+## CLI Reference
+
+```bash
+# Agent mode - LLM-guided analysis
+scagent analyze "your request" --data file.h5
+scagent analyze --data file.h5                    # Auto-analyze (agent decides)
+scagent analyze --data file.h5 --interactive      # Continue with follow-ups
+scagent analyze --data file.h5 --provider openai  # Use OpenAI instead of Anthropic
+
+# Direct mode - no LLM
+scagent qc input.h5 output.h5ad                   # Run QC pipeline directly
+scagent qc input.h5 output.h5ad --mt-threshold 20 # Custom MT threshold
+scagent inspect data.h5ad                         # Show data state
+scagent inspect data.h5ad --goal cluster          # Get recommendations for goal
+
+# Chat - quick questions (no data)
+scagent chat "What MT threshold should I use for nuclei?"
 ```
 
 ## Testing
