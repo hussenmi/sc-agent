@@ -110,14 +110,15 @@ Agent: "Cluster 13 has highest MT% (mean 15.14%) and its markers
         cell population, not a real immune cell type."
 ```
 
-## Available Tools
+## Available Tools (20 total)
 
 | Category | Tools |
 |----------|-------|
-| **Analysis** | `run_qc`, `normalize_and_hvg`, `run_dimred`, `run_clustering`, `run_celltypist`, `run_batch_correction`, `run_deg` |
+| **Analysis** | `run_qc`, `normalize_and_hvg`, `run_dimred`, `run_clustering`, `run_celltypist`, `run_batch_correction`, `run_deg`, `run_gsea` |
 | **Visualization** | `generate_figure` (UMAP, violin, dotplot, heatmap) |
 | **Inspection** | `inspect_data`, `get_cluster_sizes`, `get_top_markers`, `summarize_qc_metrics`, `get_celltypes`, `list_obs_columns` |
-| **Meta** | `ask_user`, `run_code`, `web_search`, `install_package` |
+| **Research** | `research_findings` (PubMed literature search with citations), `web_search` |
+| **Meta** | `ask_user`, `run_code`, `install_package` |
 
 ## Lab Parameters (Best Practices)
 
@@ -134,6 +135,16 @@ Agent: "Cluster 13 has highest MT% (mean 15.14%) and its markers
 | UMAP min_dist | 0.1 | |
 | **CellTypist target_sum** | **10000** | CRITICAL |
 | Scanorama dimred/knn | 30 | |
+
+### Automatic Best Practices
+
+The agent automatically follows these best practices:
+
+- **CellTypist**: Normalizes to `target_sum=10000` from raw counts layer (not from scaled data). Returns complete cell type breakdown with counts and percentages.
+- **DEG Analysis**: Uses raw counts layer for Wilcoxon test (more accurate than scaled data). Returns top 5 markers per cluster immediately for quick insight.
+- **Batch Correction**: After Harmony/Scanorama, automatically recomputes neighbors and UMAP on the corrected embedding.
+- **GSEA**: Uses DEG scores for prerank GSEA with GSEApy. Returns top up/downregulated pathways with NES scores, FDR values, and leading edge genes. Supports KEGG, GO, Reactome, MSigDB Hallmark databases.
+- **Literature Research**: After GSEA, uses PubMed E-utilities API to find recent papers about enriched pathways. Returns PMIDs, titles, abstracts, and journal info for citation.
 
 ## Run Output Structure
 

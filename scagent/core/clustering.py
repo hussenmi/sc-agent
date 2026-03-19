@@ -206,10 +206,15 @@ def run_differential_expression(
     method: str = 'wilcoxon',
     n_genes: int = 100,
     key_added: str = 'rank_genes_groups',
+    use_raw: bool = True,
     inplace: bool = True,
 ) -> Optional[AnnData]:
     """
     Run differential expression analysis between clusters.
+
+    BEST PRACTICE: Wilcoxon test should be run on raw counts (or log-normalized
+    from raw counts) rather than scaled data. This function uses raw counts
+    layer if available.
 
     Parameters
     ----------
@@ -223,6 +228,8 @@ def run_differential_expression(
         Number of top genes to store.
     key_added : str, default 'rank_genes_groups'
         Key to add to adata.uns.
+    use_raw : bool, default True
+        Use raw counts layer for DEG (recommended for Wilcoxon).
     inplace : bool, default True
         Modify adata in place.
 
@@ -239,15 +246,26 @@ def run_differential_expression(
 
     logger.info(f"Running differential expression analysis by {groupby}")
 
+    # Best practice: use raw counts for Wilcoxon test
+    layer = None
+    if use_raw and method == 'wilcoxon':
+        for raw_layer in ['raw_counts', 'counts', 'raw_data']:
+            if raw_layer in adata.layers:
+                layer = raw_layer
+                logger.info(f"Using '{layer}' layer for DEG (best practice)")
+                break
+
     sc.tl.rank_genes_groups(
         adata,
         groupby=groupby,
         method=method,
         n_genes=n_genes,
         key_added=key_added,
+        layer=layer,
     )
 
-    logger.info("Differential expression analysis complete")
+    n_groups = adata.obs[groupby].nunique()
+    logger.info(f"Differential expression analysis complete: {n_groups} groups analyzed")
 
     if not inplace:
         return adata
