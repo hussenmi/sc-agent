@@ -71,6 +71,12 @@ class DataState:
     batch_correction_applied: bool = False
     batch_correction_method: str = ''
 
+    # Gene ID format
+    gene_id_format: str = 'unknown'  # 'symbol', 'ensembl', 'entrez', 'mixed', 'unknown'
+    has_gene_symbols: bool = False
+    has_ensembl_ids: bool = False
+    sample_gene_names: List[str] = field(default_factory=list)
+
     # Additional observations
     obs_columns: List[str] = field(default_factory=list)
     var_columns: List[str] = field(default_factory=list)
@@ -143,6 +149,43 @@ def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
                 return True, name
 
     return False, ''
+
+
+def _detect_gene_id_format(adata: AnnData) -> Tuple[str, bool, bool, List[str]]:
+    """
+    Detect the format of gene identifiers.
+
+    Returns: (format, has_symbols, has_ensembl, sample_names)
+    """
+    import re
+
+    gene_names = adata.var_names.tolist()
+    sample = gene_names[:20]  # Check first 20 genes
+
+    # Patterns
+    ensembl_pattern = re.compile(r'^ENS[A-Z]{0,3}G\d{11}')  # ENSG00000000001
+    entrez_pattern = re.compile(r'^\d{1,8}$')  # Pure numeric
+    symbol_pattern = re.compile(r'^[A-Z][A-Z0-9-]{1,15}$', re.IGNORECASE)  # Gene symbols like TP53, CD4
+
+    ensembl_count = sum(1 for g in sample if ensembl_pattern.match(str(g)))
+    entrez_count = sum(1 for g in sample if entrez_pattern.match(str(g)))
+    symbol_count = sum(1 for g in sample if symbol_pattern.match(str(g)) and not ensembl_pattern.match(str(g)))
+
+    # Also check var columns for alternate IDs
+    has_symbols = 'gene_symbols' in adata.var.columns or 'gene_name' in adata.var.columns
+    has_ensembl = 'gene_ids' in adata.var.columns or 'ensembl_id' in adata.var.columns
+
+    # Determine primary format
+    if ensembl_count > len(sample) * 0.5:
+        fmt = 'ensembl'
+    elif entrez_count > len(sample) * 0.5:
+        fmt = 'entrez'
+    elif symbol_count > len(sample) * 0.3:
+        fmt = 'symbol'
+    else:
+        fmt = 'mixed' if (ensembl_count > 0 and symbol_count > 0) else 'unknown'
+
+    return fmt, has_symbols or fmt == 'symbol', has_ensembl or fmt == 'ensembl', sample[:5]
 
 
 def _detect_normalization(adata: AnnData) -> Tuple[bool, bool, str]:
@@ -223,6 +266,13 @@ def inspect_data(adata: AnnData) -> DataState:
     # Raw data detection
     state.has_raw_layer, state.raw_layer_name = _detect_raw_layer(adata)
     state.is_counts = _is_integer_matrix(adata.X)
+
+    # Gene ID format detection
+    gene_fmt, has_sym, has_ens, sample_genes = _detect_gene_id_format(adata)
+    state.gene_id_format = gene_fmt
+    state.has_gene_symbols = has_sym
+    state.has_ensembl_ids = has_ens
+    state.sample_gene_names = sample_genes
 
     # QC metrics
     qc_obs_cols = ['n_genes_by_counts', 'total_counts', 'n_genes']

@@ -8,6 +8,11 @@ Tools are organized into two layers:
 All tools return structured JSON for LLM reasoning.
 """
 
+# Configure tqdm for cleaner progress bars (must be before any imports that use tqdm)
+import os
+os.environ.setdefault('TQDM_NCOLS', '60')
+os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
+
 from typing import List, Dict, Any
 import json
 
@@ -29,13 +34,13 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - only save at key checkpoints)"},
                     "mt_threshold": {"type": "number", "description": "Max MT% (default: auto-detect)"},
                     "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
                     "batch_key": {"type": "string", "description": "Batch column for per-batch doublet detection"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": []
             }
         },
         {
@@ -44,11 +49,11 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": []
             }
         },
         {
@@ -57,12 +62,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_pcs": {"type": "integer", "description": "Number of PCs (default: 30)"},
                     "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": []
             }
         },
         {
@@ -71,12 +76,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": []
             }
         },
         {
@@ -85,12 +90,24 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "model": {"type": "string", "description": "Model name (default: Immune_All_Low.pkl)"},
                     "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": []
+            }
+        },
+        {
+            "name": "run_scimilarity",
+            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Model path is pre-configured via SCIMILARITY_MODEL_PATH env var - do NOT ask the user for a model path. Different from CellTypist - use when you want embedding-based annotation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data if already loaded)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"}
+                },
+                "required": []
             }
         },
         {
@@ -99,12 +116,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
                     "batch_key": {"type": "string", "description": "Batch column name"},
                     "method": {"type": "string", "enum": ["harmony", "scanorama"], "description": "Method (default: harmony)"}
                 },
-                "required": ["data_path", "output_path", "batch_key"]
+                "required": ["batch_key"]
             }
         },
         {
@@ -113,12 +130,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
                     "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"}
                 },
-                "required": ["data_path", "output_path"]
+                "required": []
             }
         },
         {
@@ -127,13 +144,99 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save PNG figure"},
                     "plot_type": {"type": "string", "enum": ["umap", "violin", "dotplot", "heatmap"], "description": "Plot type"},
                     "color_by": {"type": "string", "description": "Column or gene to color by"},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"}
                 },
-                "required": ["data_path", "output_path", "plot_type"]
+                "required": ["output_path", "plot_type"]
+            }
+        },
+        {
+            "name": "run_gsea",
+            "description": "Run Gene Set Enrichment Analysis on DEG results. Identifies enriched biological pathways/processes. Requires DEG to be run first. Returns top enriched pathways with NES scores and FDR values.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to h5ad with DEG results (optional - uses in-memory data)"},
+                    "output_dir": {"type": "string", "description": "Directory to save GSEA results"},
+                    "cluster": {"type": "string", "description": "Cluster to analyze (or 'all' for all clusters)"},
+                    "gene_sets": {"type": "string", "description": "Gene set database: KEGG_2021_Human, GO_Biological_Process_2021, Reactome_2022, MSigDB_Hallmark_2020 (default: KEGG_2021_Human)"},
+                    "min_size": {"type": "integer", "description": "Min genes in pathway (default: 5)"},
+                    "max_size": {"type": "integer", "description": "Max genes in pathway (default: 500)"},
+                    "permutation_num": {"type": "integer", "description": "Permutations for p-value (default: 1000)"}
+                },
+                "required": ["output_dir", "cluster"]
+            }
+        },
+    ]
+
+    # Meta tools (agent control)
+    meta_tools = [
+        {
+            "name": "ask_user",
+            "description": "Ask the user a question and wait for their response. Use this when you need clarification about: data type (cells vs nuclei), batch structure, which annotation model to use, gene ID format, or any ambiguous situation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask the user"},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices"},
+                    "default": {"type": "string", "description": "Default answer if user just presses enter"}
+                },
+                "required": ["question"]
+            }
+        },
+        {
+            "name": "run_code",
+            "description": "Execute custom Python code on the AnnData object. Use this for operations not covered by other tools, like: gene ID conversion, custom filtering, subsetting, merging datasets, plotting, or any data manipulation. The code has access to 'adata', 'sc' (scanpy), 'plt' (matplotlib), 'np', 'pd'. For plots, save to a file path.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python code to execute. Has access to adata, sc, plt, np, pd."},
+                    "description": {"type": "string", "description": "Brief description of what the code does"},
+                    "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
+                },
+                "required": ["code", "description"]
+            }
+        },
+        {
+            "name": "web_search",
+            "description": "Search the web for information. Use for: looking up gene functions, pathway databases (MSigDB, GO, KEGG), troubleshooting errors, finding best practices, or referencing papers. Returns relevant snippets.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "site": {"type": "string", "description": "Optional site filter (e.g., 'msigdb.gsea-msigdb.org', 'pubmed.ncbi.nlm.nih.gov')"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "research_findings",
+            "description": "Conduct thorough literature research on GSEA/pathway findings. Searches PubMed, reviews, and scientific databases to find recent publications about enriched pathways in the context of your cell type. Use AFTER run_gsea to understand what the enriched pathways mean biologically and find supporting literature.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pathway": {"type": "string", "description": "Pathway name to research (e.g., 'Oxidative phosphorylation', 'TNF signaling')"},
+                    "cell_type": {"type": "string", "description": "Cell type context (e.g., 'classical monocytes', 'CD8 T cells', 'B cells')"},
+                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Leading edge genes from GSEA to include in search"},
+                    "context": {"type": "string", "description": "Additional context (e.g., 'PBMC', 'tumor microenvironment', 'inflammation')"},
+                    "recent_years": {"type": "integer", "description": "Limit to papers from last N years (default: 3)"}
+                },
+                "required": ["pathway", "cell_type"]
+            }
+        },
+        {
+            "name": "install_package",
+            "description": "Request installation of a Python package. Requires user approval. Use when you need a package that isn't installed (e.g., gseapy, mygene, biomart).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "package": {"type": "string", "description": "Package name (pip format)"},
+                    "reason": {"type": "string", "description": "Why this package is needed"}
+                },
+                "required": ["package", "reason"]
             }
         },
     ]
@@ -146,10 +249,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"},
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
                     "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -158,10 +261,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"},
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
                     "cluster_key": {"type": "string", "description": "Cluster column (default: leiden)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -170,11 +273,11 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad with DEG results"},
+                    "data_path": {"type": "string", "description": "Path to h5ad with DEG results (optional - uses in-memory data)"},
                     "cluster": {"type": "string", "description": "Cluster ID"},
                     "n_genes": {"type": "integer", "description": "Number of genes (default: 10)"}
                 },
-                "required": ["data_path", "cluster"]
+                "required": ["cluster"]
             }
         },
         {
@@ -183,9 +286,9 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"}
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -194,10 +297,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"},
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
                     "annotation_key": {"type": "string", "description": "Annotation column (default: auto-detect)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -206,14 +309,56 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"}
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
     ]
 
-    return action_tools + inspection_tools
+    return action_tools + meta_tools + inspection_tools
+
+
+def get_openai_tools() -> List[Dict[str, Any]]:
+    """
+    Get OpenAI-format tool definitions.
+
+    OpenAI uses a different schema format than Anthropic.
+    """
+    anthropic_tools = get_tools()
+    openai_tools = []
+
+    for tool in anthropic_tools:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
+            }
+        })
+
+    return openai_tools
+
+
+def encode_image_base64(image_path: str) -> str:
+    """Encode an image file to base64 for vision API."""
+    import base64
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def get_image_mime_type(image_path: str) -> str:
+    """Get MIME type for image."""
+    ext = image_path.lower().split(".")[-1]
+    mime_types = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }
+    return mime_types.get(ext, "image/png")
 
 
 def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) -> tuple:
@@ -226,6 +371,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
         (json_result_string, updated_adata)
     """
     import numpy as np
+
     from ..core import (
         inspect_data, load_data, run_qc_pipeline, normalize_data,
         run_pca, compute_neighbors, compute_umap,
@@ -252,10 +398,382 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             "has_celltypes": state.has_celltypist or state.has_scimilarity,
         }
 
+    def get_adata(tool_input, existing_adata):
+        """Get adata from memory or load from disk."""
+        data_path = tool_input.get("data_path")
+        # If adata is already in memory and no specific path given, use it
+        if existing_adata is not None and (data_path is None or data_path == "memory"):
+            return existing_adata
+        # Otherwise load from disk
+        if data_path and data_path != "memory":
+            return load_data(data_path)
+        raise ValueError("No data available. Provide data_path or load data first.")
+
+    def fix_output_path(output_path: str, tool_name: str) -> str:
+        """Fix output_path if it's a directory by adding a filename."""
+        import os as os_module
+        if output_path is None:
+            return None
+        if os_module.path.isdir(output_path):
+            # It's a directory, construct a proper filename
+            filename = f"{tool_name}_result.h5ad"
+            return os_module.path.join(output_path, filename)
+        return output_path
+
     try:
+        # ===== META TOOLS =====
+        if tool_name == "ask_user":
+            # This is handled specially by the agent loop - just return the question
+            return json.dumps({
+                "status": "needs_input",
+                "tool": "ask_user",
+                "question": tool_input["question"],
+                "options": tool_input.get("options", []),
+                "default": tool_input.get("default", ""),
+            }, indent=2), adata
+
+        elif tool_name == "run_code":
+            # Execute custom Python code on adata
+            import scanpy as sc
+            import pandas as pd
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+
+            code = tool_input["code"]
+            description = tool_input["description"]
+            save_to = tool_input.get("save_to")
+
+            # Security: basic checks (not foolproof, but helps)
+            forbidden = ["import os", "import sys", "subprocess", "eval(",
+                        "__import__", "rm -rf", "shutil.rmtree", "requests."]
+            for f in forbidden:
+                if f in code:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "run_code",
+                        "message": f"Forbidden operation: {f}"
+                    }, indent=2), adata
+
+            # Load data if needed
+            if adata is None and "data_path" in tool_input:
+                adata = get_adata(tool_input, adata)
+
+            # Execute in controlled namespace
+            namespace = {
+                "adata": adata,
+                "sc": sc,
+                "np": np,
+                "pd": pd,
+                "plt": plt,
+                "scanpy": sc,
+                "matplotlib": matplotlib,
+            }
+
+            # Capture stdout so LLM can see print outputs
+            import io
+            import sys
+            stdout_capture = io.StringIO()
+            old_stdout = sys.stdout
+
+            # Capture any figures created
+            plt.close('all')
+
+            try:
+                sys.stdout = stdout_capture
+                exec(code, namespace)
+            finally:
+                sys.stdout = old_stdout
+
+            captured_output = stdout_capture.getvalue()
+            adata = namespace.get("adata", adata)
+
+            # Check if any figures were created
+            figures_saved = []
+            if plt.get_fignums():
+                # There are open figures - check if code saved them
+                pass
+
+            if save_to:
+                adata.write_h5ad(save_to)
+
+            # Save code to file if output directory exists
+            code_file = None
+            if "output_dir" in tool_input:
+                import os
+                code_dir = os.path.join(tool_input["output_dir"], "code")
+                os.makedirs(code_dir, exist_ok=True)
+
+                # Create filename from description
+                safe_desc = "".join(c if c.isalnum() or c in "_ " else "_" for c in description)
+                safe_desc = safe_desc.replace(" ", "_")[:50]
+                code_file = os.path.join(code_dir, f"{safe_desc}.py")
+
+                with open(code_file, "w") as f:
+                    f.write(f'"""\n{description}\n\nAuto-generated by scagent\n"""\n\n')
+                    f.write("import scanpy as sc\n")
+                    f.write("import numpy as np\n")
+                    f.write("import pandas as pd\n")
+                    f.write("import matplotlib.pyplot as plt\n\n")
+                    f.write("# Load data (adjust path as needed)\n")
+                    f.write("# adata = sc.read_h5ad('path/to/data.h5ad')\n\n")
+                    f.write("# Generated code:\n")
+                    f.write(code)
+
+            result = {
+                "status": "ok",
+                "tool": "run_code",
+                "description": description,
+            }
+            if adata is not None:
+                result["shape"] = {"n_cells": adata.n_obs, "n_genes": adata.n_vars}
+            if save_to:
+                result["saved_to"] = save_to
+            if code_file:
+                result["code_file"] = code_file
+            if captured_output:
+                # Truncate if too long
+                result["output"] = captured_output[:2000]
+                if len(captured_output) > 2000:
+                    result["output_truncated"] = True
+
+            return json.dumps(result, indent=2), adata
+
+        elif tool_name == "web_search":
+            # Web search - uses Google if configured, falls back to DuckDuckGo
+            import os
+            import requests
+
+            query = tool_input["query"]
+            site = tool_input.get("site", "")
+
+            if site:
+                query = f"site:{site} {query}"
+
+            # Try Google Custom Search first (more reliable, 100 free/day)
+            google_api_key = os.environ.get("GOOGLE_API_KEY")
+            google_cx = os.environ.get("GOOGLE_CX")
+
+            if google_api_key and google_cx:
+                try:
+                    url = "https://www.googleapis.com/customsearch/v1"
+                    params = {
+                        "key": google_api_key,
+                        "cx": google_cx,
+                        "q": query,
+                        "num": 5
+                    }
+                    resp = requests.get(url, params=params, timeout=10)
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    snippets = []
+                    for item in data.get("items", []):
+                        snippets.append({
+                            "title": item.get("title", ""),
+                            "url": item.get("link", ""),
+                            "snippet": item.get("snippet", "")[:300]
+                        })
+
+                    return json.dumps({
+                        "status": "ok",
+                        "tool": "web_search",
+                        "backend": "google",
+                        "query": query,
+                        "results": snippets
+                    }, indent=2), adata
+
+                except Exception as e:
+                    # Fall through to DuckDuckGo if Google fails
+                    pass
+
+            # Fall back to DuckDuckGo (no API key needed)
+            try:
+                from duckduckgo_search import DDGS
+
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=5))
+
+                snippets = []
+                for r in results:
+                    snippets.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("href", ""),
+                        "snippet": r.get("body", "")[:300]
+                    })
+
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "web_search",
+                    "backend": "duckduckgo",
+                    "query": query,
+                    "results": snippets
+                }, indent=2), adata
+
+            except ImportError:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "web_search",
+                    "message": "No search backend available. Set GOOGLE_API_KEY + GOOGLE_CX, or install duckduckgo-search.",
+                }, indent=2), adata
+
+        elif tool_name == "research_findings":
+            # Thorough literature research using PubMed E-utilities API (free, reliable)
+            import requests
+            from datetime import datetime
+
+            pathway = tool_input["pathway"]
+            cell_type = tool_input["cell_type"]
+            genes = tool_input.get("genes", [])
+            context = tool_input.get("context", "")
+            recent_years = tool_input.get("recent_years", 3)
+
+            all_findings = {
+                "pathway": pathway,
+                "cell_type": cell_type,
+                "pubmed_results": [],
+                "review_articles": [],
+                "gene_specific": [],
+            }
+
+            # PubMed E-utilities base URL
+            ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+            EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+            def search_pubmed(query, max_results=5, filter_review=False):
+                """Search PubMed and return article info."""
+                results = []
+                try:
+                    # Calculate date range
+                    current_year = datetime.now().year
+                    min_date = f"{current_year - recent_years}/01/01"
+
+                    # Search for IDs
+                    search_params = {
+                        "db": "pubmed",
+                        "term": query,
+                        "retmax": max_results,
+                        "retmode": "json",
+                        "sort": "relevance",
+                        "mindate": min_date,
+                        "maxdate": f"{current_year}/12/31",
+                        "datetype": "pdat",
+                    }
+                    if filter_review:
+                        search_params["term"] += " AND review[pt]"
+
+                    resp = requests.get(ESEARCH_URL, params=search_params, timeout=10)
+                    data = resp.json()
+                    ids = data.get("esearchresult", {}).get("idlist", [])
+
+                    if not ids:
+                        return results
+
+                    # Fetch article details
+                    fetch_params = {
+                        "db": "pubmed",
+                        "id": ",".join(ids),
+                        "retmode": "xml",
+                        "rettype": "abstract",
+                    }
+                    resp = requests.get(EFETCH_URL, params=fetch_params, timeout=10)
+
+                    # Parse XML (simple extraction)
+                    import re
+                    xml = resp.text
+
+                    # Extract articles
+                    articles = re.findall(r'<PubmedArticle>(.*?)</PubmedArticle>', xml, re.DOTALL)
+                    for article in articles:
+                        title_match = re.search(r'<ArticleTitle>(.*?)</ArticleTitle>', article, re.DOTALL)
+                        abstract_match = re.search(r'<AbstractText[^>]*>(.*?)</AbstractText>', article, re.DOTALL)
+                        pmid_match = re.search(r'<PMID[^>]*>(\d+)</PMID>', article)
+                        year_match = re.search(r'<PubDate>.*?<Year>(\d+)</Year>', article, re.DOTALL)
+                        journal_match = re.search(r'<Title>(.*?)</Title>', article)
+
+                        if title_match and pmid_match:
+                            # Clean HTML tags from text
+                            title = re.sub(r'<[^>]+>', '', title_match.group(1))
+                            abstract = re.sub(r'<[^>]+>', '', abstract_match.group(1))[:500] if abstract_match else ""
+                            pmid = pmid_match.group(1)
+                            year = year_match.group(1) if year_match else "N/A"
+                            journal = journal_match.group(1) if journal_match else "N/A"
+
+                            results.append({
+                                "pmid": pmid,
+                                "title": title,
+                                "year": year,
+                                "journal": journal,
+                                "abstract": abstract,
+                                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                            })
+
+                except Exception as e:
+                    pass  # Fail silently, return what we have
+
+                return results
+
+            # Simplify cell type for better PubMed matches
+            # "classical monocytes" -> "monocyte", "CD8+ T cells" -> "T cell"
+            cell_type_simple = cell_type.lower()
+            for prefix in ["classical ", "non-classical ", "cd4+ ", "cd8+ ", "naive ", "memory ", "regulatory "]:
+                cell_type_simple = cell_type_simple.replace(prefix, "")
+            cell_type_simple = cell_type_simple.rstrip("s")  # monocytes -> monocyte
+
+            # Search 1: Pathway + cell type (ignore context for main query - too restrictive)
+            query1 = f'("{pathway}"[Title/Abstract]) AND ("{cell_type_simple}"[Title/Abstract])'
+            all_findings["pubmed_results"] = search_pubmed(query1, max_results=5)
+
+            # If no results, try broader search
+            if not all_findings["pubmed_results"]:
+                query1_broad = f'("{pathway}") AND ("{cell_type_simple}")'
+                all_findings["pubmed_results"] = search_pubmed(query1_broad, max_results=5)
+
+            # Search 2: Review articles on this topic
+            query2 = f'("{pathway}") AND ("{cell_type_simple}")'
+            all_findings["review_articles"] = search_pubmed(query2, max_results=3, filter_review=True)
+
+            # Search 3: Key genes in cell type context
+            if genes and len(genes) >= 2:
+                gene_str = " OR ".join([f'"{g}"[Title/Abstract]' for g in genes[:3]])
+                query3 = f'({gene_str}) AND ("{cell_type_simple}"[Title/Abstract])'
+                all_findings["gene_specific"] = search_pubmed(query3, max_results=4)
+
+            # Count findings
+            total_results = (
+                len(all_findings["pubmed_results"]) +
+                len(all_findings["review_articles"]) +
+                len(all_findings["gene_specific"])
+            )
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "research_findings",
+                "pathway": pathway,
+                "cell_type": cell_type,
+                "genes_researched": genes[:5] if genes else [],
+                "years_searched": f"last {recent_years} years",
+                "total_papers_found": total_results,
+                "findings": all_findings,
+                "note": "Papers are from PubMed. Review abstracts for: (1) biological function of pathway in this cell type, (2) disease associations, (3) therapeutic implications. Cite PMIDs when referencing."
+            }, indent=2), adata
+
+        elif tool_name == "install_package":
+            # Request package installation - requires user approval
+            package = tool_input["package"]
+            reason = tool_input["reason"]
+
+            return json.dumps({
+                "status": "needs_approval",
+                "tool": "install_package",
+                "package": package,
+                "reason": reason,
+                "message": f"Agent wants to install '{package}': {reason}"
+            }, indent=2), adata
+
         # ===== INSPECTION TOOLS =====
-        if tool_name == "inspect_data":
-            adata = load_data(tool_input["data_path"])
+        elif tool_name == "inspect_data":
+            adata = get_adata(tool_input, adata)
             state = inspect_data(adata)
             goal = tool_input.get("goal")
 
@@ -267,6 +785,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "state": make_state(adata),
                 "embeddings": [k for k in adata.obsm.keys()],
                 "layers": list(adata.layers.keys()),
+                "genes": {
+                    "format": state.gene_id_format,
+                    "has_symbols": state.has_gene_symbols,
+                    "has_ensembl": state.has_ensembl_ids,
+                    "sample": state.sample_gene_names,
+                    "var_columns": list(adata.var.columns)[:10],
+                },
                 "clustering": {
                     "has_clusters": state.has_clusters,
                     "cluster_key": state.cluster_key,
@@ -283,7 +808,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps(result, indent=2), adata
 
         elif tool_name == "get_cluster_sizes":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             key = tool_input.get("cluster_key", "leiden")
             if key not in adata.obs:
                 return json.dumps({"status": "error", "message": f"No cluster column '{key}'"}), adata
@@ -298,7 +823,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "get_top_markers":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             cluster = tool_input["cluster"]
             n_genes = tool_input.get("n_genes", 10)
 
@@ -313,7 +838,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "summarize_qc_metrics":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
 
             metrics = {}
             for col in ['total_counts', 'n_genes_by_counts', 'pct_counts_mt', 'doublet_score']:
@@ -341,7 +866,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "get_celltypes":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
 
             # Find annotation column
             key = tool_input.get("annotation_key")
@@ -355,17 +880,38 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             if not key or key not in adata.obs:
                 return json.dumps({"status": "error", "message": "No cell type annotations found"}), adata
 
-            counts = adata.obs[key].value_counts().to_dict()
+            counts = adata.obs[key].value_counts()
+            total_cells = adata.n_obs
+
+            # Build detailed breakdown with percentages
+            breakdown = {}
+            for ct, count in counts.items():
+                breakdown[str(ct)] = {
+                    "count": int(count),
+                    "percent": round(100.0 * count / total_cells, 1)
+                }
+
+            # Group by major categories if there are many types
+            major_types = {}
+            if len(counts) > 5:
+                for ct in counts.head(10).index:
+                    major_types[str(ct)] = {
+                        "count": int(counts[ct]),
+                        "percent": round(100.0 * counts[ct] / total_cells, 1)
+                    }
+
             return json.dumps({
                 "status": "ok",
                 "tool": "get_celltypes",
                 "annotation_key": key,
+                "total_cells": total_cells,
                 "n_types": len(counts),
-                "counts": {str(k): int(v) for k, v in counts.items()}
+                "top_10_types": major_types if major_types else breakdown,
+                "all_types": breakdown
             }, indent=2), adata
 
         elif tool_name == "list_obs_columns":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             return json.dumps({
                 "status": "ok",
                 "tool": "list_obs_columns",
@@ -375,7 +921,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
         # ===== ACTION TOOLS =====
         elif tool_name == "run_qc":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             n_before, g_before = adata.n_obs, adata.n_vars
 
             warnings = []
@@ -394,13 +940,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 remove_ribo=tool_input.get("remove_ribo", True),
                 batch_key=batch_key,
             )
-            adata.write_h5ad(tool_input["output_path"])
+            output_path = fix_output_path(tool_input.get("output_path"), "run_qc")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_qc",
                 "input_path": tool_input["data_path"],
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "before": {"n_cells": n_before, "n_genes": g_before},
                 "after": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "metrics": {
@@ -414,34 +963,42 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "normalize_and_hvg":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             normalize_data(adata)
             n_hvg = tool_input.get("n_hvg", 4000)
             select_hvg(adata, n_top_genes=n_hvg)
-            adata.write_h5ad(tool_input["output_path"])
+
+            output_path = fix_output_path(tool_input.get("output_path"), "normalize_and_hvg")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "normalize_and_hvg",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "n_hvg": int(adata.var['highly_variable'].sum()),
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_dimred":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             n_pcs = tool_input.get("n_pcs", 30)
             n_neighbors = tool_input.get("n_neighbors", 30)
 
             run_pca(adata, n_comps=n_pcs)
             compute_neighbors(adata, n_neighbors=n_neighbors)
             compute_umap(adata)
-            adata.write_h5ad(tool_input["output_path"])
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_dimred")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_dimred",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "n_pcs": n_pcs,
                 "n_neighbors": n_neighbors,
                 "variance_explained": float(adata.uns['pca']['variance_ratio'].sum()),
@@ -449,7 +1006,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_clustering":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             method = tool_input.get("method", "leiden")
             resolution = tool_input.get("resolution", 1.0)
 
@@ -460,13 +1017,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 run_phenograph(adata, resolution=resolution)
                 cluster_key = "pheno_leiden"
 
-            adata.write_h5ad(tool_input["output_path"])
+            output_path = fix_output_path(tool_input.get("output_path"), "run_clustering")
+            if output_path:
+                adata.write_h5ad(output_path)
             sizes = adata.obs[cluster_key].value_counts().to_dict()
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_clustering",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "method": method,
                 "resolution": resolution,
                 "n_clusters": len(sizes),
@@ -475,66 +1035,274 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_celltypist":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             model = tool_input.get("model", "Immune_All_Low.pkl")
             majority = tool_input.get("majority_voting", True)
 
             run_celltypist(adata, model=model, majority_voting=majority)
-            adata.write_h5ad(tool_input["output_path"])
 
-            # Get type counts
+            output_path = fix_output_path(tool_input.get("output_path"), "run_celltypist")
+            if output_path:
+                adata.write_h5ad(output_path)
+
+            # Get detailed type breakdown
             key = 'celltypist_majority_voting' if majority and 'celltypist_majority_voting' in adata.obs else 'celltypist_predicted_labels'
-            counts = adata.obs[key].value_counts().head(10).to_dict() if key in adata.obs else {}
+            all_counts = adata.obs[key].value_counts() if key in adata.obs else {}
+            total_cells = adata.n_obs
+
+            # Build detailed breakdown with counts and percentages
+            type_breakdown = {}
+            for ct, count in all_counts.items():
+                type_breakdown[str(ct)] = {
+                    "count": int(count),
+                    "percent": round(100.0 * count / total_cells, 1)
+                }
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_celltypist",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "model": model,
                 "majority_voting": majority,
-                "n_types": len(adata.obs[key].unique()) if key in adata.obs else 0,
-                "top_types": {str(k): int(v) for k, v in counts.items()},
+                "total_cells": total_cells,
+                "n_types": len(all_counts),
+                "annotation_key": key,
+                "cell_type_breakdown": type_breakdown,
+                "state": make_state(adata)
+            }, indent=2), adata
+
+        elif tool_name == "run_scimilarity":
+            adata = get_adata(tool_input, adata)
+            model_path = tool_input.get("model_path")
+
+            # Only pass model_path if specified, otherwise use default
+            if model_path:
+                run_scimilarity(adata, model_path=model_path)
+            else:
+                run_scimilarity(adata)
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_scimilarity")
+            if output_path:
+                adata.write_h5ad(output_path)
+
+            # Get detailed type breakdown
+            key = 'scimilarity_predictions_unconstrained'
+            if key not in adata.obs:
+                key = 'scimilarity_representative_prediction'
+
+            all_counts = adata.obs[key].value_counts() if key in adata.obs else {}
+            total_cells = adata.n_obs
+
+            # Build detailed breakdown with counts and percentages
+            type_breakdown = {}
+            for ct, count in all_counts.items():
+                type_breakdown[str(ct)] = {
+                    "count": int(count),
+                    "percent": round(100.0 * count / total_cells, 1)
+                }
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "run_scimilarity",
+                "output_path": output_path,
+                "saved": output_path is not None,
+                "total_cells": total_cells,
+                "n_types": len(all_counts),
+                "annotation_key": key,
+                "has_embeddings": "X_scimilarity" in adata.obsm,
+                "cell_type_breakdown": type_breakdown,
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_batch_correction":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             method = tool_input.get("method", "harmony")
             batch_key = tool_input["batch_key"]
 
+            # Get batch sizes for output
+            batch_sizes = adata.obs[batch_key].value_counts().to_dict()
+
             if method == "harmony":
                 run_harmony(adata, batch_key=batch_key)
+                corrected_rep = 'X_pca_harmony'
             else:
                 run_scanorama(adata, batch_key=batch_key)
+                corrected_rep = 'X_scanorama'
 
-            adata.write_h5ad(tool_input["output_path"])
+            # Recompute neighbors and UMAP on corrected embedding
+            compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
+            compute_umap(adata)
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
+            if output_path:
+                adata.write_h5ad(output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_batch_correction",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "method": method,
                 "batch_key": batch_key,
-                "n_batches": adata.obs[batch_key].nunique(),
+                "n_batches": len(batch_sizes),
+                "batch_sizes": {str(k): int(v) for k, v in batch_sizes.items()},
+                "corrected_embedding": corrected_rep,
+                "umap_recomputed": True,
+                "note": f"UMAP recomputed using corrected {corrected_rep} embedding",
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_deg":
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             groupby = tool_input.get("groupby", "leiden")
             method = tool_input.get("method", "wilcoxon")
 
-            run_differential_expression(adata, groupby=groupby, method=method)
-            adata.write_h5ad(tool_input["output_path"])
+            # Best practice: use raw counts for DEG
+            run_differential_expression(adata, groupby=groupby, method=method, use_raw=True)
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_deg")
+            if output_path:
+                adata.write_h5ad(output_path)
+
+            # Get top 5 markers per cluster for immediate insight
+            groups = list(adata.obs[groupby].unique())
+            top_markers_summary = {}
+            for group in groups[:15]:  # Limit to first 15 clusters for response size
+                try:
+                    markers_df = get_top_markers(adata, group=str(group), n_genes=5)
+                    top_markers_summary[str(group)] = [
+                        {
+                            "gene": row['names'],
+                            "logfc": round(row['logfoldchanges'], 2),
+                            "pval_adj": float(f"{row['pvals_adj']:.2e}")
+                        }
+                        for _, row in markers_df.iterrows()
+                    ]
+                except Exception:
+                    pass
 
             return json.dumps({
                 "status": "ok",
                 "tool": "run_deg",
-                "output_path": tool_input["output_path"],
+                "output_path": output_path,
+                "saved": output_path is not None,
                 "groupby": groupby,
                 "method": method,
-                "n_groups": adata.obs[groupby].nunique(),
+                "n_groups": len(groups),
+                "used_raw_counts": True,
+                "top_markers_per_cluster": top_markers_summary,
+                "note": "Use get_top_markers tool for more detailed analysis of specific clusters",
                 "state": make_state(adata)
+            }, indent=2), adata
+
+        elif tool_name == "run_gsea":
+            import os
+            import scanpy as sc
+
+            adata = get_adata(tool_input, adata)
+            output_dir = tool_input["output_dir"]
+            cluster = tool_input["cluster"]
+            gene_sets = tool_input.get("gene_sets", "KEGG_2021_Human")
+            min_size = tool_input.get("min_size", 5)
+            max_size = tool_input.get("max_size", 500)
+            permutation_num = tool_input.get("permutation_num", 1000)
+
+            # Check DEG results exist
+            if 'rank_genes_groups' not in adata.uns:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_gsea",
+                    "message": "No DEG results found. Run run_deg first."
+                }, indent=2), adata
+
+            try:
+                import gseapy
+            except ImportError:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_gsea",
+                    "message": "gseapy not installed. Use install_package tool first.",
+                    "install_command": "pip install gseapy"
+                }, indent=2), adata
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Get clusters to analyze
+            groupby = adata.uns['rank_genes_groups']['params']['groupby']
+            if cluster == 'all':
+                clusters_to_analyze = list(adata.obs[groupby].unique())[:10]  # Limit to 10
+            else:
+                clusters_to_analyze = [cluster]
+
+            all_results = {}
+
+            for clust in clusters_to_analyze:
+                try:
+                    # Get DEG results for this cluster
+                    deg_df = sc.get.rank_genes_groups_df(adata, group=str(clust))
+
+                    # Create ranked gene list (gene -> score)
+                    # Use scores from DEG (stat values work well for GSEA)
+                    df_rank = deg_df[['names', 'scores']].dropna()
+                    df_rank = df_rank.set_index('names')['scores']
+
+                    # Run GSEA prerank
+                    gsea_outdir = os.path.join(output_dir, f"gsea_cluster_{clust}")
+                    pre_res = gseapy.prerank(
+                        rnk=df_rank,
+                        gene_sets=gene_sets,
+                        threads=1,
+                        min_size=min_size,
+                        max_size=max_size,
+                        permutation_num=permutation_num,
+                        outdir=gsea_outdir,
+                        seed=42,
+                        verbose=False,
+                    )
+
+                    # Get top results
+                    res_df = pre_res.res2d
+                    res_df = res_df.sort_values('NES', ascending=False)
+
+                    # Top 5 upregulated and top 5 downregulated
+                    top_up = res_df[res_df['NES'] > 0].head(5)
+                    top_down = res_df[res_df['NES'] < 0].tail(5)
+
+                    cluster_results = {
+                        "upregulated_pathways": [
+                            {
+                                "term": row['Term'],
+                                "nes": round(row['NES'], 2),
+                                "fdr": float(f"{row['FDR q-val']:.2e}"),
+                                "genes": row['Lead_genes'].split(';')[:5] if row['Lead_genes'] else []
+                            }
+                            for _, row in top_up.iterrows()
+                        ],
+                        "downregulated_pathways": [
+                            {
+                                "term": row['Term'],
+                                "nes": round(row['NES'], 2),
+                                "fdr": float(f"{row['FDR q-val']:.2e}"),
+                                "genes": row['Lead_genes'].split(';')[:5] if row['Lead_genes'] else []
+                            }
+                            for _, row in top_down.iterrows()
+                        ],
+                        "total_significant": int((res_df['FDR q-val'] < 0.25).sum()),
+                    }
+                    all_results[str(clust)] = cluster_results
+
+                except Exception as e:
+                    all_results[str(clust)] = {"error": str(e)}
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "run_gsea",
+                "output_dir": output_dir,
+                "gene_sets": gene_sets,
+                "clusters_analyzed": clusters_to_analyze,
+                "results": all_results,
+                "note": "NES > 0 means pathway upregulated in this cluster. FDR < 0.25 is typically significant. Use web_search to learn more about specific pathways."
             }, indent=2), adata
 
         elif tool_name == "generate_figure":
@@ -543,11 +1311,12 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             import matplotlib.pyplot as plt
             import scanpy as sc
 
-            adata = load_data(tool_input["data_path"])
+            adata = get_adata(tool_input, adata)
             plot_type = tool_input["plot_type"]
             output_path = tool_input["output_path"]
             color_by = tool_input.get("color_by", "leiden")
             genes = tool_input.get("genes", [])
+            include_image = tool_input.get("include_image", True)
 
             fig, ax = plt.subplots(figsize=(10, 8))
 
@@ -557,18 +1326,27 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 sc.pl.violin(adata, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
             elif plot_type == "dotplot" and genes:
                 sc.pl.dotplot(adata, var_names=genes, groupby=color_by, show=False)
+            elif plot_type == "heatmap" and genes:
+                sc.pl.heatmap(adata, var_names=genes, groupby=color_by, show=False)
 
             plt.tight_layout()
             plt.savefig(output_path, dpi=150, bbox_inches='tight')
             plt.close()
 
-            return json.dumps({
+            result = {
                 "status": "ok",
                 "tool": "generate_figure",
                 "output_path": output_path,
                 "plot_type": plot_type,
-                "color_by": color_by
-            }, indent=2), adata
+                "color_by": color_by,
+            }
+
+            # Include base64 image for vision models
+            if include_image:
+                result["image_base64"] = encode_image_base64(output_path)
+                result["image_mime"] = get_image_mime_type(output_path)
+
+            return json.dumps(result, indent=2), adata
 
         else:
             return json.dumps({

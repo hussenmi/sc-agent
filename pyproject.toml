@@ -27,14 +27,19 @@ dependencies = [
     "phenograph>=1.5",
     "h5py>=3.7",
     "scikit-misc>=0.3",  # Required for seurat_v3 HVG selection
+    "rich>=13.0",  # Terminal UI (spinners, progress bars)
 ]
 
 [project.optional-dependencies]
 agent = [
     "anthropic>=0.18",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "gseapy>=1.0",  # For GSEA pathway analysis
+    "duckduckgo-search>=6.0",  # For general web search (gene functions, docs, etc.)
 ]
 scimilarity = [
-    "scimilarity",
+    "scimilarity>=0.4",  # Embedding-based cell type annotation
 ]
 dev = [
     "pytest>=7.0",
