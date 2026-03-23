@@ -102,13 +102,13 @@ result = agent.analyze(
 ### CLI Interactive Mode
 
 ```bash
-# Start interactive session
-scagent analyze --data pbmc.h5 --interactive
+# Start interactive session (default)
+scagent analyze --data pbmc.h5
 
 # After initial analysis completes, continue with follow-ups:
 # > What are the top markers for cluster 3?
 # > Generate a heatmap of these genes
-# > done  (to exit)
+# > done  (or exit / quit / q)
 ```
 
 ## Two Modes of Operation
@@ -120,15 +120,16 @@ scagent offers two ways to run analyses:
 The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation.
 
 ```bash
-# CLI
+# CLI (interactive by default)
 scagent analyze "QC and cluster this data" --data pbmc.h5
+scagent analyze "QC and cluster this data" --data pbmc.h5 --single-run
 
 # Python
 agent = SCAgent()
 agent.analyze("QC and cluster", data_path="pbmc.h5")
 ```
 
-**Pros:** Adapts to unexpected data, handles errors gracefully, provides insights
+**Pros:** Adapts to unexpected data, handles errors gracefully, supports follow-up questions, provides insights
 **Cons:** Requires API key, costs money, slower (LLM round-trips)
 
 **Best for:** Exploratory analysis, unfamiliar data, when you want interpretation
@@ -290,10 +291,10 @@ run_2026_03_18_230927_full_analysis/
 
 ```bash
 # Agent mode - LLM-guided analysis
-scagent analyze "your request" --data file.h5
-scagent analyze --data file.h5                    # Auto-analyze (agent decides)
-scagent analyze --data file.h5 --interactive      # Continue with follow-ups
-scagent analyze --data file.h5 --provider openai  # Use OpenAI instead of Anthropic
+scagent analyze "your request" --data file.h5      # Interactive by default
+scagent analyze --data file.h5                     # Auto-analyze (agent decides)
+scagent analyze --data file.h5 --single-run        # Exit after initial summary
+scagent analyze --data file.h5 --provider openai   # Use OpenAI instead of Anthropic
 
 # Direct mode - no LLM
 scagent qc input.h5 output.h5ad                   # Run QC pipeline directly

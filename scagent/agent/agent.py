@@ -539,9 +539,56 @@ class SCAgent:
         """Execute a tool and return JSON result."""
         from rich.console import Console
         from rich.status import Status
+        from pathlib import Path
 
         console = Console()
         logger.info(f"Tool call: {tool_name} with {tool_input}")
+
+        def _sanitize_name(value: str) -> str:
+            value = value or tool_name
+            cleaned = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in value)
+            return cleaned.strip("_")[:80] or tool_name
+
+        def _prepare_tool_paths() -> None:
+            """Route artifacts into the structured run directories."""
+            if not self.run_manager:
+                return
+
+            figure_tools = {"generate_figure"}
+            checkpoint_tools = {
+                "run_qc",
+                "normalize_and_hvg",
+                "run_dimred",
+                "run_clustering",
+                "run_celltypist",
+                "run_scimilarity",
+                "run_batch_correction",
+                "run_deg",
+            }
+
+            if tool_name in figure_tools:
+                requested = tool_input.get("output_path")
+                if not requested:
+                    stem = f"{tool_input.get('plot_type', 'figure')}_{tool_input.get('color_by', 'plot')}"
+                    tool_input["output_path"] = self.run_manager.get_figure_path(_sanitize_name(stem))
+                else:
+                    requested_path = Path(requested)
+                    run_root = self.run_manager.run_dir
+                    if not requested_path.is_absolute():
+                        if requested_path.parent == Path(".") or (
+                            requested_path.parts and requested_path.parts[0] == run_root.name
+                        ):
+                            tool_input["output_path"] = self.run_manager.get_figure_path(
+                                _sanitize_name(requested_path.stem),
+                                ext=requested_path.suffix.lstrip(".") or "png",
+                            )
+
+            if self.save_checkpoints and tool_name in checkpoint_tools and not tool_input.get("output_path"):
+                tool_input["output_path"] = self.run_manager.get_intermediate_path(_sanitize_name(tool_name))
+
+        _prepare_tool_paths()
+        if self.run_manager:
+            self.run_manager.append_log(f"START {tool_name} {json.dumps(tool_input, default=str)}")
 
         # Special handling for ask_user - get input from user
         if tool_name == "ask_user":
@@ -598,12 +645,15 @@ class SCAgent:
                 self.run_manager.log_step(
                     tool=tool_name,
                     input_path=tool_input.get("data_path"),
-                    output_path=tool_input.get("output_path"),
+                    output_path=result_data.get("output_path") or tool_input.get("output_path"),
                     parameters=tool_input,
                     result=result_data,
                 )
                 for w in result_data.get("warnings", []):
                     self.run_manager.add_warning(w)
+                self.run_manager.append_log(
+                    f"END {tool_name} status={status} output={result_data.get('output_path', '')}"
+                )
 
             if status == "ok":
                 # Show key results inline

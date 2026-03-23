@@ -140,6 +140,14 @@ class RunManager:
         manifest_path = self.run_dir / "manifest.json"
         self.manifest.save(str(manifest_path))
 
+    def append_log(self, message: str, filename: str = "agent.log"):
+        """Append a line to a run log file."""
+        log_path = self.dirs["logs"] / filename
+        timestamp = datetime.now().isoformat()
+        with open(log_path, "a") as f:
+            f.write(f"[{timestamp}] {message}\n")
+        return str(log_path)
+
     def set_request(self, request: str):
         """Set the user's original request."""
         self.manifest.request = request
