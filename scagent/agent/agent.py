@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Literal
 import logging
+from datetime import datetime
 
 from .tools import get_tools, get_openai_tools, process_tool_call
 from .prompts import SYSTEM_PROMPT
@@ -641,6 +642,12 @@ class SCAgent:
 
             status = result_data.get("status", "unknown")
 
+            if tool_name == "run_gsea" and status == "ok" and self.run_manager:
+                evidence_reports = self._generate_gsea_evidence_reports(result_data)
+                if evidence_reports:
+                    result_data.update(evidence_reports)
+                    result_json = json.dumps(result_data, indent=2)
+
             if self.run_manager:
                 self.run_manager.log_step(
                     tool=tool_name,
@@ -677,6 +684,246 @@ class SCAgent:
             pass
 
         return result_json
+
+    def _get_best_annotation_key(self) -> Optional[str]:
+        """Return the most useful annotation column available on the current AnnData."""
+        if self.adata is None:
+            return None
+
+        candidates = [
+            "celltypist_majority_voting",
+            "celltypist_predicted_labels",
+            "scimilarity_representative_prediction",
+            "scimilarity_predictions_unconstrained",
+            "cell_type",
+            "celltype",
+        ]
+        for key in candidates:
+            if key in self.adata.obs.columns:
+                return key
+        return None
+
+    def _infer_cluster_context(self, cluster_id: str, groupby: str) -> Dict[str, Any]:
+        """Infer a cluster's likely cell-type context from available annotations."""
+        context = {
+            "cluster": str(cluster_id),
+            "groupby": groupby,
+            "annotation_key": None,
+            "cell_type": f"cluster {cluster_id}",
+            "cell_type_fraction": None,
+            "n_cells": None,
+        }
+
+        if self.adata is None or groupby not in self.adata.obs.columns:
+            return context
+
+        mask = self.adata.obs[groupby].astype(str) == str(cluster_id)
+        n_cells = int(mask.sum())
+        context["n_cells"] = n_cells
+        if n_cells == 0:
+            return context
+
+        annotation_key = self._get_best_annotation_key()
+        context["annotation_key"] = annotation_key
+        if not annotation_key:
+            return context
+
+        labels = self.adata.obs.loc[mask, annotation_key].dropna().astype(str)
+        if labels.empty:
+            return context
+
+        counts = labels.value_counts()
+        top_label = str(counts.index[0])
+        top_fraction = float(counts.iloc[0] / counts.sum())
+        context["cell_type"] = top_label
+        context["cell_type_fraction"] = top_fraction
+        return context
+
+    def _select_pathways_for_evidence(self, cluster_result: Dict[str, Any], max_pathways: int = 2) -> List[Dict[str, Any]]:
+        """Select the most informative pathways from a cluster GSEA result."""
+        candidates: List[Dict[str, Any]] = []
+        for direction, key in [
+            ("upregulated", "upregulated_pathways"),
+            ("downregulated", "downregulated_pathways"),
+        ]:
+            for pathway in cluster_result.get(key, []):
+                entry = dict(pathway)
+                entry["direction"] = direction
+                candidates.append(entry)
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda item: (item.get("fdr", 1.0), -abs(item.get("nes", 0.0))))
+        significant_candidates = [item for item in candidates if item.get("fdr", 1.0) < 0.25]
+        ranked_candidates = significant_candidates or candidates
+
+        selected: List[Dict[str, Any]] = []
+        seen_terms = set()
+        for pathway in ranked_candidates:
+            term = pathway.get("term")
+            if not term or term in seen_terms:
+                continue
+            selected.append(pathway)
+            seen_terms.add(term)
+            if len(selected) >= max_pathways:
+                break
+
+        return selected
+
+    def _generate_gsea_evidence_reports(self, gsea_result: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """Generate markdown and JSON evidence reports for GSEA results."""
+        if not self.run_manager:
+            return None
+
+        results = gsea_result.get("results", {})
+        if not results:
+            return None
+
+        groupby = "leiden"
+        if self.adata is not None and "rank_genes_groups" in self.adata.uns:
+            groupby = self.adata.uns["rank_genes_groups"].get("params", {}).get("groupby", "leiden")
+
+        max_clusters_with_literature = 5
+        max_pathways_per_cluster = 2
+
+        report_payload: Dict[str, Any] = {
+            "generated_at": datetime.now().isoformat(),
+            "groupby": groupby,
+            "gene_sets": gsea_result.get("gene_sets"),
+            "clusters_analyzed": gsea_result.get("clusters_analyzed", []),
+            "literature_limits": {
+                "max_clusters_with_literature": max_clusters_with_literature,
+                "max_pathways_per_cluster": max_pathways_per_cluster,
+            },
+            "clusters": [],
+        }
+
+        md_lines = [
+            "# GSEA Evidence Report",
+            "",
+            f"Generated: {report_payload['generated_at']}",
+            f"Gene sets: `{gsea_result.get('gene_sets', 'unknown')}`",
+            f"Cluster key: `{groupby}`",
+            "",
+            "This report combines pathway enrichment results with targeted PubMed searches.",
+            "",
+        ]
+
+        for idx, cluster_id in enumerate(gsea_result.get("clusters_analyzed", [])):
+            cluster_key = str(cluster_id)
+            cluster_result = results.get(cluster_key, {})
+            cluster_context = self._infer_cluster_context(cluster_key, groupby)
+            cluster_entry: Dict[str, Any] = {
+                "cluster": cluster_key,
+                "context": cluster_context,
+                "total_significant": cluster_result.get("total_significant"),
+                "pathways": [],
+            }
+
+            md_lines.append(f"## Cluster {cluster_key}")
+            md_lines.append("")
+            md_lines.append(f"- Inferred cell type: `{cluster_context['cell_type']}`")
+            if cluster_context.get("cell_type_fraction") is not None:
+                md_lines.append(f"- Annotation support: {cluster_context['cell_type_fraction']:.1%} of annotated cells in this cluster")
+            if cluster_context.get("n_cells") is not None:
+                md_lines.append(f"- Cells in cluster: {cluster_context['n_cells']}")
+            md_lines.append(f"- Significant pathways (FDR < 0.25): {cluster_result.get('total_significant', 0)}")
+            if cluster_result.get("total_significant", 0) == 0:
+                md_lines.append("- Note: no pathways passed the significance threshold; any literature below is exploratory context only.")
+            md_lines.append("")
+
+            if "error" in cluster_result:
+                md_lines.append(f"Pathway analysis error: {cluster_result['error']}")
+                md_lines.append("")
+                cluster_entry["error"] = cluster_result["error"]
+                report_payload["clusters"].append(cluster_entry)
+                continue
+
+            selected_pathways = self._select_pathways_for_evidence(
+                cluster_result,
+                max_pathways=max_pathways_per_cluster if idx < max_clusters_with_literature else 0,
+            )
+
+            if not selected_pathways:
+                md_lines.append("No automatically researched pathways for this cluster.")
+                md_lines.append("")
+                report_payload["clusters"].append(cluster_entry)
+                continue
+
+            for pathway in selected_pathways:
+                research_json, _ = process_tool_call(
+                    "research_findings",
+                    {
+                        "pathway": pathway["term"],
+                        "cell_type": cluster_context["cell_type"],
+                        "genes": pathway.get("genes", []),
+                        "context": self.run_manager.manifest.request or "",
+                        "recent_years": 3,
+                    },
+                    self.adata,
+                )
+                research_data = json.loads(research_json)
+                papers = research_data.get("findings", {}).get("pubmed_results", [])
+                reviews = research_data.get("findings", {}).get("review_articles", [])
+
+                pathway_entry = {
+                    "term": pathway["term"],
+                    "direction": pathway.get("direction"),
+                    "nes": pathway.get("nes"),
+                    "fdr": pathway.get("fdr"),
+                    "genes": pathway.get("genes", []),
+                    "research": research_data,
+                }
+                cluster_entry["pathways"].append(pathway_entry)
+
+                md_lines.append(f"### {pathway['term']}")
+                md_lines.append("")
+                md_lines.append(f"- Direction: {pathway.get('direction', 'unknown')}")
+                md_lines.append(f"- NES: {pathway.get('nes', 'NA')}")
+                md_lines.append(f"- FDR q-value: {pathway.get('fdr', 'NA')}")
+                md_lines.append(f"- Leading-edge genes: {', '.join(pathway.get('genes', [])[:5]) or 'NA'}")
+                md_lines.append(f"- Papers found: {research_data.get('total_papers_found', 0)}")
+                md_lines.append("")
+
+                if reviews:
+                    top_review = reviews[0]
+                    md_lines.append("Review article:")
+                    md_lines.append(
+                        f"- PMID {top_review.get('pmid')}: {top_review.get('title')} ({top_review.get('year')}, {top_review.get('journal')})"
+                    )
+                    md_lines.append("")
+
+                if papers:
+                    md_lines.append("Recent primary literature:")
+                    for paper in papers[:3]:
+                        md_lines.append(
+                            f"- PMID {paper.get('pmid')}: {paper.get('title')} ({paper.get('year')}, {paper.get('journal')})"
+                        )
+                    md_lines.append("")
+                else:
+                    md_lines.append("No recent primary literature matched this pathway/cell-type query.")
+                    md_lines.append("")
+
+            report_payload["clusters"].append(cluster_entry)
+
+        md_lines.extend([
+            "## Notes",
+            "",
+            "- Documentation lookup and literature lookup are intentionally separated.",
+            "- Pathway interpretation is based on PubMed searches anchored to pathway term, inferred cell type, and leading-edge genes.",
+            "- Use the JSON companion report for downstream programmatic inspection.",
+            "",
+        ])
+
+        md_path = self.run_manager.write_text_report("gsea_evidence", "\n".join(md_lines), ext="md")
+        json_path = self.run_manager.write_json_report("gsea_evidence", report_payload)
+        self.run_manager.append_log(f"Generated GSEA evidence reports: {md_path}, {json_path}")
+
+        return {
+            "gsea_evidence_report": md_path,
+            "gsea_evidence_json": json_path,
+        }
 
     def _handle_ask_user(self, tool_input: Dict[str, Any]) -> str:
         """Handle ask_user tool - prompt user for input."""

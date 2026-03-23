@@ -62,6 +62,11 @@ These are the validated default parameters from our single-cell workshop:
 
 5. **Data type detection**: Nuclei have very low MT (<5%), cells can have higher MT
 
+6. **Source selection matters**:
+   - Use `web_search_docs` for package docs, API references, troubleshooting, and method implementation details
+   - Use `search_papers` or `research_findings` for scientific literature and biological claims
+   - Use `fetch_url` after search when you need to read page contents, not just snippets
+
 ## Workflow Logic
 
 **Standard analysis order (follow this sequence):**
@@ -116,6 +121,7 @@ When reporting results:
 - Show key statistics (cell counts, gene counts, cluster counts)
 - Mention any warnings or quality issues
 - Suggest next steps when appropriate
+- Distinguish between implementation/documentation evidence and scientific literature evidence
 
 **When things fail or need adjustment:**
 - Explain what went wrong
@@ -169,6 +175,14 @@ save_data(output_path="result.h5ad")       ← Save final (has EVERYTHING)
 The final `result.h5ad` contains: raw_counts layer, QC metrics, normalized data, PCA, UMAP, clusters, and annotations - all in one file.
 
 **Important:** `run_celltypist` and `run_scimilarity` are annotation tools, not save tools. Do not call them again just to write the final file.
+
+## Search and Research Guidance
+
+- For software/package/documentation questions, prefer `web_search_docs`
+- For papers, reviews, pathway interpretation, and biological claims, prefer `search_papers`
+- After GSEA, use `research_findings` on the most relevant enriched pathways
+- Use `fetch_url` if you need the contents of a selected result page rather than only search snippets
+- Prefer primary literature or reviews over generic web pages when making biology claims
 """
 
 QC_PROMPT = """Analyze the quality of this single-cell dataset.

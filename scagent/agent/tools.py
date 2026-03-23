@@ -212,20 +212,60 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
-            "name": "web_search",
-            "description": "Search the web for information. Use for: looking up gene functions, pathway databases (MSigDB, GO, KEGG), troubleshooting errors, finding best practices, or referencing papers. Returns relevant snippets.",
+            "name": "web_search_docs",
+            "description": "Search general web and documentation sources. Use for package docs, API references, troubleshooting, method pages, and implementation details. Prefer this for software/documentation questions, not for scientific evidence claims.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "site": {"type": "string", "description": "Optional site filter (e.g., 'msigdb.gsea-msigdb.org', 'pubmed.ncbi.nlm.nih.gov')"}
+                    "site": {"type": "string", "description": "Optional site filter (e.g., 'scanpy.readthedocs.io', 'gseapy.readthedocs.io')"},
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 5)"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "search_papers",
+            "description": "Search scientific literature using PubMed. Use for papers, reviews, recent pathway/cell-type findings, and scientific evidence. Returns PMID, title, year, journal, abstract excerpt, and PubMed URL.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "PubMed-style search query or plain text topic"},
+                    "max_results": {"type": "integer", "description": "Maximum papers to return (default: 5)"},
+                    "recent_years": {"type": "integer", "description": "Limit to the last N publication years (default: 5)"},
+                    "reviews_only": {"type": "boolean", "description": "Restrict to review articles"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "fetch_url",
+            "description": "Fetch and summarize a web page or article landing page. Use after a search step when you need the page contents rather than just search snippets.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch"},
+                    "max_chars": {"type": "integer", "description": "Maximum text characters to return (default: 4000)"}
+                },
+                "required": ["url"]
+            }
+        },
+        {
+            "name": "web_search",
+            "description": "Backward-compatible alias for documentation/web search. Prefer web_search_docs for docs and search_papers for literature.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "site": {"type": "string", "description": "Optional site filter"},
+                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 5)"}
                 },
                 "required": ["query"]
             }
         },
         {
             "name": "research_findings",
-            "description": "Conduct thorough literature research on GSEA/pathway findings. Searches PubMed, reviews, and scientific databases to find recent publications about enriched pathways in the context of your cell type. Use AFTER run_gsea to understand what the enriched pathways mean biologically and find supporting literature.",
+            "description": "Conduct focused literature research on GSEA/pathway findings. Uses PubMed queries tailored to pathway, cell type, and leading-edge genes, and returns structured citations plus interpretation guidance. Use AFTER run_gsea to understand what enriched pathways mean biologically.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -438,6 +478,474 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return os_module.path.join(output_path, filename)
         return output_path
 
+    def search_web(query: str, site: str = "", max_results: int = 5) -> Dict[str, Any]:
+        """Search web/docs using Tavily (primary), Google CSE (backup), or DuckDuckGo (fallback)."""
+        import os as os_module
+        from urllib.parse import urlparse
+        import requests
+
+        scoped_query = f"site:{site} {query}" if site else query
+        search_errors = []
+
+        def normalize_domain(value: str) -> str:
+            value = (value or "").strip().lower()
+            if not value:
+                return ""
+            if "://" not in value:
+                value = f"https://{value}"
+            parsed = urlparse(value)
+            return parsed.netloc.replace("www.", "")
+
+        def extract_query_tokens(value: str) -> List[str]:
+            raw_tokens = [tok.strip(" ,:;()[]{}").lower() for tok in value.split()]
+            tokens = [tok for tok in raw_tokens if tok and tok not in {
+                "documentation", "docs", "api", "function", "method", "tutorial", "guide",
+                "site"
+            }]
+            return tokens
+
+        query_tokens = extract_query_tokens(query)
+        technical_tokens = [
+            tok for tok in query_tokens
+            if "_" in tok or "." in tok or any(ch.isdigit() for ch in tok) or len(tok) >= 8
+        ]
+        priority_tokens = technical_tokens or query_tokens[-2:]
+
+        def score_result(item: Dict[str, Any], preferred_domain: str = "") -> tuple:
+            domain = normalize_domain(item.get("url", ""))
+            title = (item.get("title") or "").lower()
+            snippet = (item.get("snippet") or "").lower()
+            url = (item.get("url") or "").lower()
+            domain_match = 1 if preferred_domain and preferred_domain in domain else 0
+            exact_token_match = 0
+            partial_token_match = 0
+            api_page_bonus = 0
+
+            for token in priority_tokens:
+                if token and token in url:
+                    exact_token_match += 1
+                if token and token in title:
+                    partial_token_match += 1
+
+            api_indicators = [
+                "/generated/",
+                "/api/",
+                "api.",
+                "reference",
+                "class",
+                "function",
+            ]
+            if any(ind in url for ind in api_indicators):
+                api_page_bonus = 1
+
+            query_bonus = 0
+            for token in query_tokens:
+                if token in title:
+                    query_bonus += 2
+                elif token in snippet:
+                    query_bonus += 1
+            return (
+                exact_token_match,
+                domain_match,
+                api_page_bonus,
+                partial_token_match,
+                query_bonus,
+                len(snippet),
+            )
+
+        def run_ddg(search_query: str) -> List[Dict[str, Any]]:
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
+
+            with DDGS() as ddgs:
+                results = list(ddgs.text(search_query, max_results=max_results))
+
+            snippets = []
+            for item in results:
+                snippets.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("href", "") or item.get("url", ""),
+                    "snippet": item.get("body", "")[:300],
+                })
+            return snippets
+
+        def dedupe_and_rank(snippets: List[Dict[str, Any]], preferred_domain: str = "") -> List[Dict[str, Any]]:
+            deduped: Dict[str, Dict[str, Any]] = {}
+            for item in snippets:
+                url = item.get("url", "")
+                key = url or f"{item.get('title', '')}|{item.get('snippet', '')}"
+                if key not in deduped:
+                    deduped[key] = item
+            ranked = sorted(
+                deduped.values(),
+                key=lambda item: score_result(item, preferred_domain=preferred_domain),
+                reverse=True,
+            )
+            return ranked[:max_results]
+
+        preferred_domain = normalize_domain(site)
+
+        def run_tavily(search_query: str, include_domains: List[str]) -> List[Dict[str, Any]]:
+            resp = requests.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": tavily_api_key,
+                    "query": search_query,
+                    "search_depth": "basic",
+                    "max_results": max_results,
+                    "include_domains": include_domains,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            snippets = []
+            for item in data.get("results", []):
+                snippets.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "snippet": item.get("content", "")[:300],
+                })
+            return snippets
+
+        # === TAVILY (Primary - best for AI agents) ===
+        tavily_api_key = os_module.environ.get("TAVILY_API_KEY")
+        if tavily_api_key:
+            try:
+                snippets = []
+                used_dual_query = False
+                if site:
+                    snippets.extend(run_tavily(query, [site]))
+                    snippets.extend(run_tavily(query, []))
+                    used_dual_query = True
+                else:
+                    snippets.extend(run_tavily(query, []))
+
+                if snippets:
+                    snippets = dedupe_and_rank(snippets, preferred_domain=preferred_domain)
+                    return {
+                        "status": "ok",
+                        "backend": "tavily",
+                        "query": query,
+                        "results": snippets,
+                        "used_dual_query": used_dual_query,
+                        "site_filter_requested": bool(site),
+                    }
+                search_errors.append({"backend": "tavily", "type": "no_results"})
+            except requests.HTTPError as e:
+                response = getattr(e, "response", None)
+                search_errors.append({
+                    "backend": "tavily",
+                    "type": "http_error",
+                    "status_code": response.status_code if response is not None else None,
+                    "message": response.text[:200] if response is not None and response.text else str(e),
+                })
+            except Exception as e:
+                search_errors.append({"backend": "tavily", "type": type(e).__name__, "message": str(e)})
+
+        # === GOOGLE (Backup) ===
+        google_api_key = os_module.environ.get("GOOGLE_API_KEY")
+        google_cx = os_module.environ.get("GOOGLE_CX")
+
+        if google_api_key and google_cx:
+            try:
+                url = "https://www.googleapis.com/customsearch/v1"
+                params = {
+                    "key": google_api_key,
+                    "cx": google_cx,
+                    "q": scoped_query,
+                    "num": max(1, min(max_results, 10)),
+                }
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+
+                snippets = []
+                for item in data.get("items", []):
+                    snippets.append({
+                        "title": item.get("title", ""),
+                        "url": item.get("link", ""),
+                        "snippet": item.get("snippet", "")[:300],
+                    })
+
+                if snippets:
+                    snippets = dedupe_and_rank(snippets, preferred_domain=preferred_domain)
+                    return {
+                        "status": "ok",
+                        "backend": "google",
+                        "query": scoped_query,
+                        "results": snippets,
+                    }
+                search_errors.append({"backend": "google", "type": "no_results"})
+            except requests.HTTPError as e:
+                response = getattr(e, "response", None)
+                search_errors.append({
+                    "backend": "google",
+                    "type": "http_error",
+                    "status_code": response.status_code if response is not None else None,
+                    "message": response.text[:200] if response is not None and response.text else str(e),
+                })
+            except Exception as e:
+                search_errors.append({"backend": "google", "type": type(e).__name__, "message": str(e)})
+
+        # === DUCKDUCKGO (Final fallback) ===
+        try:
+            ddg_queries = [scoped_query]
+            if site:
+                ddg_queries.append(query)
+                ddg_queries.append(f"{query} {site}")
+
+            snippets = []
+            retried_without_site = False
+            for idx, ddg_query in enumerate(ddg_queries):
+                current = run_ddg(ddg_query)
+                if idx > 0 and current:
+                    retried_without_site = True
+                snippets.extend(current)
+                if len(snippets) >= max_results * 2:
+                    break
+
+            snippets = dedupe_and_rank(snippets, preferred_domain=preferred_domain)
+
+            return {
+                "status": "ok" if snippets else "warning",
+                "backend": "duckduckgo",
+                "query": scoped_query,
+                "results": snippets,
+                "retried_without_site": retried_without_site,
+                "fallback_used": True,
+                "backends_tried": [e["backend"] for e in search_errors],
+                "errors": search_errors if search_errors else None,
+                "message": "" if snippets else "No results found for this query.",
+            }
+        except ImportError:
+            search_errors.append({"backend": "duckduckgo", "type": "not_installed", "message": "duckduckgo-search not installed"})
+            return {
+                "status": "error",
+                "query": scoped_query,
+                "message": "No search backend available. Set TAVILY_API_KEY, or configure Google, or install duckduckgo-search.",
+                "errors": search_errors,
+            }
+
+    def search_pubmed(query: str, max_results: int = 5, recent_years: int = 5, reviews_only: bool = False) -> List[Dict[str, Any]]:
+        """Search PubMed and return structured article metadata."""
+        import re
+        import requests
+        from datetime import datetime
+
+        current_year = datetime.now().year
+        min_date = f"{current_year - recent_years}/01/01"
+        esearch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+        search_term = query
+        if reviews_only:
+            search_term += " AND review[pt]"
+
+        search_params = {
+            "db": "pubmed",
+            "term": search_term,
+            "retmax": max_results,
+            "retmode": "json",
+            "sort": "relevance",
+            "mindate": min_date,
+            "maxdate": f"{current_year}/12/31",
+            "datetype": "pdat",
+        }
+
+        try:
+            resp = requests.get(esearch_url, params=search_params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            ids = data.get("esearchresult", {}).get("idlist", [])
+            if not ids:
+                return []
+
+            fetch_params = {
+                "db": "pubmed",
+                "id": ",".join(ids),
+                "retmode": "xml",
+                "rettype": "abstract",
+            }
+            resp = requests.get(efetch_url, params=fetch_params, timeout=10)
+            resp.raise_for_status()
+            xml = resp.text
+
+            results = []
+            articles = re.findall(r"<PubmedArticle>(.*?)</PubmedArticle>", xml, re.DOTALL)
+            for article in articles:
+                title_match = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", article, re.DOTALL)
+                abstract_match = re.search(r"<AbstractText[^>]*>(.*?)</AbstractText>", article, re.DOTALL)
+                pmid_match = re.search(r"<PMID[^>]*>(\d+)</PMID>", article)
+                year_match = re.search(r"<PubDate>.*?<Year>(\d+)</Year>", article, re.DOTALL)
+                journal_match = re.search(r"<Title>(.*?)</Title>", article)
+
+                if title_match and pmid_match:
+                    title = re.sub(r"<[^>]+>", "", title_match.group(1))
+                    abstract = re.sub(r"<[^>]+>", "", abstract_match.group(1))[:700] if abstract_match else ""
+                    pmid = pmid_match.group(1)
+                    year = year_match.group(1) if year_match else "N/A"
+                    journal = journal_match.group(1) if journal_match else "N/A"
+                    results.append({
+                        "pmid": pmid,
+                        "title": title,
+                        "year": year,
+                        "journal": journal,
+                        "abstract": abstract,
+                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    })
+
+            return results
+        except Exception:
+            return []
+
+    def fetch_url_text(url: str, max_chars: int = 4000) -> Dict[str, Any]:
+        """Fetch a URL and return a compact, structured text summary."""
+        import html
+        import io
+        import re
+        from urllib.parse import urlparse
+        import requests
+
+        headers = {
+            "User-Agent": "scagent/0.1 (+single-cell analysis agent)"
+        }
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("content-type", "")
+        raw_bytes = resp.content
+        text = resp.text
+        title = ""
+        meta_description = ""
+        extracted_with = "plain_text"
+        warning = None
+
+        def clean_whitespace(value: str) -> str:
+            return re.sub(r"\s+", " ", value).strip()
+
+        def extract_html_text(html_text: str) -> Dict[str, Any]:
+            nonlocal warning
+            try:
+                from bs4 import BeautifulSoup  # type: ignore
+            except ImportError:
+                BeautifulSoup = None
+
+            if BeautifulSoup is not None:
+                soup = BeautifulSoup(html_text, "html.parser")
+                for tag in soup(["script", "style", "noscript", "svg"]):
+                    tag.decompose()
+
+                page_title = clean_whitespace(soup.title.get_text(" ", strip=True)) if soup.title else ""
+                meta = soup.find("meta", attrs={"name": "description"})
+                meta_desc = clean_whitespace(meta.get("content", "")) if meta else ""
+
+                main = soup.find("main") or soup.find("article") or soup.body or soup
+                parts = []
+                for tag in main.find_all(["h1", "h2", "h3", "p", "li"]):
+                    text_part = clean_whitespace(tag.get_text(" ", strip=True))
+                    if text_part:
+                        parts.append(text_part)
+
+                if not parts:
+                    parts = [clean_whitespace(main.get_text(" ", strip=True))]
+
+                return {
+                    "title": page_title,
+                    "meta_description": meta_desc,
+                    "text": clean_whitespace(" ".join(parts)),
+                    "extracted_with": "beautifulsoup4",
+                }
+
+            warning = "beautifulsoup4 not installed; used regex-based HTML extraction."
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
+            meta_match = re.search(
+                r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+                html_text,
+                re.IGNORECASE | re.DOTALL,
+            )
+            page_title = html.unescape(clean_whitespace(title_match.group(1))) if title_match else ""
+            meta_desc = html.unescape(clean_whitespace(meta_match.group(1))) if meta_match else ""
+            cleaned = re.sub(r"<script.*?</script>", " ", html_text, flags=re.IGNORECASE | re.DOTALL)
+            cleaned = re.sub(r"<style.*?</style>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+            cleaned = re.sub(r"<noscript.*?</noscript>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+            cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+            cleaned = html.unescape(cleaned)
+            cleaned = clean_whitespace(cleaned)
+            return {
+                "title": page_title,
+                "meta_description": meta_desc,
+                "text": cleaned,
+                "extracted_with": "regex_html",
+            }
+
+        def extract_pdf_text(data: bytes) -> Dict[str, Any]:
+            try:
+                from pypdf import PdfReader  # type: ignore
+            except ImportError:
+                try:
+                    from PyPDF2 import PdfReader  # type: ignore
+                except ImportError as e:
+                    raise ImportError("PDF reader dependency not installed") from e
+
+            reader = PdfReader(io.BytesIO(data))
+            pages = []
+            for page in reader.pages[:5]:
+                page_text = page.extract_text() or ""
+                if page_text:
+                    pages.append(clean_whitespace(page_text))
+
+            return {
+                "title": "",
+                "meta_description": "",
+                "text": clean_whitespace(" ".join(pages)),
+                "extracted_with": "pdf_reader",
+            }
+
+        lower_content_type = content_type.lower()
+        if "html" in lower_content_type:
+            extracted = extract_html_text(text)
+            title = extracted["title"]
+            meta_description = extracted["meta_description"]
+            cleaned = extracted["text"]
+            extracted_with = extracted["extracted_with"]
+        elif "pdf" in lower_content_type or urlparse(str(resp.url)).path.lower().endswith(".pdf"):
+            try:
+                extracted = extract_pdf_text(raw_bytes)
+                title = extracted["title"]
+                meta_description = extracted["meta_description"]
+                cleaned = extracted["text"]
+                extracted_with = extracted["extracted_with"]
+            except ImportError:
+                cleaned = ""
+                extracted_with = "pdf_unsupported"
+                warning = "PDF content fetched but no PDF text extraction library is installed."
+        else:
+            cleaned = clean_whitespace(text)
+
+        result = {
+            "status": "ok",
+            "url": url,
+            "final_url": str(resp.url),
+            "content_type": content_type,
+            "domain": urlparse(str(resp.url)).netloc,
+            "title": title,
+            "meta_description": meta_description,
+            "extracted_with": extracted_with,
+            "text_excerpt": cleaned[:max_chars],
+            "text_length": len(cleaned),
+            "truncated": len(cleaned) > max_chars,
+        }
+        if warning:
+            result["warning"] = warning
+        if not cleaned:
+            result["status"] = "warning"
+            result["message"] = "Fetched the URL, but extracted little or no readable text."
+        return result
+
     try:
         # ===== META TOOLS =====
         if tool_name == "ask_user":
@@ -557,89 +1065,56 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             return json.dumps(result, indent=2), adata
 
-        elif tool_name == "web_search":
-            # Web search - uses Google if configured, falls back to DuckDuckGo
-            import os
-            import requests
-
+        elif tool_name in {"web_search", "web_search_docs"}:
             query = tool_input["query"]
             site = tool_input.get("site", "")
+            max_results = tool_input.get("max_results", 5)
+            search_result = search_web(query, site=site, max_results=max_results)
+            search_result["tool"] = tool_name
+            search_result["search_kind"] = "docs"
+            if tool_name == "web_search":
+                search_result["deprecated_alias"] = True
+                search_result["warning"] = (
+                    "web_search is retained for backward compatibility. Prefer web_search_docs for documentation lookup."
+                )
+            search_result["note"] = (
+                "Use this for documentation, troubleshooting, and implementation details. "
+                "For scientific literature, prefer search_papers or research_findings."
+            )
+            return json.dumps(search_result, indent=2), adata
 
-            if site:
-                query = f"site:{site} {query}"
+        elif tool_name == "search_papers":
+            query = tool_input["query"]
+            max_results = tool_input.get("max_results", 5)
+            recent_years = tool_input.get("recent_years", 5)
+            reviews_only = tool_input.get("reviews_only", False)
 
-            # Try Google Custom Search first (more reliable, 100 free/day)
-            google_api_key = os.environ.get("GOOGLE_API_KEY")
-            google_cx = os.environ.get("GOOGLE_CX")
+            results = search_pubmed(
+                query=query,
+                max_results=max_results,
+                recent_years=recent_years,
+                reviews_only=reviews_only,
+            )
 
-            if google_api_key and google_cx:
-                try:
-                    url = "https://www.googleapis.com/customsearch/v1"
-                    params = {
-                        "key": google_api_key,
-                        "cx": google_cx,
-                        "q": query,
-                        "num": 5
-                    }
-                    resp = requests.get(url, params=params, timeout=10)
-                    resp.raise_for_status()
-                    data = resp.json()
+            return json.dumps({
+                "status": "ok",
+                "tool": "search_papers",
+                "backend": "pubmed",
+                "query": query,
+                "reviews_only": reviews_only,
+                "years_searched": f"last {recent_years} years",
+                "results": results,
+                "note": "Use fetch_url on a selected PubMed URL if you want the landing page text. Prefer PMID-backed evidence for scientific claims.",
+            }, indent=2), adata
 
-                    snippets = []
-                    for item in data.get("items", []):
-                        snippets.append({
-                            "title": item.get("title", ""),
-                            "url": item.get("link", ""),
-                            "snippet": item.get("snippet", "")[:300]
-                        })
-
-                    return json.dumps({
-                        "status": "ok",
-                        "tool": "web_search",
-                        "backend": "google",
-                        "query": query,
-                        "results": snippets
-                    }, indent=2), adata
-
-                except Exception as e:
-                    # Fall through to DuckDuckGo if Google fails
-                    pass
-
-            # Fall back to DuckDuckGo (no API key needed)
-            try:
-                from duckduckgo_search import DDGS
-
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(query, max_results=5))
-
-                snippets = []
-                for r in results:
-                    snippets.append({
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "snippet": r.get("body", "")[:300]
-                    })
-
-                return json.dumps({
-                    "status": "ok",
-                    "tool": "web_search",
-                    "backend": "duckduckgo",
-                    "query": query,
-                    "results": snippets
-                }, indent=2), adata
-
-            except ImportError:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "web_search",
-                    "message": "No search backend available. Set GOOGLE_API_KEY + GOOGLE_CX, or install duckduckgo-search.",
-                }, indent=2), adata
+        elif tool_name == "fetch_url":
+            url = tool_input["url"]
+            max_chars = tool_input.get("max_chars", 4000)
+            fetched = fetch_url_text(url, max_chars=max_chars)
+            fetched["tool"] = "fetch_url"
+            return json.dumps(fetched, indent=2), adata
 
         elif tool_name == "research_findings":
-            # Thorough literature research using PubMed E-utilities API (free, reliable)
-            import requests
-            from datetime import datetime
-
             pathway = tool_input["pathway"]
             cell_type = tool_input["cell_type"]
             genes = tool_input.get("genes", [])
@@ -654,83 +1129,6 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "gene_specific": [],
             }
 
-            # PubMed E-utilities base URL
-            ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-            EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-
-            def search_pubmed(query, max_results=5, filter_review=False):
-                """Search PubMed and return article info."""
-                results = []
-                try:
-                    # Calculate date range
-                    current_year = datetime.now().year
-                    min_date = f"{current_year - recent_years}/01/01"
-
-                    # Search for IDs
-                    search_params = {
-                        "db": "pubmed",
-                        "term": query,
-                        "retmax": max_results,
-                        "retmode": "json",
-                        "sort": "relevance",
-                        "mindate": min_date,
-                        "maxdate": f"{current_year}/12/31",
-                        "datetype": "pdat",
-                    }
-                    if filter_review:
-                        search_params["term"] += " AND review[pt]"
-
-                    resp = requests.get(ESEARCH_URL, params=search_params, timeout=10)
-                    data = resp.json()
-                    ids = data.get("esearchresult", {}).get("idlist", [])
-
-                    if not ids:
-                        return results
-
-                    # Fetch article details
-                    fetch_params = {
-                        "db": "pubmed",
-                        "id": ",".join(ids),
-                        "retmode": "xml",
-                        "rettype": "abstract",
-                    }
-                    resp = requests.get(EFETCH_URL, params=fetch_params, timeout=10)
-
-                    # Parse XML (simple extraction)
-                    import re
-                    xml = resp.text
-
-                    # Extract articles
-                    articles = re.findall(r'<PubmedArticle>(.*?)</PubmedArticle>', xml, re.DOTALL)
-                    for article in articles:
-                        title_match = re.search(r'<ArticleTitle>(.*?)</ArticleTitle>', article, re.DOTALL)
-                        abstract_match = re.search(r'<AbstractText[^>]*>(.*?)</AbstractText>', article, re.DOTALL)
-                        pmid_match = re.search(r'<PMID[^>]*>(\d+)</PMID>', article)
-                        year_match = re.search(r'<PubDate>.*?<Year>(\d+)</Year>', article, re.DOTALL)
-                        journal_match = re.search(r'<Title>(.*?)</Title>', article)
-
-                        if title_match and pmid_match:
-                            # Clean HTML tags from text
-                            title = re.sub(r'<[^>]+>', '', title_match.group(1))
-                            abstract = re.sub(r'<[^>]+>', '', abstract_match.group(1))[:500] if abstract_match else ""
-                            pmid = pmid_match.group(1)
-                            year = year_match.group(1) if year_match else "N/A"
-                            journal = journal_match.group(1) if journal_match else "N/A"
-
-                            results.append({
-                                "pmid": pmid,
-                                "title": title,
-                                "year": year,
-                                "journal": journal,
-                                "abstract": abstract,
-                                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                            })
-
-                except Exception as e:
-                    pass  # Fail silently, return what we have
-
-                return results
-
             # Simplify cell type for better PubMed matches
             # "classical monocytes" -> "monocyte", "CD8+ T cells" -> "T cell"
             cell_type_simple = cell_type.lower()
@@ -740,22 +1138,27 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             # Search 1: Pathway + cell type (ignore context for main query - too restrictive)
             query1 = f'("{pathway}"[Title/Abstract]) AND ("{cell_type_simple}"[Title/Abstract])'
-            all_findings["pubmed_results"] = search_pubmed(query1, max_results=5)
+            all_findings["pubmed_results"] = search_pubmed(query1, max_results=5, recent_years=recent_years)
 
             # If no results, try broader search
             if not all_findings["pubmed_results"]:
                 query1_broad = f'("{pathway}") AND ("{cell_type_simple}")'
-                all_findings["pubmed_results"] = search_pubmed(query1_broad, max_results=5)
+                all_findings["pubmed_results"] = search_pubmed(query1_broad, max_results=5, recent_years=recent_years)
 
             # Search 2: Review articles on this topic
             query2 = f'("{pathway}") AND ("{cell_type_simple}")'
-            all_findings["review_articles"] = search_pubmed(query2, max_results=3, filter_review=True)
+            all_findings["review_articles"] = search_pubmed(
+                query2,
+                max_results=3,
+                recent_years=recent_years,
+                reviews_only=True,
+            )
 
             # Search 3: Key genes in cell type context
             if genes and len(genes) >= 2:
                 gene_str = " OR ".join([f'"{g}"[Title/Abstract]' for g in genes[:3]])
                 query3 = f'({gene_str}) AND ("{cell_type_simple}"[Title/Abstract])'
-                all_findings["gene_specific"] = search_pubmed(query3, max_results=4)
+                all_findings["gene_specific"] = search_pubmed(query3, max_results=4, recent_years=recent_years)
 
             # Count findings
             total_results = (
@@ -770,10 +1173,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "pathway": pathway,
                 "cell_type": cell_type,
                 "genes_researched": genes[:5] if genes else [],
+                "context": context,
                 "years_searched": f"last {recent_years} years",
                 "total_papers_found": total_results,
                 "findings": all_findings,
-                "note": "Papers are from PubMed. Review abstracts for: (1) biological function of pathway in this cell type, (2) disease associations, (3) therapeutic implications. Cite PMIDs when referencing."
+                "recommended_next_steps": [
+                    "Prioritize review articles to understand the pathway in this cell context.",
+                    "Use primary studies to support concrete biological claims.",
+                    "Cite PMIDs when summarizing pathway relevance."
+                ],
+                "note": "Papers are from PubMed. Review abstracts for biological function, disease context, and therapeutic implications."
             }, indent=2), adata
 
         elif tool_name == "install_package":
@@ -1340,7 +1749,12 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "gene_sets": gene_sets,
                 "clusters_analyzed": clusters_to_analyze,
                 "results": all_results,
-                "note": "NES > 0 means pathway upregulated in this cluster. FDR < 0.25 is typically significant. Use web_search to learn more about specific pathways."
+                "recommended_next_steps": [
+                    "Use research_findings on the most significant pathway terms for biological interpretation.",
+                    "Use search_papers for broader literature questions or recent reviews.",
+                    "Use web_search_docs for pathway database or software documentation questions."
+                ],
+                "note": "NES > 0 means pathway upregulated in this cluster. FDR < 0.25 is typically significant."
             }, indent=2), adata
 
         elif tool_name == "generate_figure":

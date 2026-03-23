@@ -196,6 +196,22 @@ class RunManager:
         """Get path for a report file."""
         return str(self.dirs["reports"] / f"{name}.{ext}")
 
+    def write_text_report(self, name: str, content: str, ext: str = "md") -> str:
+        """Write a text report into the reports directory and register it."""
+        path = self.dirs["reports"] / f"{name}.{ext}"
+        with open(path, "w") as f:
+            f.write(content)
+        self.add_output(str(path))
+        return str(path)
+
+    def write_json_report(self, name: str, payload: Dict[str, Any]) -> str:
+        """Write a JSON report into the reports directory and register it."""
+        path = self.dirs["reports"] / f"{name}.json"
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        self.add_output(str(path))
+        return str(path)
+
     def log_step(
         self,
         tool: str,

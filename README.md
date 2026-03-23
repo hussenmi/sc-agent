@@ -185,14 +185,14 @@ Agent: "Cluster 13 has highest MT% (mean 15.14%) and its markers
         cell population, not a real immune cell type."
 ```
 
-## Available Tools (21 total)
+## Available Tools (24 total)
 
 | Category | Tools |
 |----------|-------|
 | **Analysis** | `run_qc`, `normalize_and_hvg`, `run_dimred`, `run_clustering`, `run_celltypist`, `run_scimilarity`, `run_batch_correction`, `run_deg`, `run_gsea` |
 | **Visualization** | `generate_figure` (UMAP, violin, dotplot, heatmap) |
 | **Inspection** | `inspect_data`, `get_cluster_sizes`, `get_top_markers`, `summarize_qc_metrics`, `get_celltypes`, `list_obs_columns` |
-| **Research** | `research_findings` (PubMed literature search with citations), `web_search` |
+| **Research** | `web_search_docs`, `search_papers`, `fetch_url`, `research_findings` |
 | **Meta** | `ask_user`, `run_code`, `install_package` |
 
 ## Standard Analysis Order
@@ -246,8 +246,15 @@ The agent automatically follows these best practices:
 - **DEG Analysis**: Uses raw counts layer for Wilcoxon test (more accurate than scaled data). Returns top 5 markers per cluster immediately for quick insight.
 - **Batch Correction**: After Harmony/Scanorama, automatically recomputes neighbors and UMAP on the corrected embedding.
 - **GSEA**: Uses DEG scores for prerank GSEA with GSEApy. Returns top up/downregulated pathways with NES scores, FDR values, and leading edge genes. Supports KEGG, GO, Reactome, MSigDB Hallmark databases.
-- **Literature Research**: After GSEA, uses PubMed E-utilities API to find recent papers about enriched pathways. Returns PMIDs, titles, abstracts, and journal info for citation.
+- **Documentation Search**: `web_search_docs` uses Tavily when configured (`TAVILY_API_KEY`), falls back to Google Programmable Search when available, and finally falls back to DuckDuckGo. Best for software docs, APIs, troubleshooting, and method pages.
+- **Paper Search**: `search_papers` uses PubMed E-utilities to return recent papers with PMID, title, abstract excerpt, journal, year, and PubMed URL.
+- **Literature Research**: After GSEA, `research_findings` performs focused PubMed searches around enriched pathways, cell types, and leading-edge genes, and returns structured citations for interpretation.
+- **Source Reading**: `fetch_url` reads selected web pages and, when dependencies are available, extracts cleaner HTML text and basic PDF text for downstream reasoning.
+- **GSEA Evidence Reports**: Successful `run_gsea` calls automatically write `reports/gsea_evidence.md` and `reports/gsea_evidence.json`, combining pathway output with targeted PubMed evidence for the most relevant pathways.
 - **File Management**: Minimizes intermediate h5ad files - only saves after QC filtering and at end of analysis. Data persists in memory between tool calls.
+
+Search/research design note:
+- [`SEARCH_RESEARCH_ARCHITECTURE.md`](/Users/hibrahim/Desktop/iris_peerd/cs_agent/SEARCH_RESEARCH_ARCHITECTURE.md)
 
 ### Where Results Are Stored
 
@@ -276,15 +283,15 @@ run_2026_03_18_230927_full_analysis/
 ├── manifest.json           # Full reproducibility log
 ├── reports/
 │   └── summary.md          # Analysis summary
-├── code/
-│   └── *.py                # Generated code saved for reuse
+│   └── gsea_evidence.md    # Pathway evidence summary (after GSEA)
+│   └── gsea_evidence.json  # Machine-readable pathway evidence
+├── logs/
+│   └── agent.log           # Tool-level execution log
 ├── figures/
 │   └── *.png               # Visualizations
 ├── intermediate/
 │   └── *.h5ad              # Checkpoint files
-├── pbmc_qc.h5ad
-├── pbmc_clustered.h5ad
-└── ...
+└── result.h5ad             # Final saved AnnData (if requested)
 ```
 
 ## CLI Reference
