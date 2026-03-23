@@ -25,6 +25,9 @@ Examples:
   # Auto-analyze (agent decides what to do)
   scagent analyze --data pbmc.h5
 
+  # Run once and exit (skip follow-up prompt)
+  scagent analyze --data pbmc.h5 --single-run
+
   # Just inspect data state
   scagent inspect clustered_data.h5ad
 
@@ -87,11 +90,20 @@ Examples:
         action="store_true",
         help="Less verbose output"
     )
-    analyze_parser.add_argument(
+    analyze_mode = analyze_parser.add_mutually_exclusive_group()
+    analyze_mode.add_argument(
         "--interactive", "-i",
+        dest="interactive",
         action="store_true",
-        help="Interactive mode - continue conversation after analysis"
+        help="Interactive mode - continue conversation after analysis (default)"
     )
+    analyze_mode.add_argument(
+        "--single-run",
+        dest="interactive",
+        action="store_false",
+        help="Exit after the initial analysis summary"
+    )
+    analyze_parser.set_defaults(interactive=True)
     analyze_parser.add_argument(
         "--checkpoints",
         action="store_true",
@@ -205,8 +217,12 @@ def run_analyze(args):
 
     # Interactive mode - continue conversation
     if args.interactive:
+        if not sys.stdin.isatty():
+            print("\nInteractive mode requested, but stdin is not a TTY. Exiting after the initial run.")
+            return 0
+
         print("\n" + "=" * 50)
-        print("INTERACTIVE MODE - Enter follow-up requests or 'done' to exit")
+        print("INTERACTIVE MODE - Enter follow-up requests or 'done', 'exit', 'quit', or 'q' to exit")
         print("=" * 50)
 
         while True:

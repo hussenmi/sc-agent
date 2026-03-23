@@ -136,7 +136,8 @@ After the first tool loads data, all subsequent tools should use the in-memory d
 2. normalize_and_hvg()                     ← No data_path, uses memory
 3. run_dimred()                            ← No data_path, uses memory
 4. run_clustering()                        ← No data_path, uses memory
-5. run_scimilarity(output_path="final.h5ad")  ← Save final result
+5. run_scimilarity()                       ← Annotate in memory
+6. save_data(output_path="final.h5ad")     ← Save final result
 ```
 
 **WRONG (loses state):**
@@ -152,6 +153,8 @@ After the first tool loads data, all subsequent tools should use the in-memory d
 - `output_path` is OPTIONAL for all tools
 - Only provide `output_path` on the FINAL step of analysis
 - The final h5ad will contain everything: QC metrics, clusters, annotations, embeddings
+- If you generate figures, prefer leaving `output_path` unspecified so the agent routes them into the run's `figures/` directory automatically
+- If checkpoint saving is enabled, analysis checkpoints are routed into `intermediate/` automatically
 
 **Example - correct workflow:**
 ```
@@ -159,10 +162,13 @@ run_qc(data_path="input.h5")              ← Load only
 normalize_and_hvg()                        ← Memory
 run_dimred()                               ← Memory
 run_clustering()                           ← Memory
-run_scimilarity(output_path="result.h5ad") ← Save final (has EVERYTHING)
+run_scimilarity()                          ← Annotate in memory
+save_data(output_path="result.h5ad")       ← Save final (has EVERYTHING)
 ```
 
-The final `result.h5ad` contains: raw_counts layer, QC metrics, normalized data, PCA, UMAP, clusters, and scimilarity annotations - all in one file.
+The final `result.h5ad` contains: raw_counts layer, QC metrics, normalized data, PCA, UMAP, clusters, and annotations - all in one file.
+
+**Important:** `run_celltypist` and `run_scimilarity` are annotation tools, not save tools. Do not call them again just to write the final file.
 """
 
 QC_PROMPT = """Analyze the quality of this single-cell dataset.

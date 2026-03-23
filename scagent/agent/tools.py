@@ -170,6 +170,17 @@ def get_tools() -> List[Dict[str, Any]]:
                 "required": ["output_dir", "cluster"]
             }
         },
+        {
+            "name": "save_data",
+            "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "output_path": {"type": "string", "description": "Path to save the current in-memory h5ad"}
+                },
+                "required": ["output_path"]
+            }
+        },
     ]
 
     # Meta tools (agent control)
@@ -398,15 +409,22 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             "has_celltypes": state.has_celltypist or state.has_scimilarity,
         }
 
-    def get_adata(tool_input, existing_adata):
-        """Get adata from memory or load from disk."""
+    def get_adata(tool_input, existing_adata, update_memory: bool = True):
+        """Get adata from memory or load from disk.
+
+        If ``update_memory`` is False, loading from disk is treated as read-only
+        and does not replace the active in-memory AnnData tracked by the agent.
+        """
         data_path = tool_input.get("data_path")
         # If adata is already in memory and no specific path given, use it
         if existing_adata is not None and (data_path is None or data_path == "memory"):
-            return existing_adata
+            return existing_adata, existing_adata
         # Otherwise load from disk
         if data_path and data_path != "memory":
-            return load_data(data_path)
+            loaded = load_data(data_path)
+            if update_memory:
+                return loaded, loaded
+            return loaded, existing_adata
         raise ValueError("No data available. Provide data_path or load data first.")
 
     def fix_output_path(output_path: str, tool_name: str) -> str:
@@ -773,8 +791,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
         # ===== INSPECTION TOOLS =====
         elif tool_name == "inspect_data":
-            adata = get_adata(tool_input, adata)
-            state = inspect_data(adata)
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
+            state = inspect_data(working_adata)
             goal = tool_input.get("goal")
 
             result = {
@@ -782,15 +800,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "tool": "inspect_data",
                 "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
                 "data_type": state.data_type,
-                "state": make_state(adata),
-                "embeddings": [k for k in adata.obsm.keys()],
-                "layers": list(adata.layers.keys()),
+                "state": make_state(working_adata),
+                "embeddings": [k for k in working_adata.obsm.keys()],
+                "layers": list(working_adata.layers.keys()),
                 "genes": {
                     "format": state.gene_id_format,
                     "has_symbols": state.has_gene_symbols,
                     "has_ensembl": state.has_ensembl_ids,
                     "sample": state.sample_gene_names,
-                    "var_columns": list(adata.var.columns)[:10],
+                    "var_columns": list(working_adata.var.columns)[:10],
                 },
                 "clustering": {
                     "has_clusters": state.has_clusters,
@@ -805,29 +823,29 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)
 
-            return json.dumps(result, indent=2), adata
+            return json.dumps(result, indent=2), updated_adata
 
         elif tool_name == "get_cluster_sizes":
-            adata = get_adata(tool_input, adata)
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             key = tool_input.get("cluster_key", "leiden")
-            if key not in adata.obs:
-                return json.dumps({"status": "error", "message": f"No cluster column '{key}'"}), adata
+            if key not in working_adata.obs:
+                return json.dumps({"status": "error", "message": f"No cluster column '{key}'"}), updated_adata
 
-            sizes = adata.obs[key].value_counts().to_dict()
+            sizes = working_adata.obs[key].value_counts().to_dict()
             return json.dumps({
                 "status": "ok",
                 "tool": "get_cluster_sizes",
                 "cluster_key": key,
                 "n_clusters": len(sizes),
                 "sizes": {str(k): int(v) for k, v in sizes.items()}
-            }, indent=2), adata
+            }, indent=2), updated_adata
 
         elif tool_name == "get_top_markers":
-            adata = get_adata(tool_input, adata)
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             cluster = tool_input["cluster"]
             n_genes = tool_input.get("n_genes", 10)
 
-            markers_df = get_top_markers(adata, group=cluster, n_genes=n_genes)
+            markers_df = get_top_markers(working_adata, group=cluster, n_genes=n_genes)
             markers = markers_df[['names', 'scores', 'logfoldchanges', 'pvals_adj']].to_dict('records')
 
             return json.dumps({
@@ -835,53 +853,53 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "tool": "get_top_markers",
                 "cluster": cluster,
                 "markers": markers
-            }, indent=2), adata
+            }, indent=2), updated_adata
 
         elif tool_name == "summarize_qc_metrics":
-            adata = get_adata(tool_input, adata)
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
 
             metrics = {}
             for col in ['total_counts', 'n_genes_by_counts', 'pct_counts_mt', 'doublet_score']:
-                if col in adata.obs:
+                if col in working_adata.obs:
                     metrics[col] = {
-                        "median": float(adata.obs[col].median()),
-                        "mean": float(adata.obs[col].mean()),
-                        "min": float(adata.obs[col].min()),
-                        "max": float(adata.obs[col].max())
+                        "median": float(working_adata.obs[col].median()),
+                        "mean": float(working_adata.obs[col].mean()),
+                        "min": float(working_adata.obs[col].min()),
+                        "max": float(working_adata.obs[col].max())
                     }
 
             doublet_info = {}
-            if 'predicted_doublet' in adata.obs:
+            if 'predicted_doublet' in working_adata.obs:
                 doublet_info = {
-                    "n_doublets": int(adata.obs['predicted_doublet'].sum()),
-                    "doublet_rate": float(adata.obs['predicted_doublet'].mean())
+                    "n_doublets": int(working_adata.obs['predicted_doublet'].sum()),
+                    "doublet_rate": float(working_adata.obs['predicted_doublet'].mean())
                 }
 
             return json.dumps({
                 "status": "ok",
                 "tool": "summarize_qc_metrics",
-                "n_cells": adata.n_obs,
+                "n_cells": working_adata.n_obs,
                 "metrics": metrics,
                 "doublets": doublet_info
-            }, indent=2), adata
+            }, indent=2), updated_adata
 
         elif tool_name == "get_celltypes":
-            adata = get_adata(tool_input, adata)
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
 
             # Find annotation column
             key = tool_input.get("annotation_key")
             if not key:
                 for candidate in ['celltypist_majority_voting', 'celltypist_predicted_labels',
                                   'scimilarity_representative_prediction', 'cell_type', 'celltype']:
-                    if candidate in adata.obs:
+                    if candidate in working_adata.obs:
                         key = candidate
                         break
 
-            if not key or key not in adata.obs:
-                return json.dumps({"status": "error", "message": "No cell type annotations found"}), adata
+            if not key or key not in working_adata.obs:
+                return json.dumps({"status": "error", "message": "No cell type annotations found"}), updated_adata
 
-            counts = adata.obs[key].value_counts()
-            total_cells = adata.n_obs
+            counts = working_adata.obs[key].value_counts()
+            total_cells = working_adata.n_obs
 
             # Build detailed breakdown with percentages
             breakdown = {}
@@ -908,20 +926,20 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "n_types": len(counts),
                 "top_10_types": major_types if major_types else breakdown,
                 "all_types": breakdown
-            }, indent=2), adata
+            }, indent=2), updated_adata
 
         elif tool_name == "list_obs_columns":
-            adata = get_adata(tool_input, adata)
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             return json.dumps({
                 "status": "ok",
                 "tool": "list_obs_columns",
-                "columns": list(adata.obs.columns),
-                "n_columns": len(adata.obs.columns)
-            }, indent=2), adata
+                "columns": list(working_adata.obs.columns),
+                "n_columns": len(working_adata.obs.columns)
+            }, indent=2), updated_adata
 
         # ===== ACTION TOOLS =====
         elif tool_name == "run_qc":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             n_before, g_before = adata.n_obs, adata.n_vars
 
             warnings = []
@@ -963,7 +981,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "normalize_and_hvg":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             normalize_data(adata)
             n_hvg = tool_input.get("n_hvg", 4000)
             select_hvg(adata, n_top_genes=n_hvg)
@@ -982,7 +1000,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_dimred":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             n_pcs = tool_input.get("n_pcs", 30)
             n_neighbors = tool_input.get("n_neighbors", 30)
 
@@ -1006,7 +1024,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_clustering":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             method = tool_input.get("method", "leiden")
             resolution = tool_input.get("resolution", 1.0)
 
@@ -1035,7 +1053,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_celltypist":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             model = tool_input.get("model", "Immune_All_Low.pkl")
             majority = tool_input.get("majority_voting", True)
 
@@ -1073,7 +1091,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_scimilarity":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             model_path = tool_input.get("model_path")
 
             # Only pass model_path if specified, otherwise use default
@@ -1115,8 +1133,28 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "state": make_state(adata)
             }, indent=2), adata
 
+        elif tool_name == "save_data":
+            if adata is None:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "save_data",
+                    "message": "No in-memory data available to save. Run an analysis tool first."
+                }, indent=2), adata
+
+            output_path = fix_output_path(tool_input.get("output_path"), "save_data")
+            adata.write_h5ad(output_path)
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "save_data",
+                "output_path": output_path,
+                "saved": True,
+                "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
+                "state": make_state(adata)
+            }, indent=2), adata
+
         elif tool_name == "run_batch_correction":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             method = tool_input.get("method", "harmony")
             batch_key = tool_input["batch_key"]
 
@@ -1154,7 +1192,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_deg":
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             groupby = tool_input.get("groupby", "leiden")
             method = tool_input.get("method", "wilcoxon")
 
@@ -1200,7 +1238,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             import os
             import scanpy as sc
 
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             output_dir = tool_input["output_dir"]
             cluster = tool_input["cluster"]
             gene_sets = tool_input.get("gene_sets", "KEGG_2021_Human")
@@ -1311,7 +1349,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             import matplotlib.pyplot as plt
             import scanpy as sc
 
-            adata = get_adata(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata)
             plot_type = tool_input["plot_type"]
             output_path = tool_input["output_path"]
             color_by = tool_input.get("color_by", "leiden")
