@@ -122,30 +122,47 @@ When reporting results:
 - Describe your revised approach
 - Then proceed with the fix
 
-## File Saving Guidelines
+## Data Persistence and File Saving
 
-**The output_path parameter is OPTIONAL for most tools.** Data persists in memory between tool calls.
+**CRITICAL: Data persists in memory between tool calls.** You do NOT need to save/load files between steps.
 
-**Only provide output_path when you want to save:**
-- After QC filtering (important checkpoint - cells are removed)
-- At end of analysis (final result with all annotations)
-- When user explicitly requests a save
+### Using In-Memory Data
 
-**Do NOT provide output_path for:**
-- normalize_and_hvg (no data lost, just transformed)
-- run_dimred (just adds embeddings)
-- run_clustering (just adds labels)
-- run_celltypist / run_scimilarity (just adds annotations)
-- run_deg (just adds results to adata.uns)
+After the first tool loads data, all subsequent tools should use the in-memory data:
 
-**Example - full analysis should only save TWICE:**
-1. run_qc(..., output_path="qc_filtered.h5ad")  ← Save: cells removed
-2. normalize_and_hvg(...)  ← No save
-3. run_dimred(...)  ← No save
-4. run_clustering(...)  ← No save
-5. run_celltypist(...)  ← No save
-6. run_deg(...)  ← No save
-7. At end: save final with all results
+**CORRECT (use memory):**
+```
+1. run_qc(data_path="input.h5")           ← Load from file
+2. normalize_and_hvg()                     ← No data_path, uses memory
+3. run_dimred()                            ← No data_path, uses memory
+4. run_clustering()                        ← No data_path, uses memory
+5. run_scimilarity(output_path="final.h5ad")  ← Save final result
+```
+
+**WRONG (loses state):**
+```
+1. run_qc(data_path="input.h5", output_path="qc.h5ad")
+2. normalize_and_hvg(data_path="qc.h5ad", output_path="norm.h5ad")  ← WRONG!
+```
+
+### File Saving Rules
+
+**Save only ONE file at the end** with all results. Do NOT save intermediate files.
+
+- `output_path` is OPTIONAL for all tools
+- Only provide `output_path` on the FINAL step of analysis
+- The final h5ad will contain everything: QC metrics, clusters, annotations, embeddings
+
+**Example - correct workflow:**
+```
+run_qc(data_path="input.h5")              ← Load only
+normalize_and_hvg()                        ← Memory
+run_dimred()                               ← Memory
+run_clustering()                           ← Memory
+run_scimilarity(output_path="result.h5ad") ← Save final (has EVERYTHING)
+```
+
+The final `result.h5ad` contains: raw_counts layer, QC metrics, normalized data, PCA, UMAP, clusters, and scimilarity annotations - all in one file.
 """
 
 QC_PROMPT = """Analyze the quality of this single-cell dataset.

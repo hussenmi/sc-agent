@@ -15,7 +15,7 @@
 - **Differential Expression**: Wilcoxon, t-test, logistic regression
 
 ### Autonomous Agent
-- **Multi-provider**: Works with OpenAI (GPT-4o, GPT-5.4) or Anthropic (Claude)
+- **Multi-provider**: Works with OpenAI (GPT-4o, GPT-5.4, etc.) or Anthropic (Claude)
 - **18 Built-in Tools**: QC, clustering, annotation, visualization, and more
 - **Code Generation**: Dynamically writes and executes Python for custom analyses
 - **Vision Support**: Agent can see and analyze generated plots

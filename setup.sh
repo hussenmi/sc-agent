@@ -91,8 +91,8 @@ source "${VENV_DIR}/bin/activate"
 
 echo "Installing scagent and dependencies..."
 cd "${SCAGENT_DIR}"
-# Install with agent extra for full functionality
-${UV_CMD} pip install -e ".[agent]" --quiet
+# Install with all extras for full functionality (agent + scimilarity)
+${UV_CMD} pip install -e ".[all]" --quiet
 
 # =============================================================================
 # Set environment variables

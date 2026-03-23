@@ -148,10 +148,66 @@ class SCAgent:
         self.model = model or "gpt-4o"
         self.tools = get_openai_tools()
 
-    def _print(self, message: str):
-        """Print message if verbose."""
+    def _print(self, message: str, style: str = None):
+        """Print message if verbose using rich formatting."""
         if self.verbose:
-            print(message, flush=True)
+            from rich.console import Console
+            console = Console()
+            if style:
+                console.print(message, style=style)
+            else:
+                console.print(message)
+
+    def _print_thinking(self, message: str):
+        """Print agent thinking/reasoning."""
+        if self.verbose:
+            from rich.console import Console
+            from rich.panel import Panel
+            console = Console()
+            console.print(f"[dim]💭[/dim] [italic]{message}[/italic]")
+
+    def _print_error(self, message: str):
+        """Print error message."""
+        if self.verbose:
+            from rich.console import Console
+            console = Console()
+            console.print(f"[red]✗ Error:[/red] {message}")
+
+    def _print_success(self, message: str):
+        """Print success message."""
+        if self.verbose:
+            from rich.console import Console
+            console = Console()
+            console.print(f"[green]✓[/green] {message}")
+
+    def _ask_continue(self, error_msg: str, suggestions: list = None) -> str:
+        """Ask user how to proceed after an error."""
+        from rich.console import Console
+        from rich.panel import Panel
+        console = Console()
+
+        console.print()
+        console.print(Panel(
+            f"{error_msg}",
+            title="⚠️  Issue Detected",
+            border_style="yellow"
+        ))
+
+        if suggestions:
+            console.print("\n[bold]Suggestions:[/bold]")
+            for i, s in enumerate(suggestions, 1):
+                console.print(f"  {i}. {s}")
+
+        console.print("\n[bold]What would you like to do?[/bold]")
+        console.print("  • Type a new instruction")
+        console.print("  • Press Enter to let the agent try to recover")
+        console.print("  • Type 'quit' to stop")
+
+        try:
+            response = input("\n> ").strip()
+            return response if response else "try to recover from the error"
+        except (EOFError, KeyboardInterrupt):
+            return "quit"
 
     def analyze(
         self,
@@ -210,7 +266,7 @@ class SCAgent:
             except:
                 pass
 
-            self._print(f"Run directory: {self.run_manager.run_dir}")
+            self._print(f"[dim]📁 Output: {self.run_manager.run_dir}[/dim]")
 
             if data_path:
                 self.run_manager.add_input(data_path)
@@ -232,8 +288,12 @@ class SCAgent:
         if self.run_manager:
             user_message += f"\nOutput directory: {self.run_manager.run_dir}"
 
-        self._print(f"\nAnalyzing: {request}")
-        self._print("-" * 50)
+        if self.verbose:
+            from rich.console import Console
+            from rich.panel import Panel
+            console = Console()
+            console.print()
+            console.print(Panel(request, title="🔬 Analyzing", border_style="cyan"))
 
         # Route to provider-specific implementation
         if self.provider == "anthropic":
@@ -270,7 +330,7 @@ class SCAgent:
                         if content.type == "text":
                             assistant_content.append(content)
                             if self.verbose:
-                                self._print(f"\n💭 Agent: {content.text}")
+                                self._print_thinking(content.text)
 
                         elif content.type == "tool_use":
                             assistant_content.append(content)
@@ -315,12 +375,29 @@ class SCAgent:
                             self._print("\n" + "-" * 50)
                             self._print(final_result)
 
+                    # Check if the response indicates failure/incomplete
+                    failure_indicators = ["error", "failed", "couldn't", "unable to", "not installed",
+                                         "missing", "cannot", "exception", "try again"]
+                    seems_like_failure = any(ind in final_result.lower() for ind in failure_indicators)
+
+                    # If it looks like a failure, offer interactive recovery
+                    if seems_like_failure and self.verbose:
+                        user_input = self._ask_continue(
+                            final_result,  # Pass the actual response - it contains the specific issue
+                            suggestions=["Provide additional instructions", "Try a different approach"]
+                        )
+                        if user_input.lower() not in ["quit", "exit", "q"]:
+                            # Continue the conversation with user input
+                            messages.append({"role": "user", "content": user_input})
+                            self._conversation_history = messages
+                            continue  # Go to next iteration
+
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
                     if self.run_manager:
                         self.run_manager.complete(summary=final_result)
-                        self._print(f"\nRun manifest: {self.run_manager.run_dir}/manifest.json")
+                        self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
 
@@ -353,14 +430,12 @@ class SCAgent:
 
         try:
             for iteration in range(max_iterations):
-                self._print(f"\n[Iteration {iteration+1}/{max_iterations}]")
                 response = self.client.chat.completions.create(
                     model=self.model,
                     max_completion_tokens=4096,
                     tools=self.tools,
                     messages=messages,
                 )
-                self._print(f"[finish_reason: {response.choices[0].finish_reason}]")
 
                 choice = response.choices[0]
                 message = choice.message
@@ -371,7 +446,7 @@ class SCAgent:
 
                     # Print any reasoning/text content from the agent
                     if message.content:
-                        self._print(f"\n💭 Agent: {message.content}")
+                        self._print_thinking(message.content)
 
                     # Process each tool call
                     for tool_call in message.tool_calls:
@@ -407,15 +482,33 @@ class SCAgent:
                     messages.append({"role": "assistant", "content": message.content})
 
                     final_result = message.content or ""
+
+                    # Check if the response indicates failure/incomplete
+                    failure_indicators = ["error", "failed", "couldn't", "unable to", "not installed",
+                                         "missing", "cannot", "exception", "try again"]
+                    seems_like_failure = any(ind in final_result.lower() for ind in failure_indicators)
+
                     self._print("\n" + "-" * 50)
                     self._print(final_result)
+
+                    # If it looks like a failure, offer interactive recovery
+                    if seems_like_failure and self.verbose:
+                        user_input = self._ask_continue(
+                            final_result,  # Pass the actual response - it contains the specific issue
+                            suggestions=["Provide additional instructions", "Try a different approach"]
+                        )
+                        if user_input.lower() not in ["quit", "exit", "q"]:
+                            # Continue the conversation with user input
+                            messages.append({"role": "user", "content": user_input})
+                            self._conversation_history = messages
+                            continue  # Go to next iteration
 
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
                     if self.run_manager:
                         self.run_manager.complete(summary=final_result)
-                        self._print(f"\nRun manifest: {self.run_manager.run_dir}/manifest.json")
+                        self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
 
@@ -444,7 +537,10 @@ class SCAgent:
 
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Execute a tool and return JSON result."""
-        self._print(f"\n[Tool] {tool_name}")
+        from rich.console import Console
+        from rich.status import Status
+
+        console = Console()
         logger.info(f"Tool call: {tool_name} with {tool_input}")
 
         # Special handling for ask_user - get input from user
@@ -457,6 +553,7 @@ class SCAgent:
 
         # Special handling for run_code - show what's being executed
         if tool_name == "run_code":
+            self._print(f"\n[Tool] {tool_name}")
             self._print(f"    Description: {tool_input.get('description', 'custom code')}")
             if self.verbose:
                 code_preview = tool_input.get('code', '')[:100]
@@ -466,8 +563,16 @@ class SCAgent:
             # Pass output directory for code file saving
             if self.run_manager:
                 tool_input["output_dir"] = str(self.run_manager.run_dir)
-
-        result_json, self.adata = process_tool_call(tool_name, tool_input, self.adata)
+            # Run without spinner for code (it may have its own output)
+            result_json, self.adata = process_tool_call(tool_name, tool_input, self.adata)
+        else:
+            # Run with spinner for other tools
+            if self.verbose:
+                with console.status(f"[bold cyan]Running {tool_name}...", spinner="dots") as status:
+                    result_json, self.adata = process_tool_call(tool_name, tool_input, self.adata)
+                console.print(f"[green]✓[/green] {tool_name} complete")
+            else:
+                result_json, self.adata = process_tool_call(tool_name, tool_input, self.adata)
 
         # Check for image in result and store for vision
         try:
@@ -501,16 +606,22 @@ class SCAgent:
                     self.run_manager.add_warning(w)
 
             if status == "ok":
+                # Show key results inline
+                details = []
                 if "after" in result_data:
-                    self._print(f"    → {result_data['after'].get('n_cells', '?')} cells")
+                    details.append(f"{result_data['after'].get('n_cells', '?')} cells")
                 if "n_clusters" in result_data:
-                    self._print(f"    → {result_data['n_clusters']} clusters")
+                    details.append(f"{result_data['n_clusters']} clusters")
+                if "n_types" in result_data:
+                    details.append(f"{result_data['n_types']} cell types")
                 if "shape" in result_data and tool_name == "run_code":
-                    self._print(f"    → {result_data['shape']['n_cells']} cells, {result_data['shape']['n_genes']} genes")
+                    details.append(f"{result_data['shape']['n_cells']} cells")
+                if details:
+                    self._print(f"    → {', '.join(details)}")
             elif status == "needs_input":
                 pass  # Handled by ask_user
-            else:
-                self._print(f"    → {status}: {result_data.get('message', '')}")
+            elif status == "error":
+                self._print(f"    [red]✗ Error:[/red] {result_data.get('message', '')}")
 
         except json.JSONDecodeError:
             pass
@@ -550,6 +661,7 @@ class SCAgent:
     def _handle_install_package(self, tool_input: Dict[str, Any]) -> str:
         """Handle install_package tool - requires user approval."""
         import subprocess
+        import sys
 
         package = tool_input["package"]
         reason = tool_input["reason"]
@@ -567,34 +679,44 @@ class SCAgent:
             response = "n"
 
         if response in ("y", "yes"):
-            # Install the package
-            try:
-                result = subprocess.run(
-                    ["pip", "install", package],
-                    capture_output=True,
-                    text=True,
-                    timeout=120
-                )
-                if result.returncode == 0:
-                    return json.dumps({
-                        "status": "ok",
-                        "tool": "install_package",
-                        "package": package,
-                        "message": f"Successfully installed {package}"
-                    }, indent=2)
-                else:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "install_package",
-                        "package": package,
-                        "message": f"Installation failed: {result.stderr}"
-                    }, indent=2)
-            except subprocess.TimeoutExpired:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "install_package",
-                    "message": "Installation timed out"
-                }, indent=2)
+            # Try uv first (faster, works with uv-managed venvs), fall back to pip
+            python_path = sys.executable
+            install_commands = [
+                ["uv", "pip", "install", "--python", python_path, package],
+                [python_path, "-m", "pip", "install", package],
+            ]
+
+            last_error = None
+            for cmd in install_commands:
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=180
+                    )
+                    if result.returncode == 0:
+                        return json.dumps({
+                            "status": "ok",
+                            "tool": "install_package",
+                            "package": package,
+                            "message": f"Successfully installed {package}"
+                        }, indent=2)
+                    else:
+                        last_error = result.stderr
+                except subprocess.TimeoutExpired:
+                    last_error = "Installation timed out"
+                except FileNotFoundError:
+                    # Command not found (e.g., uv not installed), try next
+                    continue
+
+            # All install methods failed
+            return json.dumps({
+                "status": "error",
+                "tool": "install_package",
+                "package": package,
+                "message": f"Installation failed: {last_error}"
+            }, indent=2)
         else:
             return json.dumps({
                 "status": "denied",

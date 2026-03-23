@@ -8,6 +8,11 @@ Tools are organized into two layers:
 All tools return structured JSON for LLM reasoning.
 """
 
+# Configure tqdm for cleaner progress bars (must be before any imports that use tqdm)
+import os
+os.environ.setdefault('TQDM_NCOLS', '60')
+os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
+
 from typing import List, Dict, Any
 import json
 
@@ -29,13 +34,13 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - only save at key checkpoints)"},
                     "mt_threshold": {"type": "number", "description": "Max MT% (default: auto-detect)"},
                     "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
                     "batch_key": {"type": "string", "description": "Batch column for per-batch doublet detection"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -44,11 +49,11 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -57,12 +62,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_pcs": {"type": "integer", "description": "Number of PCs (default: 30)"},
                     "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -71,12 +76,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -85,25 +90,24 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "model": {"type": "string", "description": "Model name (default: Immune_All_Low.pkl)"},
                     "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
             "name": "run_scimilarity",
-            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Different from CellTypist - use when you want embedding-based annotation.",
+            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Model path is pre-configured via SCIMILARITY_MODEL_PATH env var - do NOT ask the user for a model path. Different from CellTypist - use when you want embedding-based annotation.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "model_path": {"type": "string", "description": "Path to Scimilarity model (default: lab model)"}
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data if already loaded)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -112,12 +116,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
                     "batch_key": {"type": "string", "description": "Batch column name"},
                     "method": {"type": "string", "enum": ["harmony", "scanorama"], "description": "Method (default: harmony)"}
                 },
-                "required": ["data_path", "batch_key"]
+                "required": ["batch_key"]
             }
         },
         {
@@ -126,12 +130,12 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
                     "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -140,13 +144,13 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad"},
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save PNG figure"},
                     "plot_type": {"type": "string", "enum": ["umap", "violin", "dotplot", "heatmap"], "description": "Plot type"},
                     "color_by": {"type": "string", "description": "Column or gene to color by"},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"}
                 },
-                "required": ["data_path", "output_path", "plot_type"]
+                "required": ["output_path", "plot_type"]
             }
         },
         {
@@ -155,7 +159,7 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad with DEG results"},
+                    "data_path": {"type": "string", "description": "Path to h5ad with DEG results (optional - uses in-memory data)"},
                     "output_dir": {"type": "string", "description": "Directory to save GSEA results"},
                     "cluster": {"type": "string", "description": "Cluster to analyze (or 'all' for all clusters)"},
                     "gene_sets": {"type": "string", "description": "Gene set database: KEGG_2021_Human, GO_Biological_Process_2021, Reactome_2022, MSigDB_Hallmark_2020 (default: KEGG_2021_Human)"},
@@ -163,7 +167,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     "max_size": {"type": "integer", "description": "Max genes in pathway (default: 500)"},
                     "permutation_num": {"type": "integer", "description": "Permutations for p-value (default: 1000)"}
                 },
-                "required": ["data_path", "output_dir", "cluster"]
+                "required": ["output_dir", "cluster"]
             }
         },
     ]
@@ -245,10 +249,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"},
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
                     "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -257,10 +261,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"},
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
                     "cluster_key": {"type": "string", "description": "Cluster column (default: leiden)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -269,11 +273,11 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad with DEG results"},
+                    "data_path": {"type": "string", "description": "Path to h5ad with DEG results (optional - uses in-memory data)"},
                     "cluster": {"type": "string", "description": "Cluster ID"},
                     "n_genes": {"type": "integer", "description": "Number of genes (default: 10)"}
                 },
-                "required": ["data_path", "cluster"]
+                "required": ["cluster"]
             }
         },
         {
@@ -282,9 +286,9 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"}
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -293,10 +297,10 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"},
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
                     "annotation_key": {"type": "string", "description": "Annotation column (default: auto-detect)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
         {
@@ -305,9 +309,9 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file"}
+                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"}
                 },
-                "required": ["data_path"]
+                "required": []
             }
         },
     ]
@@ -367,6 +371,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
         (json_result_string, updated_adata)
     """
     import numpy as np
+
     from ..core import (
         inspect_data, load_data, run_qc_pipeline, normalize_data,
         run_pca, compute_neighbors, compute_umap,
@@ -403,6 +408,17 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
         if data_path and data_path != "memory":
             return load_data(data_path)
         raise ValueError("No data available. Provide data_path or load data first.")
+
+    def fix_output_path(output_path: str, tool_name: str) -> str:
+        """Fix output_path if it's a directory by adding a filename."""
+        import os as os_module
+        if output_path is None:
+            return None
+        if os_module.path.isdir(output_path):
+            # It's a directory, construct a proper filename
+            filename = f"{tool_name}_result.h5ad"
+            return os_module.path.join(output_path, filename)
+        return output_path
 
     try:
         # ===== META TOOLS =====
@@ -924,7 +940,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 remove_ribo=tool_input.get("remove_ribo", True),
                 batch_key=batch_key,
             )
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_qc")
             if output_path:
                 adata.write_h5ad(output_path)
 
@@ -952,7 +968,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             n_hvg = tool_input.get("n_hvg", 4000)
             select_hvg(adata, n_top_genes=n_hvg)
 
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "normalize_and_hvg")
             if output_path:
                 adata.write_h5ad(output_path)
 
@@ -974,7 +990,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             compute_neighbors(adata, n_neighbors=n_neighbors)
             compute_umap(adata)
 
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_dimred")
             if output_path:
                 adata.write_h5ad(output_path)
 
@@ -1001,7 +1017,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 run_phenograph(adata, resolution=resolution)
                 cluster_key = "pheno_leiden"
 
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_clustering")
             if output_path:
                 adata.write_h5ad(output_path)
             sizes = adata.obs[cluster_key].value_counts().to_dict()
@@ -1025,7 +1041,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             run_celltypist(adata, model=model, majority_voting=majority)
 
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_celltypist")
             if output_path:
                 adata.write_h5ad(output_path)
 
@@ -1066,7 +1082,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             else:
                 run_scimilarity(adata)
 
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_scimilarity")
             if output_path:
                 adata.write_h5ad(output_path)
 
@@ -1118,7 +1134,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
             compute_umap(adata)
 
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
             if output_path:
                 adata.write_h5ad(output_path)
 
@@ -1145,7 +1161,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             # Best practice: use raw counts for DEG
             run_differential_expression(adata, groupby=groupby, method=method, use_raw=True)
 
-            output_path = tool_input.get("output_path")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_deg")
             if output_path:
                 adata.write_h5ad(output_path)
 
