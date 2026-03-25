@@ -111,6 +111,63 @@ class BatchDefaults:
     harmony_adjusted_basis: str = 'X_pca_harmony'
 
 
+@dataclass(frozen=True)
+class DEGDefaults:
+    """Differential expression analysis defaults."""
+
+    # Method
+    method: str = 'wilcoxon'  # Recommended for single-cell
+    n_genes: int = 100        # Top genes to store per cluster
+
+    # Validation thresholds
+    min_cluster_size: int = 20       # ERROR if smaller
+    warn_cluster_size: int = 50      # WARNING if smaller
+    max_logfc_sanity: float = 10.0   # Flag genes with |logFC| > this
+
+    # Group imbalance
+    max_imbalance_ratio: float = 20.0  # WARNING if largest/smallest > this
+
+    # Batch confounding
+    batch_confound_threshold: float = 0.7  # Cramer's V threshold for WARNING
+
+    # Preferred layers (in order of preference)
+    preferred_raw_layers: tuple = ('raw_counts', 'counts', 'raw_data')
+
+    # Gene set compatibility
+    default_geneset: str = 'MSigDB_Hallmark_2020'
+
+
+@dataclass(frozen=True)
+class GSEADefaults:
+    """Gene Set Enrichment Analysis defaults."""
+
+    # GSEA parameters
+    min_size: int = 5         # Min genes in pathway
+    max_size: int = 500       # Max genes in pathway
+    permutation_num: int = 1000
+    seed: int = 42
+
+    # Default gene sets
+    default_geneset: str = 'MSigDB_Hallmark_2020'
+
+    # Available gene sets with descriptions
+    available_genesets: tuple = (
+        'MSigDB_Hallmark_2020',
+        'KEGG_2021_Human',
+        'GO_Biological_Process_2021',
+        'Reactome_2022',
+        'WikiPathways_2021_Human',
+    )
+
+    # Significance thresholds
+    fdr_threshold: float = 0.25  # Standard GSEA threshold
+    nes_min: float = 1.0         # Minimum |NES| to report
+
+    # Literature search
+    max_pathways_per_cluster: int = 3
+    max_papers_per_pathway: int = 5
+
+
 # Create singleton instances
 QC_DEFAULTS = QCDefaults()
 HVG_DEFAULTS = HVGDefaults()
@@ -119,6 +176,8 @@ CLUSTERING_DEFAULTS = ClusteringDefaults()
 CELLTYPIST_DEFAULTS = CellTypistDefaults()
 SCIMILARITY_DEFAULTS = ScimilarityDefaults()
 BATCH_DEFAULTS = BatchDefaults()
+DEG_DEFAULTS = DEGDefaults()
+GSEA_DEFAULTS = GSEADefaults()
 
 
 # Utility function to get all defaults as a dictionary
@@ -154,5 +213,21 @@ def get_all_defaults() -> dict:
         'batch': {
             'scanorama_dimred': BATCH_DEFAULTS.scanorama_dimred,
             'scanorama_knn': BATCH_DEFAULTS.scanorama_knn,
+        },
+        'deg': {
+            'method': DEG_DEFAULTS.method,
+            'n_genes': DEG_DEFAULTS.n_genes,
+            'min_cluster_size': DEG_DEFAULTS.min_cluster_size,
+            'warn_cluster_size': DEG_DEFAULTS.warn_cluster_size,
+            'max_logfc_sanity': DEG_DEFAULTS.max_logfc_sanity,
+            'max_imbalance_ratio': DEG_DEFAULTS.max_imbalance_ratio,
+            'batch_confound_threshold': DEG_DEFAULTS.batch_confound_threshold,
+        },
+        'gsea': {
+            'min_size': GSEA_DEFAULTS.min_size,
+            'max_size': GSEA_DEFAULTS.max_size,
+            'permutation_num': GSEA_DEFAULTS.permutation_num,
+            'fdr_threshold': GSEA_DEFAULTS.fdr_threshold,
+            'default_geneset': GSEA_DEFAULTS.default_geneset,
         },
     }

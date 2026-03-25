@@ -208,7 +208,7 @@ The agent follows this pipeline sequence:
 6. Compute UMAP
 7. Clustering (Leiden) ← MUST come before CellTypist!
 8. Cell type annotation (CellTypist)
-9. DEG analysis (uses raw counts layer)
+9. DEG analysis (run Wilcoxon on the normalized/log1p analysis matrix; keep raw counts preserved in a layer)
 10. GSEA / pathway analysis
 ```
 
@@ -243,10 +243,10 @@ This ensures the pipeline is **predictable** (always starts with validated param
 The agent automatically follows these best practices:
 
 - **CellTypist**: Normalizes to `target_sum=10000` from raw counts layer (not from scaled data). Returns complete cell type breakdown with counts and percentages.
-- **DEG Analysis**: Uses raw counts layer for Wilcoxon test (more accurate than scaled data). Returns top 5 markers per cluster immediately for quick insight.
+- **DEG Analysis**: Preserves raw counts in a layer, but runs Wilcoxon on the active normalized/log1p analysis matrix to match the workshop notebooks. Returns validation warnings plus top 5 markers per cluster immediately for quick insight.
 - **Batch Correction**: After Harmony/Scanorama, automatically recomputes neighbors and UMAP on the corrected embedding.
 - **GSEA**: Uses DEG scores for prerank GSEA with GSEApy. Returns top up/downregulated pathways with NES scores, FDR values, and leading edge genes. Supports KEGG, GO, Reactome, MSigDB Hallmark databases.
-- **Documentation Search**: `web_search_docs` uses Tavily when configured (`TAVILY_API_KEY`), falls back to Google Programmable Search when available, and finally falls back to DuckDuckGo. Best for software docs, APIs, troubleshooting, and method pages.
+- **Documentation Search**: `web_search_docs` uses Tavily when configured (`TAVILY_API_KEY`), falls back to DuckDuckGo, and only tries Google Programmable Search as a last fallback. Best for software docs, APIs, troubleshooting, and method pages.
 - **Paper Search**: `search_papers` uses PubMed E-utilities to return recent papers with PMID, title, abstract excerpt, journal, year, and PubMed URL.
 - **Literature Research**: After GSEA, `research_findings` performs focused PubMed searches around enriched pathways, cell types, and leading-edge genes, and returns structured citations for interpretation.
 - **Source Reading**: `fetch_url` reads selected web pages and, when dependencies are available, extracts cleaner HTML text and basic PDF text for downstream reasoning.

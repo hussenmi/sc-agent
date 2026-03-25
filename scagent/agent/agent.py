@@ -567,6 +567,8 @@ class SCAgent:
                 "run_deg",
             }
 
+            run_root = self.run_manager.run_dir
+
             if tool_name in figure_tools:
                 requested = tool_input.get("output_path")
                 if not requested:
@@ -574,7 +576,6 @@ class SCAgent:
                     tool_input["output_path"] = self.run_manager.get_figure_path(_sanitize_name(stem))
                 else:
                     requested_path = Path(requested)
-                    run_root = self.run_manager.run_dir
                     if not requested_path.is_absolute():
                         if requested_path.parent == Path(".") or (
                             requested_path.parts and requested_path.parts[0] == run_root.name
@@ -583,6 +584,26 @@ class SCAgent:
                                 _sanitize_name(requested_path.stem),
                                 ext=requested_path.suffix.lstrip(".") or "png",
                             )
+
+            if tool_name == "run_qc" and not tool_input.get("figure_dir"):
+                tool_input["figure_dir"] = str(self.run_manager.dirs["figures"])
+
+            if tool_name == "run_gsea":
+                requested_dir = tool_input.get("output_dir")
+                if not requested_dir:
+                    tool_input["output_dir"] = str(self.run_manager.dirs["gsea"])
+                else:
+                    requested_path = Path(requested_dir)
+                    if not requested_path.is_absolute():
+                        if requested_path == Path(".") or requested_path.name == run_root.name:
+                            tool_input["output_dir"] = str(self.run_manager.dirs["gsea"])
+
+            if tool_name in checkpoint_tools and not self.save_checkpoints:
+                requested = tool_input.get("output_path")
+                if requested:
+                    requested_path = Path(requested)
+                    if requested_path.suffix.lower() != '.h5ad':
+                        tool_input.pop("output_path", None)
 
             if self.save_checkpoints and tool_name in checkpoint_tools and not tool_input.get("output_path"):
                 tool_input["output_path"] = self.run_manager.get_intermediate_path(_sanitize_name(tool_name))
@@ -703,14 +724,166 @@ class SCAgent:
                 return key
         return None
 
+    def _cluster_annotation_summary(self, cluster_id: str, groupby: str, annotation_key: str) -> Optional[Dict[str, Any]]:
+        """Return dominant-label summary for one annotation source within a cluster."""
+        if self.adata is None or groupby not in self.adata.obs.columns or annotation_key not in self.adata.obs.columns:
+            return None
+
+        mask = self.adata.obs[groupby].astype(str) == str(cluster_id)
+        labels = self.adata.obs.loc[mask, annotation_key].dropna().astype(str)
+        if labels.empty:
+            return None
+
+        counts = labels.value_counts()
+        return {
+            "annotation_key": annotation_key,
+            "label": str(counts.index[0]),
+            "fraction": float(counts.iloc[0] / counts.sum()),
+            "n_annotated": int(counts.sum()),
+        }
+
+    def _normalize_annotation_lineage(self, label: str) -> str:
+        """Map detailed annotation labels to broad lineages for sanity checks."""
+        lowered = (label or "").lower()
+        if not lowered:
+            return "unknown"
+        if "plasmablast" in lowered or "plasma" in lowered:
+            return "plasma"
+        if "pdc" in lowered or "plasmacytoid" in lowered:
+            return "pdc"
+        if "dc" in lowered or "dendritic" in lowered:
+            return "dendritic"
+        if any(tok in lowered for tok in ["monocyte", "macroph", "myelo", "myelocyte"]):
+            return "monocyte"
+        if "nk" in lowered or "natural killer" in lowered:
+            return "nk"
+        if "b cell" in lowered or "b-cell" in lowered or lowered.startswith("b "):
+            return "b_cell"
+        if any(tok in lowered for tok in ["t cell", "helper t", "cytotoxic t", "regulatory t", "treg", "mait", "trm", "tem", "tcm"]):
+            return "t_cell"
+        return "unknown"
+
+    def _annotation_agreement_summary(self, primary_label: str, secondary_label: Optional[str]) -> Dict[str, Any]:
+        """Summarize whether annotation sources agree at fine or broad lineage level."""
+        primary_lineage = self._normalize_annotation_lineage(primary_label)
+        secondary_lineage = self._normalize_annotation_lineage(secondary_label or "")
+        summary = {
+            "status": "unknown",
+            "note": "Only one annotation source available.",
+            "primary_lineage": primary_lineage,
+            "secondary_lineage": secondary_lineage,
+        }
+        if not secondary_label:
+            return summary
+
+        if primary_label.lower() == secondary_label.lower():
+            summary.update(status="aligned", note="Annotation systems agree on the same label.")
+            return summary
+
+        if primary_lineage != "unknown" and primary_lineage == secondary_lineage:
+            summary.update(status="broadly_aligned", note="Annotation systems agree on the broad lineage but not the fine-grained label.")
+            return summary
+
+        myeloid = {"monocyte", "dendritic", "pdc"}
+        lymphoid = {"t_cell", "nk", "b_cell", "plasma"}
+        if primary_lineage in myeloid and secondary_lineage in myeloid:
+            summary.update(status="myeloid_disagreement", note="Annotation systems agree this cluster is myeloid, but disagree on the finer identity.")
+        elif primary_lineage in lymphoid and secondary_lineage in lymphoid:
+            summary.update(status="lymphoid_disagreement", note="Annotation systems agree this cluster is lymphoid, but disagree on the finer identity.")
+        else:
+            summary.update(status="conflicting", note="Annotation systems disagree on the broad lineage assignment for this cluster.")
+        return summary
+
+    def _get_cluster_top_markers(self, cluster_id: str, groupby: str, n_genes: int = 10) -> List[str]:
+        """Return top marker genes for a cluster from the current DEG result if available."""
+        if self.adata is None or "rank_genes_groups" not in self.adata.uns:
+            return []
+        params = self.adata.uns["rank_genes_groups"].get("params", {})
+        if params.get("groupby") != groupby:
+            return []
+
+        try:
+            import scanpy as sc
+            markers_df = sc.get.rank_genes_groups_df(self.adata, group=str(cluster_id)).head(n_genes)
+        except Exception:
+            return []
+
+        return [str(name) for name in markers_df["names"].tolist()]
+
+    def _expected_marker_panel(self, label: str) -> Dict[str, Any]:
+        """Return a coarse canonical marker panel for the inferred label."""
+        lineage = self._normalize_annotation_lineage(label)
+        lowered = (label or "").lower()
+        panels = {
+            "cytotoxic_t": {"CCL5", "NKG7", "CTSW", "CST7", "GZMA", "PRF1", "GNLY", "CD3D"},
+            "treg": {"IL32", "TIGIT", "LTB", "IL7R", "CTLA4", "FOXP3", "LTB"},
+            "t_cell": {"CD3D", "CD3E", "TRAC", "LTB", "IL7R", "MALAT1"},
+            "nk": {"GNLY", "NKG7", "KLRD1", "PRF1", "KLRF1", "CST7", "CTSW", "TYROBP"},
+            "b_cell": {"MS4A1", "CD79A", "CD79B", "BANK1", "CD74", "HLA-DRA", "CD37"},
+            "plasma": {"JCHAIN", "MZB1", "SDC1", "IGHG1", "IGKC", "XBP1"},
+            "monocyte": {"LYZ", "S100A8", "S100A9", "FCN1", "CTSS", "SAT1", "LST1", "VCAN", "MNDA", "FCER1G"},
+            "dendritic": {"HLA-DRA", "HLA-DPA1", "HLA-DPB1", "CD74", "FCER1A", "CLEC10A", "CST3", "HLA-DQA1"},
+            "pdc": {"IL3RA", "GZMB", "JCHAIN", "TCF4", "IRF7", "IFITM1"},
+        }
+
+        if any(tok in lowered for tok in ["regulatory t", "treg"]):
+            panel_key = "treg"
+        elif lineage == "t_cell" and any(tok in lowered for tok in ["cytotoxic", "trm", "tem"]):
+            panel_key = "cytotoxic_t"
+        elif lineage in panels:
+            panel_key = lineage
+        else:
+            panel_key = "t_cell" if lineage == "t_cell" else "unknown"
+
+        return {
+            "panel_key": panel_key,
+            "lineage": lineage,
+            "markers": panels.get(panel_key, set()),
+        }
+
+    def _marker_support_summary(self, label: str, markers: List[str]) -> Dict[str, Any]:
+        """Assess whether cluster markers support the inferred broad lineage."""
+        panel = self._expected_marker_panel(label)
+        expected = {marker.upper() for marker in panel["markers"]}
+        observed = [marker for marker in markers if marker.upper() in expected]
+        n_matched = len(observed)
+
+        if not markers:
+            status = "unknown"
+        elif n_matched >= 3:
+            status = "strong"
+        elif n_matched == 2:
+            status = "moderate"
+        elif n_matched == 1:
+            status = "weak"
+        else:
+            status = "absent"
+
+        return {
+            "status": status,
+            "lineage": panel["lineage"],
+            "panel_key": panel["panel_key"],
+            "matched_markers": observed[:5],
+        }
+
     def _infer_cluster_context(self, cluster_id: str, groupby: str) -> Dict[str, Any]:
-        """Infer a cluster's likely cell-type context from available annotations."""
+        """Infer a cluster's likely context, annotation agreement, and marker support."""
         context = {
             "cluster": str(cluster_id),
             "groupby": groupby,
             "annotation_key": None,
             "cell_type": f"cluster {cluster_id}",
             "cell_type_fraction": None,
+            "secondary_annotation_key": None,
+            "secondary_cell_type": None,
+            "secondary_cell_type_fraction": None,
+            "annotation_agreement": "unknown",
+            "annotation_agreement_note": None,
+            "marker_support": "unknown",
+            "marker_lineage": "unknown",
+            "marker_support_markers": [],
+            "top_markers": [],
+            "interpretation_cautions": [],
             "n_cells": None,
         }
 
@@ -723,20 +896,55 @@ class SCAgent:
         if n_cells == 0:
             return context
 
-        annotation_key = self._get_best_annotation_key()
-        context["annotation_key"] = annotation_key
-        if not annotation_key:
-            return context
+        primary_key = self._get_best_annotation_key()
+        context["annotation_key"] = primary_key
+        primary_summary = self._cluster_annotation_summary(cluster_id, groupby, primary_key) if primary_key else None
+        if primary_summary:
+            context["cell_type"] = primary_summary["label"]
+            context["cell_type_fraction"] = primary_summary["fraction"]
 
-        labels = self.adata.obs.loc[mask, annotation_key].dropna().astype(str)
-        if labels.empty:
-            return context
+        secondary_summary = None
+        for secondary_key in [
+            "scimilarity_representative_prediction",
+            "celltypist_majority_voting",
+            "celltypist_predicted_labels",
+        ]:
+            if secondary_key == primary_key:
+                continue
+            secondary_summary = self._cluster_annotation_summary(cluster_id, groupby, secondary_key)
+            if secondary_summary:
+                break
 
-        counts = labels.value_counts()
-        top_label = str(counts.index[0])
-        top_fraction = float(counts.iloc[0] / counts.sum())
-        context["cell_type"] = top_label
-        context["cell_type_fraction"] = top_fraction
+        if secondary_summary:
+            context["secondary_annotation_key"] = secondary_summary["annotation_key"]
+            context["secondary_cell_type"] = secondary_summary["label"]
+            context["secondary_cell_type_fraction"] = secondary_summary["fraction"]
+
+        agreement = self._annotation_agreement_summary(
+            context["cell_type"],
+            context.get("secondary_cell_type"),
+        )
+        context["annotation_agreement"] = agreement["status"]
+        context["annotation_agreement_note"] = agreement["note"]
+
+        markers = self._get_cluster_top_markers(cluster_id, groupby, n_genes=10)
+        context["top_markers"] = markers[:5]
+        marker_support = self._marker_support_summary(context["cell_type"], markers)
+        context["marker_support"] = marker_support["status"]
+        context["marker_lineage"] = marker_support["lineage"]
+        context["marker_support_markers"] = marker_support["matched_markers"]
+
+        cautions = []
+        if context.get("cell_type_fraction") is not None and context["cell_type_fraction"] < 0.75:
+            cautions.append("Dominant annotation covers less than 75% of the cluster.")
+        if agreement["status"] in {"myeloid_disagreement", "lymphoid_disagreement", "conflicting"}:
+            cautions.append(agreement["note"])
+        if marker_support["status"] in {"weak", "absent"}:
+            if marker_support["status"] == "weak":
+                cautions.append("Top markers only weakly support the inferred lineage.")
+            else:
+                cautions.append("Top markers do not clearly support the inferred lineage.")
+        context["interpretation_cautions"] = cautions
         return context
 
     def _select_pathways_for_evidence(self, cluster_result: Dict[str, Any], max_pathways: int = 2) -> List[Dict[str, Any]]:
@@ -771,6 +979,77 @@ class SCAgent:
 
         return selected
 
+    def _pathway_function_hint(self, pathway_term: str) -> Optional[str]:
+        """Return a lightweight biological interpretation hint for common pathway families."""
+        term = (pathway_term or "").lower()
+        hints = [
+            (["allograft", "rejection"], "broad immune activation, antigen presentation, and cytotoxic lymphocyte programs rather than literal transplant biology"),
+            (["p53"], "cell stress, DNA damage response, and apoptosis-related programs"),
+            (["il2", "stat5"], "cytokine signaling and immune activation programs"),
+            (["tnf", "nf-kb"], "inflammatory signaling and innate immune activation"),
+            (["tnf", "nfkb"], "inflammatory signaling and innate immune activation"),
+            (["interferon", "gamma"], "interferon-driven inflammatory and antigen-presentation responses"),
+            (["interferon"], "interferon-driven antiviral and inflammatory responses"),
+            (["oxidative", "phosphorylation"], "mitochondrial respiration and energy metabolism"),
+            (["glycolysis"], "glycolytic metabolism and rapid energy-demand programs"),
+            (["hypoxia"], "cellular hypoxia and stress adaptation"),
+            (["mtor"], "growth, nutrient sensing, and anabolic signaling"),
+            (["e2f"], "cell-cycle progression and proliferation"),
+            (["apoptosis"], "programmed cell death and survival control"),
+            (["apical", "junction"], "cell adhesion, cytoskeletal remodeling, and tissue-interaction programs"),
+            (["kras"], "RAS/MAPK-linked activation and signaling programs"),
+            (["coagulation"], "coagulation-linked inflammatory and immunothrombotic programs"),
+        ]
+        for keywords, hint in hints:
+            if all(keyword in term for keyword in keywords):
+                return hint
+        return None
+
+    def _summarize_pathway_interpretation(
+        self,
+        pathway: Dict[str, Any],
+        cluster_context: Dict[str, Any],
+        research_data: Dict[str, Any],
+        statistically_significant: bool,
+    ) -> str:
+        """Create a concise interpretation sentence for a pathway."""
+        direction = pathway.get("direction", "unknown")
+        term = pathway.get("term", "pathway")
+        cell_type = cluster_context.get("cell_type", "this cluster")
+        hint = self._pathway_function_hint(term)
+        fdr = pathway.get("fdr")
+        papers = research_data.get("findings", {}).get("selected_papers") or research_data.get("findings", {}).get("pubmed_results", [])
+
+        direction_phrase = {
+            "upregulated": "relative enrichment of",
+            "downregulated": "relative depletion of",
+        }.get(direction, "altered activity of")
+
+        pieces = [f"This result suggests {direction_phrase} `{term}` in `{cell_type}`."]
+        if hint:
+            pieces.append(f"`{term}` is commonly associated with {hint}.")
+        if pathway.get("genes"):
+            pieces.append(f"Leading-edge genes include {', '.join(pathway['genes'][:3])}.")
+        if statistically_significant:
+            pieces.append(f"The statistical signal is stronger here (FDR {fdr}).")
+        else:
+            pieces.append(f"This pathway did not pass the default significance cutoff (FDR {fdr}), so treat it as exploratory.")
+
+        agreement_status = cluster_context.get("annotation_agreement")
+        if agreement_status in {"myeloid_disagreement", "lymphoid_disagreement", "conflicting"}:
+            pieces.append("Cluster identity is not fully settled across annotation sources, so lineage-specific claims should be treated cautiously.")
+        if cluster_context.get("marker_support") in {"weak", "absent"}:
+            pieces.append("Marker support for the inferred lineage is limited, so this interpretation should be considered provisional.")
+
+        if papers:
+            top_paper = papers[0]
+            reasons = top_paper.get("match_reasons", [])
+            if reasons:
+                pieces.append(f"Top literature match was selected due to {'; '.join(reasons[:2])}.")
+        else:
+            pieces.append("Literature support was limited for this exact pathway/cell-type combination.")
+        return " ".join(pieces)
+
     def _generate_gsea_evidence_reports(self, gsea_result: Dict[str, Any]) -> Optional[Dict[str, str]]:
         """Generate markdown and JSON evidence reports for GSEA results."""
         if not self.run_manager:
@@ -787,6 +1066,14 @@ class SCAgent:
         max_clusters_with_literature = 5
         max_pathways_per_cluster = 2
 
+        # Get DEG validity metadata
+        deg_validity = None
+        deg_caveats = []
+        cluster_caveats = gsea_result.get("cluster_caveats", {})
+        if self.adata is not None:
+            deg_validity = self.adata.uns.get("deg_validity")
+            deg_caveats = self.adata.uns.get("deg_caveats", [])
+
         report_payload: Dict[str, Any] = {
             "generated_at": datetime.now().isoformat(),
             "groupby": groupby,
@@ -796,6 +1083,8 @@ class SCAgent:
                 "max_clusters_with_literature": max_clusters_with_literature,
                 "max_pathways_per_cluster": max_pathways_per_cluster,
             },
+            "deg_validity": deg_validity,
+            "deg_caveats": deg_caveats,
             "clusters": [],
         }
 
@@ -807,17 +1096,71 @@ class SCAgent:
             f"Cluster key: `{groupby}`",
             "",
             "This report combines pathway enrichment results with targeted PubMed searches.",
+            "Cluster sections include cross-annotation agreement and marker-support cues so pathway narratives can be weighted by cluster identity confidence.",
             "",
         ]
 
-        for idx, cluster_id in enumerate(gsea_result.get("clusters_analyzed", [])):
-            cluster_key = str(cluster_id)
+        # Add DEG validity summary if present
+        if deg_validity:
+            md_lines.append("## DEG Validity")
+            md_lines.append("")
+            if deg_validity.get("is_valid") and not deg_validity.get("has_warnings"):
+                md_lines.append("- Status: **VALID** (no issues detected)")
+            elif deg_validity.get("is_valid"):
+                md_lines.append(f"- Status: **VALID** with {deg_validity.get('n_warnings', 0)} warning(s)")
+            else:
+                md_lines.append(f"- Status: **ISSUES DETECTED** ({deg_validity.get('n_errors', 0)} error(s))")
+            md_lines.append(f"- Matrix type: `{deg_validity.get('matrix_type', 'unknown')}`")
+            md_lines.append(f"- Species: `{deg_validity.get('data_species', 'unknown')}`")
+            md_lines.append(f"- Gene format: `{deg_validity.get('gene_id_format', 'unknown')}`")
+            md_lines.append("")
+            if deg_caveats:
+                md_lines.append("### Caveats (apply to all clusters)")
+                md_lines.append("")
+                for caveat in deg_caveats:
+                    md_lines.append(f"- {caveat}")
+                md_lines.append("")
+
+        cluster_ids = [str(cid) for cid in gsea_result.get("clusters_analyzed", [])]
+        cluster_ids.sort(
+            key=lambda cid: (
+                results.get(cid, {}).get("total_significant", 0),
+                max(
+                    [abs(p.get("nes", 0.0)) for p in (
+                        results.get(cid, {}).get("upregulated_pathways", []) +
+                        results.get(cid, {}).get("downregulated_pathways", [])
+                    )] or [0.0]
+                ),
+            ),
+            reverse=True,
+        )
+        any_significant = any(results.get(cid, {}).get("total_significant", 0) > 0 for cid in cluster_ids)
+
+        md_lines.extend([
+            f"- Clusters analyzed: {len(cluster_ids)}",
+            f"- Clusters with significant pathways: {sum(results.get(cid, {}).get('total_significant', 0) > 0 for cid in cluster_ids)}",
+            "",
+        ])
+
+        if any_significant:
+            md_lines.append("Clusters are ordered by the number of statistically significant pathways and pathway effect size.")
+        else:
+            md_lines.append("No clusters passed the default significance cutoff; exploratory pathway summaries are shown instead.")
+        md_lines.append("")
+
+        for idx, cluster_key in enumerate(cluster_ids):
             cluster_result = results.get(cluster_key, {})
             cluster_context = self._infer_cluster_context(cluster_key, groupby)
+            specific_caveats = list(cluster_caveats.get(cluster_key, []))
+            for context_caveat in cluster_context.get("interpretation_cautions", []):
+                if context_caveat not in specific_caveats:
+                    specific_caveats.append(context_caveat)
+
             cluster_entry: Dict[str, Any] = {
                 "cluster": cluster_key,
                 "context": cluster_context,
                 "total_significant": cluster_result.get("total_significant"),
+                "caveats": specific_caveats,
                 "pathways": [],
             }
 
@@ -826,11 +1169,28 @@ class SCAgent:
             md_lines.append(f"- Inferred cell type: `{cluster_context['cell_type']}`")
             if cluster_context.get("cell_type_fraction") is not None:
                 md_lines.append(f"- Annotation support: {cluster_context['cell_type_fraction']:.1%} of annotated cells in this cluster")
+            if cluster_context.get("secondary_cell_type"):
+                md_lines.append(f"- Secondary annotation: `{cluster_context['secondary_cell_type']}` from `{cluster_context.get('secondary_annotation_key')}`")
+            if cluster_context.get("annotation_agreement_note"):
+                agreement_label = cluster_context.get("annotation_agreement", "unknown").replace("_", " ")
+                md_lines.append(f"- Cross-annotation agreement: `{agreement_label}`")
+                md_lines.append(f"  {cluster_context['annotation_agreement_note']}")
+            if cluster_context.get("marker_support") and cluster_context.get("marker_support") != "unknown":
+                matched = ", ".join(cluster_context.get("marker_support_markers", [])[:4]) or "no canonical markers among current top markers"
+                md_lines.append(f"- Marker support: `{cluster_context['marker_support']}` for `{cluster_context.get('marker_lineage', 'unknown')}` lineage ({matched})")
+            if cluster_context.get("top_markers"):
+                md_lines.append(f"- Top markers: {', '.join(cluster_context['top_markers'][:5])}")
             if cluster_context.get("n_cells") is not None:
                 md_lines.append(f"- Cells in cluster: {cluster_context['n_cells']}")
             md_lines.append(f"- Significant pathways (FDR < 0.25): {cluster_result.get('total_significant', 0)}")
             if cluster_result.get("total_significant", 0) == 0:
                 md_lines.append("- Note: no pathways passed the significance threshold; any literature below is exploratory context only.")
+
+            if specific_caveats:
+                md_lines.append(f"- **Interpretation caveats for this cluster:**")
+                for caveat in specific_caveats:
+                    md_lines.append(f"  - {caveat}")
+
             md_lines.append("")
 
             if "error" in cluster_result:
@@ -842,11 +1202,18 @@ class SCAgent:
 
             selected_pathways = self._select_pathways_for_evidence(
                 cluster_result,
-                max_pathways=max_pathways_per_cluster if idx < max_clusters_with_literature else 0,
+                max_pathways=max_pathways_per_cluster if (
+                    idx < max_clusters_with_literature and (
+                        cluster_result.get("total_significant", 0) > 0 or not any_significant
+                    )
+                ) else 0,
             )
 
             if not selected_pathways:
-                md_lines.append("No automatically researched pathways for this cluster.")
+                if any_significant and cluster_result.get("total_significant", 0) == 0:
+                    md_lines.append("Skipped automatic literature expansion because other clusters had stronger statistically significant pathway signals.")
+                else:
+                    md_lines.append("No automatically researched pathways for this cluster.")
                 md_lines.append("")
                 report_payload["clusters"].append(cluster_entry)
                 continue
@@ -864,8 +1231,16 @@ class SCAgent:
                     self.adata,
                 )
                 research_data = json.loads(research_json)
-                papers = research_data.get("findings", {}).get("pubmed_results", [])
+                papers = research_data.get("findings", {}).get("selected_papers", [])
                 reviews = research_data.get("findings", {}).get("review_articles", [])
+                fdr_value = pathway.get("fdr")
+                statistically_significant = (fdr_value if fdr_value is not None else 1.0) < 0.25
+                interpretation = self._summarize_pathway_interpretation(
+                    pathway,
+                    cluster_context,
+                    research_data,
+                    statistically_significant=statistically_significant,
+                )
 
                 pathway_entry = {
                     "term": pathway["term"],
@@ -874,6 +1249,8 @@ class SCAgent:
                     "fdr": pathway.get("fdr"),
                     "genes": pathway.get("genes", []),
                     "research": research_data,
+                    "interpretation": interpretation,
+                    "statistically_significant": statistically_significant,
                 }
                 cluster_entry["pathways"].append(pathway_entry)
 
@@ -882,8 +1259,11 @@ class SCAgent:
                 md_lines.append(f"- Direction: {pathway.get('direction', 'unknown')}")
                 md_lines.append(f"- NES: {pathway.get('nes', 'NA')}")
                 md_lines.append(f"- FDR q-value: {pathway.get('fdr', 'NA')}")
+                md_lines.append(f"- Evidence tier: {'significant' if statistically_significant else 'exploratory'}")
                 md_lines.append(f"- Leading-edge genes: {', '.join(pathway.get('genes', [])[:5]) or 'NA'}")
                 md_lines.append(f"- Papers found: {research_data.get('total_papers_found', 0)}")
+                md_lines.append("")
+                md_lines.append(f"Interpretation: {interpretation}")
                 md_lines.append("")
 
                 if reviews:
@@ -897,8 +1277,10 @@ class SCAgent:
                 if papers:
                     md_lines.append("Recent primary literature:")
                     for paper in papers[:3]:
+                        reasons = paper.get("match_reasons", [])
+                        reason_suffix = f" [matched on: {', '.join(reasons[:2])}]" if reasons else ""
                         md_lines.append(
-                            f"- PMID {paper.get('pmid')}: {paper.get('title')} ({paper.get('year')}, {paper.get('journal')})"
+                            f"- PMID {paper.get('pmid')}: {paper.get('title')} ({paper.get('year')}, {paper.get('journal')}){reason_suffix}"
                         )
                     md_lines.append("")
                 else:
@@ -912,6 +1294,8 @@ class SCAgent:
             "",
             "- Documentation lookup and literature lookup are intentionally separated.",
             "- Pathway interpretation is based on PubMed searches anchored to pathway term, inferred cell type, and leading-edge genes.",
+            "- DEG validity checks are run before GSEA; caveats propagate to cluster interpretations.",
+            "- Clusters with caveats (small size, batch confounding, etc.) should be interpreted with caution.",
             "- Use the JSON companion report for downstream programmatic inspection.",
             "",
         ])

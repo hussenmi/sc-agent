@@ -78,7 +78,7 @@ These are the validated default parameters from our single-cell workshop:
 6. Compute UMAP
 7. Clustering (Leiden) ← MUST come before CellTypist!
 8. Cell type annotation (CellTypist)
-9. DEG analysis (uses raw counts layer)
+9. DEG analysis (run Wilcoxon on the normalized/log1p analysis matrix; preserve raw counts in a layer for provenance and methods that need them)
 10. GSEA / pathway analysis
 
 When analyzing data, first inspect its current state:

@@ -126,14 +126,16 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_deg",
-            "description": "Run differential expression analysis between groups.",
+            "description": "Run validated differential expression analysis between groups. Validates input data (matrix type, cluster sizes, batch confounding) and attaches validity metadata for downstream GSEA interpretation. Returns validation warnings alongside DEG results.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
-                    "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"}
+                    "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"},
+                    "layer": {"type": "string", "description": "Optional expression layer to use for DEG (for example scran_norm)"},
+                    "target_geneset": {"type": "string", "description": "Target gene set database for compatibility check (default: MSigDB_Hallmark_2020)"}
                 },
                 "required": []
             }
@@ -468,18 +470,115 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
         raise ValueError("No data available. Provide data_path or load data first.")
 
     def fix_output_path(output_path: str, tool_name: str) -> str:
-        """Fix output_path if it's a directory by adding a filename."""
+        """Normalize output_path values for h5ad-producing tools."""
         import os as os_module
         if output_path is None:
             return None
         if os_module.path.isdir(output_path):
-            # It's a directory, construct a proper filename
-            filename = f"{tool_name}_result.h5ad"
-            return os_module.path.join(output_path, filename)
+            if tool_name == "save_data":
+                return os_module.path.join(output_path, "final_result.h5ad")
+            return None
         return output_path
 
+    def _stringify_dataframe_columns(df):
+        if df is None:
+            return df
+        for col in df.columns:
+            try:
+                dtype_str = str(df[col].dtype)
+            except Exception:
+                dtype_str = ""
+            if dtype_str in {"object", "category"}:
+                df[col] = df[col].astype(str)
+        return df
+
+    def _sanitize_uns_value(value):
+        import numpy as _np
+        import pandas as _pd
+        try:
+            import scipy.sparse as _sp
+        except Exception:
+            _sp = None
+
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (_np.integer, _np.floating, _np.bool_)):
+            return value.item()
+        if _sp is not None and _sp.issparse(value):
+            return value.toarray().tolist()
+        if isinstance(value, _np.ndarray):
+            if value.dtype.names is not None:
+                return {str(name): _sanitize_uns_value(value[name]) for name in value.dtype.names}
+            if value.dtype.kind in "biufc":
+                return value.tolist()
+            if value.dtype.kind in "SU":
+                return value.astype(str).tolist()
+            return [_sanitize_uns_value(v) for v in value.tolist()]
+        if isinstance(value, (_pd.Series, _pd.Index)):
+            return [_sanitize_uns_value(v) for v in value.tolist()]
+        if isinstance(value, _pd.DataFrame):
+            safe_df = value.copy()
+            _stringify_dataframe_columns(safe_df)
+            return {str(col): [_sanitize_uns_value(v) for v in safe_df[col].tolist()] for col in safe_df.columns}
+        if isinstance(value, dict):
+            return {str(k): _sanitize_uns_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            sanitized_items = [_sanitize_uns_value(v) for v in value]
+            normalized_items = []
+            for item in sanitized_items:
+                if isinstance(item, (dict, list, tuple, set)):
+                    try:
+                        normalized_items.append(json.dumps(item, default=str, sort_keys=True))
+                    except Exception:
+                        normalized_items.append(str(item))
+                else:
+                    normalized_items.append(item)
+            return normalized_items
+        return str(value)
+
+    def _make_serializable_copy(current_adata, aggressive_uns: bool = False):
+        sanitized = current_adata.copy()
+        _stringify_dataframe_columns(sanitized.obs)
+        _stringify_dataframe_columns(sanitized.var)
+        if sanitized.raw is not None:
+            _stringify_dataframe_columns(sanitized.raw.var)
+        if aggressive_uns:
+            sanitized.uns = {str(k): _sanitize_uns_value(v) for k, v in sanitized.uns.items()}
+        return sanitized
+
+    def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
+        details = {"save_mode": "direct", "warnings": []}
+        first_error_msg = None
+        second_error_msg = None
+        try:
+            current_adata.write_h5ad(output_path)
+            return details
+        except Exception as first_error:
+            first_error_msg = str(first_error)
+            details["warnings"].append(f"Direct save failed; retrying with obs/var cleanup: {first_error_msg}")
+
+        try:
+            sanitized = _make_serializable_copy(current_adata, aggressive_uns=False)
+            sanitized.write_h5ad(output_path)
+            details["save_mode"] = "clean_obs_var"
+            return details
+        except Exception as second_error:
+            second_error_msg = str(second_error)
+            details["warnings"].append(f"Obs/var cleanup save failed; retrying with uns cleanup: {second_error_msg}")
+
+        try:
+            sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
+            sanitized.write_h5ad(output_path)
+            details["save_mode"] = "clean_obs_var_uns"
+            return details
+        except Exception as third_error:
+            raise RuntimeError(
+                "Unable to save AnnData after serialization cleanup. "
+                f"Direct error: {first_error_msg}; obs/var cleanup error: {second_error_msg}; uns cleanup error: {third_error}"
+            )
+
     def search_web(query: str, site: str = "", max_results: int = 5) -> Dict[str, Any]:
-        """Search web/docs using Tavily (primary), Google CSE (backup), or DuckDuckGo (fallback)."""
+        """Search web/docs using Tavily (primary), DuckDuckGo (secondary), or Google CSE (last fallback)."""
         import os as os_module
         from urllib.parse import urlparse
         import requests
@@ -646,7 +745,40 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             except Exception as e:
                 search_errors.append({"backend": "tavily", "type": type(e).__name__, "message": str(e)})
 
-        # === GOOGLE (Backup) ===
+        # === DUCKDUCKGO (Secondary) ===
+        try:
+            ddg_queries = [scoped_query]
+            if site:
+                ddg_queries.append(query)
+                ddg_queries.append(f"{query} {site}")
+
+            snippets = []
+            retried_without_site = False
+            for idx, ddg_query in enumerate(ddg_queries):
+                current = run_ddg(ddg_query)
+                if idx > 0 and current:
+                    retried_without_site = True
+                snippets.extend(current)
+                if len(snippets) >= max_results * 2:
+                    break
+
+            snippets = dedupe_and_rank(snippets, preferred_domain=preferred_domain)
+
+            if snippets:
+                return {
+                    "status": "ok",
+                    "backend": "duckduckgo",
+                    "query": scoped_query,
+                    "results": snippets,
+                    "retried_without_site": retried_without_site,
+                    "fallback_used": True,
+                    "backends_tried": [e["backend"] for e in search_errors],
+                    "errors": search_errors if search_errors else None,
+                }
+        except ImportError:
+            search_errors.append({"backend": "duckduckgo", "type": "not_installed", "message": "duckduckgo-search not installed"})
+
+        # === GOOGLE (Last fallback) ===
         google_api_key = os_module.environ.get("GOOGLE_API_KEY")
         google_cx = os_module.environ.get("GOOGLE_CX")
 
@@ -678,6 +810,9 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                         "backend": "google",
                         "query": scoped_query,
                         "results": snippets,
+                        "fallback_used": True,
+                        "backends_tried": [e["backend"] for e in search_errors],
+                        "errors": search_errors if search_errors else None,
                     }
                 search_errors.append({"backend": "google", "type": "no_results"})
             except requests.HTTPError as e:
@@ -691,42 +826,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             except Exception as e:
                 search_errors.append({"backend": "google", "type": type(e).__name__, "message": str(e)})
 
-        # === DUCKDUCKGO (Final fallback) ===
-        try:
-            ddg_queries = [scoped_query]
-            if site:
-                ddg_queries.append(query)
-                ddg_queries.append(f"{query} {site}")
-
-            snippets = []
-            retried_without_site = False
-            for idx, ddg_query in enumerate(ddg_queries):
-                current = run_ddg(ddg_query)
-                if idx > 0 and current:
-                    retried_without_site = True
-                snippets.extend(current)
-                if len(snippets) >= max_results * 2:
-                    break
-
-            snippets = dedupe_and_rank(snippets, preferred_domain=preferred_domain)
-
+        if search_errors:
             return {
-                "status": "ok" if snippets else "warning",
-                "backend": "duckduckgo",
+                "status": "warning",
                 "query": scoped_query,
-                "results": snippets,
-                "retried_without_site": retried_without_site,
-                "fallback_used": True,
-                "backends_tried": [e["backend"] for e in search_errors],
-                "errors": search_errors if search_errors else None,
-                "message": "" if snippets else "No results found for this query.",
-            }
-        except ImportError:
-            search_errors.append({"backend": "duckduckgo", "type": "not_installed", "message": "duckduckgo-search not installed"})
-            return {
-                "status": "error",
-                "query": scoped_query,
-                "message": "No search backend available. Set TAVILY_API_KEY, or configure Google, or install duckduckgo-search.",
+                "backend": "none",
+                "results": [],
+                "message": "No search backend returned results for this query.",
                 "errors": search_errors,
             }
 
@@ -969,6 +1075,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             code = tool_input["code"]
             description = tool_input["description"]
             save_to = tool_input.get("save_to")
+            save_warning = None
 
             # Security: basic checks (not foolproof, but helps)
             forbidden = ["import os", "import sys", "subprocess", "eval(",
@@ -1021,7 +1128,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 pass
 
             if save_to:
-                adata.write_h5ad(save_to)
+                save_warning = "run_code ignored save_to; use save_data to save AnnData after custom code modifications"
 
             # Save code to file if output directory exists
             code_file = None
@@ -1054,7 +1161,9 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             if adata is not None:
                 result["shape"] = {"n_cells": adata.n_obs, "n_genes": adata.n_vars}
             if save_to:
-                result["saved_to"] = save_to
+                result["ignored_save_to"] = save_to
+            if save_warning:
+                result.setdefault("warnings", []).append(save_warning)
             if code_file:
                 result["code_file"] = code_file
             if captured_output:
@@ -1115,50 +1224,344 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps(fetched, indent=2), adata
 
         elif tool_name == "research_findings":
+            import re
+
             pathway = tool_input["pathway"]
             cell_type = tool_input["cell_type"]
             genes = tool_input.get("genes", [])
             context = tool_input.get("context", "")
             recent_years = tool_input.get("recent_years", 3)
 
+            def normalize_pathway_term(term: str) -> str:
+                cleaned = term.replace("HALLMARK_", "").replace("GO_", "").replace("REACTOME_", "")
+                cleaned = cleaned.replace("_", " ")
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                replacements = {
+                    "nf kb": "NF-kB",
+                    "il 2": "IL-2",
+                    "stat 5": "STAT5",
+                    "tgf beta": "TGF-beta",
+                }
+                lowered = cleaned.lower()
+                for old, new in replacements.items():
+                    lowered = lowered.replace(old, new.lower())
+                return lowered.title().replace("Nf-Kb", "NF-kB").replace("Il-2", "IL-2").replace("Stat5", "STAT5")
+
+            def pathway_tokens(term: str) -> List[str]:
+                tokens = [tok.lower() for tok in re.split(r"[^A-Za-z0-9]+", term) if tok]
+                stop = {"pathway", "signaling", "response", "process", "hallmark", "up", "down", "v1", "cell", "cells", "immune"}
+                return [tok for tok in tokens if tok not in stop and len(tok) > 2]
+
+            def infer_cell_lineage(cell_type_term: str) -> str:
+                lowered = re.sub(r"\s+", " ", cell_type_term.lower()).strip()
+                if any(tok in lowered for tok in ["cytotoxic t", "helper t", "regulatory t", "treg", "mait", "trm", "tem", "tcm", "t cell"]):
+                    return "t_cell"
+                if "nk" in lowered or "natural killer" in lowered:
+                    return "nk"
+                if "pdc" in lowered or "plasmacytoid" in lowered:
+                    return "pdc"
+                if "dc" in lowered or "dendritic" in lowered:
+                    return "dendritic"
+                if "monocyte" in lowered or "myelo" in lowered or "myelocyte" in lowered:
+                    return "monocyte"
+                if "b cell" in lowered:
+                    return "b_cell"
+                if "plasma" in lowered or "plasmablast" in lowered:
+                    return "plasma"
+                return "unknown"
+
+            def pathway_query_profile(term: str, cell_type_term: str) -> Dict[str, Any]:
+                normalized = normalize_pathway_term(term)
+                lineage = infer_cell_lineage(cell_type_term)
+                profiles = {
+                    "allograft rejection": {
+                        "query_terms": [normalized, "immune activation", "cytotoxic lymphocyte", "antigen presentation"],
+                        "scoring_terms": ["immune activation", "cytotoxic lymphocyte", "antigen presentation", "t cell activation", "nk cell activation"],
+                        "penalty_terms": ["transplant", "allogeneic", "recipient", "donor"],
+                    },
+                    "interferon gamma response": {
+                        "query_terms": [normalized, "interferon gamma signaling", "ifng response", "antigen presentation"],
+                        "scoring_terms": ["interferon gamma", "interferon signaling", "antigen presentation"],
+                    },
+                    "il-2/stat5 signaling": {
+                        "query_terms": [normalized, "IL-2 signaling", "STAT5 signaling", "cytokine signaling"],
+                        "scoring_terms": ["il-2", "stat5", "cytokine signaling"],
+                    },
+                    "apical junction": {
+                        "query_terms": [normalized, "cell adhesion", "junctional remodeling", "cytoskeletal remodeling"],
+                        "scoring_terms": ["cell adhesion", "junction", "cytoskeletal remodeling"],
+                    },
+                    "kras signaling up": {
+                        "query_terms": [normalized, "RAS signaling", "MAPK signaling"],
+                        "scoring_terms": ["ras signaling", "mapk signaling", "kras"],
+                    },
+                    "coagulation": {
+                        "query_terms": [normalized, "coagulation", "immunothrombosis", "thromboinflammation"],
+                        "scoring_terms": ["coagulation", "immunothrombosis", "thromboinflammation"],
+                    },
+                    "myc targets v1": {
+                        "query_terms": [normalized, "MYC signaling", "MYC target genes", "proliferation"],
+                        "scoring_terms": ["myc", "proliferation"],
+                    },
+                    "p53 pathway": {
+                        "query_terms": [normalized, "p53 signaling", "DNA damage response", "apoptosis"],
+                        "scoring_terms": ["p53", "dna damage", "apoptosis"],
+                    },
+                }
+                profile = dict(profiles.get(normalized.lower(), {"query_terms": [normalized], "scoring_terms": [normalized]}))
+
+                if normalized.lower() == "allograft rejection":
+                    if lineage in {"t_cell", "nk"}:
+                        profile["query_terms"] = [normalized, "cytotoxic lymphocyte activation", "t cell activation", "natural killer cell activation"]
+                        profile["scoring_terms"] = ["cytotoxic lymphocyte", "t cell activation", "natural killer cell activation", "immune activation"]
+                    elif lineage in {"dendritic", "monocyte", "pdc"}:
+                        profile["query_terms"] = [normalized, "antigen presentation", "myeloid activation", "interferon response"]
+                        profile["scoring_terms"] = ["antigen presentation", "myeloid activation", "interferon response", "inflammatory activation"]
+                    elif lineage in {"b_cell", "plasma"}:
+                        profile["query_terms"] = [normalized, "antigen presentation", "lymphocyte activation", "b cell activation"]
+                        profile["scoring_terms"] = ["antigen presentation", "lymphocyte activation", "b cell activation"]
+
+                if normalized.lower() == "apical junction" and lineage in {"t_cell", "nk", "monocyte", "dendritic", "pdc"}:
+                    profile["query_terms"] = [normalized, "cell adhesion", "immune cell migration", "cytoskeletal remodeling", "immune synapse"]
+                    profile["scoring_terms"] = ["cell adhesion", "immune cell migration", "cytoskeletal remodeling", "immune synapse"]
+
+                if normalized.lower() == "kras signaling up" and lineage in {"monocyte", "dendritic", "pdc"}:
+                    profile["query_terms"] = [normalized, "MAPK signaling", "myeloid activation", "inflammatory signaling"]
+                    profile["scoring_terms"] = ["mapk signaling", "myeloid activation", "inflammatory signaling"]
+
+                if normalized.lower() == "myc targets v1" and lineage in {"t_cell", "b_cell", "plasma"}:
+                    profile["query_terms"] = [normalized, "lymphocyte proliferation", "MYC signaling", "activation-induced proliferation"]
+                    profile["scoring_terms"] = ["lymphocyte proliferation", "myc signaling", "proliferation"]
+
+                profile["display_term"] = normalized
+                profile["lineage"] = lineage
+                return profile
+
+            def build_cell_type_terms(cell_type_term: str) -> List[str]:
+                lowered = re.sub(r"\s+", " ", cell_type_term.lower()).strip().rstrip("s")
+                terms = [lowered]
+                if any(tok in lowered for tok in ["cytotoxic t", "trm", "tem", "tcm", "helper t", "regulatory t", "treg", "mait", "t cell"]):
+                    if "cytotoxic" in lowered or "trm" in lowered or "tem" in lowered:
+                        terms.extend(["cytotoxic t cell", "t cell"])
+                    elif "regulatory" in lowered or "treg" in lowered:
+                        terms.extend(["regulatory t cell", "t cell"])
+                    else:
+                        terms.append("t cell")
+                elif "nk" in lowered or "natural killer" in lowered:
+                    terms.extend(["natural killer cell", "nk cell"])
+                elif "pdc" in lowered or "plasmacytoid" in lowered:
+                    terms.extend(["plasmacytoid dendritic cell", "dendritic cell"])
+                elif "dc" in lowered or "dendritic" in lowered:
+                    terms.extend(["dendritic cell", "conventional dendritic cell"])
+                elif "monocyte" in lowered or "myelo" in lowered:
+                    terms.append("monocyte")
+                elif "b cell" in lowered:
+                    terms.append("b cell")
+                elif "plasma" in lowered:
+                    terms.extend(["plasma cell", "antibody secreting cell"])
+
+                seen = set()
+                ordered = []
+                for term in terms:
+                    if term and term not in seen:
+                        ordered.append(term)
+                        seen.add(term)
+                return ordered[:3]
+
+            def score_paper(
+                paper: Dict[str, Any],
+                pathway_profile: Dict[str, Any],
+                cell_type_terms: List[str],
+                genes_list: List[str],
+                prefer_reviews: bool = False,
+            ) -> Dict[str, Any]:
+                haystack = f"{paper.get('title', '')} {paper.get('abstract', '')}".lower()
+                reasons = []
+                score = 0.0
+
+                phrase_hits = []
+                for phrase in pathway_profile.get("scoring_terms", []):
+                    lowered_phrase = phrase.lower()
+                    if lowered_phrase and lowered_phrase in haystack:
+                        phrase_hits.append(phrase)
+                if phrase_hits:
+                    score += 3.5
+                    reasons.append(f"pathway phrase '{phrase_hits[0]}'")
+
+                matched_tokens = []
+                for phrase in pathway_profile.get("scoring_terms", []):
+                    for tok in pathway_tokens(phrase):
+                        if tok in haystack and tok not in matched_tokens:
+                            matched_tokens.append(tok)
+                if matched_tokens:
+                    score += min(3.0, 0.75 * len(matched_tokens))
+                    reasons.append(f"pathway tokens {', '.join(matched_tokens[:3])}")
+
+                cell_match = False
+                matched_cell_term = None
+                for idx, term in enumerate(cell_type_terms):
+                    if term and term in haystack:
+                        cell_match = True
+                        matched_cell_term = term
+                        score += max(2.0, 4.0 - idx)
+                        reasons.append(f"cell-type term '{term}'")
+                        break
+                if not cell_match:
+                    cell_tokens = [tok for term in cell_type_terms for tok in pathway_tokens(term) if tok not in {"cell"}]
+                    token_hits = [tok for tok in cell_tokens if tok in haystack]
+                    if token_hits:
+                        score += 1.5
+                        reasons.append("cell-type context")
+                        cell_match = True
+
+                matched_genes = []
+                for gene in genes_list[:5]:
+                    if gene.lower() in haystack:
+                        matched_genes.append(gene)
+                if matched_genes:
+                    score += 1.5 * len(matched_genes)
+                    reasons.append(f"leading-edge genes {', '.join(matched_genes[:3])}")
+
+                year = str(paper.get("year") or "")
+                if year.isdigit() and int(year) >= 2024:
+                    score += 0.5
+
+                journal = (paper.get("journal") or "").lower()
+                title = (paper.get("title") or "").lower()
+                is_review = "review" in journal or "review" in title
+                if prefer_reviews and is_review:
+                    score += 0.75
+                elif is_review:
+                    score += 0.25
+
+                penalty_hits = [term for term in pathway_profile.get("penalty_terms", []) if term in haystack]
+                if penalty_hits and not matched_genes and matched_cell_term not in set(cell_type_terms[:2]):
+                    score -= 2.0
+                    reasons.append("generic transplant context")
+
+                if not cell_match and not matched_genes:
+                    score -= 1.0
+
+                scored = dict(paper)
+                scored["relevance_score"] = round(score, 2)
+                scored["match_reasons"] = reasons[:4]
+                return scored
+
             all_findings = {
                 "pathway": pathway,
                 "cell_type": cell_type,
+                "normalized_pathway": normalize_pathway_term(pathway),
                 "pubmed_results": [],
                 "review_articles": [],
                 "gene_specific": [],
+                "selected_papers": [],
+                "search_strategy": [],
             }
 
-            # Simplify cell type for better PubMed matches
-            # "classical monocytes" -> "monocyte", "CD8+ T cells" -> "T cell"
-            cell_type_simple = cell_type.lower()
-            for prefix in ["classical ", "non-classical ", "cd4+ ", "cd8+ ", "naive ", "memory ", "regulatory "]:
-                cell_type_simple = cell_type_simple.replace(prefix, "")
-            cell_type_simple = cell_type_simple.rstrip("s")  # monocytes -> monocyte
+            cell_type_terms = build_cell_type_terms(cell_type)
+            pathway_profile = pathway_query_profile(pathway, cell_type)
+            normalized_pathway = pathway_profile["display_term"]
+            all_findings["normalized_pathway"] = normalized_pathway
+            all_findings["pathway_query_terms"] = pathway_profile["query_terms"]
+            all_findings["cell_type_query_terms"] = cell_type_terms
 
-            # Search 1: Pathway + cell type (ignore context for main query - too restrictive)
-            query1 = f'("{pathway}"[Title/Abstract]) AND ("{cell_type_simple}"[Title/Abstract])'
-            all_findings["pubmed_results"] = search_pubmed(query1, max_results=5, recent_years=recent_years)
+            primary_queries = [
+                ("pathway_and_cell_type_strict", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])'),
+                ("pathway_only", f'("{normalized_pathway}"[Title/Abstract])'),
+            ]
 
-            # If no results, try broader search
-            if not all_findings["pubmed_results"]:
-                query1_broad = f'("{pathway}") AND ("{cell_type_simple}")'
-                all_findings["pubmed_results"] = search_pubmed(query1_broad, max_results=5, recent_years=recent_years)
+            for idx, alias_term in enumerate(pathway_profile.get("query_terms", [])[1:3], start=1):
+                primary_queries.append(
+                    (f"pathway_alias_{idx}_and_cell_type", f'("{alias_term}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])')
+                )
 
-            # Search 2: Review articles on this topic
-            query2 = f'("{pathway}") AND ("{cell_type_simple}")'
-            all_findings["review_articles"] = search_pubmed(
-                query2,
-                max_results=3,
-                recent_years=recent_years,
-                reviews_only=True,
-            )
+            if len(cell_type_terms) > 1:
+                primary_queries.append(
+                    ("pathway_and_broad_cell_type", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[1]}"[Title/Abstract])')
+                )
 
-            # Search 3: Key genes in cell type context
             if genes and len(genes) >= 2:
                 gene_str = " OR ".join([f'"{g}"[Title/Abstract]' for g in genes[:3]])
-                query3 = f'({gene_str}) AND ("{cell_type_simple}"[Title/Abstract])'
-                all_findings["gene_specific"] = search_pubmed(query3, max_results=4, recent_years=recent_years)
+                primary_queries.append(
+                    ("leading_edge_and_cell_type", f'({gene_str}) AND ("{cell_type_terms[0]}"[Title/Abstract])')
+                )
+                alias_for_genes = pathway_profile.get("query_terms", [normalized_pathway])[1] if len(pathway_profile.get("query_terms", [])) > 1 else normalized_pathway
+                primary_queries.append(
+                    ("pathway_alias_and_leading_edge", f'("{alias_for_genes}"[Title/Abstract]) AND ({gene_str})')
+                )
+
+            seen_pmids = set()
+            aggregated_primary = []
+            for label, query_str in primary_queries:
+                results = search_pubmed(query_str, max_results=4, recent_years=recent_years)
+                all_findings["search_strategy"].append({
+                    "label": label,
+                    "query": query_str,
+                    "results_found": len(results),
+                })
+                for paper in results:
+                    if paper["pmid"] not in seen_pmids:
+                        seen_pmids.add(paper["pmid"])
+                        aggregated_primary.append(paper)
+
+            all_findings["pubmed_results"] = aggregated_primary
+
+            # Review searches
+            review_queries = [
+                ("review_pathway_and_cell_type", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])'),
+                ("review_pathway_only", f'("{normalized_pathway}"[Title/Abstract])'),
+            ]
+            for idx, alias_term in enumerate(pathway_profile.get("query_terms", [])[1:3], start=1):
+                review_queries.append(
+                    (f"review_alias_{idx}", f'("{alias_term}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])')
+                )
+            review_results = []
+            seen_review_pmids = set()
+            for label, query_str in review_queries:
+                results = search_pubmed(
+                    query_str,
+                    max_results=3,
+                    recent_years=recent_years,
+                    reviews_only=True,
+                )
+                all_findings["search_strategy"].append({
+                    "label": label,
+                    "query": f"{query_str} AND review[pt]",
+                    "results_found": len(results),
+                })
+                for paper in results:
+                    if paper["pmid"] not in seen_review_pmids:
+                        seen_review_pmids.add(paper["pmid"])
+                        review_results.append(paper)
+            scored_reviews = [
+                score_paper(paper, pathway_profile, cell_type_terms, genes, prefer_reviews=True)
+                for paper in review_results
+            ]
+            scored_reviews.sort(
+                key=lambda paper: (paper.get("relevance_score", 0), paper.get("year", "0")),
+                reverse=True,
+            )
+            all_findings["review_articles"] = [paper for paper in scored_reviews if paper.get("relevance_score", 0) >= 2.0][:3]
+
+            # Gene-specific subset for compatibility / inspection
+            gene_specific = []
+            if genes and len(genes) >= 2:
+                for paper in aggregated_primary:
+                    scored = score_paper(paper, pathway_profile, cell_type_terms, genes)
+                    if any("leading-edge genes" in reason for reason in scored["match_reasons"]):
+                        gene_specific.append(scored)
+            all_findings["gene_specific"] = gene_specific[:4]
+
+            scored_primary = [
+                score_paper(paper, pathway_profile, cell_type_terms, genes)
+                for paper in aggregated_primary
+            ]
+            scored_primary.sort(
+                key=lambda paper: (paper.get("relevance_score", 0), paper.get("year", "0")),
+                reverse=True,
+            )
+            selected_primary = [paper for paper in scored_primary if paper.get("relevance_score", 0) >= 2.5]
+            all_findings["selected_papers"] = selected_primary[:5]
 
             # Count findings
             total_results = (
@@ -1171,6 +1574,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "status": "ok",
                 "tool": "research_findings",
                 "pathway": pathway,
+                "normalized_pathway": normalized_pathway,
                 "cell_type": cell_type,
                 "genes_researched": genes[:5] if genes else [],
                 "context": context,
@@ -1361,15 +1765,60 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                         warnings.append(f"batch_key auto-detected as '{k}'")
                         break
 
-            run_qc_pipeline(
-                adata,
-                mt_threshold=tool_input.get("mt_threshold"),
-                remove_ribo=tool_input.get("remove_ribo", True),
-                batch_key=batch_key,
-            )
+            detect_doublets_flag = tool_input.get("detect_doublets_flag", True)
+            try:
+                run_qc_pipeline(
+                    adata,
+                    mt_threshold=tool_input.get("mt_threshold"),
+                    remove_ribo=tool_input.get("remove_ribo", True),
+                    detect_doublets_flag=detect_doublets_flag,
+                    batch_key=batch_key,
+                )
+            except ValueError as e:
+                if detect_doublets_flag and "skimage is not installed" in str(e):
+                    warnings.append("Scrublet auto-threshold requires skimage; reran QC without doublet detection.")
+                    run_qc_pipeline(
+                        adata,
+                        mt_threshold=tool_input.get("mt_threshold"),
+                        remove_ribo=tool_input.get("remove_ribo", True),
+                        detect_doublets_flag=False,
+                        batch_key=batch_key,
+                    )
+                else:
+                    raise
+
+            figure_outputs = []
+            figure_dir = tool_input.get("figure_dir")
+            if figure_dir:
+                import os
+                import scanpy as sc
+                import matplotlib.pyplot as plt
+                os.makedirs(figure_dir, exist_ok=True)
+                try:
+                    qc_keys = [k for k in ["total_counts", "n_genes_by_counts", "pct_counts_mt", "pct_counts_ribo", "doublet_score"] if k in adata.obs.columns]
+                    if qc_keys:
+                        sc.pl.violin(adata, qc_keys, jitter=0.2, multi_panel=True, show=False)
+                        violin_path = os.path.join(figure_dir, "qc_violin.png")
+                        plt.savefig(violin_path, dpi=150, bbox_inches='tight')
+                        plt.close()
+                        figure_outputs.append(violin_path)
+
+                    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                    if 'n_genes_by_counts' in adata.obs.columns and 'total_counts' in adata.obs.columns:
+                        sc.pl.scatter(adata, x='total_counts', y='n_genes_by_counts', ax=axes[0], show=False)
+                    if 'pct_counts_mt' in adata.obs.columns and 'total_counts' in adata.obs.columns:
+                        sc.pl.scatter(adata, x='total_counts', y='pct_counts_mt', ax=axes[1], show=False)
+                    scatter_path = os.path.join(figure_dir, "qc_scatter.png")
+                    fig.tight_layout()
+                    fig.savefig(scatter_path, dpi=150, bbox_inches='tight')
+                    plt.close(fig)
+                    figure_outputs.append(scatter_path)
+                except Exception as e:
+                    warnings.append(f"QC figure generation failed: {e}")
+
             output_path = fix_output_path(tool_input.get("output_path"), "run_qc")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
 
             return json.dumps({
                 "status": "ok",
@@ -1386,6 +1835,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     "median_pct_mt": float(adata.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in adata.obs else None,
                 },
                 "warnings": warnings,
+                "figures": figure_outputs,
                 "state": make_state(adata)
             }, indent=2), adata
 
@@ -1397,7 +1847,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             output_path = fix_output_path(tool_input.get("output_path"), "normalize_and_hvg")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
 
             return json.dumps({
                 "status": "ok",
@@ -1419,7 +1869,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_dimred")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
 
             return json.dumps({
                 "status": "ok",
@@ -1446,7 +1896,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_clustering")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
             sizes = adata.obs[cluster_key].value_counts().to_dict()
 
             return json.dumps({
@@ -1470,7 +1920,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_celltypist")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
 
             # Get detailed type breakdown
             key = 'celltypist_majority_voting' if majority and 'celltypist_majority_voting' in adata.obs else 'celltypist_predicted_labels'
@@ -1511,7 +1961,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_scimilarity")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
 
             # Get detailed type breakdown
             key = 'scimilarity_predictions_unconstrained'
@@ -1551,13 +2001,22 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 }, indent=2), adata
 
             output_path = fix_output_path(tool_input.get("output_path"), "save_data")
-            adata.write_h5ad(output_path)
+            if not output_path:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "save_data",
+                    "message": "Provide an .h5ad output_path or a directory where the final_result.h5ad can be written."
+                }, indent=2), adata
+
+            save_details = write_h5ad_safe(adata, output_path)
 
             return json.dumps({
                 "status": "ok",
                 "tool": "save_data",
                 "output_path": output_path,
                 "saved": True,
+                "save_mode": save_details.get("save_mode", "direct"),
+                "warnings": save_details.get("warnings", []),
                 "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "state": make_state(adata)
             }, indent=2), adata
@@ -1583,7 +2042,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
 
             return json.dumps({
                 "status": "ok",
@@ -1601,16 +2060,42 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_deg":
+            from ..analysis.deg import run_validated_deg, get_deg_caveats
+            from ..config.defaults import DEG_DEFAULTS
+
             adata, _ = get_adata(tool_input, adata)
             groupby = tool_input.get("groupby", "leiden")
             method = tool_input.get("method", "wilcoxon")
+            layer = tool_input.get("layer")
+            target_geneset = tool_input.get("target_geneset", DEG_DEFAULTS.default_geneset)
 
-            # Best practice: use raw counts for DEG
-            run_differential_expression(adata, groupby=groupby, method=method, use_raw=True)
+            # Run validated DEG - this validates inputs, runs rank_genes_groups,
+            # validates outputs, and attaches validity metadata to adata.uns
+            try:
+                _, validity_report = run_validated_deg(
+                    adata,
+                    groupby=groupby,
+                    method=method,
+                    layer=layer,
+                    target_geneset=target_geneset,
+                    min_cluster_size=DEG_DEFAULTS.min_cluster_size,
+                    warn_cluster_size=DEG_DEFAULTS.warn_cluster_size,
+                    imbalance_ratio=DEG_DEFAULTS.max_imbalance_ratio,
+                    block_on_errors=False,  # Don't block, let agent see issues
+                    batch_confound_threshold=DEG_DEFAULTS.batch_confound_threshold,
+                    max_logfc=DEG_DEFAULTS.max_logfc_sanity,
+                    inplace=True,
+                )
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_deg",
+                    "message": str(e),
+                }, indent=2), adata
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_deg")
             if output_path:
-                adata.write_h5ad(output_path)
+                write_h5ad_safe(adata, output_path)
 
             # Get top 5 markers per cluster for immediate insight
             groups = list(adata.obs[groupby].unique())
@@ -1629,6 +2114,26 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 except Exception:
                     pass
 
+            # Build validation summary for response
+            validity_summary = {
+                "is_valid": validity_report.is_valid,
+                "has_warnings": validity_report.has_warnings,
+                "n_errors": len(validity_report.errors),
+                "n_warnings": len(validity_report.warnings),
+                "matrix_type": validity_report.matrix_type,
+                "data_species": validity_report.data_species,
+                "gene_id_format": validity_report.gene_id_format,
+            }
+
+            # Include specific issues for agent awareness
+            if validity_report.errors:
+                validity_summary["errors"] = [e.message for e in validity_report.errors]
+            if validity_report.warnings:
+                validity_summary["warnings"] = [w.message for w in validity_report.warnings]
+
+            # Get caveats that should propagate to GSEA
+            deg_caveats = get_deg_caveats(adata)
+
             return json.dumps({
                 "status": "ok",
                 "tool": "run_deg",
@@ -1637,15 +2142,20 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "groupby": groupby,
                 "method": method,
                 "n_groups": len(groups),
-                "used_raw_counts": True,
+                "requested_layer": layer,
+                "layer_used": validity_report.layer_used,
+                "cluster_sizes": validity_report.cluster_sizes,
+                "validity": validity_summary,
+                "caveats_for_gsea": deg_caveats,
                 "top_markers_per_cluster": top_markers_summary,
-                "note": "Use get_top_markers tool for more detailed analysis of specific clusters",
+                "note": "Validity metadata stored in adata.uns['deg_validity'] - will propagate to GSEA",
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_gsea":
             import os
             import scanpy as sc
+            from ..analysis.deg import get_deg_validity, get_cluster_caveats
 
             adata, _ = get_adata(tool_input, adata)
             output_dir = tool_input["output_dir"]
@@ -1663,6 +2173,10 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     "message": "No DEG results found. Run run_deg first."
                 }, indent=2), adata
 
+            # Get DEG validity info for caveats
+            deg_validity = get_deg_validity(adata)
+            deg_caveats = adata.uns.get("deg_caveats", [])
+
             try:
                 import gseapy
             except ImportError:
@@ -1677,11 +2191,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             # Get clusters to analyze
             groupby = adata.uns['rank_genes_groups']['params']['groupby']
+            max_clusters = tool_input.get("max_clusters")
             if cluster == 'all':
-                clusters_to_analyze = list(adata.obs[groupby].unique())[:10]  # Limit to 10
+                clusters_to_analyze = list(adata.obs[groupby].unique())
+                if max_clusters is not None:
+                    clusters_to_analyze = clusters_to_analyze[: int(max_clusters)]
             else:
                 clusters_to_analyze = [cluster]
-
             all_results = {}
 
             for clust in clusters_to_analyze:
@@ -1695,7 +2211,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     df_rank = df_rank.set_index('names')['scores']
 
                     # Run GSEA prerank
-                    gsea_outdir = os.path.join(output_dir, f"gsea_cluster_{clust}")
+                    gsea_outdir = os.path.join(output_dir, f"cluster_{clust}")
                     pre_res = gseapy.prerank(
                         rnk=df_rank,
                         gene_sets=gene_sets,
@@ -1742,7 +2258,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 except Exception as e:
                     all_results[str(clust)] = {"error": str(e)}
 
-            return json.dumps({
+            # Add per-cluster caveats based on DEG validity
+            cluster_caveats = {}
+            for clust in clusters_to_analyze:
+                caveats = get_cluster_caveats(adata, str(clust))
+                if caveats:
+                    cluster_caveats[str(clust)] = caveats
+
+            # Build response with validity metadata
+            response = {
                 "status": "ok",
                 "tool": "run_gsea",
                 "output_dir": output_dir,
@@ -1754,8 +2278,24 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     "Use search_papers for broader literature questions or recent reviews.",
                     "Use web_search_docs for pathway database or software documentation questions."
                 ],
-                "note": "NES > 0 means pathway upregulated in this cluster. FDR < 0.25 is typically significant."
-            }, indent=2), adata
+                "note": "NES > 0 means pathway upregulated in this cluster. FDR < 0.25 is typically significant.",
+            }
+
+            # Add DEG validity info if present
+            if deg_validity:
+                response["deg_validity"] = {
+                    "is_valid": deg_validity.get("is_valid", True),
+                    "has_warnings": deg_validity.get("has_warnings", False),
+                    "matrix_type": deg_validity.get("matrix_type"),
+                    "data_species": deg_validity.get("data_species"),
+                    "gene_id_format": deg_validity.get("gene_id_format"),
+                }
+            if deg_caveats:
+                response["deg_caveats"] = deg_caveats
+            if cluster_caveats:
+                response["cluster_caveats"] = cluster_caveats
+
+            return json.dumps(response, indent=2), adata
 
         elif tool_name == "generate_figure":
             import matplotlib
@@ -1765,7 +2305,10 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             adata, _ = get_adata(tool_input, adata)
             plot_type = tool_input["plot_type"]
-            output_path = tool_input["output_path"]
+            output_path = tool_input.get("output_path")
+            if not output_path:
+                safe_color = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in str(tool_input.get("color_by", "plot")))
+                output_path = f"{plot_type}_{safe_color or 'plot'}.png"
             color_by = tool_input.get("color_by", "leiden")
             genes = tool_input.get("genes", [])
             include_image = tool_input.get("include_image", True)

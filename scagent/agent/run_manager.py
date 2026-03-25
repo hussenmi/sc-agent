@@ -110,6 +110,7 @@ class RunManager:
             "intermediate": self.run_dir / "intermediate",
             "figures": self.run_dir / "figures",
             "reports": self.run_dir / "reports",
+            "gsea": self.run_dir / "gsea",
         }
 
         # Initialize manifest
