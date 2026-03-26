@@ -275,6 +275,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     "cell_type": {"type": "string", "description": "Cell type context (e.g., 'classical monocytes', 'CD8 T cells', 'B cells')"},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Leading edge genes from GSEA to include in search"},
                     "context": {"type": "string", "description": "Additional context (e.g., 'PBMC', 'tumor microenvironment', 'inflammation')"},
+                    "cluster_confidence": {"type": "number", "description": "Optional cluster confidence score (0-1) from annotation sanity checks"},
                     "recent_years": {"type": "integer", "description": "Limit to papers from last N years (default: 3)"}
                 },
                 "required": ["pathway", "cell_type"]
@@ -303,7 +304,8 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
-                    "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"}
+                    "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"},
+                    "context": {"type": "string", "description": "Optional biological context hint from the user or file path (e.g., 'PBMC healthy human cells')"}
                 },
                 "required": []
             }
@@ -434,6 +436,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import run_celltypist, run_scimilarity
     from ..batch import run_scanorama, run_harmony
+    from ..analysis import infer_biological_context, build_literature_context, score_paper_relevance
 
     def make_state(adata):
         """Create compact state dict."""
@@ -1230,6 +1233,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             cell_type = tool_input["cell_type"]
             genes = tool_input.get("genes", [])
             context = tool_input.get("context", "")
+            cluster_confidence = tool_input.get("cluster_confidence")
             recent_years = tool_input.get("recent_years", 3)
 
             def normalize_pathway_term(term: str) -> str:
@@ -1368,85 +1372,6 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                         seen.add(term)
                 return ordered[:3]
 
-            def score_paper(
-                paper: Dict[str, Any],
-                pathway_profile: Dict[str, Any],
-                cell_type_terms: List[str],
-                genes_list: List[str],
-                prefer_reviews: bool = False,
-            ) -> Dict[str, Any]:
-                haystack = f"{paper.get('title', '')} {paper.get('abstract', '')}".lower()
-                reasons = []
-                score = 0.0
-
-                phrase_hits = []
-                for phrase in pathway_profile.get("scoring_terms", []):
-                    lowered_phrase = phrase.lower()
-                    if lowered_phrase and lowered_phrase in haystack:
-                        phrase_hits.append(phrase)
-                if phrase_hits:
-                    score += 3.5
-                    reasons.append(f"pathway phrase '{phrase_hits[0]}'")
-
-                matched_tokens = []
-                for phrase in pathway_profile.get("scoring_terms", []):
-                    for tok in pathway_tokens(phrase):
-                        if tok in haystack and tok not in matched_tokens:
-                            matched_tokens.append(tok)
-                if matched_tokens:
-                    score += min(3.0, 0.75 * len(matched_tokens))
-                    reasons.append(f"pathway tokens {', '.join(matched_tokens[:3])}")
-
-                cell_match = False
-                matched_cell_term = None
-                for idx, term in enumerate(cell_type_terms):
-                    if term and term in haystack:
-                        cell_match = True
-                        matched_cell_term = term
-                        score += max(2.0, 4.0 - idx)
-                        reasons.append(f"cell-type term '{term}'")
-                        break
-                if not cell_match:
-                    cell_tokens = [tok for term in cell_type_terms for tok in pathway_tokens(term) if tok not in {"cell"}]
-                    token_hits = [tok for tok in cell_tokens if tok in haystack]
-                    if token_hits:
-                        score += 1.5
-                        reasons.append("cell-type context")
-                        cell_match = True
-
-                matched_genes = []
-                for gene in genes_list[:5]:
-                    if gene.lower() in haystack:
-                        matched_genes.append(gene)
-                if matched_genes:
-                    score += 1.5 * len(matched_genes)
-                    reasons.append(f"leading-edge genes {', '.join(matched_genes[:3])}")
-
-                year = str(paper.get("year") or "")
-                if year.isdigit() and int(year) >= 2024:
-                    score += 0.5
-
-                journal = (paper.get("journal") or "").lower()
-                title = (paper.get("title") or "").lower()
-                is_review = "review" in journal or "review" in title
-                if prefer_reviews and is_review:
-                    score += 0.75
-                elif is_review:
-                    score += 0.25
-
-                penalty_hits = [term for term in pathway_profile.get("penalty_terms", []) if term in haystack]
-                if penalty_hits and not matched_genes and matched_cell_term not in set(cell_type_terms[:2]):
-                    score -= 2.0
-                    reasons.append("generic transplant context")
-
-                if not cell_match and not matched_genes:
-                    score -= 1.0
-
-                scored = dict(paper)
-                scored["relevance_score"] = round(score, 2)
-                scored["match_reasons"] = reasons[:4]
-                return scored
-
             all_findings = {
                 "pathway": pathway,
                 "cell_type": cell_type,
@@ -1460,10 +1385,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
             cell_type_terms = build_cell_type_terms(cell_type)
             pathway_profile = pathway_query_profile(pathway, cell_type)
+            context_profile = build_literature_context(
+                context,
+                cell_type=cell_type,
+                cluster_confidence=cluster_confidence,
+            )
             normalized_pathway = pathway_profile["display_term"]
             all_findings["normalized_pathway"] = normalized_pathway
             all_findings["pathway_query_terms"] = pathway_profile["query_terms"]
             all_findings["cell_type_query_terms"] = cell_type_terms
+            all_findings["context_profile"] = context_profile.to_dict()
 
             primary_queries = [
                 ("pathway_and_cell_type_strict", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])'),
@@ -1534,7 +1465,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                         seen_review_pmids.add(paper["pmid"])
                         review_results.append(paper)
             scored_reviews = [
-                score_paper(paper, pathway_profile, cell_type_terms, genes, prefer_reviews=True)
+                score_paper_relevance(
+                    paper,
+                    pathway_profile=pathway_profile,
+                    cell_type_terms=cell_type_terms,
+                    genes_list=genes,
+                    context_profile=context_profile,
+                    pathway_tokens_fn=pathway_tokens,
+                    prefer_reviews=True,
+                )
                 for paper in review_results
             ]
             scored_reviews.sort(
@@ -1547,13 +1486,27 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             gene_specific = []
             if genes and len(genes) >= 2:
                 for paper in aggregated_primary:
-                    scored = score_paper(paper, pathway_profile, cell_type_terms, genes)
+                    scored = score_paper_relevance(
+                        paper,
+                        pathway_profile=pathway_profile,
+                        cell_type_terms=cell_type_terms,
+                        genes_list=genes,
+                        context_profile=context_profile,
+                        pathway_tokens_fn=pathway_tokens,
+                    )
                     if any("leading-edge genes" in reason for reason in scored["match_reasons"]):
                         gene_specific.append(scored)
             all_findings["gene_specific"] = gene_specific[:4]
 
             scored_primary = [
-                score_paper(paper, pathway_profile, cell_type_terms, genes)
+                score_paper_relevance(
+                    paper,
+                    pathway_profile=pathway_profile,
+                    cell_type_terms=cell_type_terms,
+                    genes_list=genes,
+                    context_profile=context_profile,
+                    pathway_tokens_fn=pathway_tokens,
+                )
                 for paper in aggregated_primary
             ]
             scored_primary.sort(
@@ -1578,6 +1531,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "cell_type": cell_type,
                 "genes_researched": genes[:5] if genes else [],
                 "context": context,
+                "cluster_confidence": cluster_confidence,
+                "context_profile": context_profile.to_dict(),
                 "years_searched": f"last {recent_years} years",
                 "total_papers_found": total_results,
                 "findings": all_findings,
@@ -1607,6 +1562,10 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             state = inspect_data(working_adata)
             goal = tool_input.get("goal")
+            context_hint = tool_input.get("context", "")
+            if tool_input.get("data_path"):
+                context_hint = " ".join(part for part in [context_hint, str(tool_input.get("data_path"))] if part)
+            biological_context = infer_biological_context(working_adata, text_context=context_hint)
 
             result = {
                 "status": "ok",
@@ -1632,6 +1591,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     "batch_key": state.batch_key,
                     "n_batches": state.n_batches
                 },
+                "biological_context": biological_context.to_dict(),
             }
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)

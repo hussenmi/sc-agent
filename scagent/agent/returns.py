@@ -11,6 +11,7 @@ import json
 from anndata import AnnData
 
 from ..core.inspector import inspect_data, DataState
+from ..analysis import infer_biological_context
 
 
 @dataclass
@@ -66,6 +67,7 @@ class InspectReturn(ToolReturn):
     embeddings: List[str] = field(default_factory=list)
     clustering: Dict[str, Any] = field(default_factory=dict)
     batch_info: Dict[str, Any] = field(default_factory=dict)
+    biological_context: Dict[str, Any] = field(default_factory=dict)
     recommended_next_steps: List[str] = field(default_factory=list)
 
 
@@ -119,6 +121,7 @@ def build_inspect_return(adata: AnnData, goal: str = None) -> InspectReturn:
     from ..core import recommend_next_steps
 
     state = inspect_data(adata)
+    biological_context = infer_biological_context(adata)
 
     return InspectReturn(
         status="ok",
@@ -136,5 +139,6 @@ def build_inspect_return(adata: AnnData, goal: str = None) -> InspectReturn:
             "n_batches": state.n_batches,
             "corrected": state.batch_correction_applied,
         },
+        biological_context=biological_context.to_dict(),
         recommended_next_steps=recommend_next_steps(state, goal) if goal else [],
     )

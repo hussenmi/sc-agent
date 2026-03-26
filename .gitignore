@@ -62,3 +62,6 @@ workshop_slides/
 
 # macOS metadata files
 ._*
+
+# some files
+test.py
