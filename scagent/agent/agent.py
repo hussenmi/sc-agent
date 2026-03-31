@@ -7,6 +7,7 @@ Creates run directories with manifests for reproducibility.
 """
 
 import os
+import sys
 import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Literal
@@ -62,10 +63,14 @@ class SCAgent:
         Model to use. Defaults: "claude-sonnet-4-20250514" (Anthropic) or "gpt-4o" (OpenAI).
     verbose : bool, default True
         Print agent outputs.
+    collaborative : bool, default True
+        Pause at major checkpoints, summarize findings, and ask before consequential steps.
     create_run_dir : bool, default True
         Create structured run directory with manifest.
     output_dir : str, default "."
         Base directory for run outputs.
+    save_checkpoints : bool, default False
+        Save intermediate checkpoint h5ad files. Disabled by default.
 
     Examples
     --------
@@ -84,6 +89,7 @@ class SCAgent:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         verbose: bool = True,
+        collaborative: bool = True,
         create_run_dir: bool = True,
         output_dir: str = ".",
         save_checkpoints: bool = False,
@@ -96,6 +102,7 @@ class SCAgent:
 
         self.provider = provider
         self.verbose = verbose
+        self.collaborative = collaborative
         self.create_run_dir = create_run_dir
         self.output_dir = output_dir
         self.save_checkpoints = save_checkpoints
@@ -104,6 +111,8 @@ class SCAgent:
         self.biological_context: Optional[Dict[str, Any]] = None
         self._pending_image: Optional[Dict[str, str]] = None  # For vision support
         self._conversation_history: List[Dict[str, Any]] = []  # For interactive mode
+        self._active_request: str = ""
+        self._active_request_is_followup: bool = False
 
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
@@ -251,13 +260,16 @@ class SCAgent:
         """
         # Determine if this is a follow-up (data already loaded)
         is_followup = data_path is None and self.adata is not None
+        self._active_request = request
+        self._active_request_is_followup = is_followup
 
         # Create run directory only for first analysis
         if self.create_run_dir and self.run_manager is None:
             self.run_manager = create_run(
                 base_dir=self.output_dir,
                 run_name=run_name,
-                mode="agent"
+                mode="agent",
+                keep_intermediate=self.save_checkpoints,
             )
             self.run_manager.set_request(request)
             self.run_manager.set_model(f"{self.provider}:{self.model}")
@@ -668,7 +680,7 @@ class SCAgent:
                 evidence_reports = self._generate_gsea_evidence_reports(result_data)
                 if evidence_reports:
                     result_data.update(evidence_reports)
-                    result_json = json.dumps(result_data, indent=2)
+            result_json = json.dumps(result_data, indent=2)
 
             if self.run_manager:
                 self.run_manager.log_step(
@@ -1178,21 +1190,24 @@ class SCAgent:
     def _handle_ask_user(self, tool_input: Dict[str, Any]) -> str:
         """Handle ask_user tool - prompt user for input."""
         question = tool_input["question"]
-        options = tool_input.get("options", [])
         default = tool_input.get("default", "")
 
-        # Format the question
-        print(f"\n{'='*50}")
-        print(f"AGENT QUESTION: {question}")
-        if options:
-            print(f"Options: {', '.join(options)}")
-        if default:
-            print(f"Default: {default}")
-        print('='*50)
+        if not self.collaborative or not sys.stdin.isatty():
+            response = default or "proceed"
+            return json.dumps({
+                "status": "ok",
+                "tool": "ask_user",
+                "question": question,
+                "user_response": response,
+                "auto_selected": True,
+            }, indent=2)
+
+        print()
+        print(question)
 
         # Get user input
         try:
-            response = input("Your answer: ").strip()
+            response = input("> ").strip()
             if not response and default:
                 response = default
         except (EOFError, KeyboardInterrupt):

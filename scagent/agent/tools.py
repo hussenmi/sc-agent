@@ -30,14 +30,19 @@ def get_tools() -> List[Dict[str, Any]]:
     action_tools = [
         {
             "name": "run_qc",
-            "description": "Run quality control pipeline: QC metrics, doublet detection, cell/gene filtering. Returns structured summary with before/after counts and metrics.",
+            "description": "Run or preview the quality control pipeline: QC metrics, doublet detection, cell/gene filtering. Use preview_only=true first in collaborative workflows so the user can review proposed removals before filters are applied. Do not assume intermediate h5ad saving is desired.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - only save at key checkpoints)"},
+                    "output_path": {"type": "string", "description": "Optional path to save a processed h5ad. Prefer saving only final outputs unless the user explicitly asks for checkpoints."},
+                    "preview_only": {"type": "boolean", "description": "If true, do not filter. Instead compute full QC metrics, estimate removals, and generate pre-filter QC figures."},
                     "mt_threshold": {"type": "number", "description": "Max MT% (default: auto-detect)"},
+                    "min_cells": {"type": "integer", "description": "Minimum cells per gene before gene removal (default: ~55)"},
                     "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
+                    "remove_mt": {"type": "boolean", "description": "Remove mitochondrial genes from the feature set (default: false)"},
+                    "detect_doublets_flag": {"type": "boolean", "description": "Run Scrublet doublet detection (default: true)"},
+                    "figure_dir": {"type": "string", "description": "Directory for QC figures. Plots are generated from the full pre-filter data."},
                     "batch_key": {"type": "string", "description": "Batch column for per-batch doublet detection"}
                 },
                 "required": []
@@ -189,7 +194,7 @@ def get_tools() -> List[Dict[str, Any]]:
     meta_tools = [
         {
             "name": "ask_user",
-            "description": "Ask the user a question and wait for their response. Use this when you need clarification about: data type (cells vs nuclei), batch structure, which annotation model to use, gene ID format, or any ambiguous situation.",
+            "description": "Ask the user a question and wait for their response. Collaboration is the default style, but do not use this for trivial bookkeeping. Use it when a preprocessing or interpretation choice should stay under user control, including QC thresholds, filtering decisions, clustering resolution changes, annotation ambiguity, batch correction, DEG comparisons, or any other material fork in the analysis.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -430,7 +435,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
     from ..core import (
         inspect_data, load_data, run_qc_pipeline, normalize_data,
         run_pca, compute_neighbors, compute_umap,
-        run_leiden, run_phenograph, recommend_next_steps
+        run_leiden, run_phenograph, recommend_next_steps,
+        calculate_qc_metrics, detect_doublets
     )
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
@@ -454,13 +460,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             "has_celltypes": state.has_celltypist or state.has_scimilarity,
         }
 
-    def get_adata(tool_input, existing_adata, update_memory: bool = True):
+    def get_adata(tool_input, existing_adata, update_memory: bool = True, prefer_memory: bool = False):
         """Get adata from memory or load from disk.
 
         If ``update_memory`` is False, loading from disk is treated as read-only
         and does not replace the active in-memory AnnData tracked by the agent.
         """
         data_path = tool_input.get("data_path")
+        if prefer_memory and existing_adata is not None:
+            return existing_adata, existing_adata
         # If adata is already in memory and no specific path given, use it
         if existing_adata is not None and (data_path is None or data_path == "memory"):
             return existing_adata, existing_adata
@@ -482,6 +490,26 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 return os_module.path.join(output_path, "final_result.h5ad")
             return None
         return output_path
+
+    def _state_preservation_warning(tool_input, existing_adata):
+        if existing_adata is not None and tool_input.get("data_path") not in (None, "memory"):
+            return ["Ignored data_path and continued with the in-memory dataset to preserve prior analysis state."]
+        return []
+
+    def _validate_obs_column(adata_obj, column_name: str, warnings: List[str], *, required: bool = False, context: str = "parameter"):
+        """Validate an obs column reference and either warn or raise a clean error."""
+        if not column_name:
+            return None
+        if column_name not in adata_obj.obs.columns:
+            available = list(adata_obj.obs.columns)
+            if required:
+                raise ValueError(
+                    f"{context} '{column_name}' is not present in adata.obs. "
+                    f"Available columns: {available}"
+                )
+            warnings.append(f"Ignored invalid {context} '{column_name}' because it is not present in adata.obs.")
+            return None
+        return column_name
 
     def _stringify_dataframe_columns(df):
         if df is None:
@@ -1712,11 +1740,16 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
 
         # ===== ACTION TOOLS =====
         elif tool_name == "run_qc":
-            adata, _ = get_adata(tool_input, adata)
+            warnings = []
+            if adata is not None and tool_input.get("data_path") not in (None, "memory"):
+                warnings.append(
+                    "Ignored data_path and continued with the in-memory dataset to preserve prior analysis state."
+                )
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             n_before, g_before = adata.n_obs, adata.n_vars
 
-            warnings = []
-            batch_key = tool_input.get("batch_key")
+            batch_key = _validate_obs_column(adata, tool_input.get("batch_key"), warnings, required=False, context="batch_key")
             if not batch_key:
                 # Auto-detect
                 for k in ['batch', 'batch_id', 'sample', 'sample_id']:
@@ -1724,28 +1757,49 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                         batch_key = k
                         warnings.append(f"batch_key auto-detected as '{k}'")
                         break
+            elif adata.obs[batch_key].nunique() <= 1:
+                warnings.append(f"Ignored batch_key '{batch_key}' because it has only one unique value.")
+                batch_key = None
 
             detect_doublets_flag = tool_input.get("detect_doublets_flag", True)
+            remove_ribo = tool_input.get("remove_ribo", True)
+            remove_mt = tool_input.get("remove_mt", False)
+            min_cells = tool_input.get("min_cells")
+            requested_mt_threshold = tool_input.get("mt_threshold")
+            preview_only = bool(tool_input.get("preview_only", False))
+
+            qc_preview = adata.copy()
             try:
-                run_qc_pipeline(
-                    adata,
-                    mt_threshold=tool_input.get("mt_threshold"),
-                    remove_ribo=tool_input.get("remove_ribo", True),
-                    detect_doublets_flag=detect_doublets_flag,
-                    batch_key=batch_key,
-                )
+                calculate_qc_metrics(qc_preview, inplace=True)
+                if detect_doublets_flag:
+                    detect_doublets(qc_preview, batch_key=batch_key, inplace=True)
             except ValueError as e:
                 if detect_doublets_flag and "skimage is not installed" in str(e):
-                    warnings.append("Scrublet auto-threshold requires skimage; reran QC without doublet detection.")
-                    run_qc_pipeline(
-                        adata,
-                        mt_threshold=tool_input.get("mt_threshold"),
-                        remove_ribo=tool_input.get("remove_ribo", True),
-                        detect_doublets_flag=False,
-                        batch_key=batch_key,
-                    )
+                    warnings.append("Scrublet auto-threshold requires skimage; preview reran without doublet detection.")
+                    detect_doublets_flag = False
                 else:
                     raise
+
+            if requested_mt_threshold is None:
+                median_mt_preview = float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else 0.0
+                auto_data_type = "nuclei" if median_mt_preview < 2.0 else "cells"
+                mt_threshold = 5.0 if auto_data_type == "nuclei" else 25.0
+                warnings.append(
+                    f"mt_threshold auto-selected as {mt_threshold:.1f}% based on median pct_counts_mt={median_mt_preview:.2f} ({auto_data_type}-like)."
+                )
+            else:
+                mt_threshold = float(requested_mt_threshold)
+                auto_data_type = "user-specified"
+
+            if min_cells is None:
+                from ..config.defaults import QC_DEFAULTS
+                min_cells = int(QC_DEFAULTS.min_cells_per_gene)
+
+            cells_over_mt = int((qc_preview.obs['pct_counts_mt'] >= mt_threshold).sum()) if 'pct_counts_mt' in qc_preview.obs else 0
+            predicted_doublets = int(qc_preview.obs['predicted_doublet'].sum()) if 'predicted_doublet' in qc_preview.obs else 0
+            genes_low_cells = int((qc_preview.var['n_cells_by_counts'] < min_cells).sum()) if 'n_cells_by_counts' in qc_preview.var.columns else 0
+            ribo_genes = int(qc_preview.var['ribo'].sum()) if 'ribo' in qc_preview.var.columns and remove_ribo else 0
+            mt_genes = int(qc_preview.var['mt'].sum()) if 'mt' in qc_preview.var.columns and remove_mt else 0
 
             figure_outputs = []
             figure_dir = tool_input.get("figure_dir")
@@ -1755,19 +1809,34 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 import matplotlib.pyplot as plt
                 os.makedirs(figure_dir, exist_ok=True)
                 try:
-                    qc_keys = [k for k in ["total_counts", "n_genes_by_counts", "pct_counts_mt", "pct_counts_ribo", "doublet_score"] if k in adata.obs.columns]
-                    if qc_keys:
-                        sc.pl.violin(adata, qc_keys, jitter=0.2, multi_panel=True, show=False)
+                    qc_plot_adata = qc_preview.copy()
+                    violin_keys = []
+                    if "total_counts" in qc_plot_adata.obs.columns:
+                        qc_plot_adata.obs["log10_total_counts"] = np.log10(qc_plot_adata.obs["total_counts"] + 1)
+                        violin_keys.append("log10_total_counts")
+                    if "n_genes_by_counts" in qc_plot_adata.obs.columns:
+                        qc_plot_adata.obs["log10_n_genes_by_counts"] = np.log10(qc_plot_adata.obs["n_genes_by_counts"] + 1)
+                        violin_keys.append("log10_n_genes_by_counts")
+                    violin_keys.extend(
+                        key for key in ["pct_counts_mt", "pct_counts_ribo", "doublet_score"]
+                        if key in qc_plot_adata.obs.columns
+                    )
+                    if violin_keys:
+                        sc.pl.violin(qc_plot_adata, violin_keys, jitter=0.2, multi_panel=True, show=False)
                         violin_path = os.path.join(figure_dir, "qc_violin.png")
                         plt.savefig(violin_path, dpi=150, bbox_inches='tight')
                         plt.close()
                         figure_outputs.append(violin_path)
 
                     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-                    if 'n_genes_by_counts' in adata.obs.columns and 'total_counts' in adata.obs.columns:
-                        sc.pl.scatter(adata, x='total_counts', y='n_genes_by_counts', ax=axes[0], show=False)
-                    if 'pct_counts_mt' in adata.obs.columns and 'total_counts' in adata.obs.columns:
-                        sc.pl.scatter(adata, x='total_counts', y='pct_counts_mt', ax=axes[1], show=False)
+                    if 'n_genes_by_counts' in qc_plot_adata.obs.columns and 'total_counts' in qc_plot_adata.obs.columns:
+                        sc.pl.scatter(qc_plot_adata, x='total_counts', y='n_genes_by_counts', ax=axes[0], show=False)
+                        axes[0].set_xscale('log')
+                        axes[0].set_yscale('log')
+                    if 'pct_counts_mt' in qc_plot_adata.obs.columns and 'total_counts' in qc_plot_adata.obs.columns:
+                        sc.pl.scatter(qc_plot_adata, x='total_counts', y='pct_counts_mt', ax=axes[1], show=False)
+                        axes[1].set_xscale('log')
+                        axes[1].axhline(mt_threshold, color='red', linestyle='--', linewidth=1)
                     scatter_path = os.path.join(figure_dir, "qc_scatter.png")
                     fig.tight_layout()
                     fig.savefig(scatter_path, dpi=150, bbox_inches='tight')
@@ -1776,6 +1845,91 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 except Exception as e:
                     warnings.append(f"QC figure generation failed: {e}")
 
+            qc_decisions = {
+                "mt_threshold": {
+                    "value": mt_threshold,
+                    "reason": (
+                        f"Cells with pct_counts_mt >= {mt_threshold:.1f}% are usually stressed, damaged, or dying; "
+                        "high mitochondrial RNA often indicates low-quality cells."
+                    ),
+                    "cells_flagged": cells_over_mt,
+                },
+                "min_cells_per_gene": {
+                    "value": int(min_cells),
+                    "reason": (
+                        f"Genes detected in fewer than {int(min_cells)} cells add noise and little clustering signal."
+                    ),
+                    "genes_flagged": genes_low_cells,
+                },
+                "doublet_detection": {
+                    "enabled": bool(detect_doublets_flag),
+                    "reason": (
+                        "Scrublet flags likely multiplets; these are reported so the user can decide whether to exclude them."
+                    ),
+                    "cells_flagged": predicted_doublets,
+                    "removal_default": False,
+                },
+                "remove_ribo": {
+                    "enabled": bool(remove_ribo),
+                    "reason": "Ribosomal genes can dominate variance and dilute biologically informative structure.",
+                    "genes_flagged": ribo_genes,
+                },
+                "remove_mt_genes": {
+                    "enabled": bool(remove_mt),
+                    "reason": "Mitochondrial genes are often excluded from downstream feature selection to reduce QC-driven signal.",
+                    "genes_flagged": mt_genes,
+                },
+            }
+
+            recommendation = (
+                f"I recommend filtering {cells_over_mt} high-MT cells with pct_counts_mt >= {mt_threshold:.1f}%, "
+                f"removing {genes_low_cells} low-detection genes, and "
+                f"{'flagging' if detect_doublets_flag else 'skipping'} doublets ({predicted_doublets} cells)."
+            )
+
+            if preview_only:
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "run_qc",
+                    "mode": "preview",
+                    "before": {"n_cells": n_before, "n_genes": g_before},
+                    "after": {"n_cells": n_before, "n_genes": g_before},
+                    "recommended_data_type": auto_data_type,
+                    "recommendation": recommendation,
+                    "qc_decisions": qc_decisions,
+                    "metrics": {
+                        "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
+                        "doublet_rate": float(qc_preview.obs['predicted_doublet'].mean()) if 'predicted_doublet' in qc_preview.obs else None,
+                    },
+                    "warnings": warnings,
+                    "figures": figure_outputs,
+                    "state": make_state(adata)
+                }, indent=2), adata
+
+            try:
+                run_qc_pipeline(
+                    adata,
+                    mt_threshold=mt_threshold,
+                    min_cells=min_cells,
+                    remove_ribo=remove_ribo,
+                    detect_doublets_flag=detect_doublets_flag,
+                    batch_key=batch_key,
+                )
+            except ValueError as e:
+                if detect_doublets_flag and "skimage is not installed" in str(e):
+                    warnings.append("Scrublet auto-threshold requires skimage; reran QC without doublet detection.")
+                    detect_doublets_flag = False
+                    run_qc_pipeline(
+                        adata,
+                        mt_threshold=mt_threshold,
+                        min_cells=min_cells,
+                        remove_ribo=remove_ribo,
+                        detect_doublets_flag=False,
+                        batch_key=batch_key,
+                    )
+                else:
+                    raise
+
             output_path = fix_output_path(tool_input.get("output_path"), "run_qc")
             if output_path:
                 write_h5ad_safe(adata, output_path)
@@ -1783,11 +1937,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps({
                 "status": "ok",
                 "tool": "run_qc",
-                "input_path": tool_input["data_path"],
+                "input_path": tool_input.get("data_path", "memory"),
                 "output_path": output_path,
                 "saved": output_path is not None,
                 "before": {"n_cells": n_before, "n_genes": g_before},
                 "after": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
+                "recommendation": recommendation,
+                "qc_decisions": qc_decisions,
                 "metrics": {
                     "cells_removed": n_before - adata.n_obs,
                     "genes_removed": g_before - adata.n_vars,
@@ -1800,7 +1956,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "normalize_and_hvg":
-            adata, _ = get_adata(tool_input, adata)
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             normalize_data(adata)
             n_hvg = tool_input.get("n_hvg", 4000)
             select_hvg(adata, n_top_genes=n_hvg)
@@ -1815,11 +1972,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "output_path": output_path,
                 "saved": output_path is not None,
                 "n_hvg": int(adata.var['highly_variable'].sum()),
+                "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_dimred":
-            adata, _ = get_adata(tool_input, adata)
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             n_pcs = tool_input.get("n_pcs", 30)
             n_neighbors = tool_input.get("n_neighbors", 30)
 
@@ -1839,11 +1998,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "n_pcs": n_pcs,
                 "n_neighbors": n_neighbors,
                 "variance_explained": float(adata.uns['pca']['variance_ratio'].sum()),
+                "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_clustering":
-            adata, _ = get_adata(tool_input, adata)
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             method = tool_input.get("method", "leiden")
             resolution = tool_input.get("resolution", 1.0)
 
@@ -1868,11 +2029,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "resolution": resolution,
                 "n_clusters": len(sizes),
                 "cluster_sizes": {str(k): int(v) for k, v in sizes.items()},
+                "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_celltypist":
-            adata, _ = get_adata(tool_input, adata)
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             model = tool_input.get("model", "Immune_All_Low.pkl")
             majority = tool_input.get("majority_voting", True)
 
@@ -1906,11 +2069,13 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "n_types": len(all_counts),
                 "annotation_key": key,
                 "cell_type_breakdown": type_breakdown,
+                "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
 
         elif tool_name == "run_scimilarity":
-            adata, _ = get_adata(tool_input, adata)
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             model_path = tool_input.get("model_path")
 
             # Only pass model_path if specified, otherwise use default
@@ -1949,6 +2114,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "annotation_key": key,
                 "has_embeddings": "X_scimilarity" in adata.obsm,
                 "cell_type_breakdown": type_breakdown,
+                "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
 
@@ -1982,9 +2148,10 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_batch_correction":
-            adata, _ = get_adata(tool_input, adata)
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             method = tool_input.get("method", "harmony")
-            batch_key = tool_input["batch_key"]
+            batch_key = _validate_obs_column(adata, tool_input["batch_key"], warnings, required=True, context="batch_key")
 
             # Get batch sizes for output
             batch_sizes = adata.obs[batch_key].value_counts().to_dict()
@@ -2016,6 +2183,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "corrected_embedding": corrected_rep,
                 "umap_recomputed": True,
                 "note": f"UMAP recomputed using corrected {corrected_rep} embedding",
+                "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
 
@@ -2023,8 +2191,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             from ..analysis.deg import run_validated_deg, get_deg_caveats
             from ..config.defaults import DEG_DEFAULTS
 
-            adata, _ = get_adata(tool_input, adata)
-            groupby = tool_input.get("groupby", "leiden")
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            groupby = _validate_obs_column(
+                adata,
+                tool_input.get("groupby", "leiden"),
+                warnings,
+                required=True,
+                context="groupby"
+            )
             method = tool_input.get("method", "wilcoxon")
             layer = tool_input.get("layer")
             target_geneset = tool_input.get("target_geneset", DEG_DEFAULTS.default_geneset)
@@ -2109,6 +2284,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "caveats_for_gsea": deg_caveats,
                 "top_markers_per_cluster": top_markers_summary,
                 "note": "Validity metadata stored in adata.uns['deg_validity'] - will propagate to GSEA",
+                "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
 
@@ -2117,7 +2293,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             import scanpy as sc
             from ..analysis.deg import get_deg_validity, get_cluster_caveats
 
-            adata, _ = get_adata(tool_input, adata)
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             output_dir = tool_input["output_dir"]
             cluster = tool_input["cluster"]
             gene_sets = tool_input.get("gene_sets", "KEGG_2021_Human")
@@ -2130,7 +2307,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 return json.dumps({
                     "status": "error",
                     "tool": "run_gsea",
-                    "message": "No DEG results found. Run run_deg first."
+                    "message": "No DEG results found. Run run_deg first.",
+                    "warnings": warnings,
                 }, indent=2), adata
 
             # Get DEG validity info for caveats

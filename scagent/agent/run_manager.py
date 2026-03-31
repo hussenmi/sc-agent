@@ -2,9 +2,9 @@
 Run directory and manifest management for scagent.
 
 Creates structured output directories with:
-- Intermediate analysis files
 - Figures
 - Reports
+- Optional checkpoint files
 - Machine-readable manifest for reproducibility
 """
 
@@ -75,16 +75,16 @@ class RunManager:
         run_YYYY_MM_DD_HHMMSS_<name>/
             manifest.json
             logs/
-            intermediate/
-                01_qc.h5ad
-                02_normalized.h5ad
-                ...
             figures/
                 umap_clusters.png
                 ...
             reports/
                 summary.md
                 cluster_sizes.csv
+                ...
+            intermediate/   # only when checkpoint saving is enabled
+                01_qc.h5ad
+                02_normalized.h5ad
                 ...
     """
 
@@ -93,9 +93,11 @@ class RunManager:
         base_dir: str = ".",
         run_name: Optional[str] = None,
         mode: str = "agent",
+        keep_intermediate: bool = False,
     ):
         self.base_dir = Path(base_dir)
         self.mode = mode
+        self.keep_intermediate = keep_intermediate
 
         # Generate run ID
         timestamp = datetime.now().strftime("%Y_%m_%d_%H%M%S")
@@ -107,11 +109,12 @@ class RunManager:
         self.dirs = {
             "root": self.run_dir,
             "logs": self.run_dir / "logs",
-            "intermediate": self.run_dir / "intermediate",
             "figures": self.run_dir / "figures",
             "reports": self.run_dir / "reports",
             "gsea": self.run_dir / "gsea",
         }
+        if self.keep_intermediate:
+            self.dirs["intermediate"] = self.run_dir / "intermediate"
 
         # Initialize manifest
         self.manifest = RunManifest(
@@ -185,6 +188,9 @@ class RunManager:
 
         Example: get_intermediate_path("qc") -> "intermediate/01_qc.h5ad"
         """
+        if "intermediate" not in self.dirs:
+            self.dirs["intermediate"] = self.run_dir / "intermediate"
+            self.dirs["intermediate"].mkdir(parents=True, exist_ok=True)
         self._step_counter += 1
         filename = f"{self._step_counter:02d}_{name}.{ext}"
         return str(self.dirs["intermediate"] / filename)
@@ -289,6 +295,7 @@ def create_run(
     base_dir: str = ".",
     run_name: Optional[str] = None,
     mode: str = "agent",
+    keep_intermediate: bool = False,
 ) -> RunManager:
     """
     Create and initialize a new run directory.
@@ -301,12 +308,19 @@ def create_run(
         Name suffix for the run directory.
     mode : str
         Execution mode: "agent", "library", "cli".
+    keep_intermediate : bool
+        Whether to create an `intermediate/` directory for checkpoint h5ad files.
 
     Returns
     -------
     RunManager
         Initialized run manager.
     """
-    manager = RunManager(base_dir=base_dir, run_name=run_name, mode=mode)
+    manager = RunManager(
+        base_dir=base_dir,
+        run_name=run_name,
+        mode=mode,
+        keep_intermediate=keep_intermediate,
+    )
     manager.create()
     return manager

@@ -245,6 +245,23 @@ def detect_doublets(
 
     logger.info("Running Scrublet doublet detection...")
 
+    if batch_key is not None:
+        batch_key = str(batch_key).strip()
+        if not batch_key:
+            batch_key = None
+        elif batch_key not in adata.obs.columns:
+            logger.warning(
+                "Ignoring invalid batch_key '%s' for Scrublet because it is not present in adata.obs",
+                batch_key,
+            )
+            batch_key = None
+        elif adata.obs[batch_key].nunique() <= 1:
+            logger.warning(
+                "Ignoring batch_key '%s' for Scrublet because it has only one unique value",
+                batch_key,
+            )
+            batch_key = None
+
     # Auto-detect batch key if not provided
     if batch_key is None:
         common_batch_keys = ['batch', 'batch_id', 'sample', 'sample_id']

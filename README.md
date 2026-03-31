@@ -75,9 +75,9 @@ run_qc_pipeline(adata)
 from scagent.agent import SCAgent
 
 # Initialize (reads from .env)
-agent = SCAgent()
+agent = SCAgent()  # collaborative checkpoints on by default
 
-# Simple analysis
+# Simple analysis: inspect, recommend, ask, then proceed
 result = agent.analyze(
     "QC and cluster this PBMC data, then identify cell types",
     data_path="pbmc.h5"
@@ -102,8 +102,11 @@ result = agent.analyze(
 ### CLI Interactive Mode
 
 ```bash
-# Start interactive session (default)
+# Start a collaborative session (default)
 scagent analyze --data pbmc.h5
+
+# Or run end-to-end without checkpoint prompts
+scagent analyze --data pbmc.h5 --autonomous
 
 # After initial analysis completes, continue with follow-ups:
 # > What are the top markers for cluster 3?
@@ -117,11 +120,12 @@ scagent offers two ways to run analyses:
 
 ### 1. Agent Mode (LLM-Guided)
 
-The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation.
+The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation. By default it works collaboratively: it summarizes findings at major checkpoints, recommends a next step, and asks before applying consequential analysis decisions.
 
 ```bash
-# CLI (interactive by default)
+# CLI (collaborative by default)
 scagent analyze "QC and cluster this data" --data pbmc.h5
+scagent analyze "QC and cluster this data" --data pbmc.h5 --autonomous
 scagent analyze "QC and cluster this data" --data pbmc.h5 --single-run
 
 # Python
@@ -132,7 +136,7 @@ agent.analyze("QC and cluster", data_path="pbmc.h5")
 **Pros:** Adapts to unexpected data, handles errors gracefully, supports follow-up questions, provides insights
 **Cons:** Requires API key, costs money, slower (LLM round-trips)
 
-**Best for:** Exploratory analysis, unfamiliar data, when you want interpretation
+**Best for:** Exploratory analysis, unfamiliar data, when you want interpretation and checkpointed collaboration
 
 ### 2. Direct Mode (No LLM)
 
@@ -251,7 +255,7 @@ The agent automatically follows these best practices:
 - **Literature Research**: After GSEA, `research_findings` performs focused PubMed searches around enriched pathways, cell types, and leading-edge genes, and returns structured citations for interpretation.
 - **Source Reading**: `fetch_url` reads selected web pages and, when dependencies are available, extracts cleaner HTML text and basic PDF text for downstream reasoning.
 - **GSEA Evidence Reports**: Successful `run_gsea` calls automatically write `reports/gsea_evidence.md` and `reports/gsea_evidence.json`, combining pathway output with targeted PubMed evidence for the most relevant pathways.
-- **File Management**: Minimizes intermediate h5ad files - only saves after QC filtering and at end of analysis. Data persists in memory between tool calls.
+- **File Management**: Keeps data in memory between tool calls and does not write intermediate `.h5ad` files unless checkpoint saving is explicitly enabled.
 
 Search/research design note:
 - [`SEARCH_RESEARCH_ARCHITECTURE.md`](/Users/hibrahim/Desktop/iris_peerd/cs_agent/SEARCH_RESEARCH_ARCHITECTURE.md)
@@ -289,18 +293,19 @@ run_2026_03_18_230927_full_analysis/
 │   └── agent.log           # Tool-level execution log
 ├── figures/
 │   └── *.png               # Visualizations
-├── intermediate/
-│   └── *.h5ad              # Checkpoint files
 └── result.h5ad             # Final saved AnnData (if requested)
 ```
+
+If checkpoint saving is enabled, an additional `intermediate/` folder is created for checkpoint `.h5ad` files.
 
 ## CLI Reference
 
 ```bash
 # Agent mode - LLM-guided analysis
-scagent analyze "your request" --data file.h5      # Interactive by default
+scagent analyze "your request" --data file.h5      # Collaborative by default
 scagent analyze --data file.h5                     # Auto-analyze (agent decides)
 scagent analyze --data file.h5 --single-run        # Exit after initial summary
+scagent analyze --data file.h5 --autonomous        # Skip checkpoint prompts
 scagent analyze --data file.h5 --provider openai   # Use OpenAI instead of Anthropic
 
 # Direct mode - no LLM
