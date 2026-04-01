@@ -49,6 +49,11 @@ class RunManifest:
     status: str = "in_progress"  # "in_progress", "completed", "failed"
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    artifact_registry: List[Dict[str, Any]] = field(default_factory=list)
+    session_events: List[Dict[str, Any]] = field(default_factory=list)
+    world_state_snapshots: List[Dict[str, Any]] = field(default_factory=list)
+    user_decisions: List[Dict[str, Any]] = field(default_factory=list)
+    verification_history: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -182,6 +187,56 @@ class RunManager:
         self.manifest.warnings.append(warning)
         self._save_manifest()
 
+    def add_artifact(self, artifact: Dict[str, Any]):
+        """Register or update a known artifact and append an event."""
+        path = artifact.get("path")
+        if path:
+            existing_index = next(
+                (index for index, current in enumerate(self.manifest.artifact_registry) if current.get("path") == path),
+                None,
+            )
+            if existing_index is not None:
+                self.manifest.artifact_registry[existing_index] = artifact
+            else:
+                self.manifest.artifact_registry.append(artifact)
+        else:
+            self.manifest.artifact_registry.append(artifact)
+        self.append_event("artifact", artifact)
+        self._save_manifest()
+
+    def add_user_decision(self, decision: Dict[str, Any]):
+        """Record a user-facing decision or override."""
+        self.manifest.user_decisions.append(decision)
+        self.append_event("decision", decision)
+        self._save_manifest()
+
+    def add_verification(self, verification: Dict[str, Any]):
+        """Record a verification result."""
+        self.manifest.verification_history.append(verification)
+        self.append_event("verification", verification)
+        self._save_manifest()
+
+    def append_event(self, event_type: str, payload: Dict[str, Any]):
+        """Append an immutable session event."""
+        self.manifest.session_events.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "event_type": event_type,
+                "payload": payload,
+            }
+        )
+        self._save_manifest()
+
+    def append_world_state_snapshot(self, snapshot: Dict[str, Any]):
+        """Append a compact snapshot of the agent world state."""
+        self.manifest.world_state_snapshots.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "snapshot": snapshot,
+            }
+        )
+        self._save_manifest()
+
     def get_intermediate_path(self, name: str, ext: str = "h5ad") -> str:
         """
         Get path for an intermediate file with ordering prefix.
@@ -281,6 +336,20 @@ class RunManager:
                 f.write("\n## Warnings\n\n")
                 for w in self.manifest.warnings:
                     f.write(f"- {w}\n")
+
+            if self.manifest.artifact_registry:
+                f.write("\n## Artifacts\n\n")
+                for artifact in self.manifest.artifact_registry[-10:]:
+                    label = artifact.get("kind", "artifact")
+                    path = artifact.get("path", "")
+                    f.write(f"- `{label}` → `{Path(path).name}`\n")
+
+            if self.manifest.user_decisions:
+                f.write("\n## Decisions\n\n")
+                for decision in self.manifest.user_decisions[-10:]:
+                    key = decision.get("key", "decision")
+                    value = decision.get("applied_value", decision.get("recommended_value"))
+                    f.write(f"- `{key}` → `{value}`\n")
 
         return str(summary_path)
 

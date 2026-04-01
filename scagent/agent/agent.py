@@ -13,10 +13,15 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Literal
 import logging
 from datetime import datetime
+import re
 
 from .tools import get_tools, get_openai_tools, process_tool_call
 from .prompts import SYSTEM_PROMPT
 from .run_manager import RunManager, create_run
+from .decision_policy import (
+    decision_for_clustering_selection,
+)
+from .world_state import AgentWorldState, artifact_id_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -108,11 +113,17 @@ class SCAgent:
         self.save_checkpoints = save_checkpoints
         self.adata = None
         self.run_manager: Optional[RunManager] = None
+        self.world_state = AgentWorldState()
         self.biological_context: Optional[Dict[str, Any]] = None
         self._pending_image: Optional[Dict[str, str]] = None  # For vision support
         self._conversation_history: List[Dict[str, Any]] = []  # For interactive mode
         self._active_request: str = ""
         self._active_request_is_followup: bool = False
+        self._interaction_state: Dict[str, List[Dict[str, Any]]] = {
+            "shown_figures": [],
+            "reviewed_figures": [],
+            "asked_questions": [],
+        }
 
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
@@ -191,6 +202,285 @@ class SCAgent:
             console = Console()
             console.print(f"[green]✓[/green] {message}")
 
+    def _runtime_guidance(self) -> str:
+        """Build compact runtime guidance so the model can avoid repeating itself."""
+        payload = self.world_state.snapshot()
+        payload["is_followup"] = self._active_request_is_followup
+        payload["shown_figures"] = self._interaction_state["shown_figures"][-5:]
+        payload["reviewed_figures"] = self._interaction_state["reviewed_figures"][-5:]
+        payload["recent_questions"] = self._interaction_state["asked_questions"][-3:]
+        return json.dumps(payload, indent=2)
+
+    def _build_system_prompt(self) -> str:
+        """Attach runtime state to the static system prompt."""
+        return f"{SYSTEM_PROMPT}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
+
+    def _sync_world_state(self, extra_text: Optional[str] = None) -> None:
+        """Refresh the unified world state from the active AnnData and request context."""
+        self.world_state.set_active_request(self._active_request)
+        self.world_state.sync_from_adata(
+            self.adata,
+            request_text=extra_text or self._active_request,
+        )
+
+    def _record_world_state_snapshot(self) -> None:
+        """Persist a compact world-state snapshot into the run ledger."""
+        if self.run_manager:
+            self.run_manager.append_world_state_snapshot(self.world_state.snapshot())
+
+    def _remember_user_preferences(self, message: str) -> None:
+        """Persist explicit user corrections so later tools can reuse them mechanically."""
+        if not message:
+            return
+
+        batch_patterns = [
+            r"\buse\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s+(?:the\s+)?batch(?:\s+key|\s+column)?\b",
+            r"\bbatch(?:\s+key|\s+column)?\s+(?:is|=)\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"\bsample(?:\s+key|\s+column)?\s+(?:is|=)\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+        ]
+
+        for pattern in batch_patterns:
+            match = re.search(pattern, message, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1)
+            if self.adata is not None and candidate not in self.adata.obs.columns:
+                continue
+            self.world_state.resolve_decision(
+                "batch_key",
+                candidate,
+                source="user",
+                message=message,
+            )
+            if self.run_manager:
+                self.run_manager.add_user_decision(
+                    {
+                        "key": "batch_key",
+                        "policy_action": "recommend_and_confirm",
+                        "status": "user_corrected",
+                        "applied_value": candidate,
+                        "user_message": message,
+                    }
+                )
+            break
+
+    def _apply_world_state_overrides(self, tool_name: str, tool_input: Dict[str, Any]) -> None:
+        """Apply confirmed decisions to tool inputs when the user did not restate them."""
+        if tool_name in {"run_qc", "run_batch_correction"} and not tool_input.get("batch_key"):
+            batch_key = self.world_state.get_confirmed_value("batch_key")
+            if batch_key and (self.adata is None or batch_key in self.adata.obs.columns):
+                tool_input["batch_key"] = batch_key
+
+    def _artifact_kind_from_path(self, path: str) -> str:
+        suffix = Path(path).suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            return "figure"
+        if suffix in {".h5ad", ".h5", ".loom"}:
+            return "data"
+        if suffix in {".json"}:
+            return "json"
+        if suffix in {".md", ".txt", ".csv", ".tsv"}:
+            return "report"
+        if suffix in {".log"}:
+            return "log"
+        return "artifact"
+
+    def _generic_artifacts_from_result(self, tool_name: str, result_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        paths: List[tuple[str, Dict[str, Any]]] = []
+        for key in ["output_path", "figure_path", "gsea_evidence_report", "gsea_evidence_json"]:
+            value = result_data.get(key)
+            if value:
+                paths.append((value, {}))
+        for figure_path in result_data.get("figures", []) or []:
+            paths.append((figure_path, {"mode": result_data.get("mode", "")}))
+        for comparison in result_data.get("comparisons", []) or []:
+            if comparison.get("figure_path"):
+                paths.append(
+                    (
+                        comparison["figure_path"],
+                        {"cluster_key": comparison.get("cluster_key")},
+                    )
+                )
+
+        artifacts = []
+        for path, metadata in paths:
+            normalized = os.path.abspath(path)
+            artifacts.append(
+                {
+                    "artifact_id": artifact_id_from_path(normalized),
+                    "path": normalized,
+                    "kind": self._artifact_kind_from_path(normalized),
+                    "role": "artifact",
+                    "source_tool": tool_name,
+                    "created_at": datetime.now().isoformat(),
+                    "exists": os.path.exists(normalized),
+                    "metadata": metadata,
+                    "review_count": 0,
+                    "last_reviewed_at": None,
+                    "last_review_question": "",
+                }
+            )
+        # Deduplicate while preserving order
+        deduped = []
+        seen_paths = set()
+        for artifact in artifacts:
+            if artifact["path"] in seen_paths:
+                continue
+            seen_paths.add(artifact["path"])
+            deduped.append(artifact)
+        return deduped
+
+    def _generic_decisions_from_result(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result_data: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        decisions = list(result_data.get("decisions_raised", []) or [])
+        if decisions:
+            return decisions
+
+        if tool_name == "compare_clusterings" and result_data.get("comparisons") and not tool_input.get("promote_resolution"):
+            clustering_decision = decision_for_clustering_selection(
+                result_data.get("comparisons", []),
+                source_tool=tool_name,
+            )
+            if clustering_decision is not None:
+                decisions.append(clustering_decision)
+
+        return decisions
+
+    def _generic_verification(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if "verification" in result_data:
+            return result_data["verification"]
+
+        status = result_data.get("status", "ok")
+        if status == "error":
+            return {
+                "status": "failed",
+                "summary": result_data.get("message", f"{tool_name} failed."),
+                "checks": [],
+                "recovery_options": ["Inspect the error message and choose a corrective next step."],
+            }
+
+        checks = []
+        for artifact in self._generic_artifacts_from_result(tool_name, result_data):
+            checks.append(
+                {
+                    "name": f"artifact_exists:{Path(artifact['path']).name}",
+                    "status": "passed" if artifact["exists"] else "failed",
+                    "details": f"Artifact path: {artifact['path']}",
+                }
+            )
+
+        if tool_name == "run_clustering" and self.adata is not None:
+            cluster_key = result_data.get("cluster_key")
+            if cluster_key:
+                checks.append(
+                    {
+                        "name": "cluster_key_present",
+                        "status": "passed" if cluster_key in self.adata.obs.columns else "failed",
+                        "details": f"Clustering key '{cluster_key}' should exist in adata.obs.",
+                    }
+                )
+        if tool_name == "generate_figure":
+            output_path = result_data.get("output_path")
+            if output_path:
+                checks.append(
+                    {
+                        "name": "figure_exists",
+                        "status": "passed" if os.path.exists(output_path) else "failed",
+                        "details": f"Figure output path: {output_path}",
+                    }
+                )
+
+        verification_status = "passed" if all(check["status"] == "passed" for check in checks) else "warning"
+        return {
+            "status": verification_status,
+            "summary": f"{tool_name} completed with {'no' if verification_status == 'passed' else 'some'} verification issues.",
+            "checks": checks,
+            "recovery_options": [] if verification_status == "passed" else ["Review the failed checks before continuing."],
+        }
+
+    def _ensure_standard_tool_result(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result_data: Dict[str, Any],
+        before_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        after_snapshot = self.world_state.snapshot()
+
+        if "state_delta" not in result_data:
+            before_stage = before_snapshot.get("analysis_stage", "uninitialized")
+            after_stage = after_snapshot.get("analysis_stage", before_stage)
+            before_processing = (before_snapshot.get("data_summary") or {}).get("processing", {})
+            after_processing = (after_snapshot.get("data_summary") or {}).get("processing", {})
+            changed_flags = {}
+            for key in sorted(set(before_processing.keys()) | set(after_processing.keys())):
+                if before_processing.get(key) != after_processing.get(key):
+                    changed_flags[key] = {
+                        "before": before_processing.get(key),
+                        "after": after_processing.get(key),
+                    }
+            result_data["state_delta"] = {
+                "tool": tool_name,
+                "summary": result_data.get("message") or f"{tool_name} completed.",
+                "dataset_changed": tool_name in {
+                    "run_qc",
+                    "normalize_and_hvg",
+                    "run_dimred",
+                    "run_clustering",
+                    "compare_clusterings",
+                    "run_celltypist",
+                    "run_scimilarity",
+                    "run_batch_correction",
+                    "run_deg",
+                },
+                "stage_before": before_stage,
+                "stage_after": after_stage,
+                "changed_flags": changed_flags,
+                "notes": [],
+            }
+
+        existing_artifacts = result_data.get("artifacts_created", []) or []
+        if existing_artifacts:
+            result_data["artifacts_created"] = existing_artifacts
+        else:
+            result_data["artifacts_created"] = self._generic_artifacts_from_result(tool_name, result_data)
+        existing_decisions = result_data.get("decisions_raised", []) or []
+        if existing_decisions:
+            result_data["decisions_raised"] = existing_decisions
+        else:
+            result_data["decisions_raised"] = self._generic_decisions_from_result(tool_name, tool_input, result_data)
+        if (
+            tool_name == "ask_user"
+            and result_data.get("decision_key")
+            and result_data.get("user_response")
+            and result_data.get("user_response") not in {"proceed", "no response"}
+        ):
+            self.world_state.resolve_decision(
+                result_data["decision_key"],
+                result_data["user_response"],
+                source="user",
+                message=result_data.get("question", ""),
+            )
+            result_data["decisions_raised"] = [
+                decision
+                for decision in self.world_state.resolved_decisions[-1:]
+            ]
+            result_data["decisions_raised"] = [
+                decision.to_dict() if hasattr(decision, "to_dict") else decision
+                for decision in result_data["decisions_raised"]
+            ]
+        result_data["verification"] = self._generic_verification(tool_name, tool_input, result_data)
+        return result_data
+
     def _ask_continue(self, error_msg: str, suggestions: list = None) -> str:
         """Ask user how to proceed after an error."""
         from rich.console import Console
@@ -262,6 +552,9 @@ class SCAgent:
         is_followup = data_path is None and self.adata is not None
         self._active_request = request
         self._active_request_is_followup = is_followup
+        self.world_state.set_active_request(request)
+        self._remember_user_preferences(request)
+        self._sync_world_state(extra_text=request)
 
         # Create run directory only for first analysis
         if self.create_run_dir and self.run_manager is None:
@@ -284,6 +577,7 @@ class SCAgent:
 
             if data_path:
                 self.run_manager.add_input(data_path)
+            self._record_world_state_snapshot()
         elif is_followup and self.run_manager:
             # Log follow-up request in existing manifest
             self.run_manager.log_step(
@@ -291,6 +585,7 @@ class SCAgent:
                 parameters={"request": request},
                 result={"status": "starting"}
             )
+            self.run_manager.append_event("follow_up_request", {"request": request})
 
         # Build initial message
         user_message = request
@@ -331,7 +626,7 @@ class SCAgent:
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=4096,
-                    system=SYSTEM_PROMPT,
+                    system=self._build_system_prompt(),
                     tools=self.tools,
                     messages=messages,
                 )
@@ -437,13 +732,15 @@ class SCAgent:
         else:
             # Start fresh
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self._build_system_prompt()},
                 {"role": "user", "content": user_message},
             ]
         final_result = ""
 
         try:
             for iteration in range(max_iterations):
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = self._build_system_prompt()
                 response = self.client.chat.completions.create(
                     model=self.model,
                     max_completion_tokens=4096,
@@ -601,6 +898,9 @@ class SCAgent:
             if tool_name == "run_qc" and not tool_input.get("figure_dir"):
                 tool_input["figure_dir"] = str(self.run_manager.dirs["figures"])
 
+            if tool_name == "compare_clusterings" and tool_input.get("generate_figures") and not tool_input.get("figure_dir"):
+                tool_input["figure_dir"] = str(self.run_manager.dirs["figures"])
+
             if tool_name == "run_gsea":
                 requested_dir = tool_input.get("output_dir")
                 if not requested_dir:
@@ -622,19 +922,20 @@ class SCAgent:
                 tool_input["output_path"] = self.run_manager.get_intermediate_path(_sanitize_name(tool_name))
 
         _prepare_tool_paths()
+        self._apply_world_state_overrides(tool_name, tool_input)
+        self._sync_world_state()
+        before_snapshot = self.world_state.snapshot()
         if self.run_manager:
             self.run_manager.append_log(f"START {tool_name} {json.dumps(tool_input, default=str)}")
 
-        # Special handling for ask_user - get input from user
+        # Special handling for ask_user - get input from user but still track it like other tools
         if tool_name == "ask_user":
-            return self._handle_ask_user(tool_input)
-
+            result_json = self._handle_ask_user(tool_input)
         # Special handling for install_package - requires approval
-        if tool_name == "install_package":
-            return self._handle_install_package(tool_input)
-
+        elif tool_name == "install_package":
+            result_json = self._handle_install_package(tool_input)
         # Special handling for run_code - show what's being executed
-        if tool_name == "run_code":
+        elif tool_name == "run_code":
             self._print(f"\n[Tool] {tool_name}")
             self._print(f"    Description: {tool_input.get('description', 'custom code')}")
             if self.verbose:
@@ -646,26 +947,51 @@ class SCAgent:
             if self.run_manager:
                 tool_input["output_dir"] = str(self.run_manager.run_dir)
             # Run without spinner for code (it may have its own output)
-            result_json, self.adata = process_tool_call(tool_name, tool_input, self.adata)
+            result_json, self.adata = process_tool_call(
+                tool_name,
+                tool_input,
+                self.adata,
+                world_state=self.world_state,
+                run_manager=self.run_manager,
+            )
         else:
             # Run with spinner for other tools
             if self.verbose:
                 with console.status(f"[bold cyan]Running {tool_name}...", spinner="dots") as status:
-                    result_json, self.adata = process_tool_call(tool_name, tool_input, self.adata)
+                    result_json, self.adata = process_tool_call(
+                        tool_name,
+                        tool_input,
+                        self.adata,
+                        world_state=self.world_state,
+                        run_manager=self.run_manager,
+                    )
                 console.print(f"[green]✓[/green] {tool_name} complete")
             else:
-                result_json, self.adata = process_tool_call(tool_name, tool_input, self.adata)
+                result_json, self.adata = process_tool_call(
+                    tool_name,
+                    tool_input,
+                    self.adata,
+                    world_state=self.world_state,
+                    run_manager=self.run_manager,
+                )
 
         # Check for image in result and store for vision
         try:
             result_data = json.loads(result_json)
+            self._sync_world_state()
 
             # If there's an image, store it for the next message
             if "image_base64" in result_data:
+                image_context = result_data.get("image_context", {})
                 self._pending_image = {
                     "base64": result_data["image_base64"],
                     "mime": result_data.get("image_mime", "image/png"),
-                    "path": result_data.get("output_path", "figure.png"),
+                    "path": (
+                        result_data.get("output_path")
+                        or result_data.get("figure_path")
+                        or image_context.get("output_path")
+                        or "figure.png"
+                    ),
                 }
                 # Remove base64 from JSON to keep response small
                 del result_data["image_base64"]
@@ -680,6 +1006,13 @@ class SCAgent:
                 evidence_reports = self._generate_gsea_evidence_reports(result_data)
                 if evidence_reports:
                     result_data.update(evidence_reports)
+            result_data = self._ensure_standard_tool_result(
+                tool_name,
+                tool_input,
+                result_data,
+                before_snapshot,
+            )
+            self.world_state.apply_tool_result(tool_name, result_data, adata=self.adata)
             result_json = json.dumps(result_data, indent=2)
 
             if self.run_manager:
@@ -692,11 +1025,42 @@ class SCAgent:
                 )
                 for w in result_data.get("warnings", []):
                     self.run_manager.add_warning(w)
+                for artifact in result_data.get("artifacts_created", []):
+                    self.run_manager.add_artifact(artifact)
+                for decision in result_data.get("decisions_raised", []):
+                    self.run_manager.add_user_decision(decision)
+                if result_data.get("verification"):
+                    self.run_manager.add_verification(result_data["verification"])
+                self._record_world_state_snapshot()
                 self.run_manager.append_log(
                     f"END {tool_name} status={status} output={result_data.get('output_path', '')}"
                 )
 
             if status == "ok":
+                if tool_name == "generate_figure" and result_data.get("output_path"):
+                    self._interaction_state["shown_figures"].append({
+                        "path": result_data["output_path"],
+                        "kind": result_data.get("plot_type", "figure"),
+                        "color_by": result_data.get("color_by"),
+                    })
+                elif tool_name == "review_figure" and result_data.get("figure_path"):
+                    self._interaction_state["reviewed_figures"].append({
+                        "path": result_data["figure_path"],
+                        "question": result_data.get("question", ""),
+                    })
+                elif tool_name == "compare_clusterings":
+                    for comparison in result_data.get("comparisons", []):
+                        if comparison.get("figure_path"):
+                            self._interaction_state["shown_figures"].append({
+                                "path": comparison["figure_path"],
+                                "kind": "umap",
+                                "color_by": comparison.get("cluster_key"),
+                            })
+                elif tool_name == "ask_user":
+                    self._interaction_state["asked_questions"].append({
+                        "question": result_data.get("question", ""),
+                        "options": result_data.get("options", []),
+                    })
                 # Show key results inline
                 details = []
                 if "after" in result_data:
@@ -713,6 +1077,12 @@ class SCAgent:
                 pass  # Handled by ask_user
             elif status == "error":
                 self._print(f"    [red]✗ Error:[/red] {result_data.get('message', '')}")
+            verification_status = (result_data.get("verification") or {}).get("status")
+            if verification_status in {"warning", "failed"}:
+                self._print(
+                    f"    [yellow]Verification {verification_status}:[/yellow] "
+                    f"{result_data['verification'].get('summary', '')}"
+                )
 
         except json.JSONDecodeError:
             pass
@@ -1089,6 +1459,8 @@ class SCAgent:
                         "recent_years": 3,
                     },
                     self.adata,
+                    world_state=self.world_state,
+                    run_manager=self.run_manager,
                 )
                 research_data = json.loads(research_json)
                 papers = research_data.get("findings", {}).get("selected_papers", [])
@@ -1190,7 +1562,9 @@ class SCAgent:
     def _handle_ask_user(self, tool_input: Dict[str, Any]) -> str:
         """Handle ask_user tool - prompt user for input."""
         question = tool_input["question"]
+        options = tool_input.get("options", [])
         default = tool_input.get("default", "")
+        decision_key = tool_input.get("decision_key", "")
 
         if not self.collaborative or not sys.stdin.isatty():
             response = default or "proceed"
@@ -1198,12 +1572,20 @@ class SCAgent:
                 "status": "ok",
                 "tool": "ask_user",
                 "question": question,
+                "options": options,
+                "default": default,
+                "decision_key": decision_key,
                 "user_response": response,
                 "auto_selected": True,
             }, indent=2)
 
         print()
         print(question)
+        if options and not re.search(r"(^|\n)\s*1\.\s", question):
+            for idx, option in enumerate(options, 1):
+                print(f"{idx}. {option}")
+        if default:
+            print(f"[Default: {default}]")
 
         # Get user input
         try:
@@ -1217,6 +1599,9 @@ class SCAgent:
             "status": "ok",
             "tool": "ask_user",
             "question": question,
+            "options": options,
+            "default": default,
+            "decision_key": decision_key,
             "user_response": response,
         }, indent=2)
 
@@ -1307,7 +1692,7 @@ class SCAgent:
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=4096,
-                system=SYSTEM_PROMPT,
+                system=self._build_system_prompt(),
                 messages=[{"role": "user", "content": message}],
             )
             for content in response.content:
@@ -1320,7 +1705,7 @@ class SCAgent:
                 model=self.model,
                 max_completion_tokens=4096,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self._build_system_prompt()},
                     {"role": "user", "content": message},
                 ],
             )
@@ -1343,10 +1728,15 @@ class SCAgent:
         result_json, self.adata = process_tool_call(
             "inspect_data",
             {"data_path": data_path},
-            self.adata
+            self.adata,
+            world_state=self.world_state,
+            run_manager=self.run_manager,
         )
         result = json.loads(result_json)
         self.biological_context = result.get("biological_context")
+        self._sync_world_state(extra_text=data_path)
+        self.world_state.apply_tool_result("inspect_data", result, adata=self.adata)
+        self._record_world_state_snapshot()
         return result
 
     def reset_conversation(self):
@@ -1357,6 +1747,13 @@ class SCAgent:
         Note: This does NOT unload the data - call reset() for that.
         """
         self._conversation_history = []
+        self._interaction_state = {
+            "shown_figures": [],
+            "reviewed_figures": [],
+            "asked_questions": [],
+        }
+        self.world_state = AgentWorldState()
+        self._sync_world_state()
         self._print("Conversation history cleared.")
 
     def reset(self):
@@ -1370,6 +1767,12 @@ class SCAgent:
         self.run_manager = None
         self.biological_context = None
         self._pending_image = None
+        self._interaction_state = {
+            "shown_figures": [],
+            "reviewed_figures": [],
+            "asked_questions": [],
+        }
+        self.world_state = AgentWorldState()
         self._print("Agent state reset.")
 
     def recommend(self, goal: str) -> List[str]:

@@ -10,7 +10,12 @@ from typing import Optional, List, Dict, Any
 import json
 from anndata import AnnData
 
-from ..core.inspector import inspect_data, DataState
+from ..core.inspector import (
+    DataState,
+    clustering_record_to_dict,
+    inspect_data,
+    metadata_candidate_to_dict,
+)
 from ..analysis import infer_biological_context
 
 
@@ -133,11 +138,19 @@ def build_inspect_return(adata: AnnData, goal: str = None) -> InspectReturn:
             "has_clusters": state.has_clusters,
             "cluster_key": state.cluster_key,
             "n_clusters": state.n_clusters,
+            "available_clusterings": [
+                clustering_record_to_dict(record)
+                for record in state.clusterings
+            ],
         },
         batch_info={
             "batch_key": state.batch_key,
             "n_batches": state.n_batches,
             "corrected": state.batch_correction_applied,
+            "metadata_candidates": [
+                metadata_candidate_to_dict(candidate)
+                for candidate in state.metadata_candidates
+            ],
         },
         biological_context=biological_context.to_dict(),
         recommended_next_steps=recommend_next_steps(state, goal) if goal else [],

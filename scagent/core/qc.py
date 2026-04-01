@@ -15,8 +15,37 @@ from anndata import AnnData
 import logging
 
 from ..config.defaults import QC_DEFAULTS
+from .inspector import resolve_batch_metadata
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_scrublet_n_prin_comps(
+    adata: AnnData,
+    batch_key: Optional[str],
+    requested_n_prin_comps: int,
+) -> int:
+    """
+    Pick a Scrublet PCA dimension that is safe for the current dataset.
+
+    Scrublet runs PCA internally and can fail on small datasets or small
+    per-batch subsets when ``n_prin_comps`` is larger than the effective
+    sample/feature limit. We bound the requested value conservatively so QC
+    preview can degrade gracefully instead of erroring.
+    """
+    max_cells = adata.n_obs
+    if batch_key and batch_key in adata.obs:
+        batch_sizes = adata.obs[batch_key].value_counts()
+        if len(batch_sizes) > 0:
+            max_cells = int(batch_sizes.min())
+
+    upper_bound = min(int(requested_n_prin_comps), int(adata.n_vars) - 1, int(max_cells) - 1)
+    if upper_bound < 2:
+        raise ValueError(
+            "Scrublet requires at least 3 cells and 3 genes in the smallest analysis unit "
+            f"(current limit: cells={max_cells}, genes={adata.n_vars})."
+        )
+    return upper_bound
 
 
 def calculate_qc_metrics(
@@ -245,38 +274,37 @@ def detect_doublets(
 
     logger.info("Running Scrublet doublet detection...")
 
-    if batch_key is not None:
-        batch_key = str(batch_key).strip()
-        if not batch_key:
-            batch_key = None
-        elif batch_key not in adata.obs.columns:
-            logger.warning(
-                "Ignoring invalid batch_key '%s' for Scrublet because it is not present in adata.obs",
-                batch_key,
-            )
-            batch_key = None
-        elif adata.obs[batch_key].nunique() <= 1:
-            logger.warning(
-                "Ignoring batch_key '%s' for Scrublet because it has only one unique value",
-                batch_key,
-            )
-            batch_key = None
+    resolution = resolve_batch_metadata(adata, requested_column=batch_key)
+    batch_key = resolution.applied_column
+    if resolution.status == "auto_selected" and batch_key:
+        logger.info(
+            "Auto-selected '%s' for per-batch Scrublet (%s)",
+            batch_key,
+            resolution.reason,
+        )
+    elif resolution.status == "needs_confirmation":
+        logger.info(
+            "No confirmed batch_key for Scrublet; running without batch stratification. "
+            "Recommended candidate: %s",
+            resolution.recommended_column,
+        )
+    elif resolution.status == "invalid_requested":
+        logger.warning(resolution.reason)
 
-    # Auto-detect batch key if not provided
-    if batch_key is None:
-        common_batch_keys = ['batch', 'batch_id', 'sample', 'sample_id']
-        for key in common_batch_keys:
-            if key in adata.obs.columns and adata.obs[key].nunique() > 1:
-                batch_key = key
-                logger.info(f"Auto-detected batch key: {batch_key}")
-                break
+    safe_n_prin_comps = _safe_scrublet_n_prin_comps(adata, batch_key, n_prin_comps)
+    if safe_n_prin_comps != n_prin_comps:
+        logger.info(
+            "Adjusted Scrublet n_prin_comps from %s to %s for dataset size/batch size constraints.",
+            n_prin_comps,
+            safe_n_prin_comps,
+        )
 
     sc.pp.scrublet(
         adata,
         batch_key=batch_key,
         sim_doublet_ratio=sim_doublet_ratio,
         expected_doublet_rate=expected_doublet_rate,
-        n_prin_comps=n_prin_comps,
+        n_prin_comps=safe_n_prin_comps,
         random_state=random_state,
     )
 

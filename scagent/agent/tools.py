@@ -15,6 +15,8 @@ os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
 from typing import List, Dict, Any
 import json
+from pathlib import Path
+import re
 
 
 def get_tools() -> List[Dict[str, Any]]:
@@ -77,16 +79,35 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_clustering",
-            "description": "Run Leiden or PhenoGraph clustering.",
+            "description": "Run Leiden or PhenoGraph clustering. Preserves alternative clustering results under explicit keys so comparisons do not overwrite the primary clustering by accident.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
-                    "resolution": {"type": "number", "description": "Resolution (default: 1.0)"}
+                    "resolution": {"type": "number", "description": "Resolution (default: 1.0)"},
+                    "cluster_key": {"type": "string", "description": "Optional explicit obs column to store this clustering result. If omitted, scagent will keep primary aliases like 'leiden' stable and store comparisons under deterministic keys like 'leiden_res_0_5'."},
+                    "make_primary": {"type": "boolean", "description": "If true, promote this clustering to the default alias for the method (for example 'leiden') while preserving the explicit result key."}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "compare_clusterings",
+            "description": "Run a safe clustering comparison across multiple resolutions without overwriting earlier results. Use this instead of chaining several run_clustering calls when the goal is to compare resolutions.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
+                    "resolutions": {"type": "array", "items": {"type": "number"}, "description": "List of resolutions to compare"},
+                    "generate_figures": {"type": "boolean", "description": "If true and UMAP is present, save one figure per clustering"},
+                    "figure_dir": {"type": "string", "description": "Optional directory for generated comparison figures"},
+                    "include_images": {"type": "boolean", "description": "If true, include image data for generated figures"},
+                    "promote_resolution": {"type": "number", "description": "Optional resolution to promote to the primary alias after comparison"}
+                },
+                "required": ["resolutions"]
             }
         },
         {
@@ -98,7 +119,8 @@ def get_tools() -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "model": {"type": "string", "description": "Model name (default: Immune_All_Low.pkl)"},
-                    "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"}
+                    "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"},
+                    "cluster_key": {"type": "string", "description": "Cluster column to use for CellTypist majority voting (default: leiden)"}
                 },
                 "required": []
             }
@@ -110,7 +132,8 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data if already loaded)"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"}
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
+                    "cluster_key": {"type": "string", "description": "Cluster column to use for cluster-level representative predictions (default: leiden)"}
                 },
                 "required": []
             }
@@ -126,7 +149,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     "batch_key": {"type": "string", "description": "Batch column name"},
                     "method": {"type": "string", "enum": ["harmony", "scanorama"], "description": "Method (default: harmony)"}
                 },
-                "required": ["batch_key"]
+                "required": []
             }
         },
         {
@@ -147,7 +170,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "generate_figure",
-            "description": "Generate and save a visualization (UMAP, violin, dotplot, etc.).",
+            "description": "Generate and save a visualization (UMAP, violin, dotplot, etc.). For clustering comparisons, always use an explicit cluster key returned by run_clustering or compare_clusterings rather than a bare primary alias unless you intentionally want the promoted default.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -155,7 +178,8 @@ def get_tools() -> List[Dict[str, Any]]:
                     "output_path": {"type": "string", "description": "Path to save PNG figure"},
                     "plot_type": {"type": "string", "enum": ["umap", "violin", "dotplot", "heatmap"], "description": "Plot type"},
                     "color_by": {"type": "string", "description": "Column or gene to color by"},
-                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"}
+                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"},
+                    "include_image": {"type": "boolean", "description": "If true, include image data for model review (default: true)"}
                 },
                 "required": ["output_path", "plot_type"]
             }
@@ -194,13 +218,14 @@ def get_tools() -> List[Dict[str, Any]]:
     meta_tools = [
         {
             "name": "ask_user",
-            "description": "Ask the user a question and wait for their response. Collaboration is the default style, but do not use this for trivial bookkeeping. Use it when a preprocessing or interpretation choice should stay under user control, including QC thresholds, filtering decisions, clustering resolution changes, annotation ambiguity, batch correction, DEG comparisons, or any other material fork in the analysis.",
+            "description": "Ask the user a question and wait for their response. Collaboration is the default style, but do not use this for trivial bookkeeping. Use it when a preprocessing or interpretation choice should stay under user control, including QC thresholds, filtering decisions, clustering resolution changes, annotation ambiguity, batch correction, DEG comparisons, or any other material fork in the analysis. Keep the question concise and put the actionable choices in the options field.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "question": {"type": "string", "description": "The question to ask the user"},
                     "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices"},
-                    "default": {"type": "string", "description": "Default answer if user just presses enter"}
+                    "default": {"type": "string", "description": "Default answer if user just presses enter"},
+                    "decision_key": {"type": "string", "description": "Optional state key to persist if the user answers explicitly (for example batch_key or primary_clustering)."}
                 },
                 "required": ["question"]
             }
@@ -304,13 +329,37 @@ def get_tools() -> List[Dict[str, Any]]:
     inspection_tools = [
         {
             "name": "inspect_data",
-            "description": "Inspect data state: shape, processing status, available embeddings, what steps are done. Use this first to understand the data.",
+            "description": "Inspect data state: shape, processing status, available embeddings, what steps are done, likely metadata columns, and tracked clustering results. Use this first to understand the data.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
                     "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"},
                     "context": {"type": "string", "description": "Optional biological context hint from the user or file path (e.g., 'PBMC healthy human cells')"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "inspect_session",
+            "description": "Inspect the unified agent session state: active dataset summary, artifacts, recent actions, unresolved decisions, and latest verification.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "include_history": {"type": "boolean", "description": "Include recent events and resolved decisions (default: true)"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "list_artifacts",
+            "description": "List known artifacts from the current session ledger or a saved run manifest.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "run_path": {"type": "string", "description": "Optional run directory or manifest.json path when inspecting a saved run."},
+                    "artifact_kind": {"type": "string", "description": "Optional artifact kind filter (for example figure, report, data, log)."},
+                    "limit": {"type": "integer", "description": "Maximum artifacts to return (default: 20)"}
                 },
                 "required": []
             }
@@ -374,6 +423,59 @@ def get_tools() -> List[Dict[str, Any]]:
                 "required": []
             }
         },
+        {
+            "name": "review_figure",
+            "description": "Attach and review an existing saved figure with the LLM. Use this when the user wants the agent to interpret QC plots, UMAPs, or other already-generated artifacts.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "figure_path": {"type": "string", "description": "Path to an existing figure image file"},
+                    "question": {"type": "string", "description": "Optional prompt to guide the review of the figure"},
+                    "include_image": {"type": "boolean", "description": "If true, include the image data for model review (default: true)"}
+                },
+                "required": ["figure_path"]
+            }
+        },
+        {
+            "name": "review_artifact",
+            "description": "Review an existing artifact from the session or workspace. Supports figures, text reports, JSON outputs, logs, and AnnData files in read-only mode.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "artifact_path": {"type": "string", "description": "Absolute or run-relative path to the artifact."},
+                    "artifact_id": {"type": "string", "description": "Artifact id from list_artifacts or inspect_session."},
+                    "question": {"type": "string", "description": "Optional prompt to guide the review."},
+                    "include_image": {"type": "boolean", "description": "If true, include image data when reviewing image artifacts (default: true)."},
+                    "max_chars": {"type": "integer", "description": "Maximum text characters to return for text-like artifacts (default: 4000)."}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "inspect_run_state",
+            "description": "Inspect a saved run manifest or the active run ledger: status, steps, artifacts, decisions, and recent world-state snapshots.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "run_path": {"type": "string", "description": "Run directory or manifest.json path. Optional when an active run exists."},
+                    "include_history": {"type": "boolean", "description": "Include recent events and snapshots (default: true)."}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "inspect_workspace",
+            "description": "Read-only workspace inspection for the current project or run directory. Use this sparingly for awareness and recovery.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative path to inspect (default: current working directory)."},
+                    "max_depth": {"type": "integer", "description": "Maximum directory depth to traverse (default: 2)."},
+                    "limit": {"type": "integer", "description": "Maximum entries to return (default: 50)."}
+                },
+                "required": []
+            }
+        },
     ]
 
     return action_tools + meta_tools + inspection_tools
@@ -421,7 +523,13 @@ def get_image_mime_type(image_path: str) -> str:
     return mime_types.get(ext, "image/png")
 
 
-def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) -> tuple:
+def process_tool_call(
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    adata=None,
+    world_state=None,
+    run_manager=None,
+) -> tuple:
     """
     Process a tool call and return structured JSON result.
 
@@ -433,16 +541,39 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
     import numpy as np
 
     from ..core import (
-        inspect_data, load_data, run_qc_pipeline, normalize_data,
-        run_pca, compute_neighbors, compute_umap,
-        run_leiden, run_phenograph, recommend_next_steps,
-        calculate_qc_metrics, detect_doublets
+        clustering_record_to_dict,
+        default_cluster_key_for_method,
+        get_clustering_registry,
+        infer_cluster_key,
+        inspect_data,
+        load_data,
+        metadata_candidate_to_dict,
+        metadata_resolution_to_dict,
+        promote_clustering_to_primary,
+        rank_obs_metadata_candidates,
+        recommend_next_steps,
+        register_clustering,
+        resolve_batch_metadata,
+        run_qc_pipeline,
+        normalize_data,
+        run_pca,
+        compute_neighbors,
+        compute_umap,
+        run_leiden,
+        run_phenograph,
+        calculate_qc_metrics,
+        detect_doublets,
     )
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import run_celltypist, run_scimilarity
     from ..batch import run_scanorama, run_harmony
     from ..analysis import infer_biological_context, build_literature_context, score_paper_relevance
+    from .decision_policy import (
+        decision_for_batch_strategy,
+        decision_for_clustering_selection,
+    )
+    from .world_state import ArtifactRecord, StateDelta, VerificationResult
 
     def make_state(adata):
         """Create compact state dict."""
@@ -458,6 +589,184 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             "has_umap": state.has_umap,
             "has_clusters": state.has_clusters,
             "has_celltypes": state.has_celltypist or state.has_scimilarity,
+        }
+
+    starting_state = make_state(adata) if adata is not None else {}
+
+    def _stage_from_state(state_dict: Dict[str, Any]) -> str:
+        if not state_dict:
+            return "uninitialized"
+        if state_dict.get("has_celltypes"):
+            return "annotated"
+        if state_dict.get("has_clusters"):
+            return "clustered"
+        if state_dict.get("has_umap") or state_dict.get("has_neighbors"):
+            return "embedded"
+        if state_dict.get("is_normalized") or state_dict.get("has_hvg"):
+            return "normalized"
+        if state_dict.get("has_qc_metrics") or state_dict.get("has_doublets"):
+            return "qc"
+        if state_dict.get("has_raw_counts"):
+            return "loaded"
+        return "unknown"
+
+    def _artifact_kind_from_path(path: str) -> str:
+        suffix = Path(path).suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            return "figure"
+        if suffix in {".h5ad", ".h5", ".loom"}:
+            return "data"
+        if suffix in {".json"}:
+            return "json"
+        if suffix in {".md", ".txt", ".csv", ".tsv"}:
+            return "report"
+        if suffix in {".log"}:
+            return "log"
+        return "artifact"
+
+    def _artifact_payload(path: str, *, role: str = "artifact", metadata: Dict[str, Any] | None = None):
+        if not path:
+            return None
+        artifact = ArtifactRecord.from_path(
+            path,
+            kind=_artifact_kind_from_path(path),
+            role=role,
+            source_tool=tool_name,
+            metadata=metadata or {},
+        )
+        return artifact.to_dict()
+
+    def _build_state_delta(
+        current_adata,
+        *,
+        summary: str,
+        dataset_changed: bool,
+        notes: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        after_state = make_state(current_adata) if current_adata is not None else {}
+        changed_flags = {}
+        all_keys = set(starting_state.keys()) | set(after_state.keys())
+        for key in sorted(all_keys):
+            before = starting_state.get(key)
+            after = after_state.get(key)
+            if before != after:
+                changed_flags[key] = {"before": before, "after": after}
+        return StateDelta(
+            tool=tool_name,
+            summary=summary,
+            dataset_changed=dataset_changed,
+            stage_before=_stage_from_state(starting_state),
+            stage_after=_stage_from_state(after_state),
+            changed_flags=changed_flags,
+            notes=notes or [],
+        ).to_dict()
+
+    def _build_verification(
+        status: str,
+        summary: str,
+        checks: List[Dict[str, Any]],
+        recovery_options: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        if status == "passed" and any(check.get("status") == "failed" for check in checks):
+            status = "warning"
+        return VerificationResult(
+            status=status,
+            summary=summary,
+            checks=checks,
+            recovery_options=recovery_options or [],
+        ).to_dict()
+
+    def _check(name: str, passed: bool, details: str) -> Dict[str, Any]:
+        return {"name": name, "status": "passed" if passed else "failed", "details": details}
+
+    def _finalize_result(
+        result: Dict[str, Any],
+        updated_adata,
+        *,
+        dataset_changed: bool,
+        summary: str,
+        artifacts_created: List[Dict[str, Any]] | None = None,
+        decisions_raised: List[Dict[str, Any]] | None = None,
+        verification: Dict[str, Any] | None = None,
+        notes: List[str] | None = None,
+    ):
+        result.setdefault(
+            "state_delta",
+            _build_state_delta(
+                updated_adata,
+                summary=summary,
+                dataset_changed=dataset_changed,
+                notes=notes,
+            ),
+        )
+        result.setdefault("artifacts_created", artifacts_created or [])
+        result.setdefault("decisions_raised", decisions_raised or [])
+        result.setdefault(
+            "verification",
+            verification
+            or _build_verification(
+                "passed",
+                f"{tool_name} completed without verification issues.",
+                [],
+            ),
+        )
+        return json.dumps(result, indent=2), updated_adata
+
+    def _confirmed_decision_value(key: str):
+        if world_state is None:
+            return None
+        getter = getattr(world_state, "get_confirmed_value", None)
+        if getter is None:
+            return None
+        return getter(key)
+
+    def _clusterings_payload(adata_obj):
+        return [
+            clustering_record_to_dict(record)
+            for record in get_clustering_registry(adata_obj)
+        ]
+
+    def _batch_relevance(goal: Any = None, context: str = "") -> bool:
+        goal_text = str(goal or "").strip().lower()
+        if goal_text == "batch_correct":
+            return True
+        context_text = str(context or "").lower()
+        return bool(
+            re.search(
+                r"\b(batch|integration|integrate|harmony|scanorama|correct(?:ion)?|multi[- ]sample)\b",
+                context_text,
+            )
+        )
+
+    def _analysis_guidance(state, *, goal: Any = None, context: str = "") -> Dict[str, Any]:
+        if not state.has_qc_metrics:
+            next_priority = "qc_preview"
+        elif not state.is_normalized:
+            next_priority = "normalize_and_hvg"
+        elif not (state.has_pca and state.has_neighbors and state.has_umap):
+            next_priority = "run_dimred"
+        elif not state.has_clusters:
+            next_priority = "run_clustering"
+        else:
+            next_priority = "annotation_or_deg"
+
+        batch_relevant_now = _batch_relevance(goal, context)
+        notes = [
+            "For a routine first pass, keep the workflow QC-first before moving into normalization, embedding, and clustering.",
+        ]
+        if batch_relevant_now:
+            notes.append(
+                "Batch handling is relevant for this request, so confirm the partition column before correction or other batch-sensitive steps."
+            )
+        else:
+            notes.append(
+                "Do not make batch correction a front-and-center decision right now; batch/sample metadata only matters later for explicit integration workflows or per-batch operations."
+            )
+
+        return {
+            "next_priority": next_priority,
+            "batch_relevant_now": batch_relevant_now,
+            "notes": notes,
         }
 
     def get_adata(tool_input, existing_adata, update_memory: bool = True, prefer_memory: bool = False):
@@ -510,6 +819,120 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             warnings.append(f"Ignored invalid {context} '{column_name}' because it is not present in adata.obs.")
             return None
         return column_name
+
+    def _same_resolution(left, right) -> bool:
+        if left is None or right is None:
+            return False
+        return abs(float(left) - float(right)) < 1e-9
+
+    def _resolve_clustering_output_key(adata_obj, method: str, resolution: float, requested_key: str | None):
+        normalized_method = "phenograph" if str(method).lower() == "phenograph" else "leiden"
+        alias = default_cluster_key_for_method(normalized_method)
+        if requested_key:
+            return requested_key, requested_key == alias
+
+        registry = {record["key"]: record for record in _clusterings_payload(adata_obj)}
+        if alias not in adata_obj.obs:
+            return alias, True
+
+        alias_record = registry.get(alias)
+        if alias_record and _same_resolution(alias_record.get("resolution"), resolution):
+            return alias, True
+        if alias_record is None and _same_resolution(resolution, 1.0):
+            return alias, True
+        return infer_cluster_key(normalized_method, resolution), False
+
+    def _apply_clustering(
+        adata_obj,
+        *,
+        method: str,
+        resolution: float,
+        cluster_key: str,
+        make_primary: bool,
+    ):
+        normalized_method = "phenograph" if str(method).lower() == "phenograph" else "leiden"
+        if normalized_method == "leiden":
+            run_leiden(adata_obj, resolution=resolution, key_added=cluster_key)
+        else:
+            run_phenograph(adata_obj, resolution=resolution, key_added=cluster_key)
+
+        register_clustering(
+            adata_obj,
+            cluster_key=cluster_key,
+            method=normalized_method,
+            resolution=resolution,
+            created_by="tool",
+        )
+        primary_alias = default_cluster_key_for_method(normalized_method)
+        if make_primary:
+            primary_alias = promote_clustering_to_primary(
+                adata_obj,
+                cluster_key=cluster_key,
+                method=normalized_method,
+                resolution=resolution,
+                created_by="tool",
+            )
+
+        sizes = adata_obj.obs[cluster_key].value_counts().to_dict()
+        return {
+            "cluster_key": cluster_key,
+            "primary_cluster_key": primary_alias,
+            "method": normalized_method,
+            "resolution": float(resolution),
+            "n_clusters": len(sizes),
+            "cluster_sizes": {str(key): int(value) for key, value in sizes.items()},
+            "clusterings": _clusterings_payload(adata_obj),
+        }
+
+    def _render_figure(
+        adata_obj,
+        *,
+        plot_type: str,
+        output_path: str,
+        color_by: str = "leiden",
+        genes=None,
+        include_image: bool = True,
+    ):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import scanpy as sc
+
+        genes = genes or []
+        if plot_type == "umap":
+            if "X_umap" not in adata_obj.obsm:
+                raise ValueError("UMAP embedding not found. Run run_dimred first.")
+            if color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
+                raise ValueError(f"'{color_by}' is not available for UMAP coloring.")
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        if plot_type == "umap":
+            sc.pl.umap(adata_obj, color=color_by, ax=ax, show=False)
+        elif plot_type == "violin":
+            sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
+        elif plot_type == "dotplot" and genes:
+            sc.pl.dotplot(adata_obj, var_names=genes, groupby=color_by, show=False)
+        elif plot_type == "heatmap" and genes:
+            sc.pl.heatmap(adata_obj, var_names=genes, groupby=color_by, show=False)
+        else:
+            raise ValueError(f"Unsupported plot configuration: plot_type={plot_type}")
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close()
+
+        result = {
+            "status": "ok",
+            "tool": "generate_figure",
+            "output_path": output_path,
+            "plot_type": plot_type,
+            "color_by": color_by,
+        }
+        if include_image:
+            result["image_base64"] = encode_image_base64(output_path)
+            result["image_mime"] = get_image_mime_type(output_path)
+        return result
 
     def _stringify_dataframe_columns(df):
         if df is None:
@@ -1093,6 +1516,7 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "question": tool_input["question"],
                 "options": tool_input.get("options", []),
                 "default": tool_input.get("default", ""),
+                "decision_key": tool_input.get("decision_key", ""),
             }, indent=2), adata
 
         elif tool_name == "run_code":
@@ -1164,7 +1588,6 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             # Save code to file if output directory exists
             code_file = None
             if "output_dir" in tool_input:
-                import os
                 code_dir = os.path.join(tool_input["output_dir"], "code")
                 os.makedirs(code_dir, exist_ok=True)
 
@@ -1589,11 +2012,15 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
         elif tool_name == "inspect_data":
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             state = inspect_data(working_adata)
+            batch_resolution = resolve_batch_metadata(working_adata)
             goal = tool_input.get("goal")
             context_hint = tool_input.get("context", "")
+            guidance_context = context_hint
             if tool_input.get("data_path"):
                 context_hint = " ".join(part for part in [context_hint, str(tool_input.get("data_path"))] if part)
             biological_context = infer_biological_context(working_adata, text_context=context_hint)
+            confirmed_batch_key = _confirmed_decision_value("batch_key")
+            guidance = _analysis_guidance(state, goal=goal, context=guidance_context)
 
             result = {
                 "status": "ok",
@@ -1613,18 +2040,148 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "clustering": {
                     "has_clusters": state.has_clusters,
                     "cluster_key": state.cluster_key,
-                    "n_clusters": state.n_clusters
+                    "n_clusters": state.n_clusters,
+                    "available_clusterings": _clusterings_payload(working_adata),
                 },
                 "batch": {
-                    "batch_key": state.batch_key,
-                    "n_batches": state.n_batches
+                    "confirmed_batch_key": confirmed_batch_key,
+                    "inferred_batch_key": state.batch_key,
+                    "n_batches": state.n_batches,
+                    "status": batch_resolution.status,
+                    "recommended_batch_key": batch_resolution.recommended_column,
+                    "recommended_role": batch_resolution.recommended_role,
+                    "needs_confirmation": batch_resolution.needs_user_confirmation,
+                    "reason": batch_resolution.reason,
+                    "relevance": "current" if guidance["batch_relevant_now"] else "later_optional",
+                    "candidates": [
+                        metadata_candidate_to_dict(candidate)
+                        for candidate in state.metadata_candidates
+                    ],
                 },
+                "metadata_candidates": [
+                    metadata_candidate_to_dict(candidate)
+                    for candidate in state.metadata_candidates
+                ],
+                "batch_key": confirmed_batch_key,
+                "recommended_batch_key": batch_resolution.recommended_column,
+                "available_clusterings": _clusterings_payload(working_adata),
                 "biological_context": biological_context.to_dict(),
+                "analysis_guidance": guidance,
             }
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)
+            decisions = []
+            batch_decision = decision_for_batch_strategy(
+                metadata_resolution_to_dict(batch_resolution),
+                context="inspect_data",
+                source_tool="inspect_data",
+                batch_relevant=guidance["batch_relevant_now"],
+            )
+            if batch_decision is not None:
+                decisions.append(batch_decision)
 
-            return json.dumps(result, indent=2), updated_adata
+            return _finalize_result(
+                result,
+                updated_adata,
+                dataset_changed=False,
+                summary="Inspected the active AnnData state and collaborative metadata candidates.",
+                decisions_raised=decisions,
+                verification=_build_verification(
+                    "passed",
+                    "inspect_data returned a coherent dataset summary.",
+                    [
+                        _check("shape_available", "shape" in result, "Dataset shape is present."),
+                        _check(
+                            "batch_section_present",
+                            "batch" in result,
+                            "Batch metadata summary is present.",
+                        ),
+                    ],
+                ),
+            )
+
+        elif tool_name == "inspect_session":
+            include_history = bool(tool_input.get("include_history", True))
+            if world_state is None:
+                session_payload = {
+                    "status": "ok",
+                    "tool": "inspect_session",
+                    "message": "No active AgentWorldState was provided. Falling back to the current AnnData state only.",
+                    "world_state": {
+                        "analysis_stage": _stage_from_state(starting_state),
+                        "data_summary": {"state": starting_state},
+                    },
+                }
+                return _finalize_result(
+                    session_payload,
+                    adata,
+                    dataset_changed=False,
+                    summary="Inspected a minimal session fallback because no AgentWorldState was available.",
+                )
+
+            snapshot = world_state.snapshot()
+            if not include_history:
+                snapshot.pop("resolved_decisions", None)
+                snapshot.pop("artifacts", None)
+
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "inspect_session",
+                    "world_state": snapshot,
+                },
+                adata,
+                dataset_changed=False,
+                summary="Inspected the unified agent session state.",
+                verification=_build_verification(
+                    "passed",
+                    "Session state was available for inspection.",
+                    [
+                        _check(
+                            "analysis_stage_present",
+                            bool(snapshot.get("analysis_stage")),
+                            "Session snapshot includes an analysis stage.",
+                        ),
+                    ],
+                ),
+            )
+
+        elif tool_name == "list_artifacts":
+            limit = int(tool_input.get("limit", 20))
+            artifact_kind = tool_input.get("artifact_kind")
+            artifacts: List[Dict[str, Any]] = []
+
+            if world_state is not None:
+                artifacts = [artifact.to_dict() for artifact in world_state.artifacts]
+            elif run_manager is not None:
+                artifacts = list(run_manager.manifest.artifact_registry)
+            else:
+                run_path = tool_input.get("run_path")
+                if run_path:
+                    manifest_path = Path(run_path)
+                    if manifest_path.is_dir():
+                        manifest_path = manifest_path / "manifest.json"
+                    if not manifest_path.exists():
+                        raise FileNotFoundError(f"Run manifest not found: {manifest_path}")
+                    with open(manifest_path) as handle:
+                        manifest_payload = json.load(handle)
+                    artifacts = manifest_payload.get("artifact_registry", [])
+
+            if artifact_kind:
+                artifacts = [artifact for artifact in artifacts if artifact.get("kind") == artifact_kind]
+
+            artifacts = artifacts[-limit:]
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "list_artifacts",
+                    "artifacts": artifacts,
+                    "n_artifacts": len(artifacts),
+                },
+                adata,
+                dataset_changed=False,
+                summary="Listed known session or run artifacts.",
+            )
 
         elif tool_name == "get_cluster_sizes":
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
@@ -1735,8 +2292,206 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "status": "ok",
                 "tool": "list_obs_columns",
                 "columns": list(working_adata.obs.columns),
-                "n_columns": len(working_adata.obs.columns)
+                "n_columns": len(working_adata.obs.columns),
+                "metadata_candidates": [
+                    metadata_candidate_to_dict(candidate)
+                    for candidate in rank_obs_metadata_candidates(working_adata)
+                ],
             }, indent=2), updated_adata
+
+        elif tool_name in {"review_figure", "review_artifact"}:
+            artifact_path = tool_input.get("artifact_path") or tool_input.get("figure_path")
+            artifact_id = tool_input.get("artifact_id")
+            include_image = bool(tool_input.get("include_image", True))
+            question = tool_input.get("question", "")
+            max_chars = int(tool_input.get("max_chars", 4000))
+
+            if not artifact_path and artifact_id and world_state is not None:
+                matched = next(
+                    (artifact for artifact in world_state.artifacts if artifact.artifact_id == artifact_id),
+                    None,
+                )
+                if matched is not None:
+                    artifact_path = matched.path
+
+            if not artifact_path:
+                raise ValueError("Provide artifact_path/figure_path or artifact_id to review an artifact.")
+
+            artifact_path = os.path.abspath(artifact_path)
+            if not os.path.exists(artifact_path):
+                raise FileNotFoundError(f"Artifact not found: {artifact_path}")
+
+            artifact_kind = _artifact_kind_from_path(artifact_path)
+            result = {
+                "status": "ok",
+                "tool": tool_name,
+                "artifact_path": artifact_path,
+                "artifact_kind": artifact_kind,
+                "question": question,
+                "size_bytes": os.path.getsize(artifact_path),
+            }
+            if tool_name == "review_figure":
+                result["figure_path"] = artifact_path
+
+            if artifact_kind == "figure":
+                if include_image:
+                    result["image_base64"] = encode_image_base64(artifact_path)
+                    result["image_mime"] = get_image_mime_type(artifact_path)
+            elif artifact_kind == "json":
+                with open(artifact_path) as handle:
+                    payload = json.load(handle)
+                excerpt = json.dumps(payload, indent=2)[:max_chars]
+                result["content_excerpt"] = excerpt
+                result["json_keys"] = list(payload.keys())[:25] if isinstance(payload, dict) else []
+            elif artifact_kind in {"report", "log"}:
+                with open(artifact_path) as handle:
+                    content = handle.read()
+                result["content_excerpt"] = content[:max_chars]
+                result["truncated"] = len(content) > max_chars
+            elif artifact_kind == "data":
+                reviewed_adata = load_data(artifact_path)
+                reviewed_state = inspect_data(reviewed_adata)
+                result["data_summary"] = {
+                    "shape": {"n_cells": reviewed_state.n_cells, "n_genes": reviewed_state.n_genes},
+                    "data_type": reviewed_state.data_type,
+                    "batch_key": reviewed_state.batch_key,
+                    "cluster_key": reviewed_state.cluster_key,
+                    "n_clusters": reviewed_state.n_clusters,
+                }
+
+            verification_checks = [
+                _check("artifact_exists", os.path.exists(artifact_path), f"Artifact exists at {artifact_path}."),
+            ]
+            if artifact_kind == "figure" and include_image:
+                verification_checks.append(
+                    _check(
+                        "image_payload_attached",
+                        "image_base64" in result,
+                        "Image payload attached for model review.",
+                    )
+                )
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=False,
+                summary=f"Reviewed existing {artifact_kind} artifact.",
+                verification=_build_verification(
+                    "passed",
+                    f"{artifact_kind.title()} artifact was available for review.",
+                    verification_checks,
+                ),
+            )
+
+        elif tool_name == "inspect_run_state":
+            include_history = bool(tool_input.get("include_history", True))
+            manifest_payload = None
+            if run_manager is not None:
+                manifest_payload = run_manager.manifest.to_dict()
+            else:
+                run_path = tool_input.get("run_path")
+                if not run_path:
+                    raise ValueError("Provide run_path when no active run manager is available.")
+                manifest_path = Path(run_path)
+                if manifest_path.is_dir():
+                    manifest_path = manifest_path / "manifest.json"
+                if not manifest_path.exists():
+                    raise FileNotFoundError(f"Run manifest not found: {manifest_path}")
+                with open(manifest_path) as handle:
+                    manifest_payload = json.load(handle)
+
+            result = {
+                "status": "ok",
+                "tool": "inspect_run_state",
+                "run_id": manifest_payload.get("run_id"),
+                "run_status": manifest_payload.get("status"),
+                "request": manifest_payload.get("request"),
+                "n_steps": len(manifest_payload.get("steps_completed", [])),
+                "n_artifacts": len(manifest_payload.get("artifact_registry", [])),
+                "n_decisions": len(manifest_payload.get("user_decisions", [])),
+                "n_verifications": len(manifest_payload.get("verification_history", [])),
+                "latest_world_state": (manifest_payload.get("world_state_snapshots", []) or [{}])[-1],
+            }
+            if include_history:
+                result["recent_events"] = manifest_payload.get("session_events", [])[-10:]
+                result["recent_steps"] = manifest_payload.get("steps_completed", [])[-10:]
+
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=False,
+                summary="Inspected the active or persisted run ledger.",
+            )
+
+        elif tool_name == "inspect_workspace":
+            workspace_root = Path.cwd().resolve()
+            allowed_roots = [workspace_root]
+            if run_manager is not None:
+                allowed_roots.append(Path(run_manager.run_dir).resolve())
+
+            requested = tool_input.get("path", ".")
+            requested_path = Path(requested)
+            if not requested_path.is_absolute():
+                requested_path = (workspace_root / requested_path).resolve()
+            else:
+                requested_path = requested_path.resolve()
+
+            if not any(
+                requested_path == root or root in requested_path.parents
+                for root in allowed_roots
+            ):
+                raise ValueError(
+                    f"inspect_workspace is limited to the project workspace and active run directory. "
+                    f"Requested path: {requested_path}"
+                )
+
+            max_depth = int(tool_input.get("max_depth", 2))
+            limit = int(tool_input.get("limit", 50))
+            entries: List[Dict[str, Any]] = []
+
+            def _walk(path_obj: Path, depth: int) -> None:
+                if len(entries) >= limit:
+                    return
+                if path_obj.is_file():
+                    entries.append(
+                        {
+                            "path": str(path_obj),
+                            "kind": "file",
+                            "size_bytes": path_obj.stat().st_size,
+                        }
+                    )
+                    return
+                if not path_obj.is_dir() or depth > max_depth:
+                    return
+
+                for child in sorted(path_obj.iterdir(), key=lambda candidate: candidate.name):
+                    if len(entries) >= limit:
+                        break
+                    if child.name == "__pycache__":
+                        continue
+                    entries.append(
+                        {
+                            "path": str(child),
+                            "kind": "directory" if child.is_dir() else "file",
+                            "size_bytes": child.stat().st_size if child.is_file() else None,
+                            "depth": depth,
+                        }
+                    )
+                    if child.is_dir():
+                        _walk(child, depth + 1)
+
+            _walk(requested_path, 0)
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "inspect_workspace",
+                    "path": str(requested_path),
+                    "entries": entries,
+                    "n_entries": len(entries),
+                },
+                adata,
+                dataset_changed=False,
+                summary="Inspected the workspace in read-only mode.",
+            )
 
         # ===== ACTION TOOLS =====
         elif tool_name == "run_qc":
@@ -1749,24 +2504,39 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             n_before, g_before = adata.n_obs, adata.n_vars
 
-            batch_key = _validate_obs_column(adata, tool_input.get("batch_key"), warnings, required=False, context="batch_key")
-            if not batch_key:
-                # Auto-detect
-                for k in ['batch', 'batch_id', 'sample', 'sample_id']:
-                    if k in adata.obs and adata.obs[k].nunique() > 1:
-                        batch_key = k
-                        warnings.append(f"batch_key auto-detected as '{k}'")
-                        break
-            elif adata.obs[batch_key].nunique() <= 1:
-                warnings.append(f"Ignored batch_key '{batch_key}' because it has only one unique value.")
-                batch_key = None
-
             detect_doublets_flag = tool_input.get("detect_doublets_flag", True)
             remove_ribo = tool_input.get("remove_ribo", True)
             remove_mt = tool_input.get("remove_mt", False)
             min_cells = tool_input.get("min_cells")
             requested_mt_threshold = tool_input.get("mt_threshold")
             preview_only = bool(tool_input.get("preview_only", False))
+            requested_batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
+            if requested_batch_key and "batch_key" not in tool_input and _confirmed_decision_value("batch_key"):
+                warnings.append(
+                    f"Using previously confirmed batch_key '{requested_batch_key}' from session state."
+                )
+
+            if detect_doublets_flag:
+                batch_resolution = resolve_batch_metadata(
+                    adata,
+                    requested_column=requested_batch_key,
+                )
+            else:
+                batch_resolution = None
+
+            batch_key = batch_resolution.applied_column if batch_resolution else None
+            if batch_resolution:
+                if batch_resolution.status == "auto_selected" and batch_key:
+                    warnings.append(batch_resolution.reason)
+                elif batch_resolution.status == "invalid_requested":
+                    warnings.append(batch_resolution.reason)
+                elif batch_resolution.status == "needs_confirmation":
+                    warnings.append(
+                        f"{batch_resolution.reason} "
+                        f"{'Previewing' if preview_only else 'Running'} doublets without per-batch stratification for now."
+                    )
+                elif batch_resolution.status == "no_candidate":
+                    warnings.append(batch_resolution.reason)
 
             qc_preview = adata.copy()
             try:
@@ -1804,7 +2574,6 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             figure_outputs = []
             figure_dir = tool_input.get("figure_dir")
             if figure_dir:
-                import os
                 import scanpy as sc
                 import matplotlib.pyplot as plt
                 os.makedirs(figure_dir, exist_ok=True)
@@ -1886,9 +2655,47 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 f"removing {genes_low_cells} low-detection genes, and "
                 f"{'flagging' if detect_doublets_flag else 'skipping'} doublets ({predicted_doublets} cells)."
             )
+            if batch_resolution and batch_resolution.needs_user_confirmation and tool_input.get("batch_key"):
+                recommendation += (
+                    f" I could not confirm the requested per-batch column automatically; "
+                    f"'{batch_resolution.recommended_column}' looks closest."
+                )
+
+            batch_strategy = (
+                metadata_resolution_to_dict(batch_resolution)
+                if batch_resolution
+                else {
+                    "status": "not_applicable",
+                    "requested_column": requested_batch_key,
+                    "applied_column": None,
+                    "recommended_column": None,
+                    "recommended_role": None,
+                    "needs_user_confirmation": False,
+                    "reason": "Doublet detection is disabled for this QC run.",
+                    "candidates": [],
+                }
+            )
+            batch_strategy["used_for_doublets"] = batch_key
+            decisions = []
+            batch_decision = decision_for_batch_strategy(
+                batch_strategy,
+                context="doublet_detection",
+                source_tool="run_qc",
+                batch_relevant=bool(tool_input.get("batch_key")),
+            )
+            if batch_decision is not None:
+                decisions.append(batch_decision)
+            artifact_payloads = [
+                artifact
+                for artifact in (
+                    _artifact_payload(path, role="qc_figure", metadata={"mode": "preview" if preview_only else "applied"})
+                    for path in figure_outputs
+                )
+                if artifact is not None
+            ]
 
             if preview_only:
-                return json.dumps({
+                preview_result = {
                     "status": "ok",
                     "tool": "run_qc",
                     "mode": "preview",
@@ -1903,8 +2710,38 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     },
                     "warnings": warnings,
                     "figures": figure_outputs,
+                    "batch_strategy": batch_strategy,
                     "state": make_state(adata)
-                }, indent=2), adata
+                }
+                verification_checks = [
+                    _check("qc_metrics_computed", "pct_counts_mt" in qc_preview.obs.columns, "QC metrics were computed on the preview copy."),
+                    _check(
+                        "batch_strategy_reported",
+                        bool(batch_strategy.get("status")),
+                        "Batch strategy is attached to the QC preview.",
+                    ),
+                ]
+                if figure_outputs:
+                    verification_checks.append(
+                        _check(
+                            "preview_figures_exist",
+                            all(os.path.exists(path) for path in figure_outputs),
+                            "QC preview figures were written to disk.",
+                        )
+                    )
+                return _finalize_result(
+                    preview_result,
+                    adata,
+                    dataset_changed=False,
+                    summary="Previewed QC metrics, thresholds, and doublet strategy without filtering cells.",
+                    artifacts_created=artifact_payloads,
+                    decisions_raised=decisions,
+                    verification=_build_verification(
+                        "passed",
+                        "QC preview completed and reported a concrete batch strategy.",
+                        verification_checks,
+                    ),
+                )
 
             try:
                 run_qc_pipeline(
@@ -1933,8 +2770,12 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             output_path = fix_output_path(tool_input.get("output_path"), "run_qc")
             if output_path:
                 write_h5ad_safe(adata, output_path)
+            if output_path:
+                artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
+                if artifact is not None:
+                    artifact_payloads.append(artifact)
 
-            return json.dumps({
+            qc_result = {
                 "status": "ok",
                 "tool": "run_qc",
                 "input_path": tool_input.get("data_path", "memory"),
@@ -1952,8 +2793,38 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 },
                 "warnings": warnings,
                 "figures": figure_outputs,
+                "batch_strategy": batch_strategy,
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            verification_checks = [
+                _check("qc_metrics_present", "pct_counts_mt" in adata.obs.columns, "MT QC metric is present after QC."),
+                _check(
+                    "batch_key_valid",
+                    batch_key is None or batch_key in adata.obs.columns,
+                    f"Batch key '{batch_key}' is available on the filtered AnnData." if batch_key else "QC ran without per-batch stratification.",
+                ),
+            ]
+            if detect_doublets_flag:
+                verification_checks.append(
+                    _check(
+                        "doublet_scores_present",
+                        "predicted_doublet" in adata.obs.columns,
+                        "Doublet scores/predictions are available after QC.",
+                    )
+                )
+            return _finalize_result(
+                qc_result,
+                adata,
+                dataset_changed=True,
+                summary="Applied QC filtering and recorded the batch-aware doublet strategy.",
+                artifacts_created=artifact_payloads,
+                decisions_raised=decisions,
+                verification=_build_verification(
+                    "passed",
+                    "QC completed and the resulting AnnData passed post-action checks.",
+                    verification_checks,
+                ),
+            )
 
         elif tool_name == "normalize_and_hvg":
             warnings = _state_preservation_warning(tool_input, adata)
@@ -2006,40 +2877,249 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             method = tool_input.get("method", "leiden")
-            resolution = tool_input.get("resolution", 1.0)
+            resolution = float(tool_input.get("resolution", 1.0))
+            requested_cluster_key = tool_input.get("cluster_key")
+            cluster_key, default_make_primary = _resolve_clustering_output_key(
+                adata,
+                method,
+                resolution,
+                requested_cluster_key,
+            )
+            make_primary = tool_input.get("make_primary")
+            if make_primary is None:
+                make_primary = default_make_primary
+            if requested_cluster_key and requested_cluster_key == default_cluster_key_for_method(method) and not make_primary:
+                warnings.append(
+                    f"cluster_key '{requested_cluster_key}' is the primary alias for {method}; forcing make_primary=true."
+                )
+                make_primary = True
 
-            if method == "leiden":
-                run_leiden(adata, resolution=resolution)
-                cluster_key = "leiden"
-            else:
-                run_phenograph(adata, resolution=resolution)
-                cluster_key = "pheno_leiden"
+            result_payload = _apply_clustering(
+                adata,
+                method=method,
+                resolution=resolution,
+                cluster_key=cluster_key,
+                make_primary=bool(make_primary),
+            )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_clustering")
             if output_path:
                 write_h5ad_safe(adata, output_path)
-            sizes = adata.obs[cluster_key].value_counts().to_dict()
+            artifacts_created = []
+            if output_path:
+                artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
+                if artifact is not None:
+                    artifacts_created.append(artifact)
 
-            return json.dumps({
+            clustering_result = {
                 "status": "ok",
                 "tool": "run_clustering",
                 "output_path": output_path,
                 "saved": output_path is not None,
-                "method": method,
-                "resolution": resolution,
-                "n_clusters": len(sizes),
-                "cluster_sizes": {str(k): int(v) for k, v in sizes.items()},
+                "method": result_payload["method"],
+                "resolution": result_payload["resolution"],
+                "cluster_key": result_payload["cluster_key"],
+                "primary_cluster_key": result_payload["primary_cluster_key"],
+                "make_primary": bool(make_primary),
+                "n_clusters": result_payload["n_clusters"],
+                "cluster_sizes": result_payload["cluster_sizes"],
+                "available_clusterings": result_payload["clusterings"],
                 "warnings": warnings,
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            primary_key = result_payload["primary_cluster_key"]
+            verification_checks = [
+                _check(
+                    "cluster_key_created",
+                    result_payload["cluster_key"] in adata.obs.columns,
+                    f"Clustering column '{result_payload['cluster_key']}' exists in adata.obs.",
+                ),
+                _check(
+                    "cluster_count_matches",
+                    adata.obs[result_payload["cluster_key"]].nunique() == result_payload["n_clusters"],
+                    "Reported cluster count matches the stored clustering column.",
+                ),
+                _check(
+                    "primary_alias_available",
+                    primary_key in adata.obs.columns,
+                    f"Primary clustering alias '{primary_key}' is available.",
+                ),
+            ]
+            return _finalize_result(
+                clustering_result,
+                adata,
+                dataset_changed=True,
+                summary=(
+                    f"Ran {result_payload['method']} clustering at resolution {result_payload['resolution']} "
+                    f"and stored results in '{result_payload['cluster_key']}'."
+                ),
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "Clustering results were created and verified against the AnnData state.",
+                    verification_checks,
+                ),
+            )
+
+        elif tool_name == "compare_clusterings":
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            method = tool_input.get("method", "leiden")
+            resolutions = [float(value) for value in tool_input.get("resolutions", [])]
+            if not resolutions:
+                raise ValueError("compare_clusterings requires at least one resolution.")
+
+            compare_results = []
+            figure_dir = tool_input.get("figure_dir")
+            generate_figures = bool(tool_input.get("generate_figures", False))
+            include_images = bool(tool_input.get("include_images", False))
+            promote_resolution = tool_input.get("promote_resolution")
+            image_payloads = []
+
+            if figure_dir:
+                os.makedirs(figure_dir, exist_ok=True)
+
+            for resolution in resolutions:
+                cluster_key = infer_cluster_key(method, resolution)
+                result_payload = _apply_clustering(
+                    adata,
+                    method=method,
+                    resolution=resolution,
+                    cluster_key=cluster_key,
+                    make_primary=False,
+                )
+                compare_entry = {
+                    "resolution": result_payload["resolution"],
+                    "cluster_key": result_payload["cluster_key"],
+                    "n_clusters": result_payload["n_clusters"],
+                    "cluster_sizes": result_payload["cluster_sizes"],
+                }
+
+                if generate_figures and "X_umap" in adata.obsm:
+                    path_root = figure_dir or "."
+                    figure_name = f"umap_{cluster_key}.png"
+                    figure_path = os.path.join(path_root, figure_name)
+                    figure_result = _render_figure(
+                        adata,
+                        plot_type="umap",
+                        output_path=figure_path,
+                        color_by=cluster_key,
+                        include_image=include_images,
+                    )
+                    compare_entry["figure_path"] = figure_path
+                    if include_images and "image_base64" in figure_result:
+                        image_payloads.append({
+                            "cluster_key": cluster_key,
+                            "output_path": figure_path,
+                            "image_base64": figure_result["image_base64"],
+                            "image_mime": figure_result["image_mime"],
+                        })
+
+                compare_results.append(compare_entry)
+
+            if promote_resolution is not None:
+                promote_key = infer_cluster_key(method, float(promote_resolution))
+                if promote_key not in adata.obs.columns:
+                    raise ValueError(
+                        f"Cannot promote resolution {promote_resolution}; "
+                        f"expected clustering key '{promote_key}' was not generated."
+                    )
+                promote_clustering_to_primary(
+                    adata,
+                    cluster_key=promote_key,
+                    method=method,
+                    resolution=float(promote_resolution),
+                    created_by="tool",
+                )
+
+            result = {
+                "status": "ok",
+                "tool": "compare_clusterings",
+                "method": "phenograph" if str(method).lower() == "phenograph" else "leiden",
+                "comparisons": compare_results,
+                "available_clusterings": _clusterings_payload(adata),
+                "warnings": warnings,
+                "state": make_state(adata),
+            }
+            if image_payloads:
+                first = image_payloads[0]
+                result["image_base64"] = first["image_base64"]
+                result["image_mime"] = first["image_mime"]
+                result["image_context"] = {
+                    "cluster_key": first["cluster_key"],
+                    "output_path": first["output_path"],
+                }
+            artifacts_created = [
+                artifact
+                for artifact in (
+                    _artifact_payload(
+                        comparison.get("figure_path"),
+                        role="comparison_figure",
+                        metadata={"cluster_key": comparison.get("cluster_key")},
+                    )
+                    for comparison in compare_results
+                    if comparison.get("figure_path")
+                )
+                if artifact is not None
+            ]
+            decisions = []
+            if promote_resolution is None:
+                clustering_decision = decision_for_clustering_selection(
+                    compare_results,
+                    source_tool="compare_clusterings",
+                )
+                if clustering_decision is not None:
+                    decisions.append(clustering_decision)
+            verification_checks = [
+                _check(
+                    "comparison_keys_created",
+                    all(comparison["cluster_key"] in adata.obs.columns for comparison in compare_results),
+                    "Every compared clustering key exists in adata.obs.",
+                ),
+            ]
+            if artifacts_created:
+                verification_checks.append(
+                    _check(
+                        "comparison_figures_exist",
+                        all(os.path.exists(artifact["path"]) for artifact in artifacts_created),
+                        "Generated comparison figures exist on disk.",
+                    )
+                )
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=True,
+                summary="Generated a safe multi-resolution clustering comparison without overwriting prior results.",
+                artifacts_created=artifacts_created,
+                decisions_raised=decisions,
+                verification=_build_verification(
+                    "passed",
+                    "All requested clustering comparisons were preserved and verified.",
+                    verification_checks,
+                ),
+            )
 
         elif tool_name == "run_celltypist":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             model = tool_input.get("model", "Immune_All_Low.pkl")
             majority = tool_input.get("majority_voting", True)
+            cluster_key = tool_input.get("cluster_key", "leiden")
+            if majority:
+                cluster_key = _validate_obs_column(
+                    adata,
+                    cluster_key,
+                    warnings,
+                    required=True,
+                    context="cluster_key",
+                )
 
-            run_celltypist(adata, model=model, majority_voting=majority)
+            run_celltypist(
+                adata,
+                model=model,
+                majority_voting=majority,
+                over_clustering=cluster_key if majority else None,
+            )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_celltypist")
             if output_path:
@@ -2057,32 +3137,64 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     "count": int(count),
                     "percent": round(100.0 * count / total_cells, 1)
                 }
-
-            return json.dumps({
+            artifacts_created = []
+            if output_path:
+                artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
+                if artifact is not None:
+                    artifacts_created.append(artifact)
+            celltypist_result = {
                 "status": "ok",
                 "tool": "run_celltypist",
                 "output_path": output_path,
                 "saved": output_path is not None,
                 "model": model,
                 "majority_voting": majority,
+                "cluster_key_used": cluster_key if majority else None,
                 "total_cells": total_cells,
                 "n_types": len(all_counts),
                 "annotation_key": key,
                 "cell_type_breakdown": type_breakdown,
                 "warnings": warnings,
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            return _finalize_result(
+                celltypist_result,
+                adata,
+                dataset_changed=True,
+                summary="Ran CellTypist annotation and recorded the annotation source in session state.",
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "CellTypist annotations were written to AnnData.",
+                    [
+                        _check("annotation_key_present", key in adata.obs.columns, f"Annotation column '{key}' exists."),
+                        _check(
+                            "cluster_key_valid",
+                            not majority or cluster_key in adata.obs.columns,
+                            f"Cluster key '{cluster_key}' is valid for majority voting." if majority else "Majority voting was disabled.",
+                        ),
+                    ],
+                ),
+            )
 
         elif tool_name == "run_scimilarity":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             model_path = tool_input.get("model_path")
+            cluster_key = tool_input.get("cluster_key", "leiden")
+            cluster_key = _validate_obs_column(
+                adata,
+                cluster_key,
+                warnings,
+                required=False,
+                context="cluster_key",
+            ) or "leiden"
 
             # Only pass model_path if specified, otherwise use default
             if model_path:
-                run_scimilarity(adata, model_path=model_path)
+                run_scimilarity(adata, model_path=model_path, cluster_key=cluster_key)
             else:
-                run_scimilarity(adata)
+                run_scimilarity(adata, cluster_key=cluster_key)
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_scimilarity")
             if output_path:
@@ -2103,8 +3215,12 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                     "count": int(count),
                     "percent": round(100.0 * count / total_cells, 1)
                 }
-
-            return json.dumps({
+            artifacts_created = []
+            if output_path:
+                artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
+                if artifact is not None:
+                    artifacts_created.append(artifact)
+            scimilarity_result = {
                 "status": "ok",
                 "tool": "run_scimilarity",
                 "output_path": output_path,
@@ -2112,11 +3228,31 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "total_cells": total_cells,
                 "n_types": len(all_counts),
                 "annotation_key": key,
+                "cluster_key_used": cluster_key,
                 "has_embeddings": "X_scimilarity" in adata.obsm,
                 "cell_type_breakdown": type_breakdown,
                 "warnings": warnings,
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            return _finalize_result(
+                scimilarity_result,
+                adata,
+                dataset_changed=True,
+                summary="Ran Scimilarity annotation and recorded the representative predictions.",
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "Scimilarity outputs were written to AnnData.",
+                    [
+                        _check("annotation_key_present", key in adata.obs.columns, f"Annotation column '{key}' exists."),
+                        _check(
+                            "cluster_key_valid",
+                            cluster_key in adata.obs.columns,
+                            f"Cluster key '{cluster_key}' is available for cluster-level summaries.",
+                        ),
+                    ],
+                ),
+            )
 
         elif tool_name == "save_data":
             if adata is None:
@@ -2135,8 +3271,8 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 }, indent=2), adata
 
             save_details = write_h5ad_safe(adata, output_path)
-
-            return json.dumps({
+            artifact = _artifact_payload(output_path, role="saved_dataset", metadata={"save_mode": save_details.get("save_mode", "direct")})
+            save_result = {
                 "status": "ok",
                 "tool": "save_data",
                 "output_path": output_path,
@@ -2145,13 +3281,33 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "warnings": save_details.get("warnings", []),
                 "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            return _finalize_result(
+                save_result,
+                adata,
+                dataset_changed=False,
+                summary="Saved the current in-memory AnnData as a final dataset artifact.",
+                artifacts_created=[artifact] if artifact is not None else [],
+                verification=_build_verification(
+                    "passed",
+                    "The AnnData output file exists and was registered as an artifact.",
+                    [
+                        _check("output_exists", os.path.exists(output_path), f"Saved output exists at {output_path}."),
+                    ],
+                ),
+            )
 
         elif tool_name == "run_batch_correction":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             method = tool_input.get("method", "harmony")
-            batch_key = _validate_obs_column(adata, tool_input["batch_key"], warnings, required=True, context="batch_key")
+            requested_batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
+            if not requested_batch_key:
+                raise ValueError(
+                    "No batch_key was provided and no confirmed batch_key exists in session state. "
+                    "Confirm the correct batch column first."
+                )
+            batch_key = _validate_obs_column(adata, requested_batch_key, warnings, required=True, context="batch_key")
 
             # Get batch sizes for output
             batch_sizes = adata.obs[batch_key].value_counts().to_dict()
@@ -2170,8 +3326,30 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
             if output_path:
                 write_h5ad_safe(adata, output_path)
-
-            return json.dumps({
+            artifacts_created = []
+            if output_path:
+                artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
+                if artifact is not None:
+                    artifacts_created.append(artifact)
+            batch_strategy = {
+                "status": "user_selected" if tool_input.get("batch_key") else "auto_selected",
+                "requested_column": tool_input.get("batch_key"),
+                "applied_column": batch_key,
+                "recommended_column": batch_key,
+                "recommended_role": "batch",
+                "needs_user_confirmation": False,
+                "reason": f"Using '{batch_key}' for batch correction.",
+                "candidates": [{"column": batch_key}],
+            }
+            decisions = []
+            batch_decision = decision_for_batch_strategy(
+                batch_strategy,
+                context="batch_correction",
+                source_tool="run_batch_correction",
+            )
+            if batch_decision is not None:
+                decisions.append(batch_decision)
+            batch_result = {
                 "status": "ok",
                 "tool": "run_batch_correction",
                 "output_path": output_path,
@@ -2185,7 +3363,24 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
                 "note": f"UMAP recomputed using corrected {corrected_rep} embedding",
                 "warnings": warnings,
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            return _finalize_result(
+                batch_result,
+                adata,
+                dataset_changed=True,
+                summary=f"Applied {method} batch correction using '{batch_key}' and recomputed the neighborhood graph.",
+                artifacts_created=artifacts_created,
+                decisions_raised=decisions,
+                verification=_build_verification(
+                    "passed",
+                    "Batch correction completed and the corrected embedding is available.",
+                    [
+                        _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists in adata.obs."),
+                        _check("corrected_embedding_present", corrected_rep in adata.obsm, f"Corrected embedding '{corrected_rep}' exists in adata.obsm."),
+                        _check("umap_present", "X_umap" in adata.obsm, "UMAP was recomputed after correction."),
+                    ],
+                ),
+            )
 
         elif tool_name == "run_deg":
             from ..analysis.deg import run_validated_deg, get_deg_caveats
@@ -2289,7 +3484,6 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             }, indent=2), adata
 
         elif tool_name == "run_gsea":
-            import os
             import scanpy as sc
             from ..analysis.deg import get_deg_validity, get_cluster_caveats
 
@@ -2436,11 +3630,6 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             return json.dumps(response, indent=2), adata
 
         elif tool_name == "generate_figure":
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import scanpy as sc
-
             adata, _ = get_adata(tool_input, adata)
             plot_type = tool_input["plot_type"]
             output_path = tool_input.get("output_path")
@@ -2450,36 +3639,43 @@ def process_tool_call(tool_name: str, tool_input: Dict[str, Any], adata=None) ->
             color_by = tool_input.get("color_by", "leiden")
             genes = tool_input.get("genes", [])
             include_image = tool_input.get("include_image", True)
-
-            fig, ax = plt.subplots(figsize=(10, 8))
-
+            result = _render_figure(
+                adata,
+                plot_type=plot_type,
+                output_path=output_path,
+                color_by=color_by,
+                genes=genes,
+                include_image=include_image,
+            )
+            result["available_clusterings"] = _clusterings_payload(adata)
+            artifact = _artifact_payload(
+                output_path,
+                role="figure",
+                metadata={"plot_type": plot_type, "color_by": color_by},
+            )
+            verification_checks = [
+                _check("figure_exists", os.path.exists(output_path), f"Figure exists at {output_path}."),
+            ]
             if plot_type == "umap":
-                sc.pl.umap(adata, color=color_by, ax=ax, show=False)
-            elif plot_type == "violin":
-                sc.pl.violin(adata, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
-            elif plot_type == "dotplot" and genes:
-                sc.pl.dotplot(adata, var_names=genes, groupby=color_by, show=False)
-            elif plot_type == "heatmap" and genes:
-                sc.pl.heatmap(adata, var_names=genes, groupby=color_by, show=False)
-
-            plt.tight_layout()
-            plt.savefig(output_path, dpi=150, bbox_inches='tight')
-            plt.close()
-
-            result = {
-                "status": "ok",
-                "tool": "generate_figure",
-                "output_path": output_path,
-                "plot_type": plot_type,
-                "color_by": color_by,
-            }
-
-            # Include base64 image for vision models
-            if include_image:
-                result["image_base64"] = encode_image_base64(output_path)
-                result["image_mime"] = get_image_mime_type(output_path)
-
-            return json.dumps(result, indent=2), adata
+                verification_checks.append(
+                    _check(
+                        "color_key_valid",
+                        color_by in adata.obs.columns or color_by in adata.var_names,
+                        f"Color key '{color_by}' exists in AnnData.",
+                    )
+                )
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=False,
+                summary=f"Generated a {plot_type} figure colored by '{color_by}'.",
+                artifacts_created=[artifact] if artifact is not None else [],
+                verification=_build_verification(
+                    "passed",
+                    "Figure output was created and verified.",
+                    verification_checks,
+                ),
+            )
 
         else:
             return json.dumps({
