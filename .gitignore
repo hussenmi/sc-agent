@@ -35,6 +35,7 @@ wheels/
 
 # IDEs
 .vscode/
+.codex
 .idea/
 *.swp
 *.swo
@@ -59,9 +60,13 @@ htmlcov/
 # Test output and workshop slides
 test_output/
 workshop_slides/
+skills/
+runs/
+run*
+analysis/
 
 # macOS metadata files
 ._*
 
 # some files
-test.py
+test*.py

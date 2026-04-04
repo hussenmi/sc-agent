@@ -224,6 +224,11 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "question": {"type": "string", "description": "The question to ask the user"},
                     "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices"},
+                    "option_actions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional machine-readable action hints aligned by index with options (for example run_qc_apply, run_celltypist, review_artifact)."
+                    },
                     "default": {"type": "string", "description": "Default answer if user just presses enter"},
                     "decision_key": {"type": "string", "description": "Optional state key to persist if the user answers explicitly (for example batch_key or primary_clustering)."}
                 },
@@ -232,11 +237,11 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_code",
-            "description": "Execute custom Python code on the AnnData object. Use this for operations not covered by other tools, like: gene ID conversion, custom filtering, subsetting, merging datasets, plotting, or any data manipulation. The code has access to 'adata', 'sc' (scanpy), 'plt' (matplotlib), 'np', 'pd'. For plots, save to a file path.",
+            "description": "FLEXIBLE FALLBACK: Execute custom Python code on the AnnData object. This is your most versatile tool - use it for ANY valid request not covered by specialized tools. Examples: custom plots (variance explained, gene correlations, histograms), data filtering (remove clusters, subset cells), calculations (cluster sizes, gene stats), or any scanpy/pandas operation. Access: adata, sc (scanpy), plt (matplotlib), np, pd, output_dir, Path, ensure_dir(path). Use ensure_dir() to create directories before saving. ALWAYS prefer this over saying 'I can't do that'.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Python code to execute. Has access to adata, sc, plt, np, pd."},
+                    "code": {"type": "string", "description": "Python code to execute. Has access to adata, sc, plt, np, pd, output_dir, Path, ensure_dir(). Do NOT import os - use Path and ensure_dir instead."},
                     "description": {"type": "string", "description": "Brief description of what the code does"},
                     "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
                 },
@@ -769,6 +774,64 @@ def process_tool_call(
             "notes": notes,
         }
 
+    def _available_annotation_keys(adata_obj) -> List[str]:
+        return [
+            column
+            for column in adata_obj.obs.columns
+            if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label"))
+        ]
+
+    def _available_plot_colors(adata_obj) -> List[str]:
+        preferred = [
+            "leiden",
+            "sample_id",
+            "batch",
+            "sample",
+            "pct_counts_mt",
+            "total_counts",
+            "n_genes_by_counts",
+        ]
+        available: List[str] = []
+        for candidate in preferred + list(adata_obj.obs.columns):
+            if candidate in adata_obj.obs.columns and candidate not in available:
+                available.append(candidate)
+        return available[:20]
+
+    def _smart_unavailable_result(
+        *,
+        tool: str,
+        message: str,
+        adata_obj,
+        recovery_options: List[str],
+        missing_prerequisites: List[str] | None = None,
+        extra: Dict[str, Any] | None = None,
+    ):
+        payload = {
+            "status": "warning",
+            "tool": tool,
+            "message": message,
+            "missing_prerequisites": missing_prerequisites or [],
+            "recovery_options": recovery_options,
+            "available_clusterings": _clusterings_payload(adata_obj) if adata_obj is not None else [],
+            "available_annotation_keys": _available_annotation_keys(adata_obj) if adata_obj is not None else [],
+            "available_plot_colors": _available_plot_colors(adata_obj) if adata_obj is not None else [],
+            "state": make_state(adata_obj) if adata_obj is not None else {},
+        }
+        if extra:
+            payload.update(extra)
+        return _finalize_result(
+            payload,
+            adata_obj,
+            dataset_changed=False,
+            summary=message,
+            verification=_build_verification(
+                "warning",
+                message,
+                [],
+                recovery_options=recovery_options,
+            ),
+        )
+
     def get_adata(tool_input, existing_adata, update_memory: bool = True, prefer_memory: bool = False):
         """Get adata from memory or load from disk.
 
@@ -889,7 +952,7 @@ def process_tool_call(
         *,
         plot_type: str,
         output_path: str,
-        color_by: str = "leiden",
+        color_by: str | None = None,
         genes=None,
         include_image: bool = True,
     ):
@@ -902,13 +965,18 @@ def process_tool_call(
         if plot_type == "umap":
             if "X_umap" not in adata_obj.obsm:
                 raise ValueError("UMAP embedding not found. Run run_dimred first.")
-            if color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
+            if color_by in ("", None):
+                color_by = None
+            elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
                 raise ValueError(f"'{color_by}' is not available for UMAP coloring.")
 
         fig, ax = plt.subplots(figsize=(10, 8))
 
         if plot_type == "umap":
-            sc.pl.umap(adata_obj, color=color_by, ax=ax, show=False)
+            if color_by is None:
+                sc.pl.umap(adata_obj, ax=ax, show=False)
+            else:
+                sc.pl.umap(adata_obj, color=color_by, ax=ax, show=False)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -1292,7 +1360,6 @@ def process_tool_call(
 
     def search_pubmed(query: str, max_results: int = 5, recent_years: int = 5, reviews_only: bool = False) -> List[Dict[str, Any]]:
         """Search PubMed and return structured article metadata."""
-        import re
         import requests
         from datetime import datetime
 
@@ -1366,7 +1433,6 @@ def process_tool_call(
         """Fetch a URL and return a compact, structured text summary."""
         import html
         import io
-        import re
         from urllib.parse import urlparse
         import requests
 
@@ -1515,6 +1581,7 @@ def process_tool_call(
                 "tool": "ask_user",
                 "question": tool_input["question"],
                 "options": tool_input.get("options", []),
+                "option_actions": tool_input.get("option_actions", []),
                 "default": tool_input.get("default", ""),
                 "decision_key": tool_input.get("decision_key", ""),
             }, indent=2), adata
@@ -1533,21 +1600,31 @@ def process_tool_call(
             save_warning = None
 
             # Security: basic checks (not foolproof, but helps)
+            # Note: "import os" is blocked but pathlib.Path is allowed in namespace
             forbidden = ["import os", "import sys", "subprocess", "eval(",
-                        "__import__", "rm -rf", "shutil.rmtree", "requests."]
+                        "__import__", "rm -rf", "shutil.rmtree", "requests.",
+                        "os.system", "os.popen", "os.exec"]
             for f in forbidden:
                 if f in code:
                     return json.dumps({
                         "status": "error",
                         "tool": "run_code",
-                        "message": f"Forbidden operation: {f}"
+                        "message": f"Forbidden operation: {f}. Use Path from namespace for file operations."
                     }, indent=2), adata
 
             # Load data if needed
             if adata is None and "data_path" in tool_input:
                 adata = get_adata(tool_input, adata)
 
+            # Helper function for safe directory creation
+            from pathlib import Path as _Path
+            def ensure_dir(path):
+                """Safely create directory if it doesn't exist."""
+                _Path(path).mkdir(parents=True, exist_ok=True)
+                return str(path)
+
             # Execute in controlled namespace
+            # Note: Path and ensure_dir are provided - no need to import os
             namespace = {
                 "adata": adata,
                 "sc": sc,
@@ -1556,6 +1633,9 @@ def process_tool_call(
                 "plt": plt,
                 "scanpy": sc,
                 "matplotlib": matplotlib,
+                "output_dir": tool_input.get("output_dir", "."),
+                "Path": _Path,  # Safe path operations
+                "ensure_dir": ensure_dir,  # Helper for creating directories
             }
 
             # Capture stdout so LLM can see print outputs
@@ -1575,6 +1655,7 @@ def process_tool_call(
 
             captured_output = stdout_capture.getvalue()
             adata = namespace.get("adata", adata)
+            custom_output_path = namespace.get("output_path")
 
             # Check if any figures were created
             figures_saved = []
@@ -1620,6 +1701,8 @@ def process_tool_call(
                 result.setdefault("warnings", []).append(save_warning)
             if code_file:
                 result["code_file"] = code_file
+            if custom_output_path:
+                result["output_path"] = str(custom_output_path)
             if captured_output:
                 # Truncate if too long
                 result["output"] = captured_output[:2000]
@@ -1678,8 +1761,6 @@ def process_tool_call(
             return json.dumps(fetched, indent=2), adata
 
         elif tool_name == "research_findings":
-            import re
-
             pathway = tool_input["pathway"]
             cell_type = tool_input["cell_type"]
             genes = tool_input.get("genes", [])
@@ -2203,6 +2284,19 @@ def process_tool_call(
             cluster = tool_input["cluster"]
             n_genes = tool_input.get("n_genes", 10)
 
+            if "rank_genes_groups" not in working_adata.uns:
+                return _smart_unavailable_result(
+                    tool="get_top_markers",
+                    message="Top markers are not available because differential expression has not been run yet.",
+                    adata_obj=updated_adata,
+                    missing_prerequisites=["deg"],
+                    recovery_options=[
+                        "Run differential expression on the current clustering first.",
+                        "Inspect available clusterings before choosing a DEG grouping.",
+                    ],
+                    extra={"cluster": cluster},
+                )
+
             markers_df = get_top_markers(working_adata, group=cluster, n_genes=n_genes)
             markers = markers_df[['names', 'scores', 'logfoldchanges', 'pvals_adj']].to_dict('records')
 
@@ -2254,7 +2348,16 @@ def process_tool_call(
                         break
 
             if not key or key not in working_adata.obs:
-                return json.dumps({"status": "error", "message": "No cell type annotations found"}), updated_adata
+                return _smart_unavailable_result(
+                    tool="get_celltypes",
+                    message="No cell type annotations are available on the current in-memory dataset.",
+                    adata_obj=updated_adata,
+                    missing_prerequisites=["annotation"],
+                    recovery_options=[
+                        "Run cell type annotation on the current clustering.",
+                        "Inspect available clustering keys before annotating.",
+                    ],
+                )
 
             counts = working_adata.obs[key].value_counts()
             total_cells = working_adata.n_obs
@@ -2579,38 +2682,120 @@ def process_tool_call(
                 os.makedirs(figure_dir, exist_ok=True)
                 try:
                     qc_plot_adata = qc_preview.copy()
-                    violin_keys = []
+
+                    # Add log-transformed columns for visualization
                     if "total_counts" in qc_plot_adata.obs.columns:
                         qc_plot_adata.obs["log10_total_counts"] = np.log10(qc_plot_adata.obs["total_counts"] + 1)
-                        violin_keys.append("log10_total_counts")
                     if "n_genes_by_counts" in qc_plot_adata.obs.columns:
-                        qc_plot_adata.obs["log10_n_genes_by_counts"] = np.log10(qc_plot_adata.obs["n_genes_by_counts"] + 1)
-                        violin_keys.append("log10_n_genes_by_counts")
-                    violin_keys.extend(
-                        key for key in ["pct_counts_mt", "pct_counts_ribo", "doublet_score"]
-                        if key in qc_plot_adata.obs.columns
-                    )
-                    if violin_keys:
-                        sc.pl.violin(qc_plot_adata, violin_keys, jitter=0.2, multi_panel=True, show=False)
-                        violin_path = os.path.join(figure_dir, "qc_violin.png")
+                        qc_plot_adata.obs["log10_n_genes"] = np.log10(qc_plot_adata.obs["n_genes_by_counts"] + 1)
+
+                    # --- Figure 1: Main QC violin plots (log counts, log genes, MT%, ribo%) ---
+                    main_violin_keys = []
+                    if "log10_total_counts" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("log10_total_counts")
+                    if "log10_n_genes" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("log10_n_genes")
+                    if "pct_counts_mt" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("pct_counts_mt")
+                    if "pct_counts_ribo" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("pct_counts_ribo")
+
+                    if main_violin_keys:
+                        sc.pl.violin(qc_plot_adata, main_violin_keys, jitter=0.2, multi_panel=True, show=False)
+                        plt.suptitle("QC Metrics Distribution", y=1.02)
+                        violin_path = os.path.join(figure_dir, "qc_violin_metrics.png")
                         plt.savefig(violin_path, dpi=150, bbox_inches='tight')
                         plt.close()
                         figure_outputs.append(violin_path)
 
+                    # --- Figure 2: Doublet scores (if available) ---
+                    if "doublet_score" in qc_plot_adata.obs.columns:
+                        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                        # Violin of doublet scores
+                        sc.pl.violin(qc_plot_adata, "doublet_score", jitter=0.2, ax=axes[0], show=False)
+                        axes[0].set_title("Doublet Score Distribution")
+                        # Histogram with threshold
+                        axes[1].hist(qc_plot_adata.obs["doublet_score"], bins=50, edgecolor='black', alpha=0.7)
+                        axes[1].axvline(0.25, color='red', linestyle='--', label='Typical threshold (0.25)')
+                        axes[1].set_xlabel("Doublet Score")
+                        axes[1].set_ylabel("Cell Count")
+                        axes[1].set_title("Doublet Score Histogram")
+                        axes[1].legend()
+                        fig.tight_layout()
+                        doublet_path = os.path.join(figure_dir, "qc_doublet_scores.png")
+                        fig.savefig(doublet_path, dpi=150, bbox_inches='tight')
+                        plt.close(fig)
+                        figure_outputs.append(doublet_path)
+
+                    # --- Figure 3: Histograms for counts and genes (log scale) ---
+                    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                    if "total_counts" in qc_plot_adata.obs.columns:
+                        axes[0].hist(qc_plot_adata.obs["total_counts"], bins=100, edgecolor='black', alpha=0.7)
+                        axes[0].set_xscale('log')
+                        axes[0].set_xlabel("Total Counts (log scale)")
+                        axes[0].set_ylabel("Cell Count")
+                        axes[0].set_title("Library Size Distribution")
+                    if "n_genes_by_counts" in qc_plot_adata.obs.columns:
+                        axes[1].hist(qc_plot_adata.obs["n_genes_by_counts"], bins=100, edgecolor='black', alpha=0.7)
+                        axes[1].set_xscale('log')
+                        axes[1].set_xlabel("Genes Detected (log scale)")
+                        axes[1].set_ylabel("Cell Count")
+                        axes[1].set_title("Genes per Cell Distribution")
+                    fig.tight_layout()
+                    hist_path = os.path.join(figure_dir, "qc_histograms.png")
+                    fig.savefig(hist_path, dpi=150, bbox_inches='tight')
+                    plt.close(fig)
+                    figure_outputs.append(hist_path)
+
+                    # --- Figure 4: MT% histogram with threshold line ---
+                    if "pct_counts_mt" in qc_plot_adata.obs.columns:
+                        fig, ax = plt.subplots(figsize=(8, 4))
+                        ax.hist(qc_plot_adata.obs["pct_counts_mt"], bins=100, edgecolor='black', alpha=0.7)
+                        ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=2,
+                                   label=f'Threshold: {mt_threshold:.1f}%')
+                        ax.set_xlabel("Mitochondrial %")
+                        ax.set_ylabel("Cell Count")
+                        ax.set_title("Mitochondrial Content Distribution")
+                        ax.legend()
+                        fig.tight_layout()
+                        mt_hist_path = os.path.join(figure_dir, "qc_mt_histogram.png")
+                        fig.savefig(mt_hist_path, dpi=150, bbox_inches='tight')
+                        plt.close(fig)
+                        figure_outputs.append(mt_hist_path)
+
+                    # --- Figure 5: Scatter plots (genes vs counts, MT vs counts) ---
                     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
                     if 'n_genes_by_counts' in qc_plot_adata.obs.columns and 'total_counts' in qc_plot_adata.obs.columns:
                         sc.pl.scatter(qc_plot_adata, x='total_counts', y='n_genes_by_counts', ax=axes[0], show=False)
                         axes[0].set_xscale('log')
                         axes[0].set_yscale('log')
+                        axes[0].set_title("Genes vs Counts (log-log)")
                     if 'pct_counts_mt' in qc_plot_adata.obs.columns and 'total_counts' in qc_plot_adata.obs.columns:
                         sc.pl.scatter(qc_plot_adata, x='total_counts', y='pct_counts_mt', ax=axes[1], show=False)
                         axes[1].set_xscale('log')
-                        axes[1].axhline(mt_threshold, color='red', linestyle='--', linewidth=1)
-                    scatter_path = os.path.join(figure_dir, "qc_scatter.png")
+                        axes[1].axhline(mt_threshold, color='red', linestyle='--', linewidth=2,
+                                        label=f'MT threshold: {mt_threshold:.1f}%')
+                        axes[1].set_title("MT% vs Counts")
+                        axes[1].legend()
                     fig.tight_layout()
+                    scatter_path = os.path.join(figure_dir, "qc_scatter.png")
                     fig.savefig(scatter_path, dpi=150, bbox_inches='tight')
                     plt.close(fig)
                     figure_outputs.append(scatter_path)
+
+                    # --- Figure 6: Ribo vs MT scatter (if both available) ---
+                    if 'pct_counts_mt' in qc_plot_adata.obs.columns and 'pct_counts_ribo' in qc_plot_adata.obs.columns:
+                        fig, ax = plt.subplots(figsize=(6, 5))
+                        sc.pl.scatter(qc_plot_adata, x='pct_counts_mt', y='pct_counts_ribo', ax=ax, show=False)
+                        ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=1, label=f'MT threshold')
+                        ax.set_title("Ribosomal vs Mitochondrial Content")
+                        ax.legend()
+                        fig.tight_layout()
+                        ribo_mt_path = os.path.join(figure_dir, "qc_ribo_vs_mt.png")
+                        fig.savefig(ribo_mt_path, dpi=150, bbox_inches='tight')
+                        plt.close(fig)
+                        figure_outputs.append(ribo_mt_path)
+
                 except Exception as e:
                     warnings.append(f"QC figure generation failed: {e}")
 
@@ -3105,6 +3290,21 @@ def process_tool_call(
             model = tool_input.get("model", "Immune_All_Low.pkl")
             majority = tool_input.get("majority_voting", True)
             cluster_key = tool_input.get("cluster_key", "leiden")
+            if majority and cluster_key not in adata.obs.columns:
+                return _smart_unavailable_result(
+                    tool="run_celltypist",
+                    message=(
+                        f"CellTypist majority voting needs a valid clustering column, but '{cluster_key}' "
+                        "is not available on the current in-memory dataset."
+                    ),
+                    adata_obj=adata,
+                    missing_prerequisites=["clustering"],
+                    recovery_options=[
+                        "Run clustering first, then rerun CellTypist.",
+                        "Choose one of the available clustering keys for annotation.",
+                    ],
+                    extra={"requested_cluster_key": cluster_key},
+                )
             if majority:
                 cluster_key = _validate_obs_column(
                     adata,
@@ -3388,9 +3588,25 @@ def process_tool_call(
 
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            requested_groupby = tool_input.get("groupby", "leiden")
+            if requested_groupby not in adata.obs.columns:
+                return _smart_unavailable_result(
+                    tool="run_deg",
+                    message=(
+                        f"Differential expression needs a valid grouping column, but '{requested_groupby}' "
+                        "is not available on the current in-memory dataset."
+                    ),
+                    adata_obj=adata,
+                    missing_prerequisites=["grouping"],
+                    recovery_options=[
+                        "Run clustering first, then run DEG on the cluster key.",
+                        "Use one of the available annotation or metadata columns as the DEG grouping.",
+                    ],
+                    extra={"requested_groupby": requested_groupby},
+                )
             groupby = _validate_obs_column(
                 adata,
-                tool_input.get("groupby", "leiden"),
+                requested_groupby,
                 warnings,
                 required=True,
                 context="groupby"
@@ -3636,9 +3852,33 @@ def process_tool_call(
             if not output_path:
                 safe_color = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in str(tool_input.get("color_by", "plot")))
                 output_path = f"{plot_type}_{safe_color or 'plot'}.png"
-            color_by = tool_input.get("color_by", "leiden")
+            color_by = tool_input.get("color_by")
             genes = tool_input.get("genes", [])
             include_image = tool_input.get("include_image", True)
+            if plot_type == "umap" and "X_umap" not in adata.obsm:
+                return _smart_unavailable_result(
+                    tool="generate_figure",
+                    message="UMAP cannot be rendered because the embedding is not available on the current in-memory dataset.",
+                    adata_obj=adata,
+                    missing_prerequisites=["embedding"],
+                    recovery_options=[
+                        "Run PCA, neighbors, and UMAP first.",
+                        "If you only need a summary of current state, inspect the session instead of plotting.",
+                    ],
+                    extra={"plot_type": plot_type, "color_by": color_by},
+                )
+            if plot_type == "umap" and color_by not in (None, "") and color_by not in adata.obs.columns and color_by not in adata.var_names:
+                return _smart_unavailable_result(
+                    tool="generate_figure",
+                    message=f"UMAP coloring key '{color_by}' is not available on the current in-memory dataset.",
+                    adata_obj=adata,
+                    missing_prerequisites=["valid_color_key"],
+                    recovery_options=[
+                        "Use one of the available obs columns or genes for coloring.",
+                        "Render a plain UMAP without coloring.",
+                    ],
+                    extra={"plot_type": plot_type, "requested_color_by": color_by},
+                )
             result = _render_figure(
                 adata,
                 plot_type=plot_type,

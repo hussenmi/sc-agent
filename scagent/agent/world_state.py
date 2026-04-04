@@ -161,6 +161,122 @@ class AgentWorldState:
     recent_events: List[Dict[str, Any]] = field(default_factory=list)
     latest_verification: Dict[str, Any] = field(default_factory=dict)
 
+    def _derive_capabilities(self, adata) -> Dict[str, Any]:
+        processing = self.data_summary.get("processing", {})
+        cluster_keys = [
+            record.get("key")
+            for record in self.clustering_registry
+            if record.get("key")
+        ]
+        annotation_keys = []
+        if adata is not None:
+            annotation_keys = [
+                column
+                for column in adata.obs.columns
+                if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label"))
+            ]
+        deg_available = bool(adata is not None and "rank_genes_groups" in adata.uns)
+        primary_cluster_key = self.data_summary.get("cluster_key")
+        obs_columns = list(adata.obs.columns) if adata is not None else []
+        plot_color_candidates: List[str] = []
+        preferred = [
+            primary_cluster_key,
+            "sample_id",
+            "batch",
+            "sample",
+            "pct_counts_mt",
+            "total_counts",
+            "n_genes_by_counts",
+        ]
+        for candidate in preferred + obs_columns:
+            if candidate and candidate in obs_columns and candidate not in plot_color_candidates:
+                plot_color_candidates.append(candidate)
+        # Build available_actions list - what the agent CAN do right now
+        available_actions: List[str] = []
+        blocked_actions: List[Dict[str, str]] = []
+
+        if adata is not None:
+            # Always available
+            available_actions.extend(["run_code", "inspect_data", "save_data", "ask_user"])
+
+            # QC
+            if not processing.get("has_qc_metrics"):
+                available_actions.append("run_qc")
+
+            # Normalization - available if we have raw counts and not yet normalized
+            if processing.get("has_raw_counts") and not processing.get("is_normalized"):
+                available_actions.append("normalize_and_hvg")
+            elif not processing.get("has_raw_counts"):
+                blocked_actions.append({"action": "normalize_and_hvg", "needs": "raw counts"})
+
+            # Dimensionality reduction
+            if processing.get("is_normalized") or processing.get("has_hvg"):
+                available_actions.append("run_dimred")
+            else:
+                blocked_actions.append({"action": "run_dimred", "needs": "normalized data with HVGs"})
+
+            # Clustering
+            if processing.get("has_neighbors"):
+                available_actions.extend(["run_clustering", "compare_clusterings"])
+            elif processing.get("has_pca"):
+                available_actions.extend(["run_clustering", "compare_clusterings"])  # PhenoGraph works on PCA
+            else:
+                blocked_actions.append({"action": "run_clustering", "needs": "neighbors graph or PCA"})
+
+            # Annotation
+            if processing.get("has_clusters"):
+                available_actions.extend(["run_celltypist", "run_scimilarity"])
+            else:
+                blocked_actions.append({"action": "run_celltypist", "needs": "clustering"})
+                blocked_actions.append({"action": "run_scimilarity", "needs": "clustering"})
+
+            # DEG
+            if processing.get("has_clusters") or self.annotation_sources:
+                available_actions.append("run_deg")
+            else:
+                blocked_actions.append({"action": "run_deg", "needs": "clusters or annotations"})
+
+            # GSEA
+            if deg_available:
+                available_actions.append("run_gsea")
+            else:
+                blocked_actions.append({"action": "run_gsea", "needs": "DEG results"})
+
+            # Plotting
+            if processing.get("has_umap"):
+                available_actions.append("generate_figure")
+
+            # Batch correction
+            if processing.get("is_normalized"):
+                available_actions.append("run_batch_correction")
+
+        return {
+            "has_raw_counts": bool(processing.get("has_raw_counts")),
+            "has_normalized_matrix": bool(processing.get("is_normalized")),
+            "has_hvg": bool(processing.get("has_hvg")),
+            "has_pca": bool(processing.get("has_pca")),
+            "has_neighbors": bool(processing.get("has_neighbors")),
+            "has_umap": bool(processing.get("has_umap")),
+            "has_clusters": bool(processing.get("has_clusters")),
+            "has_annotations": bool(self.annotation_sources),
+            "deg_available": deg_available,
+            "cluster_keys": cluster_keys,
+            "primary_cluster_key": primary_cluster_key,
+            "annotation_keys": annotation_keys,
+            "obs_columns": obs_columns[:200],
+            "plot_color_candidates": plot_color_candidates[:10],
+            "can_plot_umap": bool(processing.get("has_umap")),
+            "can_plot_cluster_umap": bool(processing.get("has_umap") and processing.get("has_clusters")),
+            "can_run_clustering": bool(processing.get("has_neighbors") or processing.get("has_pca")),
+            "can_run_annotation": bool(processing.get("has_clusters")),
+            "can_run_deg": bool(processing.get("has_clusters") or self.annotation_sources),
+            "can_review_markers": deg_available,
+            # NEW: Explicit action availability for LLM reasoning
+            "available_actions": available_actions,
+            "blocked_actions": blocked_actions,
+            "run_code_note": "run_code is ALWAYS available for custom plots, filtering, or any valid analysis",
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "created_at": self.created_at,
@@ -262,6 +378,7 @@ class AgentWorldState:
             adata,
             text_context=context_text or "",
         ).to_dict()
+        self.data_summary["capabilities"] = self._derive_capabilities(adata)
 
     def register_artifact(self, artifact_payload: Dict[str, Any]) -> None:
         artifact = (

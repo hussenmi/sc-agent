@@ -27,6 +27,42 @@ logger = logging.getLogger(__name__)
 
 Provider = Literal["anthropic", "openai"]
 
+ACTION_TOOL_NAMES = {
+    "run_qc",
+    "normalize_and_hvg",
+    "run_dimred",
+    "run_clustering",
+    "compare_clusterings",
+    "run_celltypist",
+    "run_scimilarity",
+    "run_batch_correction",
+    "run_deg",
+    "run_gsea",
+    "save_data",
+    "run_code",
+    "install_package",
+}
+
+INSPECTION_TOOL_NAMES = {
+    "inspect_data",
+    "inspect_session",
+    "list_artifacts",
+    "get_cluster_sizes",
+    "get_top_markers",
+    "summarize_qc_metrics",
+    "get_celltypes",
+    "list_obs_columns",
+    "review_figure",
+    "review_artifact",
+    "inspect_run_state",
+    "inspect_workspace",
+    "web_search_docs",
+    "search_papers",
+    "fetch_url",
+    "web_search",
+    "research_findings",
+}
+
 # Load .env file if present
 def _load_dotenv():
     """Load .env file from current directory or package root."""
@@ -124,6 +160,7 @@ class SCAgent:
             "reviewed_figures": [],
             "asked_questions": [],
         }
+        self._pending_checkpoint: Optional[Dict[str, Any]] = None
 
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
@@ -209,11 +246,1163 @@ class SCAgent:
         payload["shown_figures"] = self._interaction_state["shown_figures"][-5:]
         payload["reviewed_figures"] = self._interaction_state["reviewed_figures"][-5:]
         payload["recent_questions"] = self._interaction_state["asked_questions"][-3:]
+        payload["pending_checkpoint"] = self._pending_checkpoint
         return json.dumps(payload, indent=2)
+
+    def _is_action_tool(self, tool_name: str) -> bool:
+        return tool_name in ACTION_TOOL_NAMES
+
+    def _is_inspection_tool(self, tool_name: str) -> bool:
+        return tool_name in INSPECTION_TOOL_NAMES
+
+    def _checkpoint_artifact_paths(self, result_data: Dict[str, Any]) -> List[str]:
+        paths: List[str] = []
+        for artifact in result_data.get("artifacts_created", []) or []:
+            path = artifact.get("path")
+            if path:
+                paths.append(path)
+        for key in ("output_path", "figure_path"):
+            path = result_data.get(key)
+            if path:
+                paths.append(path)
+        for figure_path in result_data.get("figures", []) or []:
+            if figure_path:
+                paths.append(figure_path)
+        deduped: List[str] = []
+        seen = set()
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            deduped.append(path)
+        return deduped[:5]
+
+    def _set_pending_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        self._pending_checkpoint = checkpoint
+        if self.run_manager:
+            self.run_manager.append_event("checkpoint_pending", checkpoint)
+
+    def _checkpoint_options(
+        self,
+        entries: List[tuple[str, str]],
+    ) -> tuple[List[str], List[str]]:
+        options = [label for label, _ in entries]
+        actions = [action for _, action in entries]
+        return options, actions
+
+    def _clear_pending_checkpoint(self, user_response: Optional[str] = None) -> None:
+        if self._pending_checkpoint and self.run_manager:
+            payload = dict(self._pending_checkpoint)
+            if user_response is not None:
+                payload["user_response"] = user_response
+            self.run_manager.append_event("checkpoint_resolved", payload)
+        self._pending_checkpoint = None
+
+    def _run_nested_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+        result_json = self._execute_tool(tool_name, tool_input)
+        try:
+            return json.loads(result_json)
+        except json.JSONDecodeError:
+            return {
+                "status": "error",
+                "tool": tool_name,
+                "message": "Nested tool execution returned invalid JSON.",
+            }
+
+    def _execute_checkpoint_action(
+        self,
+        selected_action: str,
+        checkpoint: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not selected_action or selected_action == "custom":
+            return None
+
+        action_inputs = checkpoint.get("action_inputs", {}) or {}
+        steps: List[Dict[str, Any]] = []
+
+        def run_step(tool_name: str, tool_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            payload = self._run_nested_tool(tool_name, tool_input or {})
+            steps.append(
+                {
+                    "tool": tool_name,
+                    "status": payload.get("status"),
+                    "summary": (payload.get("state_delta") or {}).get("summary", payload.get("message", "")),
+                    "checkpoint_required": payload.get("checkpoint_required", False),
+                }
+            )
+            return payload
+
+        if selected_action == "run_qc_apply":
+            qc_input = dict(action_inputs.get("run_qc_apply", {}))
+            qc_input["preview_only"] = False
+            run_step("run_qc", qc_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "run_normalize_and_hvg":
+            normalize_input = dict(action_inputs.get("run_normalize_and_hvg", {}))
+            run_step("normalize_and_hvg", normalize_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "run_dimred":
+            dimred_input = dict(action_inputs.get("run_dimred", {}))
+            run_step("run_dimred", dimred_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "run_annotation":
+            annotation_input = dict(action_inputs.get("run_annotation", {}))
+            run_step("run_celltypist", annotation_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "run_deg":
+            deg_input = dict(action_inputs.get("run_deg", {}))
+            run_step("run_deg", deg_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "save_data":
+            save_input = dict(action_inputs.get("save_data", {}))
+            if not save_input.get("output_path"):
+                if self.run_manager:
+                    save_input["output_path"] = str(self.run_manager.run_dir / "final_analyzed.h5ad")
+                else:
+                    save_input["output_path"] = "final_analyzed.h5ad"
+            run_step("save_data", save_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "compare_clusterings":
+            compare_input = dict(action_inputs.get("compare_clusterings", {}))
+            if "resolutions" not in compare_input:
+                compare_input["resolutions"] = [0.5, 1.0, 1.5]
+            compare_input.setdefault("generate_figures", True)
+            run_step("compare_clusterings", compare_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "run_clustering":
+            clustering_input = dict(action_inputs.get("run_clustering", {}))
+            run_step("run_clustering", clustering_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "render_plain_umap":
+            figure_input = dict(action_inputs.get("render_plain_umap", {}))
+            figure_input.setdefault("plot_type", "umap")
+            figure_input.setdefault("color_by", None)
+            figure_input.setdefault("include_image", True)
+            run_step("generate_figure", figure_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "list_plot_colors":
+            run_step("list_obs_columns", {})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "inspect_existing_state":
+            run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "review_post_qc_state":
+            run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "review_qc_artifacts":
+            artifact_paths = checkpoint.get("artifacts", [])
+            if artifact_paths:
+                run_step(
+                    "review_artifact",
+                    {
+                        "artifact_path": artifact_paths[0],
+                        "question": "Summarize the key QC issues in this artifact before filtering.",
+                    },
+                )
+            else:
+                run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "review_corrected_embedding":
+            artifact_paths = checkpoint.get("artifacts", [])
+            if artifact_paths:
+                run_step(
+                    "review_artifact",
+                    {
+                        "artifact_path": artifact_paths[0],
+                        "question": "Review this corrected embedding artifact and summarize whether batch structure still dominates.",
+                    },
+                )
+            else:
+                run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "review_cluster_markers":
+            cluster_key = self.world_state.data_summary.get("cluster_key") or "leiden"
+            run_step("get_cluster_sizes", {"cluster_key": cluster_key})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "review_annotation_quality":
+            annotation_key = (self._current_capabilities().get("annotation_keys") or [None])[0]
+            run_step("get_celltypes", {"annotation_key": annotation_key} if annotation_key else {})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "review_deg_results":
+            run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "inspect_batch_mixing":
+            run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "restart_from_raw":
+            run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "promote_primary_clustering":
+            run_step("inspect_session", {"include_history": True})
+            return {"selected_action": selected_action, "steps": steps}
+
+        return None
+
+    # Tools that should NOT be blocked by pending checkpoints - they're orthogonal or flexible
+    CHECKPOINT_EXEMPT_TOOLS = {
+        "run_code",  # Flexible fallback - always allow
+        "inspect_data",
+        "inspect_session",
+        "list_artifacts",
+        "get_cluster_sizes",
+        "get_top_markers",
+        "summarize_qc_metrics",
+        "get_celltypes",
+        "list_obs_columns",
+        "review_figure",
+        "review_artifact",
+        "generate_figure",  # Visualization doesn't change state
+        "save_data",  # Saving is always ok
+        "web_search_docs",
+        "search_papers",
+        "fetch_url",
+        "web_search",
+        "research_findings",
+    }
+
+    def _checkpoint_context_for_tool(self, tool_name: str) -> Optional[Dict[str, Any]]:
+        """Return checkpoint context without blocking the tool call."""
+        if not self._pending_checkpoint:
+            return None
+        return {
+            "pending_decision": self._pending_checkpoint.get("kind", "unknown"),
+            "question": self._pending_checkpoint.get("question", ""),
+            "note": "A decision point exists. You may proceed if this action addresses it or is orthogonal.",
+        }
+
+    def _blocked_by_checkpoint_result(self, tool_name: str) -> str:
+        checkpoint = self._pending_checkpoint or {}
+        return json.dumps(
+            {
+                "status": "error",
+                "tool": tool_name,
+                "message": (
+                    "A collaborative checkpoint is pending. Resolve it before running another "
+                    "state-changing step."
+                ),
+                "pending_checkpoint": checkpoint,
+                "required_next_action": "ask_user",
+            },
+            indent=2,
+        )
+
+    def _build_checkpoint_payload(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.collaborative or result_data.get("status") != "ok":
+            return None
+
+        checkpoint: Optional[Dict[str, Any]] = None
+        artifacts = self._checkpoint_artifact_paths(result_data)
+
+        if tool_name == "run_qc":
+            if tool_input.get("preview_only", False):
+                mt_threshold = tool_input.get("mt_threshold", "auto")
+                doublet_count = int(result_data.get("metrics", {}).get("predicted_doublets", 0))
+                projected_cells = result_data.get("after", {}).get("n_cells", "?")
+                question = (
+                    "QC preview is complete. I summarized the proposed removals and saved the QC figures. "
+                    "What should I do next?"
+                )
+                options, option_actions = self._checkpoint_options([
+                    (
+                        f"Apply the proposed QC filters ({projected_cells} projected cells retained)",
+                        "run_qc_apply",
+                    ),
+                    (
+                        f"Adjust the mitochondrial threshold from {mt_threshold} before applying QC",
+                        "adjust_qc_thresholds",
+                    ),
+                    (
+                        "Inspect the QC figures and flagged doublet/high-MT cells in more detail first",
+                        "review_qc_artifacts",
+                    ),
+                    ("Something else", "custom"),
+                ])
+                summary = (
+                    f"QC preview found {doublet_count} predicted doublets and estimated "
+                    f"{projected_cells} cells would remain after filtering."
+                )
+                checkpoint = {
+                    "kind": "qc_preview",
+                    "question": question,
+                    "options": options,
+                    "default": options[0],
+                    "decision_key": "qc_next_step",
+                    "summary": summary,
+                    "recommendation": options[0],
+                    "option_actions": option_actions,
+                    "action_inputs": {
+                        "run_qc_apply": {
+                            "mt_threshold": tool_input.get("mt_threshold"),
+                            "min_cells": tool_input.get("min_cells"),
+                            "remove_ribo": tool_input.get("remove_ribo", True),
+                            "remove_mt": tool_input.get("remove_mt", False),
+                            "detect_doublets_flag": tool_input.get("detect_doublets_flag", True),
+                            "batch_key": tool_input.get("batch_key"),
+                        }
+                    },
+                    "artifacts": artifacts,
+                }
+
+            else:
+                retained = result_data.get("after", {}).get("n_cells", "?")
+                summary = f"QC filtering is complete and retained {retained} cells."
+                options, option_actions = self._checkpoint_options([
+                    ("Normalize and select HVGs", "run_normalize_and_hvg"),
+                    ("Review the post-QC state and saved artifacts before continuing", "review_post_qc_state"),
+                    ("Something else", "custom"),
+                ])
+                checkpoint = {
+                    "kind": "qc_applied",
+                    "question": "QC filtering is complete. What should I do next?",
+                    "options": options,
+                    "default": options[0],
+                    "decision_key": "post_qc_next_step",
+                    "summary": summary,
+                    "recommendation": options[0],
+                    "option_actions": option_actions,
+                    "action_inputs": {
+                        "run_normalize_and_hvg": {},
+                    },
+                    "artifacts": artifacts,
+                }
+
+        elif tool_name == "normalize_and_hvg":
+            summary = "Normalization and HVG selection are complete."
+            if result_data.get("n_hvg") is not None:
+                summary = f"Normalization and HVG selection are complete ({result_data['n_hvg']} HVGs selected)."
+            options, option_actions = self._checkpoint_options([
+                ("Compute PCA, neighbors, and UMAP", "run_dimred"),
+                ("Inspect the normalized dataset state before computing embeddings", "inspect_existing_state"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "normalized",
+                "question": "Normalization and HVG selection are complete. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "normalized_next_step",
+                "summary": summary,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {
+                    "run_dimred": {},
+                },
+                "artifacts": artifacts,
+            }
+
+        elif tool_name == "run_dimred":
+            summary = "PCA, neighbors, and UMAP are complete."
+            options, option_actions = self._checkpoint_options([
+                ("Run clustering on the current embedding", "run_clustering"),
+                ("Review the embedding outputs before clustering", "review_corrected_embedding"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "dimred",
+                "question": "Dimensionality reduction is complete. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "dimred_next_step",
+                "summary": summary,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {
+                    "run_clustering": {},
+                },
+                "artifacts": artifacts,
+            }
+
+        elif tool_name in {"run_clustering", "compare_clusterings"}:
+            comparisons = result_data.get("comparisons", []) or []
+            if comparisons:
+                comparison_bits = []
+                for comparison in comparisons[:3]:
+                    comparison_bits.append(
+                        f"{comparison.get('cluster_key')} ({comparison.get('n_clusters')} clusters)"
+                    )
+                summary = "Compared clustering resolutions: " + ", ".join(comparison_bits) + "."
+                options, option_actions = self._checkpoint_options([
+                    ("Promote the recommended clustering resolution as the primary clustering", "promote_primary_clustering"),
+                    ("Review cluster sizes or marker genes before choosing a primary clustering", "review_clustering_quality"),
+                    ("Proceed with annotation using the recommended clustering", "run_annotation"),
+                    ("Something else", "custom"),
+                ])
+                checkpoint = {
+                    "kind": "clustering_comparison",
+                    "question": "I generated multiple clustering resolutions. What should I do next?",
+                    "options": options,
+                    "default": options[0],
+                    "decision_key": "primary_clustering_next_step",
+                    "summary": summary,
+                    "recommendation": options[0],
+                    "option_actions": option_actions,
+                    "action_inputs": {
+                        "compare_clusterings": {
+                            "resolutions": [
+                                comparison.get("resolution")
+                                for comparison in comparisons
+                                if comparison.get("resolution") is not None
+                            ]
+                        }
+                    },
+                    "artifacts": artifacts,
+                }
+            else:
+                cluster_key = result_data.get("cluster_key", "clustering")
+                n_clusters = result_data.get("n_clusters", "?")
+                summary = f"Clustering produced {n_clusters} clusters in '{cluster_key}'."
+                options, option_actions = self._checkpoint_options([
+                    ("Proceed to cell type annotation", "run_annotation"),
+                    ("Compare alternative clustering resolutions before annotating", "compare_clusterings"),
+                    ("Run marker analysis or cluster-size review before annotating", "review_cluster_markers"),
+                    ("Something else", "custom"),
+                ])
+                checkpoint = {
+                    "kind": "clustering",
+                    "question": "Clustering is complete. What should I do next?",
+                    "options": options,
+                    "default": options[0],
+                    "decision_key": "clustering_next_step",
+                    "summary": summary,
+                    "recommendation": options[0],
+                    "option_actions": option_actions,
+                    "action_inputs": {
+                        "run_annotation": {
+                            "majority_voting": True,
+                            "cluster_key": result_data.get("primary_cluster_key") or result_data.get("cluster_key", "leiden"),
+                        },
+                        "compare_clusterings": {
+                            "method": result_data.get("method", "leiden"),
+                            "resolutions": [0.5, 1.0, 1.5],
+                            "generate_figures": True,
+                        },
+                    },
+                    "artifacts": artifacts,
+                }
+
+        elif tool_name in {"run_celltypist", "run_scimilarity"}:
+            n_types = result_data.get("n_types", "?")
+            annotation_key = result_data.get("annotation_key", tool_name)
+            summary = f"Annotation is complete with {n_types} predicted cell types in '{annotation_key}'."
+            options, option_actions = self._checkpoint_options([
+                ("Review annotation quality and dominant labels per cluster", "review_annotation_quality"),
+                ("Run DEG on the current clustering to validate cluster identities", "run_deg"),
+                ("Save the current annotated dataset", "save_data"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "annotation",
+                "question": "Annotation is complete. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "annotation_next_step",
+                "summary": summary,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {
+                    "run_deg": {
+                        "groupby": self.world_state.data_summary.get("cluster_key") or "leiden",
+                    },
+                    "save_data": {},
+                },
+                "artifacts": artifacts,
+            }
+
+        elif tool_name == "run_batch_correction":
+            method = result_data.get("method", "batch correction")
+            batch_key = result_data.get("batch_key", "batch")
+            summary = f"Applied {method} batch correction using '{batch_key}' and recomputed the embedding."
+            options, option_actions = self._checkpoint_options([
+                ("Run clustering on the corrected representation", "run_clustering"),
+                ("Generate or review corrected UMAP figures before clustering", "review_corrected_embedding"),
+                ("Inspect batch mixing quality before continuing", "inspect_batch_mixing"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "batch_correction",
+                "question": "Batch correction is complete. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "batch_correction_next_step",
+                "summary": summary,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {
+                    "run_clustering": {},
+                },
+                "artifacts": artifacts,
+            }
+
+        elif tool_name == "run_deg":
+            groupby = result_data.get("groupby", "clusters")
+            n_groups = result_data.get("n_groups", "?")
+            summary = f"DEG is complete across {n_groups} groups using '{groupby}'."
+            options, option_actions = self._checkpoint_options([
+                ("Review top markers and caveats before any pathway analysis", "review_deg_results"),
+                ("Run GSEA for one or more interesting groups", "run_gsea"),
+                ("Save the current dataset with DEG results", "save_data"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "deg",
+                "question": "Differential expression analysis is complete. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "deg_next_step",
+                "summary": summary,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {
+                    "save_data": {},
+                },
+                "artifacts": artifacts,
+            }
+
+        elif tool_name == "inspect_data" and not self._active_request_is_followup:
+            processing = result_data.get("processing", {}) or {}
+            existing_stage = (
+                processing.get("has_clusters")
+                or result_data.get("clustering", {}).get("has_clusters")
+                or processing.get("has_umap")
+                or processing.get("is_normalized")
+            )
+            if existing_stage:
+                n_obs = result_data.get("shape", {}).get("n_obs", "?")
+                summary = (
+                    f"The loaded dataset already has existing analysis state "
+                    f"({n_obs} cells; processing includes normalization/embedding/clustering)."
+                )
+                options, option_actions = self._checkpoint_options([
+                    ("Continue from the existing processed state", "continue_existing_state"),
+                    ("Inspect the current clustering/annotation state before deciding", "inspect_existing_state"),
+                    ("Start over from the original data state if raw counts are available", "restart_from_raw"),
+                    ("Something else", "custom"),
+                ])
+                checkpoint = {
+                    "kind": "continue_existing_run",
+                    "question": "I found an already processed dataset state. What should I do next?",
+                    "options": options,
+                    "default": options[0],
+                    "decision_key": "existing_state_next_step",
+                    "summary": summary,
+                    "recommendation": options[0],
+                    "option_actions": option_actions,
+                    "action_inputs": {},
+                    "artifacts": artifacts,
+                }
+
+        return checkpoint
+
+    def _build_recovery_checkpoint(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.collaborative:
+            return None
+        if result_data.get("status") not in {"warning", "error"}:
+            return None
+
+        missing = result_data.get("missing_prerequisites") or []
+        if not missing:
+            return None
+
+        artifacts = self._checkpoint_artifact_paths(result_data)
+        message = result_data.get("message", f"{tool_name} requires additional state before it can run.")
+        checkpoint: Optional[Dict[str, Any]] = None
+
+        if tool_name == "generate_figure" and "embedding" in missing:
+            options, option_actions = self._checkpoint_options([
+                ("Compute PCA, neighbors, and UMAP now", "run_dimred"),
+                ("Inspect the current dataset state before computing embeddings", "inspect_existing_state"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "missing_embedding",
+                "question": "This plot needs a UMAP embedding that is not available yet. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "missing_embedding_next_step",
+                "summary": message,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {"run_dimred": {}},
+                "artifacts": artifacts,
+            }
+        elif tool_name == "generate_figure" and "valid_color_key" in missing:
+            options, option_actions = self._checkpoint_options([
+                ("Render a plain UMAP without coloring", "render_plain_umap"),
+                ("List the available obs columns and plot color choices", "list_plot_colors"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "invalid_plot_color",
+                "question": "The requested UMAP coloring key is not available. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "invalid_plot_color_next_step",
+                "summary": message,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {
+                    "render_plain_umap": {"plot_type": "umap", "color_by": None, "include_image": True},
+                },
+                "artifacts": artifacts,
+            }
+        elif tool_name == "run_celltypist" and "clustering" in missing:
+            options, option_actions = self._checkpoint_options([
+                ("Run clustering now, then return to annotation", "run_clustering"),
+                ("Inspect available clustering state before deciding", "inspect_existing_state"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "annotation_missing_clustering",
+                "question": "Annotation needs a valid clustering column that is not available yet. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "annotation_missing_clustering_next_step",
+                "summary": message,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {"run_clustering": {}},
+                "artifacts": artifacts,
+            }
+        elif tool_name == "run_deg" and "grouping" in missing:
+            options, option_actions = self._checkpoint_options([
+                ("Run clustering now so DEG has a grouping column", "run_clustering"),
+                ("List available obs columns to choose a DEG grouping", "list_plot_colors"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "deg_missing_grouping",
+                "question": "Differential expression needs a valid grouping column. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "deg_missing_grouping_next_step",
+                "summary": message,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {"run_clustering": {}},
+                "artifacts": artifacts,
+            }
+        elif tool_name == "get_top_markers" and "deg" in missing:
+            groupby = self.world_state.data_summary.get("cluster_key") or "leiden"
+            options, option_actions = self._checkpoint_options([
+                (f"Run DEG now using `{groupby}`", "run_deg"),
+                ("Inspect current clustering state before running DEG", "inspect_existing_state"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "markers_missing_deg",
+                "question": "Top markers are not available because DEG has not been run yet. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "markers_missing_deg_next_step",
+                "summary": message,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {"run_deg": {"groupby": groupby}},
+                "artifacts": artifacts,
+            }
+        elif tool_name == "get_celltypes" and "annotation" in missing:
+            cluster_key = self.world_state.data_summary.get("cluster_key") or "leiden"
+            options, option_actions = self._checkpoint_options([
+                ("Run cell type annotation now", "run_annotation"),
+                ("Inspect current clustering state before annotating", "inspect_existing_state"),
+                ("Something else", "custom"),
+            ])
+            checkpoint = {
+                "kind": "celltypes_missing_annotation",
+                "question": "Cell type summaries are not available because annotation has not been run yet. What should I do next?",
+                "options": options,
+                "default": options[0],
+                "decision_key": "celltypes_missing_annotation_next_step",
+                "summary": message,
+                "recommendation": options[0],
+                "option_actions": option_actions,
+                "action_inputs": {
+                    "run_annotation": {"majority_voting": True, "cluster_key": cluster_key},
+                },
+                "artifacts": artifacts,
+            }
+
+        return checkpoint
 
     def _build_system_prompt(self) -> str:
         """Attach runtime state to the static system prompt."""
         return f"{SYSTEM_PROMPT}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
+
+    def _current_capabilities(self) -> Dict[str, Any]:
+        return (self.world_state.data_summary or {}).get("capabilities", {})
+
+    def _is_yes_response(self, value: str) -> bool:
+        text = (value or "").strip().lower()
+        return text in {"y", "yes", "1", "ok", "okay", "sure", "continue", "do it", "run it", "compute it"}
+
+    def _parse_request_reconciliation(self, request: str) -> Dict[str, Any]:
+        text = (request or "").strip().lower()
+        capabilities = self._current_capabilities()
+        primary_cluster_key = capabilities.get("primary_cluster_key") or self.world_state.data_summary.get("cluster_key") or "leiden"
+        has_umap = bool(capabilities.get("has_umap"))
+        has_clusters = bool(capabilities.get("has_clusters"))
+        has_annotations = bool(capabilities.get("has_annotations"))
+        deg_available = bool(capabilities.get("deg_available"))
+        annotation_keys = capabilities.get("annotation_keys", [])
+        obs_columns = capabilities.get("obs_columns", [])
+        has_pca = bool(capabilities.get("has_pca"))
+
+        show_words = ("show", "plot", "draw", "visualize", "display", "figure")
+        wants_plot = any(word in text for word in show_words)
+        wants_umap = "umap" in text
+        wants_clustering = "leiden" in text or re.search(r"\bcluster\b", text)
+        wants_annotation = any(token in text for token in ("annotate", "annotation", "cell typist", "celltypist", "scimilarity"))
+        wants_deg = any(token in text for token in ("deg", "differential", "markers", "marker genes", "top markers"))
+        wants_celltypes_summary = any(token in text for token in ("show cell types", "show celltypes", "cell type summary", "celltype summary"))
+        generic_plot_phrases = {
+            "show me plot",
+            "show me the plot",
+            "show plot",
+            "make a plot",
+            "plot it",
+            "show me a figure",
+            "show me the figure",
+        }
+        specific_plot_keywords = (
+            "variance",
+            "scree",
+            "elbow",
+            "pca",
+            "heatmap",
+            "violin",
+            "scatter",
+            "dotplot",
+            "histogram",
+            "marker",
+            "gene",
+            "qc",
+            "counts",
+            "mt%",
+            "mitochond",
+            "doublet",
+        )
+        specific_plot_request = wants_plot and (
+            any(keyword in text for keyword in specific_plot_keywords)
+            or text not in generic_plot_phrases
+        )
+
+        color_by = None
+        if "leiden" in text or "cluster" in text:
+            color_by = primary_cluster_key
+
+        target_cluster = None
+        cluster_match = re.search(r"\bcluster\s+([A-Za-z0-9_.-]+)\b", text)
+        if cluster_match:
+            target_cluster = cluster_match.group(1)
+
+        if wants_umap and wants_clustering:
+            missing = []
+            if not has_umap:
+                missing.append("embedding")
+            if not has_clusters:
+                missing.append("clustering")
+            return {
+                "type": "cluster_and_plot_umap",
+                "color_by": color_by or primary_cluster_key,
+                "missing": missing,
+                "capabilities": capabilities,
+            }
+
+        if wants_umap and wants_plot:
+            missing = [] if has_umap else ["embedding"]
+            return {
+                "type": "show_umap",
+                "color_by": color_by,
+                "missing": missing,
+                "capabilities": capabilities,
+            }
+
+        if wants_annotation:
+            missing = []
+            if not has_clusters:
+                missing.append("clustering")
+            return {
+                "type": "annotate",
+                "missing": missing,
+                "annotation_key": annotation_keys[0] if annotation_keys else None,
+                "capabilities": capabilities,
+            }
+
+        if wants_celltypes_summary:
+            missing = []
+            if not has_annotations:
+                missing.append("annotation")
+            return {
+                "type": "show_celltypes",
+                "missing": missing,
+                "annotation_key": annotation_keys[0] if annotation_keys else None,
+                "capabilities": capabilities,
+            }
+
+        if wants_deg:
+            missing = []
+            if not has_clusters:
+                missing.append("grouping")
+            if "marker" in text and not deg_available:
+                missing.append("deg")
+            return {
+                "type": "markers" if "marker" in text else "deg",
+                "missing": missing,
+                "target_cluster": target_cluster,
+                "groupby": primary_cluster_key,
+                "capabilities": capabilities,
+            }
+
+        wants_explained_variance = any(
+            phrase in text
+            for phrase in (
+                "explained variance",
+                "variance explained",
+                "scree",
+                "elbow plot",
+                "variance vs pcs",
+                "variance vs pc",
+                "pcs and let me choose",
+            )
+        )
+        if wants_explained_variance:
+            missing = [] if has_pca else ["pca"]
+            return {
+                "type": "plot_explained_variance",
+                "missing": missing,
+                "capabilities": capabilities,
+            }
+
+        if wants_plot:
+            return {
+                "type": "generic_plot",
+                "color_by": color_by,
+                "missing": [],
+                "specific_plot_request": specific_plot_request,
+                "capabilities": capabilities,
+            }
+
+        return {"type": "none", "capabilities": capabilities}
+
+    def _run_reconciled_action(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+        result_json = self._execute_tool(tool_name, tool_input)
+        try:
+            return json.loads(result_json)
+        except json.JSONDecodeError:
+            return {"status": "error", "tool": tool_name, "message": "Invalid JSON result from tool execution."}
+
+    def _format_reconciled_response(
+        self,
+        intro: str,
+        steps: List[Dict[str, Any]],
+        final_result: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        lines = [intro, "", "Executed:"]
+        for step in steps:
+            summary = step.get("summary") or step.get("message") or step.get("tool", "")
+            lines.append(f"- `{step.get('tool')}`: {summary}")
+        if final_result:
+            output_path = final_result.get("output_path")
+            if output_path:
+                lines.extend(["", f"Output: `{output_path}`"])
+            verification = final_result.get("verification") or {}
+            if verification.get("status") in {"warning", "failed"}:
+                lines.extend(["", f"Verification: {verification.get('summary', '')}"])
+        return "\n".join(lines)
+
+    def _run_custom_analysis_code(self, description: str, code: str) -> Dict[str, Any]:
+        return self._run_reconciled_action(
+            "run_code",
+            {
+                "description": description,
+                "code": code,
+            },
+        )
+
+    def _maybe_handle_reconciled_request(self, request: str) -> Optional[str]:
+        if self.adata is None:
+            return None
+
+        reconciliation = self._parse_request_reconciliation(request)
+        request_type = reconciliation.get("type")
+        capabilities = reconciliation.get("capabilities", {})
+        primary_cluster_key = capabilities.get("primary_cluster_key") or self.world_state.data_summary.get("cluster_key") or "leiden"
+
+        if request_type == "show_umap":
+            if reconciliation.get("missing"):
+                prompt = (
+                    "UMAP is not available on the current in-memory dataset yet. "
+                    "I can compute PCA, neighbors, and UMAP now so I can show it. Proceed?"
+                )
+                answer = json.loads(self._handle_ask_user({
+                    "question": prompt,
+                    "options": [
+                        "Yes, compute PCA/neighbors/UMAP and show the UMAP",
+                        "No, stop here",
+                    ],
+                    "option_actions": ["run_dimred", "custom"],
+                    "default": "Yes, compute PCA/neighbors/UMAP and show the UMAP",
+                    "decision_key": "umap_prerequisite_approval",
+                }))
+                if not self._is_yes_response(answer.get("user_response", "")):
+                    return "UMAP was not computed. I stopped before changing state."
+                steps: List[Dict[str, Any]] = []
+                dimred_result = self._run_reconciled_action("run_dimred", {})
+                steps.append(dimred_result)
+                if dimred_result.get("status") != "ok":
+                    return self._format_reconciled_response("I could not compute UMAP.", steps, dimred_result)
+                figure_result = self._run_reconciled_action(
+                    "generate_figure",
+                    {"plot_type": "umap", "color_by": None, "include_image": True},
+                )
+                steps.append(figure_result)
+                return self._format_reconciled_response("I computed the embedding and generated a plain UMAP.", steps, figure_result)
+
+            figure_result = self._run_reconciled_action(
+                "generate_figure",
+                {"plot_type": "umap", "color_by": reconciliation.get("color_by"), "include_image": True},
+            )
+            return self._format_reconciled_response("I generated the requested UMAP.", [figure_result], figure_result)
+
+        if request_type == "cluster_and_plot_umap":
+            missing = reconciliation.get("missing", [])
+            steps: List[Dict[str, Any]] = []
+            if "embedding" in missing:
+                prompt = (
+                    "To run Leiden and show a cluster UMAP, I first need PCA, neighbors, and UMAP on the current dataset. "
+                    "Do you want me to compute that now?"
+                )
+                answer = json.loads(self._handle_ask_user({
+                    "question": prompt,
+                    "options": [
+                        "Yes, compute PCA/neighbors/UMAP, then run Leiden and show the UMAP",
+                        "No, stop here",
+                    ],
+                    "option_actions": ["run_dimred", "custom"],
+                    "default": "Yes, compute PCA/neighbors/UMAP, then run Leiden and show the UMAP",
+                    "decision_key": "cluster_plot_prerequisite_approval",
+                }))
+                if not self._is_yes_response(answer.get("user_response", "")):
+                    return "I stopped before computing the embedding."
+                dimred_result = self._run_reconciled_action("run_dimred", {})
+                steps.append(dimred_result)
+                if dimred_result.get("status") != "ok":
+                    return self._format_reconciled_response("I could not compute the embedding needed for the cluster UMAP.", steps, dimred_result)
+
+            clustering_result = self._run_reconciled_action("run_clustering", {"method": "leiden"})
+            steps.append(clustering_result)
+            if clustering_result.get("status") != "ok":
+                return self._format_reconciled_response("I could not run Leiden clustering.", steps, clustering_result)
+            cluster_key = clustering_result.get("primary_cluster_key") or clustering_result.get("cluster_key") or primary_cluster_key
+
+            figure_result = self._run_reconciled_action(
+                "generate_figure",
+                {"plot_type": "umap", "color_by": cluster_key, "include_image": True},
+            )
+            steps.append(figure_result)
+            return self._format_reconciled_response(
+                f"I reconciled the request against current state and generated a `{cluster_key}`-colored UMAP.",
+                steps,
+                figure_result,
+            )
+
+        if request_type == "generic_plot":
+            if reconciliation.get("specific_plot_request"):
+                return None
+            return (
+                "I need a more specific plotting target. I can show a plain UMAP, a cluster-colored UMAP, "
+                "or a gene/metadata-colored plot depending on what exists right now."
+            )
+
+        if request_type == "plot_explained_variance":
+            if reconciliation.get("missing"):
+                prompt = (
+                    "A scree or explained-variance plot needs PCA results, which are not available yet on the current in-memory dataset. "
+                    "I can run PCA, neighbors, and UMAP now, then make the explained-variance plot. Proceed?"
+                )
+                answer = json.loads(self._handle_ask_user({
+                    "question": prompt,
+                    "options": [
+                        "Yes, compute PCA/neighbors/UMAP and then plot explained variance",
+                        "No, stop here",
+                    ],
+                    "option_actions": ["run_dimred", "custom"],
+                    "default": "Yes, compute PCA/neighbors/UMAP and then plot explained variance",
+                    "decision_key": "pca_prerequisite_approval",
+                }))
+                if not self._is_yes_response(answer.get("user_response", "")):
+                    return "I stopped before computing PCA."
+                steps: List[Dict[str, Any]] = []
+                dimred_result = self._run_reconciled_action("run_dimred", {})
+                steps.append(dimred_result)
+                if dimred_result.get("status") != "ok":
+                    return self._format_reconciled_response("I could not compute PCA for the explained-variance plot.", steps, dimred_result)
+            else:
+                steps = []
+
+            scree_code = """
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+if "pca" not in adata.uns or "variance_ratio" not in adata.uns["pca"]:
+    raise ValueError("PCA variance ratios are not available on the current AnnData object.")
+
+variance_ratio = np.asarray(adata.uns["pca"]["variance_ratio"])
+pcs = np.arange(1, len(variance_ratio) + 1)
+cumulative = np.cumsum(variance_ratio)
+
+figure_dir = os.path.join(output_dir, "custom_figures")
+os.makedirs(figure_dir, exist_ok=True)
+output_path = os.path.join(figure_dir, "pca_explained_variance.png")
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].plot(pcs, variance_ratio * 100, marker="o", linewidth=1.5)
+axes[0].set_xlabel("Principal Component")
+axes[0].set_ylabel("Explained Variance (%)")
+axes[0].set_title("Explained Variance by PC")
+
+axes[1].plot(pcs, cumulative * 100, marker="o", linewidth=1.5)
+axes[1].axhline(80, color="red", linestyle="--", linewidth=1, label="80%")
+axes[1].set_xlabel("Principal Component")
+axes[1].set_ylabel("Cumulative Explained Variance (%)")
+axes[1].set_title("Cumulative Explained Variance")
+axes[1].legend()
+
+fig.tight_layout()
+fig.savefig(output_path, dpi=150, bbox_inches="tight")
+print(f"Saved explained variance plot to {output_path}")
+print(f"Variance explained by first 10 PCs (%): {(variance_ratio[:10] * 100).round(2).tolist()}")
+print(f"Cumulative variance by first 10 PCs (%): {(cumulative[:10] * 100).round(2).tolist()}")
+plt.close(fig)
+"""
+            code_result = self._run_custom_analysis_code(
+                "Plot explained variance and cumulative explained variance across principal components",
+                scree_code,
+            )
+            steps.append(code_result)
+            return self._format_reconciled_response(
+                "I generated the explained-variance plot from the current PCA state.",
+                steps,
+                code_result,
+            )
+
+        if request_type == "annotate":
+            if reconciliation.get("missing"):
+                return (
+                    "Cell type annotation is not ready yet because clustering is not available on the current in-memory dataset. "
+                    "Run clustering first, then I can annotate."
+                )
+            annotation_result = self._run_reconciled_action(
+                "run_celltypist",
+                {"majority_voting": True, "cluster_key": primary_cluster_key},
+            )
+            return self._format_reconciled_response(
+                "I ran cell type annotation on the current clustering.",
+                [annotation_result],
+                annotation_result,
+            )
+
+        if request_type == "show_celltypes":
+            if reconciliation.get("missing"):
+                return (
+                    "Cell type annotations are not available yet. I can annotate the current clustering first if you want."
+                )
+            celltype_result = self._run_reconciled_action(
+                "get_celltypes",
+                {"annotation_key": reconciliation.get("annotation_key")},
+            )
+            return self._format_reconciled_response(
+                "I summarized the current cell type annotations.",
+                [celltype_result],
+                celltype_result,
+            )
+
+        if request_type in {"deg", "markers"}:
+            missing = reconciliation.get("missing", [])
+            target_cluster = reconciliation.get("target_cluster")
+            groupby = reconciliation.get("groupby") or primary_cluster_key
+
+            if "grouping" in missing:
+                return (
+                    "Differential expression is not ready yet because there is no clustering or other grouping column to compare. "
+                    "Cluster or annotate the dataset first."
+                )
+
+            if request_type == "markers" and "deg" in missing:
+                prompt = (
+                    "Marker genes are not available yet because differential expression has not been run on the current clustering. "
+                    f"I can run DEG using `{groupby}` now. Proceed?"
+                )
+                answer = json.loads(self._handle_ask_user({
+                    "question": prompt,
+                    "options": [
+                        f"Yes, run DEG using {groupby}",
+                        "No, stop here",
+                    ],
+                    "option_actions": ["run_deg", "custom"],
+                    "default": f"Yes, run DEG using {groupby}",
+                    "decision_key": "deg_prerequisite_approval",
+                }))
+                if not self._is_yes_response(answer.get("user_response", "")):
+                    return "I stopped before running differential expression."
+                deg_result = self._run_reconciled_action("run_deg", {"groupby": groupby})
+                if deg_result.get("status") != "ok":
+                    return self._format_reconciled_response("I could not run differential expression.", [deg_result], deg_result)
+
+            if request_type == "markers":
+                if not target_cluster:
+                    return (
+                        f"Marker genes are available, but I need to know which cluster to summarize. "
+                        f"The current grouping is `{groupby}`."
+                    )
+                marker_result = self._run_reconciled_action(
+                    "get_top_markers",
+                    {"cluster": target_cluster},
+                )
+                return self._format_reconciled_response(
+                    f"I retrieved the top markers for cluster `{target_cluster}`.",
+                    [marker_result],
+                    marker_result,
+                )
+
+            deg_result = self._run_reconciled_action("run_deg", {"groupby": groupby})
+            return self._format_reconciled_response(
+                f"I ran differential expression using `{groupby}`.",
+                [deg_result],
+                deg_result,
+            )
+
+        return None
 
     def _sync_world_state(self, extra_text: Optional[str] = None) -> None:
         """Refresh the unified world state from the active AnnData and request context."""
@@ -587,6 +1776,46 @@ class SCAgent:
             )
             self.run_manager.append_event("follow_up_request", {"request": request})
 
+        # Handle numbered option selection from previous turn
+        # This resolves the two-input-mode confusion where CLI collects input after agent's turn
+        if self._pending_checkpoint and request.strip() in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
+            checkpoint = self._pending_checkpoint
+            options = checkpoint.get("options", [])
+            option_actions = checkpoint.get("option_actions", [])
+            action_inputs = checkpoint.get("action_inputs", {})
+            try:
+                idx = int(request.strip()) - 1
+                if 0 <= idx < len(options):
+                    selected_option = options[idx]
+                    selected_action = option_actions[idx] if idx < len(option_actions) else None
+                    self._clear_pending_checkpoint(selected_option)
+
+                    # If we have a specific action, execute it
+                    if selected_action and selected_action != "custom":
+                        action_input = action_inputs.get(selected_action, {})
+                        result = self._run_reconciled_action(selected_action, action_input)
+                        return self._format_reconciled_response(
+                            f"Executed your choice: {selected_option}",
+                            [result],
+                            result,
+                        )
+                    # Otherwise, let the LLM handle it with the selected option as context
+                    request = f"User selected option {request}: {selected_option}"
+            except (ValueError, IndexError):
+                pass
+
+        reconciled_response = self._maybe_handle_reconciled_request(request)
+        if reconciled_response is not None:
+            if self.verbose:
+                self._print("\n" + "-" * 50)
+                self._print(reconciled_response)
+            if self.run_manager:
+                self.run_manager.append_event(
+                    "request_reconciled",
+                    {"request": request, "response": reconciled_response},
+                )
+            return reconciled_response
+
         # Build initial message
         user_message = request
         if data_path:
@@ -603,6 +1832,15 @@ class SCAgent:
             console = Console()
             console.print()
             console.print(Panel(request, title="🔬 Analyzing", border_style="cyan"))
+
+        if self.collaborative and not sys.stdin.isatty():
+            message = (
+                "Collaborative agent mode requires an interactive terminal because the agent must "
+                "pause and ask for decisions at checkpoints."
+            )
+            if self.run_manager:
+                self.run_manager.fail(message)
+            raise RuntimeError(message)
 
         # Route to provider-specific implementation
         if self.provider == "anthropic":
@@ -855,6 +2093,13 @@ class SCAgent:
         console = Console()
         logger.info(f"Tool call: {tool_name} with {tool_input}")
 
+        # Only block truly pipeline-progressing tools when checkpoint pending
+        # Allow flexible tools (run_code, inspection, visualization) to proceed
+        if self._pending_checkpoint and self._is_action_tool(tool_name) and tool_name != "ask_user":
+            if tool_name not in self.CHECKPOINT_EXEMPT_TOOLS:
+                return self._blocked_by_checkpoint_result(tool_name)
+            # For exempt tools, we'll include checkpoint context in the result later
+
         def _sanitize_name(value: str) -> str:
             value = value or tool_name
             cleaned = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in value)
@@ -911,12 +2156,11 @@ class SCAgent:
                         if requested_path == Path(".") or requested_path.name == run_root.name:
                             tool_input["output_dir"] = str(self.run_manager.dirs["gsea"])
 
+            # When save_checkpoints is False, NEVER save intermediate h5ad files
+            # Only save when save_checkpoints is True OR when it's save_data tool
             if tool_name in checkpoint_tools and not self.save_checkpoints:
-                requested = tool_input.get("output_path")
-                if requested:
-                    requested_path = Path(requested)
-                    if requested_path.suffix.lower() != '.h5ad':
-                        tool_input.pop("output_path", None)
+                # Always remove output_path for checkpoint tools when not saving intermediates
+                tool_input.pop("output_path", None)
 
             if self.save_checkpoints and tool_name in checkpoint_tools and not tool_input.get("output_path"):
                 tool_input["output_path"] = self.run_manager.get_intermediate_path(_sanitize_name(tool_name))
@@ -930,6 +2174,12 @@ class SCAgent:
 
         # Special handling for ask_user - get input from user but still track it like other tools
         if tool_name == "ask_user":
+            if self._pending_checkpoint:
+                tool_input.setdefault("question", self._pending_checkpoint.get("question", "What would you like to do next?"))
+                tool_input.setdefault("options", self._pending_checkpoint.get("options", []))
+                tool_input.setdefault("option_actions", self._pending_checkpoint.get("option_actions", []))
+                tool_input.setdefault("default", self._pending_checkpoint.get("default", ""))
+                tool_input.setdefault("decision_key", self._pending_checkpoint.get("decision_key", ""))
             result_json = self._handle_ask_user(tool_input)
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
@@ -1012,6 +2262,20 @@ class SCAgent:
                 result_data,
                 before_snapshot,
             )
+            checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
+            if checkpoint is None:
+                checkpoint = self._build_recovery_checkpoint(tool_name, tool_input, result_data)
+            if tool_name == "ask_user":
+                prior_checkpoint = self._pending_checkpoint
+                selected_action = result_data.get("selected_action")
+                self._clear_pending_checkpoint(result_data.get("user_response"))
+                auto_execution = self._execute_checkpoint_action(selected_action, prior_checkpoint or {}) if prior_checkpoint else None
+                if auto_execution is not None:
+                    result_data["auto_execution"] = auto_execution
+            if checkpoint is not None:
+                result_data["checkpoint_required"] = True
+                result_data["checkpoint"] = checkpoint
+                self._set_pending_checkpoint(checkpoint)
             self.world_state.apply_tool_result(tool_name, result_data, adata=self.adata)
             result_json = json.dumps(result_data, indent=2)
 
@@ -1563,16 +2827,29 @@ class SCAgent:
         """Handle ask_user tool - prompt user for input."""
         question = tool_input["question"]
         options = tool_input.get("options", [])
+        option_actions = tool_input.get("option_actions", [])
         default = tool_input.get("default", "")
         decision_key = tool_input.get("decision_key", "")
 
-        if not self.collaborative or not sys.stdin.isatty():
+        if self.collaborative and not sys.stdin.isatty():
+            return json.dumps({
+                "status": "error",
+                "tool": "ask_user",
+                "question": question,
+                "options": options,
+                "option_actions": option_actions,
+                "default": default,
+                "decision_key": decision_key,
+                "message": "Collaborative checkpoints require an interactive terminal.",
+            }, indent=2)
+        if not self.collaborative:
             response = default or "proceed"
             return json.dumps({
                 "status": "ok",
                 "tool": "ask_user",
                 "question": question,
                 "options": options,
+                "option_actions": option_actions,
                 "default": default,
                 "decision_key": decision_key,
                 "user_response": response,
@@ -1595,14 +2872,36 @@ class SCAgent:
         except (EOFError, KeyboardInterrupt):
             response = default or "no response"
 
+        raw_response = response
+        selected_option = None
+        selected_action = None
+        selected_index = None
+        if options and response.isdigit():
+            option_index = int(response) - 1
+            if 0 <= option_index < len(options):
+                selected_option = options[option_index]
+                selected_index = option_index
+                if option_index < len(option_actions):
+                    selected_action = option_actions[option_index]
+                response = selected_option
+        elif response in options:
+            selected_index = options.index(response)
+            if selected_index < len(option_actions):
+                selected_action = option_actions[selected_index]
+
         return json.dumps({
             "status": "ok",
             "tool": "ask_user",
             "question": question,
             "options": options,
+            "option_actions": option_actions,
             "default": default,
             "decision_key": decision_key,
             "user_response": response,
+            "raw_user_response": raw_response,
+            "selected_option": selected_option,
+            "selected_action": selected_action,
+            "selected_index": selected_index,
         }, indent=2)
 
     def _handle_install_package(self, tool_input: Dict[str, Any]) -> str:

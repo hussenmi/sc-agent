@@ -1,6 +1,6 @@
 # scagent
 
-**Single-cell RNA-seq Analysis Agent** - An autonomous single-cell analysis toolkit that encapsulates lab best practices and can reason about your data.
+**Single-cell RNA-seq Analysis Agent** - A collaborative single-cell analysis toolkit that encapsulates lab best practices and can reason about your data.
 
 ## Features
 
@@ -105,9 +105,6 @@ result = agent.analyze(
 # Start a collaborative session (default)
 scagent analyze --data pbmc.h5
 
-# Or run end-to-end without checkpoint prompts
-scagent analyze --data pbmc.h5 --autonomous
-
 # After initial analysis completes, continue with follow-ups:
 # > What are the top markers for cluster 3?
 # > Generate a heatmap of these genes
@@ -120,12 +117,11 @@ scagent offers two ways to run analyses:
 
 ### 1. Agent Mode (LLM-Guided)
 
-The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation. By default it works collaboratively: it summarizes findings at major checkpoints, recommends a next step, and asks before applying consequential analysis decisions.
+The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation. It works collaboratively: it summarizes findings at major checkpoints, recommends a next step, and asks before applying consequential analysis decisions.
 
 ```bash
-# CLI (collaborative by default)
+# CLI
 scagent analyze "QC and cluster this data" --data pbmc.h5
-scagent analyze "QC and cluster this data" --data pbmc.h5 --autonomous
 scagent analyze "QC and cluster this data" --data pbmc.h5 --single-run
 
 # Python
@@ -302,10 +298,9 @@ If checkpoint saving is enabled, an additional `intermediate/` folder is created
 
 ```bash
 # Agent mode - LLM-guided analysis
-scagent analyze "your request" --data file.h5      # Collaborative by default
-scagent analyze --data file.h5                     # Auto-analyze (agent decides)
-scagent analyze --data file.h5 --single-run        # Exit after initial summary
-scagent analyze --data file.h5 --autonomous        # Skip checkpoint prompts
+scagent analyze "your request" --data file.h5      # Collaborative agent run
+scagent analyze --data file.h5                     # Let the agent choose a first pass
+scagent analyze --data file.h5 --single-run        # Exit after the initial collaborative turn
 scagent analyze --data file.h5 --provider openai   # Use OpenAI instead of Anthropic
 
 # Direct mode - no LLM

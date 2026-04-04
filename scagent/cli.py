@@ -22,7 +22,7 @@ Examples:
   # Full analysis with custom request
   scagent analyze "QC, cluster, and annotate cell types" --data pbmc.h5
 
-  # Auto-analyze (agent decides what to do)
+  # Collaborative analysis (agent decides what to do, but stops at checkpoints)
   scagent analyze --data pbmc.h5
 
   # Run once and exit (skip follow-up prompt)
@@ -104,20 +104,6 @@ Examples:
         help="Exit after the initial analysis summary"
     )
     analyze_parser.set_defaults(interactive=True)
-    collaboration_mode = analyze_parser.add_mutually_exclusive_group()
-    collaboration_mode.add_argument(
-        "--collaborative",
-        dest="collaborative",
-        action="store_true",
-        help="Pause at major analysis checkpoints to summarize findings and ask before moving on (default)"
-    )
-    collaboration_mode.add_argument(
-        "--autonomous",
-        dest="collaborative",
-        action="store_false",
-        help="Let the agent run end-to-end without checkpoint prompts unless recovery is needed"
-    )
-    analyze_parser.set_defaults(collaborative=True)
     analyze_parser.add_argument(
         "--checkpoints",
         action="store_true",
@@ -193,6 +179,13 @@ def run_analyze(args):
     """Run autonomous analysis."""
     from scagent.agent import SCAgent
 
+    if not sys.stdin.isatty():
+        print(
+            "Collaborative agent mode requires an interactive terminal. "
+            "Run `scagent analyze` from a TTY so the agent can pause for decisions."
+        )
+        return 1
+
     # Build request
     if args.request:
         request = args.request
@@ -210,7 +203,7 @@ def run_analyze(args):
         provider=args.provider,
         model=args.model,
         verbose=not args.quiet,
-        collaborative=args.collaborative,
+        collaborative=True,
         output_dir=args.output,
         save_checkpoints=args.checkpoints,
     )
@@ -218,7 +211,7 @@ def run_analyze(args):
     print(f"Data: {args.data}")
     print(f"Provider: {agent.provider}:{agent.model}")
     print(f"Session mode: {'interactive follow-up' if args.interactive else 'single-run'}")
-    print(f"Analysis style: {'collaborative checkpoints' if args.collaborative else 'autonomous run'}")
+    print("Analysis style: collaborative checkpoints")
     print(f"Checkpoints: {'enabled' if args.checkpoints else 'final only'}")
     print(f"Request: {request[:100]}{'...' if len(request) > 100 else ''}")
     print("-" * 50)
