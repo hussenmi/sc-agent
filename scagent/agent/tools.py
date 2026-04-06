@@ -2091,7 +2091,9 @@ def process_tool_call(
 
         # ===== INSPECTION TOOLS =====
         elif tool_name == "inspect_data":
-            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
+            # update_memory=True if loading from path (so data persists), False if just inspecting existing
+            should_update = tool_input.get("data_path") is not None and adata is None
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=should_update)
             state = inspect_data(working_adata)
             batch_resolution = resolve_batch_metadata(working_adata)
             goal = tool_input.get("goal")

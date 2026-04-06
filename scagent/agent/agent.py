@@ -129,6 +129,7 @@ class SCAgent:
         provider: Optional[Provider] = None,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
+        base_url: Optional[str] = None,
         verbose: bool = True,
         collaborative: bool = True,
         create_run_dir: bool = True,
@@ -140,6 +141,8 @@ class SCAgent:
             provider = os.environ.get("SCAGENT_PROVIDER", "anthropic")
         if model is None:
             model = os.environ.get("SCAGENT_MODEL")  # None = use provider default
+        if base_url is None:
+            base_url = os.environ.get("SCAGENT_BASE_URL")  # For OpenAI-compatible APIs
 
         self.provider = provider
         self.verbose = verbose
@@ -165,9 +168,17 @@ class SCAgent:
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
         elif provider == "openai":
-            self._init_openai(api_key, model)
+            self._init_openai(api_key, model, base_url)
+        elif provider == "groq":
+            # Groq uses OpenAI-compatible API
+            self._init_openai(
+                api_key or os.environ.get("GROQ_API_KEY"),
+                model or "llama-3.3-70b-versatile",
+                base_url or "https://api.groq.com/openai/v1"
+            )
+            self.provider = "groq"  # Keep track of actual provider
         else:
-            raise ValueError(f"Unknown provider: {provider}. Use 'anthropic' or 'openai'.")
+            raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'openai', or 'groq'.")
 
     def _init_anthropic(self, api_key: Optional[str], model: Optional[str]):
         """Initialize Anthropic client."""
@@ -188,8 +199,8 @@ class SCAgent:
         self.model = model or "claude-sonnet-4-20250514"
         self.tools = get_tools()
 
-    def _init_openai(self, api_key: Optional[str], model: Optional[str]):
-        """Initialize OpenAI client."""
+    def _init_openai(self, api_key: Optional[str], model: Optional[str], base_url: Optional[str] = None):
+        """Initialize OpenAI-compatible client (works with OpenAI, Groq, Together, etc.)."""
         try:
             from openai import OpenAI
         except ImportError:
@@ -203,16 +214,34 @@ class SCAgent:
                     "or pass api_key parameter."
                 )
 
-        self.client = OpenAI(api_key=api_key)
+        # Support custom base URLs for OpenAI-compatible APIs (Groq, Together, etc.)
+        if base_url:
+            self.client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            self.client = OpenAI(api_key=api_key)
         self.model = model or "gpt-4o"
         self.tools = get_openai_tools()
 
-    def _print(self, message: str, style: str = None):
-        """Print message if verbose using rich formatting."""
+    def _print(self, message: str, style: str = None, markdown: bool = False):
+        """Print message if verbose using rich formatting.
+
+        If markdown=True or message contains markdown patterns, renders as markdown.
+        """
         if self.verbose:
             from rich.console import Console
+            from rich.markdown import Markdown
             console = Console()
-            if style:
+
+            # Auto-detect markdown if not explicitly set
+            if not markdown and message:
+                # Check for common markdown patterns
+                md_patterns = ['**', '##', '- **', '```', '1. ', '2. ', '3. ']
+                if any(p in message for p in md_patterns):
+                    markdown = True
+
+            if markdown and message:
+                console.print(Markdown(message))
+            elif style:
                 console.print(message, style=style)
             else:
                 console.print(message)
@@ -520,8 +549,13 @@ class SCAgent:
         if tool_name == "run_qc":
             if tool_input.get("preview_only", False):
                 mt_threshold = tool_input.get("mt_threshold", "auto")
-                doublet_count = int(result_data.get("metrics", {}).get("predicted_doublets", 0))
-                projected_cells = result_data.get("after", {}).get("n_cells", "?")
+                # Get doublet count from the correct location
+                qc_decisions = result_data.get("qc_decisions", {})
+                doublet_count = int(qc_decisions.get("doublet_detection", {}).get("cells_flagged", 0))
+                high_mt_cells = int(qc_decisions.get("mt_threshold", {}).get("cells_flagged", 0))
+                before_cells = result_data.get("before", {}).get("n_cells", 0)
+                # Projected = before - high_mt (doublets are flagged but not auto-removed)
+                projected_cells = before_cells - high_mt_cells if before_cells else "?"
                 question = (
                     "QC preview is complete. I summarized the proposed removals and saved the QC figures. "
                     "What should I do next?"
@@ -542,8 +576,8 @@ class SCAgent:
                     ("Something else", "custom"),
                 ])
                 summary = (
-                    f"QC preview found {doublet_count} predicted doublets and estimated "
-                    f"{projected_cells} cells would remain after filtering."
+                    f"QC preview: {high_mt_cells} high-MT cells to remove, {doublet_count} doublets flagged. "
+                    f"Estimated {projected_cells} cells retained after MT filtering."
                 )
                 checkpoint = {
                     "kind": "qc_preview",
@@ -964,445 +998,24 @@ class SCAgent:
         text = (value or "").strip().lower()
         return text in {"y", "yes", "1", "ok", "okay", "sure", "continue", "do it", "run it", "compute it"}
 
-    def _parse_request_reconciliation(self, request: str) -> Dict[str, Any]:
-        text = (request or "").strip().lower()
-        capabilities = self._current_capabilities()
-        primary_cluster_key = capabilities.get("primary_cluster_key") or self.world_state.data_summary.get("cluster_key") or "leiden"
-        has_umap = bool(capabilities.get("has_umap"))
-        has_clusters = bool(capabilities.get("has_clusters"))
-        has_annotations = bool(capabilities.get("has_annotations"))
-        deg_available = bool(capabilities.get("deg_available"))
-        annotation_keys = capabilities.get("annotation_keys", [])
-        obs_columns = capabilities.get("obs_columns", [])
-        has_pca = bool(capabilities.get("has_pca"))
-
-        show_words = ("show", "plot", "draw", "visualize", "display", "figure")
-        wants_plot = any(word in text for word in show_words)
-        wants_umap = "umap" in text
-        wants_clustering = "leiden" in text or re.search(r"\bcluster\b", text)
-        wants_annotation = any(token in text for token in ("annotate", "annotation", "cell typist", "celltypist", "scimilarity"))
-        wants_deg = any(token in text for token in ("deg", "differential", "markers", "marker genes", "top markers"))
-        wants_celltypes_summary = any(token in text for token in ("show cell types", "show celltypes", "cell type summary", "celltype summary"))
-        generic_plot_phrases = {
-            "show me plot",
-            "show me the plot",
-            "show plot",
-            "make a plot",
-            "plot it",
-            "show me a figure",
-            "show me the figure",
-        }
-        specific_plot_keywords = (
-            "variance",
-            "scree",
-            "elbow",
-            "pca",
-            "heatmap",
-            "violin",
-            "scatter",
-            "dotplot",
-            "histogram",
-            "marker",
-            "gene",
-            "qc",
-            "counts",
-            "mt%",
-            "mitochond",
-            "doublet",
-        )
-        specific_plot_request = wants_plot and (
-            any(keyword in text for keyword in specific_plot_keywords)
-            or text not in generic_plot_phrases
-        )
-
-        color_by = None
-        if "leiden" in text or "cluster" in text:
-            color_by = primary_cluster_key
-
-        target_cluster = None
-        cluster_match = re.search(r"\bcluster\s+([A-Za-z0-9_.-]+)\b", text)
-        if cluster_match:
-            target_cluster = cluster_match.group(1)
-
-        if wants_umap and wants_clustering:
-            missing = []
-            if not has_umap:
-                missing.append("embedding")
-            if not has_clusters:
-                missing.append("clustering")
-            return {
-                "type": "cluster_and_plot_umap",
-                "color_by": color_by or primary_cluster_key,
-                "missing": missing,
-                "capabilities": capabilities,
-            }
-
-        if wants_umap and wants_plot:
-            missing = [] if has_umap else ["embedding"]
-            return {
-                "type": "show_umap",
-                "color_by": color_by,
-                "missing": missing,
-                "capabilities": capabilities,
-            }
-
-        if wants_annotation:
-            missing = []
-            if not has_clusters:
-                missing.append("clustering")
-            return {
-                "type": "annotate",
-                "missing": missing,
-                "annotation_key": annotation_keys[0] if annotation_keys else None,
-                "capabilities": capabilities,
-            }
-
-        if wants_celltypes_summary:
-            missing = []
-            if not has_annotations:
-                missing.append("annotation")
-            return {
-                "type": "show_celltypes",
-                "missing": missing,
-                "annotation_key": annotation_keys[0] if annotation_keys else None,
-                "capabilities": capabilities,
-            }
-
-        if wants_deg:
-            missing = []
-            if not has_clusters:
-                missing.append("grouping")
-            if "marker" in text and not deg_available:
-                missing.append("deg")
-            return {
-                "type": "markers" if "marker" in text else "deg",
-                "missing": missing,
-                "target_cluster": target_cluster,
-                "groupby": primary_cluster_key,
-                "capabilities": capabilities,
-            }
-
-        wants_explained_variance = any(
-            phrase in text
-            for phrase in (
-                "explained variance",
-                "variance explained",
-                "scree",
-                "elbow plot",
-                "variance vs pcs",
-                "variance vs pc",
-                "pcs and let me choose",
-            )
-        )
-        if wants_explained_variance:
-            missing = [] if has_pca else ["pca"]
-            return {
-                "type": "plot_explained_variance",
-                "missing": missing,
-                "capabilities": capabilities,
-            }
-
-        if wants_plot:
-            return {
-                "type": "generic_plot",
-                "color_by": color_by,
-                "missing": [],
-                "specific_plot_request": specific_plot_request,
-                "capabilities": capabilities,
-            }
-
-        return {"type": "none", "capabilities": capabilities}
-
     def _run_reconciled_action(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a tool and return parsed result. Used for checkpoint option handling."""
         result_json = self._execute_tool(tool_name, tool_input)
         try:
             return json.loads(result_json)
         except json.JSONDecodeError:
-            return {"status": "error", "tool": tool_name, "message": "Invalid JSON result from tool execution."}
+            return {"status": "error", "tool": tool_name, "message": "Invalid JSON result"}
 
-    def _format_reconciled_response(
-        self,
-        intro: str,
-        steps: List[Dict[str, Any]],
-        final_result: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        lines = [intro, "", "Executed:"]
+    def _format_reconciled_response(self, intro: str, steps: List[Dict[str, Any]], final_result: Optional[Dict[str, Any]] = None) -> str:
+        """Format a response from executed steps. Used for checkpoint option handling."""
+        lines = [intro]
         for step in steps:
-            summary = step.get("summary") or step.get("message") or step.get("tool", "")
-            lines.append(f"- `{step.get('tool')}`: {summary}")
-        if final_result:
-            output_path = final_result.get("output_path")
-            if output_path:
-                lines.extend(["", f"Output: `{output_path}`"])
-            verification = final_result.get("verification") or {}
-            if verification.get("status") in {"warning", "failed"}:
-                lines.extend(["", f"Verification: {verification.get('summary', '')}"])
+            summary = step.get("summary") or step.get("message") or ""
+            if summary:
+                lines.append(f"  {summary}")
+        if final_result and final_result.get("output_path"):
+            lines.append(f"Output: {final_result['output_path']}")
         return "\n".join(lines)
-
-    def _run_custom_analysis_code(self, description: str, code: str) -> Dict[str, Any]:
-        return self._run_reconciled_action(
-            "run_code",
-            {
-                "description": description,
-                "code": code,
-            },
-        )
-
-    def _maybe_handle_reconciled_request(self, request: str) -> Optional[str]:
-        if self.adata is None:
-            return None
-
-        reconciliation = self._parse_request_reconciliation(request)
-        request_type = reconciliation.get("type")
-        capabilities = reconciliation.get("capabilities", {})
-        primary_cluster_key = capabilities.get("primary_cluster_key") or self.world_state.data_summary.get("cluster_key") or "leiden"
-
-        if request_type == "show_umap":
-            if reconciliation.get("missing"):
-                prompt = (
-                    "UMAP is not available on the current in-memory dataset yet. "
-                    "I can compute PCA, neighbors, and UMAP now so I can show it. Proceed?"
-                )
-                answer = json.loads(self._handle_ask_user({
-                    "question": prompt,
-                    "options": [
-                        "Yes, compute PCA/neighbors/UMAP and show the UMAP",
-                        "No, stop here",
-                    ],
-                    "option_actions": ["run_dimred", "custom"],
-                    "default": "Yes, compute PCA/neighbors/UMAP and show the UMAP",
-                    "decision_key": "umap_prerequisite_approval",
-                }))
-                if not self._is_yes_response(answer.get("user_response", "")):
-                    return "UMAP was not computed. I stopped before changing state."
-                steps: List[Dict[str, Any]] = []
-                dimred_result = self._run_reconciled_action("run_dimred", {})
-                steps.append(dimred_result)
-                if dimred_result.get("status") != "ok":
-                    return self._format_reconciled_response("I could not compute UMAP.", steps, dimred_result)
-                figure_result = self._run_reconciled_action(
-                    "generate_figure",
-                    {"plot_type": "umap", "color_by": None, "include_image": True},
-                )
-                steps.append(figure_result)
-                return self._format_reconciled_response("I computed the embedding and generated a plain UMAP.", steps, figure_result)
-
-            figure_result = self._run_reconciled_action(
-                "generate_figure",
-                {"plot_type": "umap", "color_by": reconciliation.get("color_by"), "include_image": True},
-            )
-            return self._format_reconciled_response("I generated the requested UMAP.", [figure_result], figure_result)
-
-        if request_type == "cluster_and_plot_umap":
-            missing = reconciliation.get("missing", [])
-            steps: List[Dict[str, Any]] = []
-            if "embedding" in missing:
-                prompt = (
-                    "To run Leiden and show a cluster UMAP, I first need PCA, neighbors, and UMAP on the current dataset. "
-                    "Do you want me to compute that now?"
-                )
-                answer = json.loads(self._handle_ask_user({
-                    "question": prompt,
-                    "options": [
-                        "Yes, compute PCA/neighbors/UMAP, then run Leiden and show the UMAP",
-                        "No, stop here",
-                    ],
-                    "option_actions": ["run_dimred", "custom"],
-                    "default": "Yes, compute PCA/neighbors/UMAP, then run Leiden and show the UMAP",
-                    "decision_key": "cluster_plot_prerequisite_approval",
-                }))
-                if not self._is_yes_response(answer.get("user_response", "")):
-                    return "I stopped before computing the embedding."
-                dimred_result = self._run_reconciled_action("run_dimred", {})
-                steps.append(dimred_result)
-                if dimred_result.get("status") != "ok":
-                    return self._format_reconciled_response("I could not compute the embedding needed for the cluster UMAP.", steps, dimred_result)
-
-            clustering_result = self._run_reconciled_action("run_clustering", {"method": "leiden"})
-            steps.append(clustering_result)
-            if clustering_result.get("status") != "ok":
-                return self._format_reconciled_response("I could not run Leiden clustering.", steps, clustering_result)
-            cluster_key = clustering_result.get("primary_cluster_key") or clustering_result.get("cluster_key") or primary_cluster_key
-
-            figure_result = self._run_reconciled_action(
-                "generate_figure",
-                {"plot_type": "umap", "color_by": cluster_key, "include_image": True},
-            )
-            steps.append(figure_result)
-            return self._format_reconciled_response(
-                f"I reconciled the request against current state and generated a `{cluster_key}`-colored UMAP.",
-                steps,
-                figure_result,
-            )
-
-        if request_type == "generic_plot":
-            if reconciliation.get("specific_plot_request"):
-                return None
-            return (
-                "I need a more specific plotting target. I can show a plain UMAP, a cluster-colored UMAP, "
-                "or a gene/metadata-colored plot depending on what exists right now."
-            )
-
-        if request_type == "plot_explained_variance":
-            if reconciliation.get("missing"):
-                prompt = (
-                    "A scree or explained-variance plot needs PCA results, which are not available yet on the current in-memory dataset. "
-                    "I can run PCA, neighbors, and UMAP now, then make the explained-variance plot. Proceed?"
-                )
-                answer = json.loads(self._handle_ask_user({
-                    "question": prompt,
-                    "options": [
-                        "Yes, compute PCA/neighbors/UMAP and then plot explained variance",
-                        "No, stop here",
-                    ],
-                    "option_actions": ["run_dimred", "custom"],
-                    "default": "Yes, compute PCA/neighbors/UMAP and then plot explained variance",
-                    "decision_key": "pca_prerequisite_approval",
-                }))
-                if not self._is_yes_response(answer.get("user_response", "")):
-                    return "I stopped before computing PCA."
-                steps: List[Dict[str, Any]] = []
-                dimred_result = self._run_reconciled_action("run_dimred", {})
-                steps.append(dimred_result)
-                if dimred_result.get("status") != "ok":
-                    return self._format_reconciled_response("I could not compute PCA for the explained-variance plot.", steps, dimred_result)
-            else:
-                steps = []
-
-            scree_code = """
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-
-if "pca" not in adata.uns or "variance_ratio" not in adata.uns["pca"]:
-    raise ValueError("PCA variance ratios are not available on the current AnnData object.")
-
-variance_ratio = np.asarray(adata.uns["pca"]["variance_ratio"])
-pcs = np.arange(1, len(variance_ratio) + 1)
-cumulative = np.cumsum(variance_ratio)
-
-figure_dir = os.path.join(output_dir, "custom_figures")
-os.makedirs(figure_dir, exist_ok=True)
-output_path = os.path.join(figure_dir, "pca_explained_variance.png")
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-axes[0].plot(pcs, variance_ratio * 100, marker="o", linewidth=1.5)
-axes[0].set_xlabel("Principal Component")
-axes[0].set_ylabel("Explained Variance (%)")
-axes[0].set_title("Explained Variance by PC")
-
-axes[1].plot(pcs, cumulative * 100, marker="o", linewidth=1.5)
-axes[1].axhline(80, color="red", linestyle="--", linewidth=1, label="80%")
-axes[1].set_xlabel("Principal Component")
-axes[1].set_ylabel("Cumulative Explained Variance (%)")
-axes[1].set_title("Cumulative Explained Variance")
-axes[1].legend()
-
-fig.tight_layout()
-fig.savefig(output_path, dpi=150, bbox_inches="tight")
-print(f"Saved explained variance plot to {output_path}")
-print(f"Variance explained by first 10 PCs (%): {(variance_ratio[:10] * 100).round(2).tolist()}")
-print(f"Cumulative variance by first 10 PCs (%): {(cumulative[:10] * 100).round(2).tolist()}")
-plt.close(fig)
-"""
-            code_result = self._run_custom_analysis_code(
-                "Plot explained variance and cumulative explained variance across principal components",
-                scree_code,
-            )
-            steps.append(code_result)
-            return self._format_reconciled_response(
-                "I generated the explained-variance plot from the current PCA state.",
-                steps,
-                code_result,
-            )
-
-        if request_type == "annotate":
-            if reconciliation.get("missing"):
-                return (
-                    "Cell type annotation is not ready yet because clustering is not available on the current in-memory dataset. "
-                    "Run clustering first, then I can annotate."
-                )
-            annotation_result = self._run_reconciled_action(
-                "run_celltypist",
-                {"majority_voting": True, "cluster_key": primary_cluster_key},
-            )
-            return self._format_reconciled_response(
-                "I ran cell type annotation on the current clustering.",
-                [annotation_result],
-                annotation_result,
-            )
-
-        if request_type == "show_celltypes":
-            if reconciliation.get("missing"):
-                return (
-                    "Cell type annotations are not available yet. I can annotate the current clustering first if you want."
-                )
-            celltype_result = self._run_reconciled_action(
-                "get_celltypes",
-                {"annotation_key": reconciliation.get("annotation_key")},
-            )
-            return self._format_reconciled_response(
-                "I summarized the current cell type annotations.",
-                [celltype_result],
-                celltype_result,
-            )
-
-        if request_type in {"deg", "markers"}:
-            missing = reconciliation.get("missing", [])
-            target_cluster = reconciliation.get("target_cluster")
-            groupby = reconciliation.get("groupby") or primary_cluster_key
-
-            if "grouping" in missing:
-                return (
-                    "Differential expression is not ready yet because there is no clustering or other grouping column to compare. "
-                    "Cluster or annotate the dataset first."
-                )
-
-            if request_type == "markers" and "deg" in missing:
-                prompt = (
-                    "Marker genes are not available yet because differential expression has not been run on the current clustering. "
-                    f"I can run DEG using `{groupby}` now. Proceed?"
-                )
-                answer = json.loads(self._handle_ask_user({
-                    "question": prompt,
-                    "options": [
-                        f"Yes, run DEG using {groupby}",
-                        "No, stop here",
-                    ],
-                    "option_actions": ["run_deg", "custom"],
-                    "default": f"Yes, run DEG using {groupby}",
-                    "decision_key": "deg_prerequisite_approval",
-                }))
-                if not self._is_yes_response(answer.get("user_response", "")):
-                    return "I stopped before running differential expression."
-                deg_result = self._run_reconciled_action("run_deg", {"groupby": groupby})
-                if deg_result.get("status") != "ok":
-                    return self._format_reconciled_response("I could not run differential expression.", [deg_result], deg_result)
-
-            if request_type == "markers":
-                if not target_cluster:
-                    return (
-                        f"Marker genes are available, but I need to know which cluster to summarize. "
-                        f"The current grouping is `{groupby}`."
-                    )
-                marker_result = self._run_reconciled_action(
-                    "get_top_markers",
-                    {"cluster": target_cluster},
-                )
-                return self._format_reconciled_response(
-                    f"I retrieved the top markers for cluster `{target_cluster}`.",
-                    [marker_result],
-                    marker_result,
-                )
-
-            deg_result = self._run_reconciled_action("run_deg", {"groupby": groupby})
-            return self._format_reconciled_response(
-                f"I ran differential expression using `{groupby}`.",
-                [deg_result],
-                deg_result,
-            )
-
-        return None
 
     def _sync_world_state(self, extra_text: Optional[str] = None) -> None:
         """Refresh the unified world state from the active AnnData and request context."""
@@ -1776,45 +1389,10 @@ plt.close(fig)
             )
             self.run_manager.append_event("follow_up_request", {"request": request})
 
-        # Handle numbered option selection from previous turn
-        # This resolves the two-input-mode confusion where CLI collects input after agent's turn
-        if self._pending_checkpoint and request.strip() in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
-            checkpoint = self._pending_checkpoint
-            options = checkpoint.get("options", [])
-            option_actions = checkpoint.get("option_actions", [])
-            action_inputs = checkpoint.get("action_inputs", {})
-            try:
-                idx = int(request.strip()) - 1
-                if 0 <= idx < len(options):
-                    selected_option = options[idx]
-                    selected_action = option_actions[idx] if idx < len(option_actions) else None
-                    self._clear_pending_checkpoint(selected_option)
-
-                    # If we have a specific action, execute it
-                    if selected_action and selected_action != "custom":
-                        action_input = action_inputs.get(selected_action, {})
-                        result = self._run_reconciled_action(selected_action, action_input)
-                        return self._format_reconciled_response(
-                            f"Executed your choice: {selected_option}",
-                            [result],
-                            result,
-                        )
-                    # Otherwise, let the LLM handle it with the selected option as context
-                    request = f"User selected option {request}: {selected_option}"
-            except (ValueError, IndexError):
-                pass
-
-        reconciled_response = self._maybe_handle_reconciled_request(request)
-        if reconciled_response is not None:
-            if self.verbose:
-                self._print("\n" + "-" * 50)
-                self._print(reconciled_response)
-            if self.run_manager:
-                self.run_manager.append_event(
-                    "request_reconciled",
-                    {"request": request, "response": reconciled_response},
-                )
-            return reconciled_response
+        # Clear any stale checkpoint - the LLM's response options take precedence
+        # The LLM knows what options it presented and will interpret numbered inputs correctly
+        if self._pending_checkpoint:
+            self._clear_pending_checkpoint("superseded by new response")
 
         # Build initial message
         user_message = request

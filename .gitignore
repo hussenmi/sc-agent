@@ -70,3 +70,4 @@ analysis/
 
 # some files
 test*.py
+scagent/agent/prompts_backup.py
