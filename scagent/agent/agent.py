@@ -15,6 +15,7 @@ import logging
 from datetime import datetime
 import re
 
+from .codex_bridge import CODEX_DECISION_SCHEMA, CodexCLIClient, CodexCLIError
 from .tools import get_tools, get_openai_tools, process_tool_call
 from .prompts import SYSTEM_PROMPT
 from .run_manager import RunManager, create_run
@@ -25,7 +26,7 @@ from .world_state import AgentWorldState, artifact_id_from_path
 
 logger = logging.getLogger(__name__)
 
-Provider = Literal["anthropic", "openai"]
+Provider = Literal["anthropic", "openai", "groq", "codex"]
 
 ACTION_TOOL_NAMES = {
     "run_qc",
@@ -90,18 +91,19 @@ class SCAgent:
     """
     Autonomous single-cell RNA-seq analysis agent.
 
-    Uses Claude or OpenAI API to analyze single-cell data following lab best practices.
+    Uses Claude, OpenAI-compatible APIs, or Codex CLI to analyze single-cell data
+    following lab best practices.
     All tool calls return structured JSON for reliable LLM reasoning.
     Optionally creates run directories with manifests for reproducibility.
 
     Parameters
     ----------
     provider : str, default "anthropic"
-        API provider: "anthropic" or "openai".
+        LLM provider: "anthropic", "openai", "groq", or "codex".
     api_key : str, optional
         API key. If not provided, reads from ANTHROPIC_API_KEY or OPENAI_API_KEY.
     model : str, optional
-        Model to use. Defaults: "claude-sonnet-4-20250514" (Anthropic) or "gpt-4o" (OpenAI).
+        Model to use. Defaults depend on provider.
     verbose : bool, default True
         Print agent outputs.
     collaborative : bool, default True
@@ -140,7 +142,12 @@ class SCAgent:
         if provider is None:
             provider = os.environ.get("SCAGENT_PROVIDER", "anthropic")
         if model is None:
-            model = os.environ.get("SCAGENT_MODEL")  # None = use provider default
+            if provider == "codex":
+                # Prefer a Codex-specific override, but let SCAGENT_MODEL keep
+                # working for users who already configure one model in .env.
+                model = os.environ.get("SCAGENT_CODEX_MODEL") or os.environ.get("SCAGENT_MODEL")
+            else:
+                model = os.environ.get("SCAGENT_MODEL")  # None = use provider default
         if base_url is None:
             base_url = os.environ.get("SCAGENT_BASE_URL")  # For OpenAI-compatible APIs
 
@@ -169,6 +176,8 @@ class SCAgent:
             self._init_anthropic(api_key, model)
         elif provider == "openai":
             self._init_openai(api_key, model, base_url)
+        elif provider == "codex":
+            self._init_codex(model)
         elif provider == "groq":
             # Groq uses OpenAI-compatible API
             self._init_openai(
@@ -178,7 +187,9 @@ class SCAgent:
             )
             self.provider = "groq"  # Keep track of actual provider
         else:
-            raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'openai', or 'groq'.")
+            raise ValueError(
+                f"Unknown provider: {provider}. Use 'anthropic', 'openai', 'groq', or 'codex'."
+            )
 
     def _init_anthropic(self, api_key: Optional[str], model: Optional[str]):
         """Initialize Anthropic client."""
@@ -220,6 +231,13 @@ class SCAgent:
         else:
             self.client = OpenAI(api_key=api_key)
         self.model = model or "gpt-4o"
+        self.tools = get_openai_tools()
+
+    def _init_codex(self, model: Optional[str]):
+        """Initialize Codex CLI bridge for ChatGPT-login-backed runs."""
+        codex_model = model or os.environ.get("SCAGENT_CODEX_MODEL")
+        self.client = CodexCLIClient(model=codex_model, cwd=os.getcwd())
+        self.model = codex_model or "codex-default"
         self.tools = get_openai_tools()
 
     def _print(self, message: str, style: str = None, markdown: bool = False):
@@ -1423,8 +1441,147 @@ class SCAgent:
         # Route to provider-specific implementation
         if self.provider == "anthropic":
             return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
-        else:
+        elif self.provider in {"openai", "groq"}:
             return self._analyze_openai(user_message, max_iterations, continue_conversation)
+        elif self.provider == "codex":
+            return self._analyze_codex(user_message, max_iterations, continue_conversation)
+        raise RuntimeError(f"Unsupported provider: {self.provider}")
+
+    def _codex_tool_specs(self) -> List[Dict[str, Any]]:
+        """Return compact tool specs for the Codex decision prompt."""
+        specs: List[Dict[str, Any]] = []
+        for tool in self.tools:
+            function = tool.get("function", {})
+            specs.append({
+                "name": function.get("name"),
+                "description": function.get("description", ""),
+                "input_schema": function.get("parameters", {}),
+            })
+        return specs
+
+    def _build_codex_decision_prompt(self, messages: List[Dict[str, Any]]) -> str:
+        """Build a one-step planner prompt for the Codex CLI bridge."""
+        tool_result_limit = int(os.environ.get("SCAGENT_CODEX_TOOL_RESULT_LIMIT", "50000"))
+
+        def compact_message(message: Dict[str, Any]) -> Dict[str, Any]:
+            compact = dict(message)
+            content = compact.get("content")
+            if isinstance(content, str) and len(content) > tool_result_limit:
+                compact["content"] = (
+                    content[:tool_result_limit]
+                    + f"\n\n[truncated to {tool_result_limit} characters]"
+                )
+            return compact
+
+        payload = {
+            "runtime_state": json.loads(self._runtime_guidance()),
+            "conversation": [compact_message(message) for message in messages],
+            "available_tools": self._codex_tool_specs(),
+        }
+        return (
+            f"{self._build_system_prompt()}\n\n"
+            "## Codex CLI Bridge Instructions\n"
+            "You are selecting the next SCAgent action. Do not run shell commands or edit files. "
+            "SCAgent will execute exactly one returned tool call, then send you the JSON result "
+            "on the next iteration.\n\n"
+            "Return JSON matching the required schema only:\n"
+            "- Use kind='tool_call' when another SCAgent tool should run. Set tool_name to one "
+            "available tool and tool_input_json to a string containing a JSON object.\n"
+            "- Use kind='final' when the analysis response is complete. Set content to the final "
+            "user-facing answer.\n"
+            "- For final responses, set tool_name and tool_input_json to null. For tool calls, set "
+            "content to null.\n\n"
+            "## Current Request, History, Runtime State, and Tools\n"
+            f"{json.dumps(payload, indent=2, default=str)}"
+        )
+
+    def _analyze_codex(
+        self,
+        user_message: str,
+        max_iterations: int,
+        continue_conversation: bool = False,
+    ) -> str:
+        """Run analysis loop using Codex CLI ChatGPT login."""
+        if continue_conversation and self._conversation_history:
+            messages = self._conversation_history.copy()
+            messages.append({"role": "user", "content": user_message})
+        else:
+            messages = [{"role": "user", "content": user_message}]
+        final_result = ""
+        tool_names = {tool.get("name") for tool in self._codex_tool_specs()}
+
+        try:
+            for _iteration in range(max_iterations):
+                prompt = self._build_codex_decision_prompt(messages)
+                decision = self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
+
+                thought = decision.get("thought")
+                if thought:
+                    self._print_thinking(str(thought))
+
+                kind = decision.get("kind")
+                if kind == "tool_call":
+                    tool_name = decision.get("tool_name")
+                    tool_input_text = decision.get("tool_input_json") or "{}"
+                    if tool_name not in tool_names:
+                        raise CodexCLIError(f"Codex requested unknown SCAgent tool: {tool_name}")
+                    try:
+                        tool_input = json.loads(tool_input_text)
+                    except json.JSONDecodeError as exc:
+                        raise CodexCLIError(
+                            f"Codex returned invalid JSON tool_input_json for {tool_name}."
+                        ) from exc
+                    if not isinstance(tool_input, dict):
+                        raise CodexCLIError(f"Codex returned non-object tool_input_json for {tool_name}.")
+
+                    result_json = self._execute_tool(str(tool_name), tool_input)
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_call": {
+                            "name": tool_name,
+                            "arguments": tool_input,
+                        },
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_name": tool_name,
+                        "content": result_json,
+                    })
+
+                    if self._pending_image:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "A figure was generated at "
+                                f"{self._pending_image['path']}. The Codex CLI bridge did not "
+                                "send inline image bytes; call review_figure if visual review is needed."
+                            ),
+                        })
+                        self._pending_image = None
+                    continue
+
+                if kind == "final":
+                    final_result = decision.get("content") or ""
+                    messages.append({"role": "assistant", "content": final_result})
+                    self._conversation_history = messages
+                    self._print("\n" + "-" * 50)
+                    self._print(final_result)
+                    if self.run_manager:
+                        self.run_manager.complete(summary=final_result)
+                        self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
+                    return final_result
+
+                raise CodexCLIError(f"Codex returned unknown decision kind: {kind}")
+
+            final_result = "Analysis stopped: max iterations reached"
+            self._conversation_history = messages
+        except Exception as e:
+            if self.run_manager:
+                self.run_manager.fail(str(e))
+            raise
+
+        return final_result
 
     def _analyze_anthropic(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using Anthropic API."""
@@ -2576,7 +2733,7 @@ class SCAgent:
                 if hasattr(content, "text"):
                     return content.text
             return ""
-        else:
+        elif self.provider in {"openai", "groq"}:
             # OpenAI
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -2587,6 +2744,21 @@ class SCAgent:
                 ],
             )
             return response.choices[0].message.content or ""
+        elif self.provider == "codex":
+            prompt = (
+                f"{self._build_system_prompt()}\n\n"
+                "Answer the following user question directly. Return kind='final' in the "
+                "required JSON schema; do not call tools for this lightweight chat method.\n\n"
+                f"User question: {message}"
+            )
+            decision = self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
+            if decision.get("kind") == "final":
+                return decision.get("content") or ""
+            return (
+                "Codex requested an analysis tool for this question. "
+                "Use `scagent analyze --provider codex` for tool-using runs."
+            )
+        raise RuntimeError(f"Unsupported provider: {self.provider}")
 
     def inspect(self, data_path: str) -> Dict[str, Any]:
         """

@@ -10,6 +10,9 @@ Usage:
 """
 
 import argparse
+import os
+import shutil
+import subprocess
 import sys
 
 
@@ -36,6 +39,10 @@ Examples:
 
   # Use specific provider/model
   scagent analyze --data pbmc.h5 --provider openai --model gpt-4o
+
+  # Use ChatGPT/Codex login instead of API billing (experimental)
+  scagent login chatgpt
+  scagent analyze --data pbmc.h5 --provider codex
         """
     )
 
@@ -70,9 +77,9 @@ Examples:
     )
     analyze_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "groq", "codex"],
         default=None,
-        help="LLM provider (default: from .env or anthropic)"
+        help="LLM provider (default: from .env or anthropic; codex is experimental)"
     )
     analyze_parser.add_argument(
         "--model", "-m",
@@ -146,9 +153,30 @@ Examples:
     )
     chat_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "groq", "codex"],
         default=None,
         help="LLM provider"
+    )
+
+    # === login command ===
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Log in to subscription-backed providers"
+    )
+    login_parser.add_argument(
+        "provider",
+        choices=["chatgpt", "codex"],
+        help="Provider login target. chatgpt and codex both use Codex CLI auth."
+    )
+    login_parser.add_argument(
+        "--device-auth",
+        action="store_true",
+        help="Use Codex device auth flow, helpful on remote/HPC shells."
+    )
+    login_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show current Codex login status instead of starting login."
     )
 
     args = parser.parse_args()
@@ -171,6 +199,8 @@ Examples:
         return run_qc(args)
     elif args.command == "chat":
         return run_chat(args)
+    elif args.command == "login":
+        return run_login(args)
 
     return 0
 
@@ -312,6 +342,30 @@ def run_chat(args):
     print(response)
 
     return 0
+
+
+def run_login(args):
+    """Run subscription-backed login flows."""
+    command = os.environ.get("SCAGENT_CODEX_COMMAND", "codex")
+    if shutil.which(command) is None:
+        print(
+            "Codex CLI was not found. Install Codex or set SCAGENT_CODEX_COMMAND "
+            "to the Codex executable path."
+        )
+        return 1
+
+    if args.status:
+        cmd = [command, "login", "status"]
+    else:
+        cmd = [command, "login"]
+        if args.device_auth:
+            cmd.append("--device-auth")
+        print(
+            "Starting Codex ChatGPT login. This uses Codex/ChatGPT subscription "
+            "auth for the experimental `--provider codex` backend."
+        )
+
+    return subprocess.run(cmd).returncode
 
 
 if __name__ == "__main__":
