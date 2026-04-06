@@ -22,7 +22,7 @@ Examples:
   # Full analysis with custom request
   scagent analyze "QC, cluster, and annotate cell types" --data pbmc.h5
 
-  # Auto-analyze (agent decides what to do)
+  # Collaborative analysis (agent decides what to do, but stops at checkpoints)
   scagent analyze --data pbmc.h5
 
   # Run once and exit (skip follow-up prompt)
@@ -95,7 +95,7 @@ Examples:
         "--interactive", "-i",
         dest="interactive",
         action="store_true",
-        help="Interactive mode - continue conversation after analysis (default)"
+        help="Keep the conversation open for follow-up requests after the initial run (default)"
     )
     analyze_mode.add_argument(
         "--single-run",
@@ -179,6 +179,13 @@ def run_analyze(args):
     """Run autonomous analysis."""
     from scagent.agent import SCAgent
 
+    if not sys.stdin.isatty():
+        print(
+            "Collaborative agent mode requires an interactive terminal. "
+            "Run `scagent analyze` from a TTY so the agent can pause for decisions."
+        )
+        return 1
+
     # Build request
     if args.request:
         request = args.request
@@ -196,13 +203,15 @@ def run_analyze(args):
         provider=args.provider,
         model=args.model,
         verbose=not args.quiet,
+        collaborative=True,
         output_dir=args.output,
         save_checkpoints=args.checkpoints,
     )
 
     print(f"Data: {args.data}")
     print(f"Provider: {agent.provider}:{agent.model}")
-    print(f"Mode: {'interactive' if args.interactive else 'single-run'}")
+    print(f"Session mode: {'interactive follow-up' if args.interactive else 'single-run'}")
+    print("Analysis style: collaborative checkpoints")
     print(f"Checkpoints: {'enabled' if args.checkpoints else 'final only'}")
     print(f"Request: {request[:100]}{'...' if len(request) > 100 else ''}")
     print("-" * 50)
@@ -221,12 +230,10 @@ def run_analyze(args):
             print("\nInteractive mode requested, but stdin is not a TTY. Exiting after the initial run.")
             return 0
 
-        print("\n" + "=" * 50)
-        print("INTERACTIVE MODE - Enter follow-up requests or 'done', 'exit', 'quit', or 'q' to exit")
-        print("=" * 50)
-
+        # Simple prompt - no banner that implies "finished"
         while True:
             try:
+                # Just show a prompt - the conversation is ongoing
                 user_input = input("\n> ").strip()
 
                 if user_input.lower() in ['done', 'exit', 'quit', 'q']:

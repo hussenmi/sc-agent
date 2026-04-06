@@ -8,6 +8,9 @@ from .defaults import (
     CELLTYPIST_DEFAULTS,
     SCIMILARITY_DEFAULTS,
     BATCH_DEFAULTS,
+    DEG_DEFAULTS,
+    GSEA_DEFAULTS,
+    get_all_defaults,
 )
 
 __all__ = [
@@ -18,4 +21,7 @@ __all__ = [
     "CELLTYPIST_DEFAULTS",
     "SCIMILARITY_DEFAULTS",
     "BATCH_DEFAULTS",
+    "DEG_DEFAULTS",
+    "GSEA_DEFAULTS",
+    "get_all_defaults",
 ]

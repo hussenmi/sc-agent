@@ -37,6 +37,8 @@ agent = [
     "python-dotenv>=1.0",
     "gseapy>=1.0",  # For GSEA pathway analysis
     "duckduckgo-search>=6.0",  # For general web search (gene functions, docs, etc.)
+    "beautifulsoup4>=4.12",  # For robust HTML extraction in fetch_url
+    "pypdf>=5.0",  # For PDF text extraction in fetch_url
 ]
 scimilarity = [
     "scimilarity>=0.4",  # Embedding-based cell type annotation

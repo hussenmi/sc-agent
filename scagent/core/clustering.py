@@ -212,9 +212,11 @@ def run_differential_expression(
     """
     Run differential expression analysis between clusters.
 
-    BEST PRACTICE: Wilcoxon test should be run on raw counts (or log-normalized
-    from raw counts) rather than scaled data. This function uses raw counts
-    layer if available.
+    Workshop-aligned best practice:
+    - preserve raw counts in a layer before normalization
+    - run Wilcoxon DEG on the active normalized/log1p analysis matrix
+    - only use a raw-count layer when the caller explicitly requests a method
+      that needs it
 
     Parameters
     ----------
@@ -229,7 +231,7 @@ def run_differential_expression(
     key_added : str, default 'rank_genes_groups'
         Key to add to adata.uns.
     use_raw : bool, default True
-        Use raw counts layer for DEG (recommended for Wilcoxon).
+        Allow non-Wilcoxon methods to use a preserved raw-count layer when needed.
     inplace : bool, default True
         Modify adata in place.
 
@@ -246,13 +248,14 @@ def run_differential_expression(
 
     logger.info(f"Running differential expression analysis by {groupby}")
 
-    # Best practice: use raw counts for Wilcoxon test
+    # Keep the analysis matrix for Wilcoxon; other methods may opt into a raw
+    # layer when requested by the caller.
     layer = None
-    if use_raw and method == 'wilcoxon':
+    if use_raw and method != 'wilcoxon':
         for raw_layer in ['raw_counts', 'counts', 'raw_data']:
             if raw_layer in adata.layers:
                 layer = raw_layer
-                logger.info(f"Using '{layer}' layer for DEG (best practice)")
+                logger.info(f"Using '{layer}' layer for DEG")
                 break
 
     sc.tl.rank_genes_groups(

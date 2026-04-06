@@ -1,6 +1,6 @@
 # scagent
 
-**Single-cell RNA-seq Analysis Agent** - An autonomous single-cell analysis toolkit that encapsulates lab best practices and can reason about your data.
+**Single-cell RNA-seq Analysis Agent** - A collaborative single-cell analysis toolkit that encapsulates lab best practices and can reason about your data.
 
 ## Features
 
@@ -75,9 +75,9 @@ run_qc_pipeline(adata)
 from scagent.agent import SCAgent
 
 # Initialize (reads from .env)
-agent = SCAgent()
+agent = SCAgent()  # collaborative checkpoints on by default
 
-# Simple analysis
+# Simple analysis: inspect, recommend, ask, then proceed
 result = agent.analyze(
     "QC and cluster this PBMC data, then identify cell types",
     data_path="pbmc.h5"
@@ -102,7 +102,7 @@ result = agent.analyze(
 ### CLI Interactive Mode
 
 ```bash
-# Start interactive session (default)
+# Start a collaborative session (default)
 scagent analyze --data pbmc.h5
 
 # After initial analysis completes, continue with follow-ups:
@@ -117,10 +117,10 @@ scagent offers two ways to run analyses:
 
 ### 1. Agent Mode (LLM-Guided)
 
-The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation.
+The agent inspects your data, reasons about what to do, adapts to problems, and provides interpretation. It works collaboratively: it summarizes findings at major checkpoints, recommends a next step, and asks before applying consequential analysis decisions.
 
 ```bash
-# CLI (interactive by default)
+# CLI
 scagent analyze "QC and cluster this data" --data pbmc.h5
 scagent analyze "QC and cluster this data" --data pbmc.h5 --single-run
 
@@ -132,7 +132,7 @@ agent.analyze("QC and cluster", data_path="pbmc.h5")
 **Pros:** Adapts to unexpected data, handles errors gracefully, supports follow-up questions, provides insights
 **Cons:** Requires API key, costs money, slower (LLM round-trips)
 
-**Best for:** Exploratory analysis, unfamiliar data, when you want interpretation
+**Best for:** Exploratory analysis, unfamiliar data, when you want interpretation and checkpointed collaboration
 
 ### 2. Direct Mode (No LLM)
 
@@ -185,14 +185,14 @@ Agent: "Cluster 13 has highest MT% (mean 15.14%) and its markers
         cell population, not a real immune cell type."
 ```
 
-## Available Tools (21 total)
+## Available Tools (24 total)
 
 | Category | Tools |
 |----------|-------|
 | **Analysis** | `run_qc`, `normalize_and_hvg`, `run_dimred`, `run_clustering`, `run_celltypist`, `run_scimilarity`, `run_batch_correction`, `run_deg`, `run_gsea` |
 | **Visualization** | `generate_figure` (UMAP, violin, dotplot, heatmap) |
 | **Inspection** | `inspect_data`, `get_cluster_sizes`, `get_top_markers`, `summarize_qc_metrics`, `get_celltypes`, `list_obs_columns` |
-| **Research** | `research_findings` (PubMed literature search with citations), `web_search` |
+| **Research** | `web_search_docs`, `search_papers`, `fetch_url`, `research_findings` |
 | **Meta** | `ask_user`, `run_code`, `install_package` |
 
 ## Standard Analysis Order
@@ -208,7 +208,7 @@ The agent follows this pipeline sequence:
 6. Compute UMAP
 7. Clustering (Leiden) ← MUST come before CellTypist!
 8. Cell type annotation (CellTypist)
-9. DEG analysis (uses raw counts layer)
+9. DEG analysis (run Wilcoxon on the normalized/log1p analysis matrix; keep raw counts preserved in a layer)
 10. GSEA / pathway analysis
 ```
 
@@ -243,11 +243,18 @@ This ensures the pipeline is **predictable** (always starts with validated param
 The agent automatically follows these best practices:
 
 - **CellTypist**: Normalizes to `target_sum=10000` from raw counts layer (not from scaled data). Returns complete cell type breakdown with counts and percentages.
-- **DEG Analysis**: Uses raw counts layer for Wilcoxon test (more accurate than scaled data). Returns top 5 markers per cluster immediately for quick insight.
+- **DEG Analysis**: Preserves raw counts in a layer, but runs Wilcoxon on the active normalized/log1p analysis matrix to match the workshop notebooks. Returns validation warnings plus top 5 markers per cluster immediately for quick insight.
 - **Batch Correction**: After Harmony/Scanorama, automatically recomputes neighbors and UMAP on the corrected embedding.
 - **GSEA**: Uses DEG scores for prerank GSEA with GSEApy. Returns top up/downregulated pathways with NES scores, FDR values, and leading edge genes. Supports KEGG, GO, Reactome, MSigDB Hallmark databases.
-- **Literature Research**: After GSEA, uses PubMed E-utilities API to find recent papers about enriched pathways. Returns PMIDs, titles, abstracts, and journal info for citation.
-- **File Management**: Minimizes intermediate h5ad files - only saves after QC filtering and at end of analysis. Data persists in memory between tool calls.
+- **Documentation Search**: `web_search_docs` uses Tavily when configured (`TAVILY_API_KEY`), falls back to DuckDuckGo, and only tries Google Programmable Search as a last fallback. Best for software docs, APIs, troubleshooting, and method pages.
+- **Paper Search**: `search_papers` uses PubMed E-utilities to return recent papers with PMID, title, abstract excerpt, journal, year, and PubMed URL.
+- **Literature Research**: After GSEA, `research_findings` performs focused PubMed searches around enriched pathways, cell types, and leading-edge genes, and returns structured citations for interpretation.
+- **Source Reading**: `fetch_url` reads selected web pages and, when dependencies are available, extracts cleaner HTML text and basic PDF text for downstream reasoning.
+- **GSEA Evidence Reports**: Successful `run_gsea` calls automatically write `reports/gsea_evidence.md` and `reports/gsea_evidence.json`, combining pathway output with targeted PubMed evidence for the most relevant pathways.
+- **File Management**: Keeps data in memory between tool calls and does not write intermediate `.h5ad` files unless checkpoint saving is explicitly enabled.
+
+Search/research design note:
+- [`SEARCH_RESEARCH_ARCHITECTURE.md`](/Users/hibrahim/Desktop/iris_peerd/cs_agent/SEARCH_RESEARCH_ARCHITECTURE.md)
 
 ### Where Results Are Stored
 
@@ -276,24 +283,24 @@ run_2026_03_18_230927_full_analysis/
 ├── manifest.json           # Full reproducibility log
 ├── reports/
 │   └── summary.md          # Analysis summary
-├── code/
-│   └── *.py                # Generated code saved for reuse
+│   └── gsea_evidence.md    # Pathway evidence summary (after GSEA)
+│   └── gsea_evidence.json  # Machine-readable pathway evidence
+├── logs/
+│   └── agent.log           # Tool-level execution log
 ├── figures/
 │   └── *.png               # Visualizations
-├── intermediate/
-│   └── *.h5ad              # Checkpoint files
-├── pbmc_qc.h5ad
-├── pbmc_clustered.h5ad
-└── ...
+└── result.h5ad             # Final saved AnnData (if requested)
 ```
+
+If checkpoint saving is enabled, an additional `intermediate/` folder is created for checkpoint `.h5ad` files.
 
 ## CLI Reference
 
 ```bash
 # Agent mode - LLM-guided analysis
-scagent analyze "your request" --data file.h5      # Interactive by default
-scagent analyze --data file.h5                     # Auto-analyze (agent decides)
-scagent analyze --data file.h5 --single-run        # Exit after initial summary
+scagent analyze "your request" --data file.h5      # Collaborative agent run
+scagent analyze --data file.h5                     # Let the agent choose a first pass
+scagent analyze --data file.h5 --single-run        # Exit after the initial collaborative turn
 scagent analyze --data file.h5 --provider openai   # Use OpenAI instead of Anthropic
 
 # Direct mode - no LLM

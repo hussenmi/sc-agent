@@ -77,7 +77,14 @@ from .batch import (
 )
 
 # Agent
-from .agent import SCAgent
+from .agent import (
+    SCAgent,
+    AgentWorldState,
+    ArtifactRecord,
+    DecisionRecord,
+    StateDelta,
+    VerificationResult,
+)
 
 __all__ = [
     # Version
@@ -124,4 +131,9 @@ __all__ = [
     "run_harmony",
     # Agent
     "SCAgent",
+    "AgentWorldState",
+    "ArtifactRecord",
+    "DecisionRecord",
+    "StateDelta",
+    "VerificationResult",
 ]

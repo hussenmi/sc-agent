@@ -79,7 +79,7 @@ def run_celltypist(
     adata: AnnData,
     model: str = CELLTYPIST_DEFAULTS.model,
     majority_voting: bool = CELLTYPIST_DEFAULTS.majority_voting,
-    over_clustering: Optional[str] = 'leiden',
+    over_clustering: Optional[str] = "leiden",
     mode: str = 'best match',
     raw_layer: Optional[str] = None,
     transfer_results: bool = True,
@@ -125,6 +125,12 @@ def run_celltypist(
         adata = adata.copy()
 
     logger.info(f"Running CellTypist with model '{model}'")
+
+    if majority_voting and over_clustering and over_clustering not in adata.obs.columns:
+        raise ValueError(
+            f"CellTypist majority voting requested over '{over_clustering}', "
+            "but that column is not present in adata.obs."
+        )
 
     # Download model if needed
     if not (model.startswith('/') or model.startswith('./')):
