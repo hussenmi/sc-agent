@@ -9,6 +9,7 @@ Creates run directories with manifests for reproducibility.
 import os
 import sys
 import json
+import random
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Literal
 import logging
@@ -162,6 +163,7 @@ class SCAgent:
         self.world_state = AgentWorldState()
         self.biological_context: Optional[Dict[str, Any]] = None
         self._pending_image: Optional[Dict[str, str]] = None  # For vision support
+        self._next_llm_status_message: Optional[str] = None
         self._conversation_history: List[Dict[str, Any]] = []  # For interactive mode
         self._active_request: str = ""
         self._active_request_is_followup: bool = False
@@ -1325,7 +1327,9 @@ class SCAgent:
         console.print("  • Type 'quit' to stop")
 
         try:
-            response = input("\n> ").strip()
+            from ..terminal import read_user_input
+
+            response = read_user_input("\n> ")
             return response if response else "try to recover from the error"
         except (EOFError, KeyboardInterrupt):
             return "quit"
@@ -1452,6 +1456,10 @@ class SCAgent:
         specs: List[Dict[str, Any]] = []
         for tool in self.tools:
             function = tool.get("function", {})
+            if function.get("name") == "ask_user":
+                # In CLI mode, user questions should be normal final responses.
+                # The next interactive turn will capture the user's choice.
+                continue
             specs.append({
                 "name": function.get("name"),
                 "description": function.get("description", ""),
@@ -1491,8 +1499,43 @@ class SCAgent:
             "user-facing answer.\n"
             "- For final responses, set tool_name and tool_input_json to null. For tool calls, set "
             "content to null.\n\n"
+            "When a tool result or runtime state says checkpoint_required or pending_checkpoint, "
+            "do not call an ask-user tool. Return kind='final' with a clear, conversational summary "
+            "of what just happened and 2-4 numbered next-step options. Do not mention internal "
+            "checkpoint fields such as default, recommendation, option_actions, or decision_key. "
+            "Do not say 'You selected option N' unless that is the actual scientific result; just "
+            "carry out the selected action or ask what to do next.\n\n"
             "## Current Request, History, Runtime State, and Tools\n"
             f"{json.dumps(payload, indent=2, default=str)}"
+        )
+
+    def _with_llm_status(self, action):
+        """Run a blocking model call with provider-neutral terminal feedback."""
+        status_messages = [
+            "Analyzing...",
+            "Working...",
+            "Thinking...",
+            "Reviewing the next step...",
+        ]
+        if self.verbose:
+            from rich.console import Console
+
+            console = Console()
+            message = self._next_llm_status_message or random.choice(status_messages)
+            self._next_llm_status_message = None
+            with console.status(
+                message,
+                spinner="dots",
+            ):
+                return action()
+        self._next_llm_status_message = None
+        return action()
+
+    def _request_codex_decision(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Ask Codex for the next step while keeping terminal feedback provider-neutral."""
+        prompt = self._build_codex_decision_prompt(messages)
+        return self._with_llm_status(
+            lambda: self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
         )
 
     def _analyze_codex(
@@ -1512,12 +1555,7 @@ class SCAgent:
 
         try:
             for _iteration in range(max_iterations):
-                prompt = self._build_codex_decision_prompt(messages)
-                decision = self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
-
-                thought = decision.get("thought")
-                if thought:
-                    self._print_thinking(str(thought))
+                decision = self._request_codex_decision(messages)
 
                 kind = decision.get("kind")
                 if kind == "tool_call":
@@ -1596,12 +1634,14 @@ class SCAgent:
 
         try:
             for iteration in range(max_iterations):
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    system=self._build_system_prompt(),
-                    tools=self.tools,
-                    messages=messages,
+                response = self._with_llm_status(
+                    lambda: self.client.messages.create(
+                        model=self.model,
+                        max_tokens=4096,
+                        system=self._build_system_prompt(),
+                        tools=self.tools,
+                        messages=messages,
+                    )
                 )
 
                 if response.stop_reason == "tool_use":
@@ -1644,7 +1684,7 @@ class SCAgent:
                             ]
                         }
                         messages.append(image_msg)
-                        self._print(f"    [Sending image to LLM for analysis]")
+                        self._next_llm_status_message = "Analyzing image..."
                         self._pending_image = None
 
                 elif response.stop_reason == "end_turn":
@@ -1714,11 +1754,13 @@ class SCAgent:
             for iteration in range(max_iterations):
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = self._build_system_prompt()
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    max_completion_tokens=4096,
-                    tools=self.tools,
-                    messages=messages,
+                response = self._with_llm_status(
+                    lambda: self.client.chat.completions.create(
+                        model=self.model,
+                        max_completion_tokens=4096,
+                        tools=self.tools,
+                        messages=messages,
+                    )
                 )
 
                 choice = response.choices[0]
@@ -1758,7 +1800,7 @@ class SCAgent:
                             ]
                         }
                         messages.append(image_msg)
-                        self._print(f"    [Sending image to LLM for analysis]")
+                        self._next_llm_status_message = "Analyzing image..."
                         self._pending_image = None
 
                 elif choice.finish_reason == "stop":
@@ -2560,11 +2602,25 @@ class SCAgent:
 
     def _handle_ask_user(self, tool_input: Dict[str, Any]) -> str:
         """Handle ask_user tool - prompt user for input."""
+        if self._pending_checkpoint:
+            checkpoint = self._pending_checkpoint
+            # Prefer the canonical checkpoint text over model-invented wording.
+            tool_input = {
+                **tool_input,
+                "question": checkpoint.get("question", tool_input.get("question", "")),
+                "options": checkpoint.get("options", tool_input.get("options", [])),
+                "option_actions": checkpoint.get("option_actions", tool_input.get("option_actions", [])),
+                "default": checkpoint.get("default", tool_input.get("default", "")),
+                "decision_key": checkpoint.get("decision_key", tool_input.get("decision_key", "")),
+                "summary": checkpoint.get("summary", tool_input.get("summary", "")),
+            }
+
         question = tool_input["question"]
         options = tool_input.get("options", [])
         option_actions = tool_input.get("option_actions", [])
         default = tool_input.get("default", "")
         decision_key = tool_input.get("decision_key", "")
+        summary = tool_input.get("summary", "")
 
         if self.collaborative and not sys.stdin.isatty():
             return json.dumps({
@@ -2592,16 +2648,21 @@ class SCAgent:
             }, indent=2)
 
         print()
+        if summary:
+            print(summary)
+            print()
         print(question)
         if options and not re.search(r"(^|\n)\s*1\.\s", question):
             for idx, option in enumerate(options, 1):
                 print(f"{idx}. {option}")
         if default:
-            print(f"[Default: {default}]")
+            print("Press Enter to use the suggested option.")
 
         # Get user input
         try:
-            response = input("> ").strip()
+            from ..terminal import read_user_input
+
+            response = read_user_input("> ")
             if not response and default:
                 response = default
         except (EOFError, KeyboardInterrupt):
@@ -2655,7 +2716,9 @@ class SCAgent:
         print('='*50)
 
         try:
-            response = input("Approve? [y/N]: ").strip().lower()
+            from ..terminal import read_user_input
+
+            response = read_user_input("Approve? [y/N]: ").lower()
         except (EOFError, KeyboardInterrupt):
             response = "n"
 
@@ -2723,11 +2786,13 @@ class SCAgent:
             Agent's response.
         """
         if self.provider == "anthropic":
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=self._build_system_prompt(),
-                messages=[{"role": "user", "content": message}],
+            response = self._with_llm_status(
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=self._build_system_prompt(),
+                    messages=[{"role": "user", "content": message}],
+                )
             )
             for content in response.content:
                 if hasattr(content, "text"):
@@ -2735,23 +2800,27 @@ class SCAgent:
             return ""
         elif self.provider in {"openai", "groq"}:
             # OpenAI
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_completion_tokens=4096,
-                messages=[
-                    {"role": "system", "content": self._build_system_prompt()},
-                    {"role": "user", "content": message},
-                ],
+            response = self._with_llm_status(
+                lambda: self.client.chat.completions.create(
+                    model=self.model,
+                    max_completion_tokens=4096,
+                    messages=[
+                        {"role": "system", "content": self._build_system_prompt()},
+                        {"role": "user", "content": message},
+                    ],
+                )
             )
             return response.choices[0].message.content or ""
         elif self.provider == "codex":
-            prompt = (
-                f"{self._build_system_prompt()}\n\n"
-                "Answer the following user question directly. Return kind='final' in the "
-                "required JSON schema; do not call tools for this lightweight chat method.\n\n"
-                f"User question: {message}"
-            )
-            decision = self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
+            messages = [{
+                "role": "user",
+                "content": (
+                    "Answer the following user question directly. Return kind='final' in the "
+                    "required JSON schema; do not call tools for this lightweight chat method.\n\n"
+                    f"User question: {message}"
+                ),
+            }]
+            decision = self._request_codex_decision(messages)
             if decision.get("kind") == "final":
                 return decision.get("content") or ""
             return (

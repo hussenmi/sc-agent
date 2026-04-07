@@ -208,6 +208,7 @@ Examples:
 def run_analyze(args):
     """Run autonomous analysis."""
     from scagent.agent import SCAgent
+    from scagent.terminal import read_user_input
 
     if not sys.stdin.isatty():
         print(
@@ -264,7 +265,7 @@ def run_analyze(args):
         while True:
             try:
                 # Just show a prompt - the conversation is ongoing
-                user_input = input("\n> ").strip()
+                user_input = read_user_input("\n> ")
 
                 if user_input.lower() in ['done', 'exit', 'quit', 'q']:
                     print("Exiting interactive mode.")
