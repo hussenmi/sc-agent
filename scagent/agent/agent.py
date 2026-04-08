@@ -29,6 +29,33 @@ logger = logging.getLogger(__name__)
 
 Provider = Literal["anthropic", "openai", "groq", "codex"]
 
+FAILURE_PATTERNS = [
+    r"\berror:",
+    r"\bfailed to\b",
+    r"\bfailed\b",
+    r"\bfailure\b",
+    r"\bexception\b",
+    r"\btraceback\b",
+    r"\bi couldn't\b",
+    r"\bi could not\b",
+    r"\bi can't\b",
+    r"\bi cannot\b",
+    r"\bunable to\b",
+    r"\bnot installed\b",
+    r"\bno module named\b",
+    r"\bmodule not found\b",
+    r"\bmissing dependency\b",
+    r"\bmissing package\b",
+    r"\bmissing module\b",
+    r"\btry again\b",
+]
+NON_FAILURE_PATTERNS = [
+    r"\bno errors?\b",
+    r"\bwithout errors?\b",
+    r"\b0 errors?\b",
+]
+AUTO_RECOVERY_ATTEMPTS = 2
+
 ACTION_TOOL_NAMES = {
     "run_qc",
     "normalize_and_hvg",
@@ -1303,15 +1330,80 @@ class SCAgent:
         result_data["verification"] = self._generic_verification(tool_name, tool_input, result_data)
         return result_data
 
+    def _looks_like_failure(self, message: str) -> bool:
+        """Heuristic for assistant responses that likely need recovery."""
+        normalized = " ".join((message or "").lower().split())
+        if not normalized:
+            return False
+        scrubbed = normalized
+        for pattern in NON_FAILURE_PATTERNS:
+            scrubbed = re.sub(pattern, "", scrubbed)
+        return any(re.search(pattern, scrubbed) for pattern in FAILURE_PATTERNS)
+
+    def _build_auto_recovery_instruction(self, error_msg: str, attempt: int) -> str:
+        """Prompt the model to self-correct before asking the user for help."""
+        return (
+            f"Your previous response indicates an unresolved issue.\n\n"
+            f"Issue:\n{error_msg}\n\n"
+            f"This is automatic recovery attempt {attempt} of {AUTO_RECOVERY_ATTEMPTS}. "
+            "Try to resolve the problem yourself before asking the user for help. "
+            "Use the available tools to inspect state, fix missing prerequisites, adjust parameters, "
+            "or try a better approach. If you can recover, do so and then give a normal user-facing "
+            "summary. Only if you still cannot proceed after genuinely trying should you ask the user "
+            "a concise follow-up question."
+        )
+
+    def _print_auto_recovery_notice(self, attempt: int) -> None:
+        """Tell the user the agent is trying to recover automatically."""
+        if self.verbose:
+            self._print(
+                f"[yellow]Issue detected. Trying to recover automatically ({attempt}/{AUTO_RECOVERY_ATTEMPTS})...[/yellow]"
+            )
+
+    def _maybe_continue_after_failure(
+        self,
+        final_result: str,
+        messages: List[Dict[str, Any]],
+        auto_recovery_attempts: int,
+        suggestions: Optional[List[str]] = None,
+    ):
+        """Try bounded automatic recovery before interrupting the user."""
+        if not self._looks_like_failure(final_result):
+            return False, auto_recovery_attempts
+
+        if auto_recovery_attempts < AUTO_RECOVERY_ATTEMPTS:
+            next_attempt = auto_recovery_attempts + 1
+            logger.warning(
+                "Assistant final response looked like a failure; starting automatic recovery attempt %s/%s",
+                next_attempt,
+                AUTO_RECOVERY_ATTEMPTS,
+            )
+            self._print_auto_recovery_notice(next_attempt)
+            messages.append({
+                "role": "user",
+                "content": self._build_auto_recovery_instruction(final_result, next_attempt),
+            })
+            self._conversation_history = messages
+            return True, next_attempt
+
+        if self.verbose:
+            user_input = self._ask_continue(final_result, suggestions=suggestions)
+            if user_input.lower() not in ["quit", "exit", "q"]:
+                messages.append({"role": "user", "content": user_input})
+                self._conversation_history = messages
+                return True, 0
+
+        return False, auto_recovery_attempts
+
     def _ask_continue(self, error_msg: str, suggestions: list = None) -> str:
-        """Ask user how to proceed after an error."""
+        """Ask user how to proceed after automatic recovery was not enough."""
         from rich.console import Console
         from rich.panel import Panel
         console = Console()
 
         console.print()
         console.print(Panel(
-            f"{error_msg}",
+            "The agent ran into an issue and could not fully recover automatically.",
             title="⚠️  Issue Detected",
             border_style="yellow"
         ))
@@ -1552,6 +1644,7 @@ class SCAgent:
             messages = [{"role": "user", "content": user_message}]
         final_result = ""
         tool_names = {tool.get("name") for tool in self._codex_tool_specs()}
+        auto_recovery_attempts = 0
 
         try:
             for _iteration in range(max_iterations):
@@ -1602,9 +1695,17 @@ class SCAgent:
                 if kind == "final":
                     final_result = decision.get("content") or ""
                     messages.append({"role": "assistant", "content": final_result})
-                    self._conversation_history = messages
                     self._print("\n" + "-" * 50)
                     self._print(final_result)
+                    should_continue, auto_recovery_attempts = self._maybe_continue_after_failure(
+                        final_result,
+                        messages,
+                        auto_recovery_attempts,
+                        suggestions=["Provide additional instructions", "Try a different approach"],
+                    )
+                    if should_continue:
+                        continue
+                    self._conversation_history = messages
                     if self.run_manager:
                         self.run_manager.complete(summary=final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
@@ -1631,6 +1732,7 @@ class SCAgent:
             # Start fresh
             messages = [{"role": "user", "content": user_message}]
         final_result = ""
+        auto_recovery_attempts = 0
 
         try:
             for iteration in range(max_iterations):
@@ -1691,28 +1793,20 @@ class SCAgent:
                     # Add final assistant message to history
                     messages.append({"role": "assistant", "content": response.content})
 
-                    for content in response.content:
-                        if hasattr(content, "text"):
-                            final_result = content.text
-                            self._print("\n" + "-" * 50)
-                            self._print(final_result)
+                    text_parts = [content.text for content in response.content if hasattr(content, "text")]
+                    final_result = "\n".join(part for part in text_parts if part)
+                    if final_result:
+                        self._print("\n" + "-" * 50)
+                        self._print(final_result)
 
-                    # Check if the response indicates failure/incomplete
-                    failure_indicators = ["error", "failed", "couldn't", "unable to", "not installed",
-                                         "missing", "cannot", "exception", "try again"]
-                    seems_like_failure = any(ind in final_result.lower() for ind in failure_indicators)
-
-                    # If it looks like a failure, offer interactive recovery
-                    if seems_like_failure and self.verbose:
-                        user_input = self._ask_continue(
-                            final_result,  # Pass the actual response - it contains the specific issue
-                            suggestions=["Provide additional instructions", "Try a different approach"]
-                        )
-                        if user_input.lower() not in ["quit", "exit", "q"]:
-                            # Continue the conversation with user input
-                            messages.append({"role": "user", "content": user_input})
-                            self._conversation_history = messages
-                            continue  # Go to next iteration
+                    should_continue, auto_recovery_attempts = self._maybe_continue_after_failure(
+                        final_result,
+                        messages,
+                        auto_recovery_attempts,
+                        suggestions=["Provide additional instructions", "Try a different approach"],
+                    )
+                    if should_continue:
+                        continue
 
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
@@ -1749,6 +1843,7 @@ class SCAgent:
                 {"role": "user", "content": user_message},
             ]
         final_result = ""
+        auto_recovery_attempts = 0
 
         try:
             for iteration in range(max_iterations):
@@ -1809,25 +1904,17 @@ class SCAgent:
 
                     final_result = message.content or ""
 
-                    # Check if the response indicates failure/incomplete
-                    failure_indicators = ["error", "failed", "couldn't", "unable to", "not installed",
-                                         "missing", "cannot", "exception", "try again"]
-                    seems_like_failure = any(ind in final_result.lower() for ind in failure_indicators)
-
                     self._print("\n" + "-" * 50)
                     self._print(final_result)
 
-                    # If it looks like a failure, offer interactive recovery
-                    if seems_like_failure and self.verbose:
-                        user_input = self._ask_continue(
-                            final_result,  # Pass the actual response - it contains the specific issue
-                            suggestions=["Provide additional instructions", "Try a different approach"]
-                        )
-                        if user_input.lower() not in ["quit", "exit", "q"]:
-                            # Continue the conversation with user input
-                            messages.append({"role": "user", "content": user_input})
-                            self._conversation_history = messages
-                            continue  # Go to next iteration
+                    should_continue, auto_recovery_attempts = self._maybe_continue_after_failure(
+                        final_result,
+                        messages,
+                        auto_recovery_attempts,
+                        suggestions=["Provide additional instructions", "Try a different approach"],
+                    )
+                    if should_continue:
+                        continue
 
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
