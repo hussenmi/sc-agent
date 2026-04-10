@@ -192,14 +192,21 @@ def infer_biological_context(
     adata: AnnData,
     *,
     text_context: Optional[str] = None,
+    _precomputed_state=None,
 ) -> BiologicalContext:
     """
     Infer biological context from user text, metadata, and coarse annotations.
 
     Provenance stays explicit so downstream interpretation can tell what came
     from user hints versus metadata versus marker/annotation heuristics.
+
+    Parameters
+    ----------
+    _precomputed_state : DataState, optional
+        Pre-computed inspect_data result. Pass this when the caller already ran
+        inspect_data to avoid a redundant (and expensive) second matrix scan.
     """
-    state = inspect_data(adata)
+    state = _precomputed_state if _precomputed_state is not None else inspect_data(adata)
     context = BiologicalContext()
 
     normalized_text = _normalize_text(text_context)

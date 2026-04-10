@@ -1470,6 +1470,16 @@ class SCAgent:
         self._active_request_is_followup = is_followup
         self.world_state.set_active_request(request)
         self._remember_user_preferences(request)
+
+        # Print the panel immediately so the terminal never looks stuck while
+        # _sync_world_state (which calls inspect_data on the full adata) runs.
+        if self.verbose:
+            from rich.console import Console
+            from rich.panel import Panel
+            console = Console()
+            console.print()
+            console.print(Panel(request, title="🔬 Analyzing", border_style="cyan"))
+
         self._sync_world_state(extra_text=request)
 
         # Create run directory only for first analysis
@@ -1517,13 +1527,6 @@ class SCAgent:
             user_message += f"\n\n[Data already loaded in memory: {self.adata.n_obs} cells x {self.adata.n_vars} genes]"
         if self.run_manager:
             user_message += f"\nOutput directory: {self.run_manager.run_dir}"
-
-        if self.verbose:
-            from rich.console import Console
-            from rich.panel import Panel
-            console = Console()
-            console.print()
-            console.print(Panel(request, title="🔬 Analyzing", border_style="cyan"))
 
         if self.collaborative and not sys.stdin.isatty():
             message = (
@@ -1607,7 +1610,10 @@ class SCAgent:
             "Analyzing...",
             "Working...",
             "Thinking...",
-            "Reviewing the next step...",
+            'Doing...',
+            'Crunching numbers...',
+            'Thinkering...',
+            'Processing...',
         ]
         if self.verbose:
             from rich.console import Console
@@ -1707,7 +1713,7 @@ class SCAgent:
                         continue
                     self._conversation_history = messages
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result)
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
 
@@ -1812,7 +1818,7 @@ class SCAgent:
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result)
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -1920,7 +1926,7 @@ class SCAgent:
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result)
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -1931,7 +1937,7 @@ class SCAgent:
                     final_result = message.content or ""
                     self._print(final_result)
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result)
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
                     return final_result
 
                 else:
@@ -2031,27 +2037,32 @@ class SCAgent:
 
         _prepare_tool_paths()
         self._apply_world_state_overrides(tool_name, tool_input)
-        self._sync_world_state()
+        # Don't re-sync here — we already synced at the start of analyze() and after
+        # the previous tool call. Re-syncing before execution hits adata.X on every
+        # tool call without any adata change having occurred.
         before_snapshot = self.world_state.snapshot()
         if self.run_manager:
             self.run_manager.append_log(f"START {tool_name} {json.dumps(tool_input, default=str)}")
 
-        # Special handling for ask_user - get input from user but still track it like other tools
+        # ask_user is no longer in the tool list — the agent uses a turn-based
+        # model and presents options in its final text response instead.
+        # This branch is a safety net in case an older serialized conversation
+        # replays the tool; treat it as a no-op so the turn continues cleanly.
         if tool_name == "ask_user":
-            if self._pending_checkpoint:
-                tool_input.setdefault("question", self._pending_checkpoint.get("question", "What would you like to do next?"))
-                tool_input.setdefault("options", self._pending_checkpoint.get("options", []))
-                tool_input.setdefault("option_actions", self._pending_checkpoint.get("option_actions", []))
-                tool_input.setdefault("default", self._pending_checkpoint.get("default", ""))
-                tool_input.setdefault("decision_key", self._pending_checkpoint.get("decision_key", ""))
-            result_json = self._handle_ask_user(tool_input)
+            result_json = json.dumps({
+                "status": "ok",
+                "tool": "ask_user",
+                "message": "ask_user is no longer used — present options in your final response text.",
+                "user_response": "proceed",
+            }, indent=2)
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
             result_json = self._handle_install_package(tool_input)
         # Special handling for run_code - show what's being executed
         elif tool_name == "run_code":
+            description = tool_input.get('description', 'custom code')
             self._print(f"\n[Tool] {tool_name}")
-            self._print(f"    Description: {tool_input.get('description', 'custom code')}")
+            self._print(f"    Description: {description}")
             if self.verbose:
                 code_preview = tool_input.get('code', '')[:100]
                 if len(tool_input.get('code', '')) > 100:
@@ -2060,14 +2071,25 @@ class SCAgent:
             # Pass output directory for code file saving
             if self.run_manager:
                 tool_input["output_dir"] = str(self.run_manager.run_dir)
-            # Run without spinner for code (it may have its own output)
-            result_json, self.adata = process_tool_call(
-                tool_name,
-                tool_input,
-                self.adata,
-                world_state=self.world_state,
-                run_manager=self.run_manager,
-            )
+            # Run with a spinner so the terminal never looks stuck during
+            # long-running custom code (decompression, large file loads, etc.)
+            if self.verbose:
+                with console.status(f"[bold cyan]{description}...", spinner="dots"):
+                    result_json, self.adata = process_tool_call(
+                        tool_name,
+                        tool_input,
+                        self.adata,
+                        world_state=self.world_state,
+                        run_manager=self.run_manager,
+                    )
+            else:
+                result_json, self.adata = process_tool_call(
+                    tool_name,
+                    tool_input,
+                    self.adata,
+                    world_state=self.world_state,
+                    run_manager=self.run_manager,
+                )
         else:
             # Run with spinner for other tools
             if self.verbose:
@@ -2092,7 +2114,14 @@ class SCAgent:
         # Check for image in result and store for vision
         try:
             result_data = json.loads(result_json)
-            self._sync_world_state()
+            # Only re-sync when the tool actually modifies adata (action tools).
+            # Inspection, figure, and search tools don't change the matrix, so
+            # syncing them would hit adata.X for no benefit.
+            # Invalidate the inspect cache first so the sync re-runs inspect_data
+            # with the fresh adata state (e.g. after QC filtering, normalization).
+            if self._is_action_tool(tool_name):
+                self.world_state.invalidate_inspect_cache()
+                self._sync_world_state()
 
             # If there's an image, store it for the next message
             if "image_base64" in result_data:

@@ -306,52 +306,56 @@ class RunManager:
 
         self._save_manifest()
 
-    def complete(self, summary: str = ""):
-        """Mark run as completed and save final manifest."""
+    def append_findings(self, request: str, summary: str, tools_used: List[str]) -> str:
+        """Append one turn's findings to the running findings log (findings.md).
+
+        This is called automatically at the end of every completed turn so the
+        file grows into a readable research journal.  It is separate from
+        summary.md which is only written when the user explicitly requests it.
+        """
+        findings_path = self.dirs["reports"] / "findings.md"
+        is_new = not findings_path.exists()
+
+        with open(findings_path, "a") as f:
+            if is_new:
+                f.write(f"# Findings Log: {self.run_id}\n\n")
+                f.write(f"**Dataset:** {', '.join(self.manifest.input_files) or 'unknown'}\n\n")
+                f.write("---\n\n")
+
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            f.write(f"## {ts} — {request[:80]}\n\n")
+
+            meaningful_tools = [t for t in tools_used if t not in ("follow_up", "inspect_run_state")]
+            if meaningful_tools:
+                f.write(f"**Tools:** {', '.join(meaningful_tools)}\n\n")
+
+            if summary:
+                f.write(f"{summary}\n\n")
+
+            f.write("---\n\n")
+
+        return str(findings_path)
+
+    def complete(self, summary: str = "", request: str = ""):
+        """Mark run as completed, append to findings log, save manifest.
+
+        Does NOT write summary.md — that is a curated document the user
+        requests explicitly (e.g. 'give me a summary of what we've done').
+        The findings log (findings.md) is the auto-maintained research journal.
+        """
         self.manifest.status = "completed"
         self._save_manifest()
 
-        # Write summary report
-        summary_path = self.dirs["reports"] / "summary.md"
-        with open(summary_path, 'w') as f:
-            f.write(f"# Run Summary: {self.run_id}\n\n")
-            f.write(f"**Status:** {self.manifest.status}\n")
-            f.write(f"**Created:** {self.manifest.created_at}\n")
-            f.write(f"**User:** {self.manifest.user}@{self.manifest.host}\n\n")
+        # Collect tools used in this turn from recent steps
+        recent_tools = [
+            s["tool"] for s in self.manifest.steps_completed[-20:]
+        ]
 
-            if self.manifest.request:
-                f.write(f"## Request\n\n{self.manifest.request}\n\n")
+        turn_request = request or self.manifest.request or ""
+        if summary and turn_request:
+            self.append_findings(turn_request, summary, recent_tools)
 
-            f.write("## Steps Completed\n\n")
-            for step in self.manifest.steps_completed:
-                f.write(f"- **{step['tool']}**")
-                if step.get('output_path'):
-                    f.write(f" → `{Path(step['output_path']).name}`")
-                f.write("\n")
-
-            if summary:
-                f.write(f"\n## Summary\n\n{summary}\n")
-
-            if self.manifest.warnings:
-                f.write("\n## Warnings\n\n")
-                for w in self.manifest.warnings:
-                    f.write(f"- {w}\n")
-
-            if self.manifest.artifact_registry:
-                f.write("\n## Artifacts\n\n")
-                for artifact in self.manifest.artifact_registry[-10:]:
-                    label = artifact.get("kind", "artifact")
-                    path = artifact.get("path", "")
-                    f.write(f"- `{label}` → `{Path(path).name}`\n")
-
-            if self.manifest.user_decisions:
-                f.write("\n## Decisions\n\n")
-                for decision in self.manifest.user_decisions[-10:]:
-                    key = decision.get("key", "decision")
-                    value = decision.get("applied_value", decision.get("recommended_value"))
-                    f.write(f"- `{key}` → `{value}`\n")
-
-        return str(summary_path)
+        return str(self.dirs["reports"] / "findings.md")
 
     def fail(self, error: str):
         """Mark run as failed."""

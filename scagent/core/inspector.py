@@ -256,18 +256,30 @@ def metadata_resolution_to_dict(resolution: MetadataResolution) -> Dict[str, Any
 
 
 def _is_integer_matrix(X) -> bool:
-    """Check if matrix contains integer values (counts)."""
+    """Check if matrix contains integer values (counts).
+
+    Uses the dtype as a fast shortcut — integer dtypes are definitely counts,
+    float dtypes with a log1p-range max are definitely not.  Only falls back
+    to sampling when the dtype is ambiguous (float that could still be counts).
+    Sampling uses a cheap head-slice instead of np.random.choice to avoid
+    allocating an index array the size of the full NNZ count.
+    """
+    # Fast dtype shortcut: integer dtypes are always counts
+    dtype = getattr(X, "dtype", None)
+    if dtype is not None and np.issubdtype(dtype, np.integer):
+        return True
+
     if sp.issparse(X):
         data = X.data
     else:
-        data = X.flatten()
+        data = X.ravel()
 
-    sample_size = min(10000, len(data))
-    if len(data) > sample_size:
-        indices = np.random.choice(len(data), sample_size, replace=False)
-        data = data[indices]
+    if len(data) == 0:
+        return True
 
-    return np.allclose(data, np.round(data))
+    # Cheap head-slice — avoids O(nnz) np.random.choice for large matrices
+    sample = data[:min(10000, len(data))]
+    return bool(np.allclose(sample, np.round(sample)))
 
 
 def _detect_data_type(adata: AnnData) -> str:
@@ -601,24 +613,45 @@ def _detect_normalization(adata: AnnData) -> Tuple[bool, bool, str]:
     """
     Detect if data is normalized and log-transformed.
 
+    Uses metadata shortcuts to avoid touching adata.X when possible — X.max()
+    on a large sparse matrix can scan hundreds of millions of values.
+
     Returns: (is_normalized, is_log_transformed, method)
     """
-    method = ""
+    # --- Metadata shortcuts (no X access) ---
+    # log1p in uns is written by sc.pp.log1p and is definitive.
     if "log1p" in adata.uns:
-        method = "log1p"
+        return True, True, "log1p"
 
+    # HVG + PCA presence strongly implies prior normalization even without log1p.
+    if "highly_variable" in adata.var.columns and "X_pca" in adata.obsm:
+        method = "log1p" if "log1p" in adata.uns else "unknown"
+        return True, False, method
+
+    # Integer dtype means raw counts — no normalization has occurred.
+    dtype = getattr(adata.X, "dtype", None)
+    if dtype is not None and np.issubdtype(dtype, np.integer):
+        return False, False, ""
+
+    # --- Fallback: sample a small prefix of X.data (cheap head-slice) ---
     if sp.issparse(adata.X):
-        max_val = adata.X.max()
-        sample_data = adata.X.data[:min(10000, len(adata.X.data))]
+        data = adata.X.data
+        if len(data) == 0:
+            return False, False, ""
+        sample_data = data[:min(10000, len(data))]
+        max_val = float(sample_data.max())
     else:
-        max_val = np.max(adata.X)
-        sample_data = adata.X.flatten()[:10000]
+        flat = adata.X.ravel()
+        if len(flat) == 0:
+            return False, False, ""
+        sample_data = flat[:10000]
+        max_val = float(sample_data.max())
 
     has_floats = not np.allclose(sample_data, np.round(sample_data))
     is_log = max_val < 15 and has_floats
     is_normalized = has_floats
 
-    return is_normalized, is_log, method
+    return is_normalized, is_log, ""
 
 
 def normalize_clustering_method(method: str) -> str:

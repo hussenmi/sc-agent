@@ -161,6 +161,13 @@ class AgentWorldState:
     recent_events: List[Dict[str, Any]] = field(default_factory=list)
     latest_verification: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self):
+        # Inspect-data cache: store a structural fingerprint of the last adata
+        # we synced from so we can skip re-running inspect_data when nothing has
+        # changed.  These are not dataclass fields — they stay out of snapshots.
+        self._inspect_cache_key: Optional[tuple] = None
+        self._inspect_cache_state = None  # cached DataState object
+
     def _derive_capabilities(self, adata) -> Dict[str, Any]:
         processing = self.data_summary.get("processing", {})
         cluster_keys = [
@@ -317,6 +324,25 @@ class AgentWorldState:
     def set_active_request(self, request: str) -> None:
         self.active_request = request
 
+    @staticmethod
+    def _adata_fingerprint(adata) -> tuple:
+        """Cheap structural key — changes whenever adata is meaningfully modified."""
+        return (
+            adata.n_obs,
+            adata.n_vars,
+            tuple(sorted(adata.obs.columns)),
+            tuple(sorted(adata.var.columns)),
+            tuple(sorted(adata.uns.keys())),
+            tuple(sorted(adata.obsm.keys())),
+            tuple(sorted(adata.obsp.keys())),
+            tuple(sorted(adata.layers.keys())),
+        )
+
+    def invalidate_inspect_cache(self) -> None:
+        """Force the next sync_from_adata to re-run inspect_data."""
+        self._inspect_cache_key = None
+        self._inspect_cache_state = None
+
     def sync_from_adata(self, adata, request_text: Optional[str] = None) -> None:
         if adata is None:
             self.data_summary = {}
@@ -324,6 +350,7 @@ class AgentWorldState:
             self.clustering_registry = []
             self.annotation_sources = []
             self.analysis_stage = "uninitialized"
+            self.invalidate_inspect_cache()
             return
 
         from ..analysis import infer_biological_context
@@ -333,7 +360,16 @@ class AgentWorldState:
             metadata_candidate_to_dict,
         )
 
-        state = inspect_data(adata)
+        # Re-use the cached DataState if adata's structure hasn't changed.
+        # inspect_data touches adata.X (expensive on large datasets); caching it
+        # means simple follow-up questions cost nothing here.
+        fingerprint = self._adata_fingerprint(adata)
+        if fingerprint == self._inspect_cache_key and self._inspect_cache_state is not None:
+            state = self._inspect_cache_state
+        else:
+            state = inspect_data(adata)
+            self._inspect_cache_key = fingerprint
+            self._inspect_cache_state = state
         processing = {
             "has_raw_counts": state.has_raw_layer,
             "has_qc_metrics": state.has_qc_metrics,
@@ -377,6 +413,7 @@ class AgentWorldState:
         self.biological_context = infer_biological_context(
             adata,
             text_context=context_text or "",
+            _precomputed_state=state,
         ).to_dict()
         self.data_summary["capabilities"] = self._derive_capabilities(adata)
 

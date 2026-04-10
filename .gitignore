@@ -64,6 +64,7 @@ skills/
 runs/
 run*
 analysis/
+test_data/
 
 # macOS metadata files
 ._*

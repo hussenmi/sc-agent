@@ -51,16 +51,22 @@ def load_data(
 
     # Auto-detect format
     if format is None:
-        if path.suffix == '.h5ad':
+        suffixes = [s.lower() for s in path.suffixes]
+        if path.suffix.lower() == '.h5ad':
             format = 'h5ad'
-        elif path.suffix == '.h5':
+        elif len(suffixes) >= 2 and suffixes[-2] == '.h5ad' and suffixes[-1] == '.gz':
+            format = 'h5ad_gz'
+        elif path.suffix.lower() == '.h5':
             format = '10x_h5'
-        elif path.suffix in ['.mtx', '.gz'] or path.is_dir():
+        elif path.suffix.lower() in ['.mtx'] or path.is_dir():
+            format = 'mtx'
+        elif path.suffix.lower() == '.gz':
+            # .gz but not .h5ad.gz — assume MTX directory (e.g. matrix.mtx.gz passed directly)
             format = 'mtx'
         else:
             raise ValueError(
                 f"Cannot auto-detect format for {path}. "
-                "Please specify format='10x_h5', 'h5ad', or 'mtx'"
+                "Please specify format='10x_h5', 'h5ad', 'h5ad_gz', or 'mtx'"
             )
 
     # Load data
@@ -68,6 +74,8 @@ def load_data(
         adata = load_10x_h5(path, make_var_unique=make_var_unique)
     elif format == 'h5ad':
         adata = load_h5ad(path)
+    elif format == 'h5ad_gz':
+        adata = load_h5ad_gz(path)
     elif format == 'mtx':
         adata = load_mtx(path, make_var_unique=make_var_unique)
     else:
@@ -129,6 +137,52 @@ def load_h5ad(path: Union[str, Path]) -> AnnData:
 
     logger.info(f"Loading h5ad file: {path}")
     return sc.read_h5ad(str(path))
+
+
+def load_h5ad_gz(path: Union[str, Path]) -> AnnData:
+    """
+    Load a gzip-compressed h5ad file (e.g. dataset.h5ad.gz from GEO).
+
+    Decompresses to a temporary file, reads it, then cleans up.
+    Shows a progress indicator because decompression of large files can take time.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the .h5ad.gz file.
+
+    Returns
+    -------
+    AnnData
+        Loaded AnnData object.
+    """
+    import gzip
+    import shutil
+    import tempfile
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    file_size_mb = path.stat().st_size / (1024 ** 2)
+    logger.info(f"Decompressing {path.name} ({file_size_mb:.0f} MB compressed) ...")
+    print(f"  Decompressing {path.name} ({file_size_mb:.0f} MB compressed) — this may take a minute...")
+
+    with tempfile.NamedTemporaryFile(suffix=".h5ad", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        with gzip.open(str(path), "rb") as f_in, open(tmp_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out, length=64 * 1024 * 1024)  # 64 MB chunks
+        decompressed_mb = Path(tmp_path).stat().st_size / (1024 ** 2)
+        logger.info(f"Decompressed to {decompressed_mb:.0f} MB, loading h5ad ...")
+        print(f"  Decompressed ({decompressed_mb:.0f} MB), loading ...")
+        return sc.read_h5ad(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def load_mtx(

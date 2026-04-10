@@ -215,33 +215,19 @@ def get_tools() -> List[Dict[str, Any]]:
     ]
 
     # Meta tools (agent control)
+    # Note: ask_user is intentionally absent. The agent follows a turn-based
+    # model (like Claude Code / Codex): run all tools to completion, produce a
+    # final response with numbered options, then wait for the user's next message.
+    # The user's reply comes back through the CLI loop as a normal analyze() call
+    # so state, data, and conversation history are always fully maintained.
     meta_tools = [
-        {
-            "name": "ask_user",
-            "description": "Ask the user a question and wait for their response. Collaboration is the default style, but do not use this for trivial bookkeeping. Use it when a preprocessing or interpretation choice should stay under user control, including QC thresholds, filtering decisions, clustering resolution changes, annotation ambiguity, batch correction, DEG comparisons, or any other material fork in the analysis. Keep the question concise and put the actionable choices in the options field.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "The question to ask the user"},
-                    "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices"},
-                    "option_actions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional machine-readable action hints aligned by index with options (for example run_qc_apply, run_celltypist, review_artifact)."
-                    },
-                    "default": {"type": "string", "description": "Default answer if user just presses enter"},
-                    "decision_key": {"type": "string", "description": "Optional state key to persist if the user answers explicitly (for example batch_key or primary_clustering)."}
-                },
-                "required": ["question"]
-            }
-        },
         {
             "name": "run_code",
             "description": "FLEXIBLE FALLBACK: Execute custom Python code on the AnnData object. This is your most versatile tool - use it for ANY valid request not covered by specialized tools. Examples: custom plots (variance explained, gene correlations, histograms), data filtering (remove clusters, subset cells), calculations (cluster sizes, gene stats), or any scanpy/pandas operation. Access: adata, sc (scanpy), plt (matplotlib), np, pd, output_dir, Path, ensure_dir(path). Use ensure_dir() to create directories before saving. ALWAYS prefer this over saying 'I can't do that'.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Python code to execute. Has access to adata, sc, plt, np, pd, output_dir, Path, ensure_dir(). Do NOT import os - use Path and ensure_dir instead."},
+                    "code": {"type": "string", "description": "Python code to execute. Has access to: adata, sc, plt, np, pd, output_dir, Path, ensure_dir(), write_report(). Key helpers: ensure_dir(path) creates the dir and returns a Path — use it for figures: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'. write_report(name, content) saves a markdown report to reports/name.md and returns the path — always use this instead of open() when saving text results, never write .txt files. Do NOT import os."},
                     "description": {"type": "string", "description": "Brief description of what the code does"},
                     "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
                 },
@@ -970,13 +956,27 @@ def process_tool_call(
             elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
                 raise ValueError(f"'{color_by}' is not available for UMAP coloring.")
 
+        # For large datasets, rasterized scatter is orders of magnitude faster than
+        # vector rendering (the matplotlib default).  vector_friendly=False tells
+        # scanpy to rasterize scatter points — identical PNG output, seconds not minutes.
+        n_cells = adata_obj.n_obs
+        large_dataset = n_cells > 50_000
+        if large_dataset:
+            sc.settings.set_figure_params(vector_friendly=False)
+            dot_size = max(1, min(5, 120_000 // n_cells))
+        else:
+            dot_size = None
+
         fig, ax = plt.subplots(figsize=(10, 8))
 
         if plot_type == "umap":
+            kwargs = dict(ax=ax, show=False)
+            if dot_size is not None:
+                kwargs["size"] = dot_size
             if color_by is None:
-                sc.pl.umap(adata_obj, ax=ax, show=False)
+                sc.pl.umap(adata_obj, **kwargs)
             else:
-                sc.pl.umap(adata_obj, color=color_by, ax=ax, show=False)
+                sc.pl.umap(adata_obj, color=color_by, **kwargs)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -989,6 +989,11 @@ def process_tool_call(
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close()
+
+        # Restore default figure params so subsequent plots in the same session
+        # are not affected.
+        if large_dataset:
+            sc.settings.set_figure_params(vector_friendly=True)
 
         result = {
             "status": "ok",
@@ -1619,8 +1624,26 @@ def process_tool_call(
             # Helper function for safe directory creation
             from pathlib import Path as _Path
             def ensure_dir(path):
-                """Safely create directory if it doesn't exist."""
-                _Path(path).mkdir(parents=True, exist_ok=True)
+                """Create directory if it doesn't exist and return it as a Path."""
+                p = _Path(path)
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+
+            _run_dir = _Path(tool_input.get("output_dir", "."))
+
+            def write_report(name: str, content: str) -> str:
+                """Write a markdown report to reports/name.md and return the path.
+
+                Always use this instead of open() when saving analysis results —
+                it ensures reports land in the right directory as readable .md files.
+
+                Example:
+                    write_report('cluster_summary', '## Cluster Summary\\n\\n...')
+                """
+                reports_dir = ensure_dir(_run_dir / "reports")
+                safe_name = name.replace(" ", "_").rstrip(".md")
+                path = reports_dir / f"{safe_name}.md"
+                path.write_text(content)
                 return str(path)
 
             # Execute in controlled namespace
@@ -1634,8 +1657,9 @@ def process_tool_call(
                 "scanpy": sc,
                 "matplotlib": matplotlib,
                 "output_dir": tool_input.get("output_dir", "."),
-                "Path": _Path,  # Safe path operations
-                "ensure_dir": ensure_dir,  # Helper for creating directories
+                "Path": _Path,
+                "ensure_dir": ensure_dir,
+                "write_report": write_report,
             }
 
             # Capture stdout so LLM can see print outputs
