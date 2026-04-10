@@ -235,71 +235,61 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
-            "name": "web_search_docs",
-            "description": "Search general web and documentation sources. Use for package docs, API references, troubleshooting, method pages, and implementation details. Prefer this for software/documentation questions, not for scientific evidence claims.",
+            "name": "web_search",
+            "description": (
+                "Search the web for documentation, API references, package guides, troubleshooting, and tutorials. "
+                "Use the `site` parameter to target specific documentation sources. "
+                "Common bioinformatics doc sites: scanpy.readthedocs.io, anndata.readthedocs.io, "
+                "celltypist.readthedocs.io, gseapy.readthedocs.io, harmonypy.readthedocs.io, "
+                "scvi-tools.readthedocs.io, muon.readthedocs.io, squidpy.readthedocs.io. "
+                "For troubleshooting use scverse.discourse.org or github.com. "
+                "Use search_papers instead for peer-reviewed scientific evidence."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "site": {"type": "string", "description": "Optional site filter (e.g., 'scanpy.readthedocs.io', 'gseapy.readthedocs.io')"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 5)"}
+                    "query": {"type": "string", "description": "Search query — be specific (e.g., 'scanpy normalize_total target_sum parameter' rather than 'scanpy normalize')"},
+                    "site": {"type": "string", "description": "Optional domain to restrict results (e.g., 'scanpy.readthedocs.io')"},
+                    "max_results": {"type": "integer", "description": "Maximum results (default: 5)"}
                 },
                 "required": ["query"]
             }
         },
         {
             "name": "search_papers",
-            "description": "Search scientific literature using PubMed. Use for papers, reviews, recent pathway/cell-type findings, and scientific evidence. Returns PMID, title, year, journal, abstract excerpt, and PubMed URL.",
+            "description": (
+                "Search PubMed for peer-reviewed scientific literature. Use for: cell type markers, "
+                "pathway biology, disease mechanisms, method papers, and any claim that needs a citation. "
+                "Automatically normalises GSEA/gene set names (strips HALLMARK_, REACTOME_, GO_ prefixes). "
+                "Returns PMID, first author, year, journal, abstract, and PubMed URL. "
+                "Use web_search for package documentation instead."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "PubMed-style search query or plain text topic"},
-                    "max_results": {"type": "integer", "description": "Maximum papers to return (default: 5)"},
-                    "recent_years": {"type": "integer", "description": "Limit to the last N publication years (default: 5)"},
-                    "reviews_only": {"type": "boolean", "description": "Restrict to review articles"}
+                    "query": {"type": "string", "description": "Free-text query or PubMed search string. GSEA set names are normalised automatically (e.g. 'HALLMARK_TNFA_SIGNALING_VIA_NFKB' → 'TNF alpha signaling NF-kB'). Be specific: include cell type, disease, or gene names for better results."},
+                    "max_results": {"type": "integer", "description": "Maximum papers (default: 5)"},
+                    "recent_years": {"type": "integer", "description": "Restrict to last N years (default: 5). Use 10-15 for foundational method papers."},
+                    "reviews_only": {"type": "boolean", "description": "Return review articles only — good for overviews of a topic"}
                 },
                 "required": ["query"]
             }
         },
         {
             "name": "fetch_url",
-            "description": "Fetch and summarize a web page or article landing page. Use after a search step when you need the page contents rather than just search snippets.",
+            "description": (
+                "Fetch the full text of a web page. Use after web_search when snippets are not enough — "
+                "e.g. to read a function's full parameter list, a method's README, or a paper abstract. "
+                "Works well for readthedocs, GitHub READMEs, and static HTML pages. "
+                "JavaScript-heavy sites (Notion, some dashboards) may return little content."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "URL to fetch"},
-                    "max_chars": {"type": "integer", "description": "Maximum text characters to return (default: 4000)"}
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return (default: 4000; increase to 8000 for long API pages)"}
                 },
                 "required": ["url"]
-            }
-        },
-        {
-            "name": "web_search",
-            "description": "Backward-compatible alias for documentation/web search. Prefer web_search_docs for docs and search_papers for literature.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "site": {"type": "string", "description": "Optional site filter"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 5)"}
-                },
-                "required": ["query"]
-            }
-        },
-        {
-            "name": "research_findings",
-            "description": "Conduct focused literature research on GSEA/pathway findings. Uses PubMed queries tailored to pathway, cell type, and leading-edge genes, and returns structured citations plus interpretation guidance. Use AFTER run_gsea to understand what enriched pathways mean biologically.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "pathway": {"type": "string", "description": "Pathway name to research (e.g., 'Oxidative phosphorylation', 'TNF signaling')"},
-                    "cell_type": {"type": "string", "description": "Cell type context (e.g., 'classical monocytes', 'CD8 T cells', 'B cells')"},
-                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Leading edge genes from GSEA to include in search"},
-                    "context": {"type": "string", "description": "Additional context (e.g., 'PBMC', 'tumor microenvironment', 'inflammation')"},
-                    "cluster_confidence": {"type": "number", "description": "Optional cluster confidence score (0-1) from annotation sanity checks"},
-                    "recent_years": {"type": "integer", "description": "Limit to papers from last N years (default: 3)"}
-                },
-                "required": ["pathway", "cell_type"]
             }
         },
         {
@@ -559,7 +549,7 @@ def process_tool_call(
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import run_celltypist, run_scimilarity
     from ..batch import run_scanorama, run_harmony
-    from ..analysis import infer_biological_context, build_literature_context, score_paper_relevance
+    from ..analysis import infer_biological_context
     from .decision_policy import (
         decision_for_batch_strategy,
         decision_for_clustering_selection,
@@ -570,7 +560,10 @@ def process_tool_call(
         """Create compact state dict."""
         state = inspect_data(adata)
         return {
-            "has_raw_counts": state.has_raw_layer,
+            "has_raw_counts": state.has_raw_layer or state.has_raw,
+            "raw_in_adata_raw": state.has_raw,
+            "raw_in_layer": state.has_raw_layer,
+            "raw_layer_name": state.raw_layer_name if state.has_raw_layer else None,
             "has_qc_metrics": state.has_qc_metrics,
             "has_doublets": state.has_doublet_scores,
             "is_normalized": state.is_normalized,
@@ -1406,29 +1399,55 @@ def process_tool_call(
             resp.raise_for_status()
             xml = resp.text
 
+            def strip_tags(s: str) -> str:
+                return re.sub(r"<[^>]+>", "", s).strip()
+
             results = []
             articles = re.findall(r"<PubmedArticle>(.*?)</PubmedArticle>", xml, re.DOTALL)
             for article in articles:
                 title_match = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", article, re.DOTALL)
-                abstract_match = re.search(r"<AbstractText[^>]*>(.*?)</AbstractText>", article, re.DOTALL)
                 pmid_match = re.search(r"<PMID[^>]*>(\d+)</PMID>", article)
-                year_match = re.search(r"<PubDate>.*?<Year>(\d+)</Year>", article, re.DOTALL)
-                journal_match = re.search(r"<Title>(.*?)</Title>", article)
+                if not (title_match and pmid_match):
+                    continue
 
-                if title_match and pmid_match:
-                    title = re.sub(r"<[^>]+>", "", title_match.group(1))
-                    abstract = re.sub(r"<[^>]+>", "", abstract_match.group(1))[:700] if abstract_match else ""
-                    pmid = pmid_match.group(1)
-                    year = year_match.group(1) if year_match else "N/A"
-                    journal = journal_match.group(1) if journal_match else "N/A"
-                    results.append({
-                        "pmid": pmid,
-                        "title": title,
-                        "year": year,
-                        "journal": journal,
-                        "abstract": abstract,
-                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                    })
+                # Abstract: join all AbstractText sections (handles structured abstracts)
+                abstract_parts = re.findall(r"<AbstractText[^>]*>(.*?)</AbstractText>", article, re.DOTALL)
+                abstract = " ".join(strip_tags(p) for p in abstract_parts)[:1000]
+
+                pmid = pmid_match.group(1)
+                title = strip_tags(title_match.group(1))
+
+                year_match = re.search(r"<PubDate>.*?<Year>(\d+)</Year>", article, re.DOTALL)
+                year = year_match.group(1) if year_match else "N/A"
+
+                journal_match = re.search(r"<ISOAbbreviation>(.*?)</ISOAbbreviation>", article)
+                if not journal_match:
+                    journal_match = re.search(r"<Title>(.*?)</Title>", article)
+                journal = strip_tags(journal_match.group(1)) if journal_match else "N/A"
+
+                # First author
+                last_name = re.search(r"<LastName>(.*?)</LastName>", article)
+                first_name = re.search(r"<Initials>(.*?)</Initials>", article)
+                first_author = ""
+                if last_name:
+                    first_author = strip_tags(last_name.group(1))
+                    if first_name:
+                        first_author += f" {strip_tags(first_name.group(1))}"
+
+                # DOI
+                doi_match = re.search(r'<ArticleId IdType="doi">(.*?)</ArticleId>', article)
+                doi = strip_tags(doi_match.group(1)) if doi_match else None
+
+                results.append({
+                    "pmid": pmid,
+                    "title": title,
+                    "first_author": first_author,
+                    "year": year,
+                    "journal": journal,
+                    "abstract": abstract,
+                    "doi": doi,
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                })
 
             return results
         except Exception:
@@ -1467,18 +1486,36 @@ def process_tool_call(
 
             if BeautifulSoup is not None:
                 soup = BeautifulSoup(html_text, "html.parser")
-                for tag in soup(["script", "style", "noscript", "svg"]):
+
+                # Strip boilerplate before extraction
+                for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header", "aside"]):
+                    tag.decompose()
+                for tag in soup.find_all(attrs={"role": ["navigation", "banner", "complementary"]}):
+                    tag.decompose()
+                for tag in soup.find_all(class_=lambda c: c and any(
+                    kw in (" ".join(c) if isinstance(c, list) else c)
+                    for kw in ("sidebar", "toctree", "nav", "menu", "breadcrumb", "footer", "header")
+                )):
                     tag.decompose()
 
                 page_title = clean_whitespace(soup.title.get_text(" ", strip=True)) if soup.title else ""
                 meta = soup.find("meta", attrs={"name": "description"})
                 meta_desc = clean_whitespace(meta.get("content", "")) if meta else ""
 
-                main = soup.find("main") or soup.find("article") or soup.body or soup
+                # Prefer semantic containers (readthedocs uses .rst-content, sphinx uses .document)
+                main = (
+                    soup.find("main") or
+                    soup.find("article") or
+                    soup.find(class_=lambda c: c and any(
+                        kw in (" ".join(c) if isinstance(c, list) else c)
+                        for kw in ("rst-content", "document", "content", "body-content")
+                    )) or
+                    soup.body or soup
+                )
                 parts = []
-                for tag in main.find_all(["h1", "h2", "h3", "p", "li"]):
+                for tag in main.find_all(["h1", "h2", "h3", "h4", "p", "li", "dt", "dd", "pre", "code"]):
                     text_part = clean_whitespace(tag.get_text(" ", strip=True))
-                    if text_part:
+                    if text_part and len(text_part) > 3:
                         parts.append(text_part)
 
                 if not parts:
@@ -1566,7 +1603,7 @@ def process_tool_call(
             "title": title,
             "meta_description": meta_description,
             "extracted_with": extracted_with,
-            "text_excerpt": cleaned[:max_chars],
+            "text": cleaned[:max_chars],
             "text_length": len(cleaned),
             "truncated": len(cleaned) > max_chars,
         }
@@ -1671,13 +1708,45 @@ def process_tool_call(
             # Capture any figures created
             plt.close('all')
 
+            exec_error = None
             try:
                 sys.stdout = stdout_capture
                 exec(code, namespace)
+            except Exception as _exec_err:
+                exec_error = _exec_err
             finally:
                 sys.stdout = old_stdout
 
             captured_output = stdout_capture.getvalue()
+
+            if exec_error is not None:
+                err_type = type(exec_error).__name__
+                err_msg = str(exec_error)
+
+                # Give the LLM targeted guidance based on the error type
+                if err_type in ("TypeError", "AttributeError") or "unexpected keyword" in err_msg or "got an unexpected" in err_msg:
+                    hint = "This looks like an API mismatch. Look up the function's documentation with web_search + fetch_url before retrying — do not guess."
+                elif err_type in ("KeyError", "IndexError") or "not in" in err_msg:
+                    hint = "This looks like a missing column or key. Check adata.obs.columns, adata.var.columns, or adata.obsm with inspect_data or a quick run_code before retrying."
+                elif err_type in ("ModuleNotFoundError", "ImportError"):
+                    hint = f"Package not installed. Use the install_package tool to request installation of the missing package."
+                elif err_type == "SyntaxError":
+                    hint = "Syntax error in the generated code — fix it directly."
+                elif err_type == "NameError":
+                    hint = "NameError — check that all variables used are defined in the namespace (adata, sc, np, pd, plt, Path, ensure_dir, write_report, output_dir)."
+                else:
+                    hint = "Diagnose the error before retrying: if it's an API issue look up docs; if it's a data issue inspect adata state."
+
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_code",
+                    "description": description,
+                    "error_type": err_type,
+                    "error": err_msg,
+                    "output": captured_output[:500] if captured_output else None,
+                    "recovery_hint": hint,
+                }, indent=2), adata
+
             adata = namespace.get("adata", adata)
             custom_output_path = namespace.get("output_path")
 
@@ -1740,24 +1809,19 @@ def process_tool_call(
             site = tool_input.get("site", "")
             max_results = tool_input.get("max_results", 5)
             search_result = search_web(query, site=site, max_results=max_results)
-            search_result["tool"] = tool_name
-            search_result["search_kind"] = "docs"
-            if tool_name == "web_search":
-                search_result["deprecated_alias"] = True
-                search_result["warning"] = (
-                    "web_search is retained for backward compatibility. Prefer web_search_docs for documentation lookup."
-                )
-            search_result["note"] = (
-                "Use this for documentation, troubleshooting, and implementation details. "
-                "For scientific literature, prefer search_papers or research_findings."
-            )
+            search_result["tool"] = "web_search"
             return json.dumps(search_result, indent=2), adata
 
         elif tool_name == "search_papers":
-            query = tool_input["query"]
+            raw_query = tool_input["query"]
             max_results = tool_input.get("max_results", 5)
             recent_years = tool_input.get("recent_years", 5)
             reviews_only = tool_input.get("reviews_only", False)
+
+            # Normalise GSEA gene set names: HALLMARK_TNFA_SIGNALING_VIA_NFKB → TNF alpha signaling NF-kB
+            import re as _re
+            query = _re.sub(r"^(HALLMARK|REACTOME|KEGG|GO|WP|BIOCARTA|PID|NABA)_", "", raw_query, flags=_re.IGNORECASE)
+            query = query.replace("_", " ").strip()
 
             results = search_pubmed(
                 query=query,
@@ -1769,12 +1833,12 @@ def process_tool_call(
             return json.dumps({
                 "status": "ok",
                 "tool": "search_papers",
-                "backend": "pubmed",
                 "query": query,
+                "original_query": raw_query if raw_query != query else None,
                 "reviews_only": reviews_only,
                 "years_searched": f"last {recent_years} years",
+                "count": len(results),
                 "results": results,
-                "note": "Use fetch_url on a selected PubMed URL if you want the landing page text. Prefer PMID-backed evidence for scientific claims.",
             }, indent=2), adata
 
         elif tool_name == "fetch_url":
@@ -1783,322 +1847,6 @@ def process_tool_call(
             fetched = fetch_url_text(url, max_chars=max_chars)
             fetched["tool"] = "fetch_url"
             return json.dumps(fetched, indent=2), adata
-
-        elif tool_name == "research_findings":
-            pathway = tool_input["pathway"]
-            cell_type = tool_input["cell_type"]
-            genes = tool_input.get("genes", [])
-            context = tool_input.get("context", "")
-            cluster_confidence = tool_input.get("cluster_confidence")
-            recent_years = tool_input.get("recent_years", 3)
-
-            def normalize_pathway_term(term: str) -> str:
-                cleaned = term.replace("HALLMARK_", "").replace("GO_", "").replace("REACTOME_", "")
-                cleaned = cleaned.replace("_", " ")
-                cleaned = re.sub(r"\s+", " ", cleaned).strip()
-                replacements = {
-                    "nf kb": "NF-kB",
-                    "il 2": "IL-2",
-                    "stat 5": "STAT5",
-                    "tgf beta": "TGF-beta",
-                }
-                lowered = cleaned.lower()
-                for old, new in replacements.items():
-                    lowered = lowered.replace(old, new.lower())
-                return lowered.title().replace("Nf-Kb", "NF-kB").replace("Il-2", "IL-2").replace("Stat5", "STAT5")
-
-            def pathway_tokens(term: str) -> List[str]:
-                tokens = [tok.lower() for tok in re.split(r"[^A-Za-z0-9]+", term) if tok]
-                stop = {"pathway", "signaling", "response", "process", "hallmark", "up", "down", "v1", "cell", "cells", "immune"}
-                return [tok for tok in tokens if tok not in stop and len(tok) > 2]
-
-            def infer_cell_lineage(cell_type_term: str) -> str:
-                lowered = re.sub(r"\s+", " ", cell_type_term.lower()).strip()
-                if any(tok in lowered for tok in ["cytotoxic t", "helper t", "regulatory t", "treg", "mait", "trm", "tem", "tcm", "t cell"]):
-                    return "t_cell"
-                if "nk" in lowered or "natural killer" in lowered:
-                    return "nk"
-                if "pdc" in lowered or "plasmacytoid" in lowered:
-                    return "pdc"
-                if "dc" in lowered or "dendritic" in lowered:
-                    return "dendritic"
-                if "monocyte" in lowered or "myelo" in lowered or "myelocyte" in lowered:
-                    return "monocyte"
-                if "b cell" in lowered:
-                    return "b_cell"
-                if "plasma" in lowered or "plasmablast" in lowered:
-                    return "plasma"
-                return "unknown"
-
-            def pathway_query_profile(term: str, cell_type_term: str) -> Dict[str, Any]:
-                normalized = normalize_pathway_term(term)
-                lineage = infer_cell_lineage(cell_type_term)
-                profiles = {
-                    "allograft rejection": {
-                        "query_terms": [normalized, "immune activation", "cytotoxic lymphocyte", "antigen presentation"],
-                        "scoring_terms": ["immune activation", "cytotoxic lymphocyte", "antigen presentation", "t cell activation", "nk cell activation"],
-                        "penalty_terms": ["transplant", "allogeneic", "recipient", "donor"],
-                    },
-                    "interferon gamma response": {
-                        "query_terms": [normalized, "interferon gamma signaling", "ifng response", "antigen presentation"],
-                        "scoring_terms": ["interferon gamma", "interferon signaling", "antigen presentation"],
-                    },
-                    "il-2/stat5 signaling": {
-                        "query_terms": [normalized, "IL-2 signaling", "STAT5 signaling", "cytokine signaling"],
-                        "scoring_terms": ["il-2", "stat5", "cytokine signaling"],
-                    },
-                    "apical junction": {
-                        "query_terms": [normalized, "cell adhesion", "junctional remodeling", "cytoskeletal remodeling"],
-                        "scoring_terms": ["cell adhesion", "junction", "cytoskeletal remodeling"],
-                    },
-                    "kras signaling up": {
-                        "query_terms": [normalized, "RAS signaling", "MAPK signaling"],
-                        "scoring_terms": ["ras signaling", "mapk signaling", "kras"],
-                    },
-                    "coagulation": {
-                        "query_terms": [normalized, "coagulation", "immunothrombosis", "thromboinflammation"],
-                        "scoring_terms": ["coagulation", "immunothrombosis", "thromboinflammation"],
-                    },
-                    "myc targets v1": {
-                        "query_terms": [normalized, "MYC signaling", "MYC target genes", "proliferation"],
-                        "scoring_terms": ["myc", "proliferation"],
-                    },
-                    "p53 pathway": {
-                        "query_terms": [normalized, "p53 signaling", "DNA damage response", "apoptosis"],
-                        "scoring_terms": ["p53", "dna damage", "apoptosis"],
-                    },
-                }
-                profile = dict(profiles.get(normalized.lower(), {"query_terms": [normalized], "scoring_terms": [normalized]}))
-
-                if normalized.lower() == "allograft rejection":
-                    if lineage in {"t_cell", "nk"}:
-                        profile["query_terms"] = [normalized, "cytotoxic lymphocyte activation", "t cell activation", "natural killer cell activation"]
-                        profile["scoring_terms"] = ["cytotoxic lymphocyte", "t cell activation", "natural killer cell activation", "immune activation"]
-                    elif lineage in {"dendritic", "monocyte", "pdc"}:
-                        profile["query_terms"] = [normalized, "antigen presentation", "myeloid activation", "interferon response"]
-                        profile["scoring_terms"] = ["antigen presentation", "myeloid activation", "interferon response", "inflammatory activation"]
-                    elif lineage in {"b_cell", "plasma"}:
-                        profile["query_terms"] = [normalized, "antigen presentation", "lymphocyte activation", "b cell activation"]
-                        profile["scoring_terms"] = ["antigen presentation", "lymphocyte activation", "b cell activation"]
-
-                if normalized.lower() == "apical junction" and lineage in {"t_cell", "nk", "monocyte", "dendritic", "pdc"}:
-                    profile["query_terms"] = [normalized, "cell adhesion", "immune cell migration", "cytoskeletal remodeling", "immune synapse"]
-                    profile["scoring_terms"] = ["cell adhesion", "immune cell migration", "cytoskeletal remodeling", "immune synapse"]
-
-                if normalized.lower() == "kras signaling up" and lineage in {"monocyte", "dendritic", "pdc"}:
-                    profile["query_terms"] = [normalized, "MAPK signaling", "myeloid activation", "inflammatory signaling"]
-                    profile["scoring_terms"] = ["mapk signaling", "myeloid activation", "inflammatory signaling"]
-
-                if normalized.lower() == "myc targets v1" and lineage in {"t_cell", "b_cell", "plasma"}:
-                    profile["query_terms"] = [normalized, "lymphocyte proliferation", "MYC signaling", "activation-induced proliferation"]
-                    profile["scoring_terms"] = ["lymphocyte proliferation", "myc signaling", "proliferation"]
-
-                profile["display_term"] = normalized
-                profile["lineage"] = lineage
-                return profile
-
-            def build_cell_type_terms(cell_type_term: str) -> List[str]:
-                lowered = re.sub(r"\s+", " ", cell_type_term.lower()).strip().rstrip("s")
-                terms = [lowered]
-                if any(tok in lowered for tok in ["cytotoxic t", "trm", "tem", "tcm", "helper t", "regulatory t", "treg", "mait", "t cell"]):
-                    if "cytotoxic" in lowered or "trm" in lowered or "tem" in lowered:
-                        terms.extend(["cytotoxic t cell", "t cell"])
-                    elif "regulatory" in lowered or "treg" in lowered:
-                        terms.extend(["regulatory t cell", "t cell"])
-                    else:
-                        terms.append("t cell")
-                elif "nk" in lowered or "natural killer" in lowered:
-                    terms.extend(["natural killer cell", "nk cell"])
-                elif "pdc" in lowered or "plasmacytoid" in lowered:
-                    terms.extend(["plasmacytoid dendritic cell", "dendritic cell"])
-                elif "dc" in lowered or "dendritic" in lowered:
-                    terms.extend(["dendritic cell", "conventional dendritic cell"])
-                elif "monocyte" in lowered or "myelo" in lowered:
-                    terms.append("monocyte")
-                elif "b cell" in lowered:
-                    terms.append("b cell")
-                elif "plasma" in lowered:
-                    terms.extend(["plasma cell", "antibody secreting cell"])
-
-                seen = set()
-                ordered = []
-                for term in terms:
-                    if term and term not in seen:
-                        ordered.append(term)
-                        seen.add(term)
-                return ordered[:3]
-
-            all_findings = {
-                "pathway": pathway,
-                "cell_type": cell_type,
-                "normalized_pathway": normalize_pathway_term(pathway),
-                "pubmed_results": [],
-                "review_articles": [],
-                "gene_specific": [],
-                "selected_papers": [],
-                "search_strategy": [],
-            }
-
-            cell_type_terms = build_cell_type_terms(cell_type)
-            pathway_profile = pathway_query_profile(pathway, cell_type)
-            context_profile = build_literature_context(
-                context,
-                cell_type=cell_type,
-                cluster_confidence=cluster_confidence,
-            )
-            normalized_pathway = pathway_profile["display_term"]
-            all_findings["normalized_pathway"] = normalized_pathway
-            all_findings["pathway_query_terms"] = pathway_profile["query_terms"]
-            all_findings["cell_type_query_terms"] = cell_type_terms
-            all_findings["context_profile"] = context_profile.to_dict()
-
-            primary_queries = [
-                ("pathway_and_cell_type_strict", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])'),
-                ("pathway_only", f'("{normalized_pathway}"[Title/Abstract])'),
-            ]
-
-            for idx, alias_term in enumerate(pathway_profile.get("query_terms", [])[1:3], start=1):
-                primary_queries.append(
-                    (f"pathway_alias_{idx}_and_cell_type", f'("{alias_term}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])')
-                )
-
-            if len(cell_type_terms) > 1:
-                primary_queries.append(
-                    ("pathway_and_broad_cell_type", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[1]}"[Title/Abstract])')
-                )
-
-            if genes and len(genes) >= 2:
-                gene_str = " OR ".join([f'"{g}"[Title/Abstract]' for g in genes[:3]])
-                primary_queries.append(
-                    ("leading_edge_and_cell_type", f'({gene_str}) AND ("{cell_type_terms[0]}"[Title/Abstract])')
-                )
-                alias_for_genes = pathway_profile.get("query_terms", [normalized_pathway])[1] if len(pathway_profile.get("query_terms", [])) > 1 else normalized_pathway
-                primary_queries.append(
-                    ("pathway_alias_and_leading_edge", f'("{alias_for_genes}"[Title/Abstract]) AND ({gene_str})')
-                )
-
-            seen_pmids = set()
-            aggregated_primary = []
-            for label, query_str in primary_queries:
-                results = search_pubmed(query_str, max_results=4, recent_years=recent_years)
-                all_findings["search_strategy"].append({
-                    "label": label,
-                    "query": query_str,
-                    "results_found": len(results),
-                })
-                for paper in results:
-                    if paper["pmid"] not in seen_pmids:
-                        seen_pmids.add(paper["pmid"])
-                        aggregated_primary.append(paper)
-
-            all_findings["pubmed_results"] = aggregated_primary
-
-            # Review searches
-            review_queries = [
-                ("review_pathway_and_cell_type", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])'),
-                ("review_pathway_only", f'("{normalized_pathway}"[Title/Abstract])'),
-            ]
-            for idx, alias_term in enumerate(pathway_profile.get("query_terms", [])[1:3], start=1):
-                review_queries.append(
-                    (f"review_alias_{idx}", f'("{alias_term}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])')
-                )
-            review_results = []
-            seen_review_pmids = set()
-            for label, query_str in review_queries:
-                results = search_pubmed(
-                    query_str,
-                    max_results=3,
-                    recent_years=recent_years,
-                    reviews_only=True,
-                )
-                all_findings["search_strategy"].append({
-                    "label": label,
-                    "query": f"{query_str} AND review[pt]",
-                    "results_found": len(results),
-                })
-                for paper in results:
-                    if paper["pmid"] not in seen_review_pmids:
-                        seen_review_pmids.add(paper["pmid"])
-                        review_results.append(paper)
-            scored_reviews = [
-                score_paper_relevance(
-                    paper,
-                    pathway_profile=pathway_profile,
-                    cell_type_terms=cell_type_terms,
-                    genes_list=genes,
-                    context_profile=context_profile,
-                    pathway_tokens_fn=pathway_tokens,
-                    prefer_reviews=True,
-                )
-                for paper in review_results
-            ]
-            scored_reviews.sort(
-                key=lambda paper: (paper.get("relevance_score", 0), paper.get("year", "0")),
-                reverse=True,
-            )
-            all_findings["review_articles"] = [paper for paper in scored_reviews if paper.get("relevance_score", 0) >= 2.0][:3]
-
-            # Gene-specific subset for compatibility / inspection
-            gene_specific = []
-            if genes and len(genes) >= 2:
-                for paper in aggregated_primary:
-                    scored = score_paper_relevance(
-                        paper,
-                        pathway_profile=pathway_profile,
-                        cell_type_terms=cell_type_terms,
-                        genes_list=genes,
-                        context_profile=context_profile,
-                        pathway_tokens_fn=pathway_tokens,
-                    )
-                    if any("leading-edge genes" in reason for reason in scored["match_reasons"]):
-                        gene_specific.append(scored)
-            all_findings["gene_specific"] = gene_specific[:4]
-
-            scored_primary = [
-                score_paper_relevance(
-                    paper,
-                    pathway_profile=pathway_profile,
-                    cell_type_terms=cell_type_terms,
-                    genes_list=genes,
-                    context_profile=context_profile,
-                    pathway_tokens_fn=pathway_tokens,
-                )
-                for paper in aggregated_primary
-            ]
-            scored_primary.sort(
-                key=lambda paper: (paper.get("relevance_score", 0), paper.get("year", "0")),
-                reverse=True,
-            )
-            selected_primary = [paper for paper in scored_primary if paper.get("relevance_score", 0) >= 2.5]
-            all_findings["selected_papers"] = selected_primary[:5]
-
-            # Count findings
-            total_results = (
-                len(all_findings["pubmed_results"]) +
-                len(all_findings["review_articles"]) +
-                len(all_findings["gene_specific"])
-            )
-
-            return json.dumps({
-                "status": "ok",
-                "tool": "research_findings",
-                "pathway": pathway,
-                "normalized_pathway": normalized_pathway,
-                "cell_type": cell_type,
-                "genes_researched": genes[:5] if genes else [],
-                "context": context,
-                "cluster_confidence": cluster_confidence,
-                "context_profile": context_profile.to_dict(),
-                "years_searched": f"last {recent_years} years",
-                "total_papers_found": total_results,
-                "findings": all_findings,
-                "recommended_next_steps": [
-                    "Prioritize review articles to understand the pathway in this cell context.",
-                    "Use primary studies to support concrete biological claims.",
-                    "Cite PMIDs when summarizing pathway relevance."
-                ],
-                "note": "Papers are from PubMed. Review abstracts for biological function, disease context, and therapeutic implications."
-            }, indent=2), adata
 
         elif tool_name == "install_package":
             # Request package installation - requires user approval
@@ -2129,11 +1877,21 @@ def process_tool_call(
             confirmed_batch_key = _confirmed_decision_value("batch_key")
             guidance = _analysis_guidance(state, goal=goal, context=guidance_context)
 
+            raw_info = {"adata_raw": None, "layers": []}
+            if state.has_raw:
+                raw_info["adata_raw"] = {
+                    "n_vars": state.raw_n_vars,
+                    "note": "full gene set before HVG subsetting" if state.raw_n_vars > state.n_genes else "same gene set as X",
+                }
+            if state.has_raw_layer:
+                raw_info["layers"].append(state.raw_layer_name)
+
             result = {
                 "status": "ok",
                 "tool": "inspect_data",
                 "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
                 "data_type": state.data_type,
+                "raw": raw_info,
                 "state": make_state(working_adata),
                 "embeddings": [k for k in working_adata.obsm.keys()],
                 "layers": list(working_adata.layers.keys()),

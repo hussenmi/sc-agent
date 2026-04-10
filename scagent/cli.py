@@ -3,6 +3,8 @@
 Command-line interface for scagent.
 
 Usage:
+    scagent start                           # Interactive session (recommended)
+    scagent start --data adata.h5ad         # Start and auto-inspect data
     scagent analyze "your request" --data path/to/data.h5
     scagent analyze --data path/to/data.h5  # Auto-analyze
     scagent inspect path/to/data.h5ad
@@ -22,6 +24,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Start an interactive session (recommended)
+  scagent start
+  scagent start --data pbmc.h5ad
+
   # Full analysis with custom request
   scagent analyze "QC, cluster, and annotate cell types" --data pbmc.h5
 
@@ -49,6 +55,37 @@ Examples:
     parser.add_argument("--version", action="store_true", help="Show version")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
+    # === start command ===
+    start_parser = subparsers.add_parser(
+        "start",
+        help="Start an interactive session (no initial request required)"
+    )
+    start_parser.add_argument(
+        "--data", "-d",
+        default=None,
+        help="Optional data file to load and inspect at startup"
+    )
+    start_parser.add_argument(
+        "--output", "-o",
+        default=".",
+        help="Output directory for run artifacts (default: current directory)"
+    )
+    start_parser.add_argument(
+        "--name", "-n",
+        default=None,
+        help="Run name for output directory"
+    )
+    start_parser.add_argument(
+        "--provider", "-p",
+        choices=["openai", "anthropic", "groq", "codex"],
+        default=None,
+        help="LLM provider (default: from .env or anthropic)"
+    )
+    start_parser.add_argument(
+        "--model", "-m",
+        default=None,
+        help="Model name (default: provider default)"
+    )
     # === analyze command ===
     analyze_parser = subparsers.add_parser(
         "analyze",
@@ -191,7 +228,9 @@ Examples:
         return 0
 
     # Handle commands
-    if args.command == "analyze":
+    if args.command == "start":
+        return run_start(args)
+    elif args.command == "analyze":
         return run_analyze(args)
     elif args.command == "inspect":
         return run_inspect(args)
@@ -201,6 +240,90 @@ Examples:
         return run_chat(args)
     elif args.command == "login":
         return run_login(args)
+
+    return 0
+
+
+def run_start(args):
+    """Start an interactive session."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from scagent.agent import SCAgent
+    from scagent.terminal import read_user_input
+
+    if not sys.stdin.isatty():
+        print("Interactive session requires a TTY. Run scagent start from a terminal.")
+        return 1
+
+    console = Console()
+
+    # Create agent early so we can show the real model name in the welcome
+    agent = SCAgent(
+        provider=args.provider,
+        model=args.model,
+        verbose=True,
+        collaborative=True,
+        output_dir=args.output,
+    )
+
+    # Welcome panel
+    cwd = os.path.abspath(args.output)
+    data_line = f"  Data:     {os.path.abspath(args.data)}" if args.data else "  Data:     none loaded yet"
+    welcome_text = Text.assemble(
+        ("scagent", "bold cyan"),
+        " — single-cell RNA-seq analysis agent\n\n",
+        ("  Working dir: ", "dim"),
+        (cwd, "white"),
+        "\n",
+        ("  Provider:   ", "dim"),
+        (f"{agent.provider}:{agent.model}", "white"),
+        "\n",
+        ("  Data:       ", "dim"),
+        (os.path.abspath(args.data) if args.data else "none loaded yet", "white"),
+        "\n\n",
+        ("Type your request to begin. Type ", "dim"),
+        ("exit", "bold"),
+        (" or ", "dim"),
+        ("quit", "bold"),
+        (" to end the session.", "dim"),
+    )
+    console.print(Panel(welcome_text, border_style="cyan", padding=(0, 1)))
+
+    run_name = args.name
+
+    # If data was given, auto-inspect it before the first user prompt
+    if args.data:
+        console.print()
+        agent.analyze(
+            request="Load and inspect this data. Describe what you find — shape, processing state, metadata, and biology.",
+            data_path=args.data,
+            run_name=run_name,
+        )
+        run_name = None  # run dir already created; don't rename on follow-ups
+
+    # REPL
+    while True:
+        try:
+            user_input = read_user_input("\n> ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Session ended.[/dim]")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ("exit", "quit", "q", "done"):
+            console.print("[dim]Session ended.[/dim]")
+            break
+
+        agent.analyze(
+            request=user_input,
+            data_path=None,
+            run_name=run_name,
+            continue_conversation=True,
+        )
+        run_name = None  # run dir created after first turn
 
     return 0
 

@@ -139,7 +139,9 @@ class DataState:
     # Raw data
     has_raw_layer: bool = False
     raw_layer_name: str = ""
-    is_counts: bool = False  # True if X contains integer counts
+    has_raw: bool = False          # True if adata.raw is set
+    raw_n_vars: int = 0            # Number of genes in adata.raw (often > n_genes after HVG)
+    is_counts: bool = False        # True if X contains integer counts
 
     # QC state
     has_qc_metrics: bool = False
@@ -563,7 +565,11 @@ def resolve_batch_metadata(
 
 
 def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
-    """Detect if a raw counts layer exists."""
+    """Detect if a raw counts layer exists in adata.layers.
+
+    Note: adata.raw is checked separately in inspect_data and reported via
+    has_raw / raw_n_vars fields.
+    """
     common_raw_names = ["raw_counts", "raw_data", "counts", "raw"]
 
     for name in common_raw_names:
@@ -870,6 +876,9 @@ def inspect_data(adata: AnnData) -> DataState:
     state.obsp_keys = list(adata.obsp.keys())
 
     state.has_raw_layer, state.raw_layer_name = _detect_raw_layer(adata)
+    if adata.raw is not None:
+        state.has_raw = True
+        state.raw_n_vars = adata.raw.n_vars
     state.is_counts = _is_integer_matrix(adata.X)
 
     gene_fmt, has_sym, has_ens, sample_genes = _detect_gene_id_format(adata)
@@ -991,7 +1000,7 @@ def recommend_next_steps(state: DataState, goal: str) -> List[str]:
         steps.append("filter_genes")
         return steps
 
-    if not state.has_raw_layer and state.is_counts:
+    if not state.has_raw_layer and not state.has_raw and state.is_counts:
         steps.append("preserve_raw_counts")
 
     if not state.has_qc_metrics:
@@ -1054,8 +1063,11 @@ def summarize_state(state: DataState) -> str:
     lines.append(f"Data type: {state.data_type}")
 
     processing = []
+    if state.has_raw:
+        extra = f", {state.raw_n_vars:,} genes" if state.raw_n_vars != state.n_genes else ""
+        processing.append(f"raw counts in adata.raw{extra}")
     if state.has_raw_layer:
-        processing.append(f"raw counts in '{state.raw_layer_name}'")
+        processing.append(f"raw counts in layer '{state.raw_layer_name}'")
     if state.has_qc_metrics:
         processing.append("QC metrics computed")
     if state.has_doublet_scores:
