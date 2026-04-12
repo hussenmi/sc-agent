@@ -1836,6 +1836,54 @@ class SCAgent:
 
         return final_result
 
+    def _parse_xml_tool_calls(self, text: str) -> list:
+        """Parse tool calls from local model text output.
+
+        Handles three formats emitted by local models (e.g. Qwen2.5-Coder via vLLM):
+          1. <tool_call>{"name": ..., "arguments": ...}</tool_call>
+          2. <tools>{"name": ..., "arguments": ...}</tools>
+          3. Bare JSON: {"name": ..., "arguments": ...}  (no wrapper)
+        Returns list of dicts with 'id', 'name', 'arguments' keys, or empty list.
+        """
+        import re, uuid
+
+        def _extract(raw):
+            try:
+                parsed = json.loads(raw.strip())
+                if isinstance(parsed, dict) and "name" in parsed:
+                    return {
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "name": parsed["name"],
+                        "arguments": parsed.get("arguments", parsed.get("parameters", {})),
+                    }
+            except (json.JSONDecodeError, KeyError):
+                pass
+            return None
+
+        results = []
+
+        # 1 & 2: XML-wrapped
+        for tag in ("tool_call", "tools"):
+            for match in re.finditer(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, re.DOTALL):
+                tc = _extract(match.group(1))
+                if tc:
+                    results.append(tc)
+
+        if results:
+            return results
+
+        # 3: Bare JSON object(s) — try whole text, then scan for {...} blocks
+        tc = _extract(text)
+        if tc:
+            return [tc]
+
+        for match in re.finditer(r'\{[^{}]*"name"\s*:\s*"[^"]+"\s*,[^{}]*\}', text, re.DOTALL):
+            tc = _extract(match.group(0))
+            if tc:
+                results.append(tc)
+
+        return results
+
     def _analyze_openai(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using OpenAI API."""
         if continue_conversation and self._conversation_history:
@@ -1905,6 +1953,37 @@ class SCAgent:
                         self._pending_image = None
 
                 elif choice.finish_reason == "stop":
+                    # Check for XML tool calls in text (local models like Qwen2.5-Coder
+                    # emit <tool_call> or <tools> tags instead of structured tool_calls)
+                    xml_calls = self._parse_xml_tool_calls(message.content or "")
+                    if xml_calls:
+                        # Treat as tool calls — build a synthetic assistant message
+                        synthetic_tool_calls = [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": json.dumps(tc["arguments"]),
+                                },
+                            }
+                            for tc in xml_calls
+                        ]
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": synthetic_tool_calls,
+                        })
+                        for tc in xml_calls:
+                            tool_input = tc["arguments"] if isinstance(tc["arguments"], dict) else json.loads(tc["arguments"])
+                            result_json = self._execute_tool(tc["name"], tool_input)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result_json,
+                            })
+                        continue
+
                     # Add final assistant message to history
                     messages.append({"role": "assistant", "content": message.content})
 
