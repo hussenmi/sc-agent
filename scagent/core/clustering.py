@@ -64,6 +64,9 @@ def run_leiden(
         random_state=random_state,
         key_added=key_added,
         neighbors_key=neighbors_key,
+        flavor="igraph",
+        n_iterations=2,
+        directed=False,
     )
 
     n_clusters = adata.obs[key_added].nunique()

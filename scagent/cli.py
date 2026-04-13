@@ -86,6 +86,12 @@ Examples:
         default=None,
         help="Model name (default: provider default)"
     )
+    start_parser.add_argument(
+        "--context-usage",
+        action="store_true",
+        default=False,
+        help="Show context window usage in the spinner during each model call"
+    )
     # === analyze command ===
     analyze_parser = subparsers.add_parser(
         "analyze",
@@ -265,6 +271,7 @@ def run_start(args):
         verbose=True,
         collaborative=True,
         output_dir=args.output,
+        show_context_usage=getattr(args, 'context_usage', False),
     )
 
     # Welcome panel
@@ -295,16 +302,20 @@ def run_start(args):
     # If data was given, auto-inspect it before the first user prompt
     if args.data:
         console.print()
-        agent.analyze(
-            request="Load and inspect this data. Describe what you find — shape, processing state, metadata, and biology.",
-            data_path=args.data,
-            run_name=run_name,
-        )
+        try:
+            agent.analyze(
+                request="Load and inspect this data. Describe what you find — shape, processing state, metadata, and biology.",
+                data_path=args.data,
+                run_name=run_name,
+            )
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
         run_name = None  # run dir already created; don't rename on follow-ups
 
     # REPL
     while True:
         try:
+            agent._update_context_bar()
             user_input = read_user_input("\n> ")
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Session ended.[/dim]")
@@ -317,12 +328,15 @@ def run_start(args):
             console.print("[dim]Session ended.[/dim]")
             break
 
-        agent.analyze(
-            request=user_input,
-            data_path=None,
-            run_name=run_name,
-            continue_conversation=True,
-        )
+        try:
+            agent.analyze(
+                request=user_input,
+                data_path=None,
+                run_name=run_name,
+                continue_conversation=True,
+            )
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted. You can continue or type exit to quit.[/yellow]")
         run_name = None  # run dir created after first turn
 
     return 0
@@ -371,12 +385,17 @@ def run_analyze(args):
     print("-" * 50)
 
     # First analysis
-    result = agent.analyze(
-        request=request,
-        data_path=args.data,
-        run_name=args.name,
-        max_iterations=args.max_iterations,
-    )
+    try:
+        result = agent.analyze(
+            request=request,
+            data_path=args.data,
+            run_name=args.name,
+            max_iterations=args.max_iterations,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        if not args.interactive:
+            return 0
 
     # Interactive mode - continue conversation
     if args.interactive:
@@ -398,12 +417,15 @@ def run_analyze(args):
                     continue
 
                 # Continue analysis with the same agent (preserves state and conversation)
-                result = agent.analyze(
-                    request=user_input,
-                    data_path=None,  # Use existing loaded data
-                    max_iterations=args.max_iterations,
-                    continue_conversation=True,  # Keep conversation history
-                )
+                try:
+                    result = agent.analyze(
+                        request=user_input,
+                        data_path=None,  # Use existing loaded data
+                        max_iterations=args.max_iterations,
+                        continue_conversation=True,  # Keep conversation history
+                    )
+                except KeyboardInterrupt:
+                    print("\nInterrupted. You can continue or type exit to quit.")
 
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting interactive mode.")

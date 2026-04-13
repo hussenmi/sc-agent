@@ -165,6 +165,7 @@ class SCAgent:
         create_run_dir: bool = True,
         output_dir: str = ".",
         save_checkpoints: bool = False,
+        show_context_usage: bool = False,
     ):
         # Use environment defaults if not specified
         if provider is None:
@@ -200,6 +201,10 @@ class SCAgent:
             "asked_questions": [],
         }
         self._pending_checkpoint: Optional[Dict[str, Any]] = None
+        self._context_limit: int = 128_000  # overwritten by _init_* below
+        self._last_estimated_tokens: int = 0
+        self._last_actual_tokens: int = 0   # exact count from API response usage field
+        self.show_context_usage: bool = show_context_usage
 
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
@@ -238,6 +243,7 @@ class SCAgent:
         self.client = Anthropic(api_key=api_key)
         self.model = model or "claude-sonnet-4-20250514"
         self.tools = get_tools()
+        self._context_limit = 200_000  # all Claude models support 200K
 
     def _init_openai(self, api_key: Optional[str], model: Optional[str], base_url: Optional[str] = None):
         """Initialize OpenAI-compatible client (works with OpenAI, Groq, Together, etc.)."""
@@ -261,6 +267,7 @@ class SCAgent:
             self.client = OpenAI(api_key=api_key)
         self.model = model or "gpt-4o"
         self.tools = get_openai_tools()
+        self._context_limit = self._resolve_context_limit()
 
     def _init_codex(self, model: Optional[str]):
         """Initialize Codex CLI bridge for ChatGPT-login-backed runs."""
@@ -1604,6 +1611,47 @@ class SCAgent:
             f"{json.dumps(payload, indent=2, default=str)}"
         )
 
+    def _context_bar_str(self) -> str:
+        """Compact context usage indicator: '▓▓▓░░░░░░░ 28% · 21K/77K'"""
+        # Prefer exact count from the last API response; fall back to estimate
+        used = self._last_actual_tokens or self._last_estimated_tokens
+        limit = self._context_limit
+        if limit <= 0 or used <= 0:
+            return ""
+        pct = min(used / limit, 1.0)
+        filled = int(pct * 10)
+        bar = "▓" * filled + "░" * (10 - filled)
+        used_k = f"{used // 1000}K" if used >= 1000 else str(used)
+        limit_k = f"{limit // 1000}K" if limit >= 1000 else str(limit)
+        return f"{bar} {pct:.0%} · {used_k}/{limit_k}"
+
+    def _update_context_bar(self) -> None:
+        """
+        Write the context usage bar to the bottom-right corner of the terminal.
+
+        Writes directly to /dev/tty (the controlling terminal) to bypass any
+        stdout wrapping by Rich. Uses ANSI cursor-save/restore so nothing else
+        on screen is disturbed. Called both before and after each model call so
+        the bar persists after the spinner clears.
+        """
+        if not self.show_context_usage or self._last_estimated_tokens <= 0:
+            return
+        try:
+            import shutil
+            size = shutil.get_terminal_size(fallback=(0, 0))
+            cols, rows = size.columns, size.lines
+            if cols <= 0 or rows <= 0:
+                return
+            bar = f" {self._context_bar_str()} "
+            col = max(1, cols - len(bar) + 1)
+            # Write directly to the terminal device — bypasses Rich's stdout wrapping
+            # \0337 / \0338 = DEC save/restore cursor (wider compat than \033[s/\033[u)
+            with open("/dev/tty", "w") as tty:
+                tty.write(f"\0337\033[{rows};{col}H\033[2m{bar}\033[0m\0338")
+                tty.flush()
+        except Exception:
+            return
+
     def _with_llm_status(self, action):
         """Run a blocking model call with provider-neutral terminal feedback."""
         status_messages = [
@@ -1621,10 +1669,7 @@ class SCAgent:
             console = Console()
             message = self._next_llm_status_message or random.choice(status_messages)
             self._next_llm_status_message = None
-            with console.status(
-                message,
-                spinner="dots",
-            ):
+            with console.status(message, spinner="dots"):
                 return action()
         self._next_llm_status_message = None
         return action()
@@ -1742,6 +1787,7 @@ class SCAgent:
 
         try:
             for iteration in range(max_iterations):
+                messages = self._trim_messages_if_needed(messages, anthropic=True)
                 response = self._with_llm_status(
                     lambda: self.client.messages.create(
                         model=self.model,
@@ -1751,6 +1797,9 @@ class SCAgent:
                         messages=messages,
                     )
                 )
+
+                if response.usage and hasattr(response.usage, 'input_tokens') and response.usage.input_tokens:
+                    self._last_actual_tokens = response.usage.input_tokens
 
                 if response.stop_reason == "tool_use":
                     tool_results = []
@@ -1884,6 +1933,169 @@ class SCAgent:
 
         return results
 
+    def _resolve_context_limit(self) -> int:
+        """
+        Determine the context window size for the current model.
+
+        For local/custom vLLM servers, queries the /v1/models endpoint which
+        reports max_model_len — the actual GPU-memory-constrained limit.
+        For cloud providers, returns known limits by model name.
+        """
+        # Any custom base_url (local or remote vLLM) — try to fetch the real limit
+        try:
+            base_url = str(getattr(self.client, 'base_url', ''))
+            cloud_hosts = ("api.openai.com", "api.anthropic.com", "api.groq.com")
+            is_cloud = any(h in base_url for h in cloud_hosts)
+            if not is_cloud and base_url:
+                for m in self.client.models.list().data:
+                    if m.id == self.model:
+                        limit = getattr(m, 'max_model_len', None)
+                        if limit and int(limit) > 0:
+                            logger.info(f"Context limit from vLLM: {int(limit):,} tokens")
+                            return int(limit)
+        except Exception:
+            pass
+
+        # Known cloud limits by model name
+        model = (self.model or "").lower()
+        if "claude" in model:
+            return 200_000
+        if "gpt-5" in model:
+            return 500_000
+        if "gpt-4o" in model:
+            return 128_000
+        if "gpt-4-turbo" in model:
+            return 128_000
+        if "llama" in model or "mixtral" in model or "gemma" in model:
+            return 128_000
+
+        return 128_000  # safe default
+
+    @staticmethod
+    def _estimate_tokens(messages: list) -> int:
+        """Rough token count: 1 token ≈ 4 chars of JSON-serialized content."""
+        try:
+            text = json.dumps(messages, default=str)
+            # Base64 image blobs (data:image/...;base64,<data>) can be 200KB+ of
+            # characters but vision models process them as ~256-2048 image tokens,
+            # not text tokens. Strip them and substitute a flat 4000-char estimate
+            # (~1000 tokens) per image so the text-token budget stays accurate.
+            text = re.sub(
+                r'data:[^;"\s]+;base64,[A-Za-z0-9+/=]+',
+                'data:image/placeholder_1000_tokens_estimated',
+                text,
+            )
+            return len(text) // 4
+        except Exception:
+            return 0
+
+    def _trim_messages_if_needed(self, messages: list, *, anthropic: bool = False) -> list:
+        """
+        Trim old tool results when approaching the context limit.
+
+        Why this is safe: the system prompt is rebuilt every iteration and
+        includes world_state.snapshot() — a structured summary of every
+        analysis step taken, the current data shape, clusters, annotations,
+        decisions made, and recent events.  A trimmed tool result from 10
+        turns ago is genuinely redundant: the model already acted on it and
+        its effects are captured in world_state.
+
+        Strategy (in order of aggressiveness):
+          1. Replace content of old tool-result messages with a short note
+          2. Truncate long assistant narrations in old messages
+
+        Always preserved:
+          - System message (index 0, OpenAI format)
+          - The most recent KEEP_TAIL messages verbatim
+          - All user messages (they're small and contain the user's intent)
+        """
+        threshold = int(self._context_limit * 0.75)
+        self._last_estimated_tokens = self._estimate_tokens(messages)
+        # Use whichever is higher: our estimate OR the last actual count from the
+        # API response. Since we only add messages between API calls, the current
+        # count is always >= last_actual, so this is a reliable lower bound that
+        # prevents under-trimming when the char-based estimate is too low.
+        token_basis = max(self._last_estimated_tokens, self._last_actual_tokens or 0)
+        if token_basis <= threshold:
+            return messages
+
+        messages = list(messages)  # shallow copy — entries are replaced, not mutated
+
+        KEEP_TAIL = 6
+        TRIM_MIN_CHARS = 300     # don't bother trimming small results
+        MAX_ASSISTANT_CHARS = 600
+
+        # System message lives at index 0 in OpenAI format; Anthropic passes it separately
+        first_trimmable = 0
+        if not anthropic and messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            first_trimmable = 1
+
+        protected_from = max(first_trimmable, len(messages) - KEEP_TAIL)
+
+        PLACEHOLDER = (
+            "[trimmed — result was processed; "
+            "current analysis state is reflected in the system prompt above]"
+        )
+
+        # Pass 1: replace large tool results
+        for i in range(first_trimmable, protected_from):
+            msg = messages[i]
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+
+            if role == "tool":
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > TRIM_MIN_CHARS:
+                    messages[i] = {**msg, "content": PLACEHOLDER}
+
+            elif role == "user" and isinstance(msg.get("content"), list):
+                # Anthropic format: tool results are blocks inside user messages
+                new_blocks, changed = [], False
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        inner = block.get("content", "")
+                        if isinstance(inner, str) and len(inner) > TRIM_MIN_CHARS:
+                            new_blocks.append({**block, "content": PLACEHOLDER})
+                            changed = True
+                            continue
+                    new_blocks.append(block)
+                if changed:
+                    messages[i] = {**msg, "content": new_blocks}
+
+        if self._estimate_tokens(messages) <= threshold:
+            return messages
+
+        # Pass 2: truncate long assistant narrations
+        for i in range(first_trimmable, protected_from):
+            msg = messages[i]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > MAX_ASSISTANT_CHARS:
+                messages[i] = {**msg, "content": content[:MAX_ASSISTANT_CHARS] + " [truncated]"}
+            elif isinstance(content, list):
+                new_blocks, changed = [], False
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if len(text) > MAX_ASSISTANT_CHARS:
+                            new_blocks.append({**block, "text": text[:MAX_ASSISTANT_CHARS] + " [truncated]"})
+                            changed = True
+                            continue
+                    new_blocks.append(block)
+                if changed:
+                    messages[i] = {**msg, "content": new_blocks}
+
+        remaining = self._estimate_tokens(messages)
+        if remaining > threshold:
+            logger.warning(
+                f"Context still large after trimming ({remaining:,} tokens estimated). "
+                f"Limit: {self._context_limit:,}. Session may be approaching its limit."
+            )
+
+        return messages
+
     def _analyze_openai(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using OpenAI API."""
         if continue_conversation and self._conversation_history:
@@ -1903,6 +2115,7 @@ class SCAgent:
             for iteration in range(max_iterations):
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = self._build_system_prompt()
+                messages = self._trim_messages_if_needed(messages)
                 response = self._with_llm_status(
                     lambda: self.client.chat.completions.create(
                         model=self.model,
@@ -1914,6 +2127,11 @@ class SCAgent:
 
                 choice = response.choices[0]
                 message = choice.message
+
+                # Capture exact token count from the API response (zero overhead —
+                # already returned). Used for the context bar display.
+                if response.usage and response.usage.prompt_tokens:
+                    self._last_actual_tokens = response.usage.prompt_tokens
 
                 if choice.finish_reason == "tool_calls" and message.tool_calls:
                     # Add assistant message with tool calls
@@ -2033,6 +2251,25 @@ class SCAgent:
 
         return final_result
 
+    _TOOL_LABELS = {
+        "run_qc":               "Running QC",
+        "normalize_and_hvg":    "Normalizing",
+        "run_dimred":           "Dimensionality reduction",
+        "run_clustering":       "Clustering",
+        "compare_clusterings":  "Comparing clusterings",
+        "run_celltypist":       "Cell type annotation",
+        "run_scimilarity":      "Scimilarity annotation",
+        "run_batch_correction": "Batch correction",
+        "run_deg":              "Differential expression",
+        "run_gsea":             "GSEA",
+        "run_code":             "Running code",
+        "generate_figure":      "Generating figure",
+        "inspect_data":         "Inspecting data",
+        "web_search_docs":      "Searching",
+        "search_papers":        "Searching papers",
+        "review_artifact":      "Reviewing artifact",
+    }
+
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Execute a tool and return JSON result."""
         from rich.console import Console
@@ -2137,23 +2374,14 @@ class SCAgent:
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
             result_json = self._handle_install_package(tool_input)
-        # Special handling for run_code - show what's being executed
+        # Special handling for run_code - pass output dir before executing
         elif tool_name == "run_code":
-            description = tool_input.get('description', 'custom code')
-            self._print(f"\n[Tool] {tool_name}")
-            self._print(f"    Description: {description}")
-            if self.verbose:
-                code_preview = tool_input.get('code', '')[:100]
-                if len(tool_input.get('code', '')) > 100:
-                    code_preview += "..."
-                self._print(f"    Code: {code_preview}")
-            # Pass output directory for code file saving
             if self.run_manager:
                 tool_input["output_dir"] = str(self.run_manager.run_dir)
-            # Run with a spinner so the terminal never looks stuck during
-            # long-running custom code (decompression, large file loads, etc.)
+            description = tool_input.get('description', 'Running code')
+            label = self._TOOL_LABELS.get(tool_name, description)
             if self.verbose:
-                with console.status(f"[bold cyan]{description}...", spinner="dots"):
+                with console.status(f"{label}...", spinner="dots"):
                     result_json, self.adata = process_tool_call(
                         tool_name,
                         tool_input,
@@ -2170,9 +2398,10 @@ class SCAgent:
                     run_manager=self.run_manager,
                 )
         else:
-            # Run with spinner for other tools
+            # All other tools — single spinner, friendly label
+            label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
             if self.verbose:
-                with console.status(f"[bold cyan]Running {tool_name}...", spinner="dots") as status:
+                with console.status(f"{label}...", spinner="dots"):
                     result_json, self.adata = process_tool_call(
                         tool_name,
                         tool_input,
@@ -2180,7 +2409,6 @@ class SCAgent:
                         world_state=self.world_state,
                         run_manager=self.run_manager,
                     )
-                console.print(f"[green]✓[/green] {tool_name} complete")
             else:
                 result_json, self.adata = process_tool_call(
                     tool_name,

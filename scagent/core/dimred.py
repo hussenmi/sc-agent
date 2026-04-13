@@ -49,17 +49,20 @@ def run_pca(
     if not inplace:
         adata = adata.copy()
 
-    # Check for HVGs if requested
-    if use_highly_variable and 'highly_variable' not in adata.var.columns:
-        logger.warning("No HVGs found, running PCA on all genes")
-        use_highly_variable = False
+    # Translate use_highly_variable to the mask_var API (use_highly_variable is deprecated)
+    if use_highly_variable and 'highly_variable' in adata.var.columns:
+        mask_var = 'highly_variable'
+    else:
+        if use_highly_variable:
+            logger.warning("No HVGs found, running PCA on all genes")
+        mask_var = None
 
     logger.info(f"Running PCA with {n_comps} components")
 
     sc.tl.pca(
         adata,
         n_comps=n_comps,
-        use_highly_variable=use_highly_variable,
+        mask_var=mask_var,
         random_state=random_state,
     )
 

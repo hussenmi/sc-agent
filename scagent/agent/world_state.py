@@ -160,6 +160,10 @@ class AgentWorldState:
     last_action: Dict[str, Any] = field(default_factory=dict)
     recent_events: List[Dict[str, Any]] = field(default_factory=list)
     latest_verification: Dict[str, Any] = field(default_factory=dict)
+    # Permanent record of key parameters and results from each major analysis step.
+    # Never trimmed from the system prompt — used for notebook generation, method
+    # sections, and follow-up questions about what was done.
+    step_log: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
         # Inspect-data cache: store a structural fingerprint of the last adata
@@ -301,6 +305,7 @@ class AgentWorldState:
             "last_action": self.last_action,
             "recent_events": self.recent_events,
             "latest_verification": self.latest_verification,
+            "step_log": self.step_log,
         }
 
     def snapshot(self) -> Dict[str, Any]:
@@ -316,6 +321,7 @@ class AgentWorldState:
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions[-5:]],
             "latest_verification": self.latest_verification,
             "last_action": self.last_action,
+            "step_log": self.step_log,
         }
 
     def render_runtime_context(self) -> str:
@@ -517,3 +523,119 @@ class AgentWorldState:
             }
         )
         self.recent_events = self.recent_events[-25:]
+
+        # Extract and permanently log key parameters/results for each major step.
+        # This survives context trimming and is the source of truth for notebook
+        # generation and retrospective questions about what was done.
+        entry = self._extract_step_entry(tool_name, result)
+        if entry:
+            # Replace any prior entry for the same tool (re-running a step updates it)
+            self.step_log = [e for e in self.step_log if e.get("tool") != tool_name]
+            self.step_log.append(entry)
+
+    @staticmethod
+    def _extract_step_entry(tool_name: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract a compact, permanent log entry from a tool result."""
+        if result.get("status") != "ok":
+            return None
+
+        ts = _utc_now_iso()
+
+        if tool_name == "run_qc":
+            before = result.get("before", {})
+            after = result.get("after", {})
+            metrics = result.get("metrics", {})
+            # Pull applied thresholds from qc_decisions if present
+            decisions = result.get("qc_decisions") or {}
+            return {
+                "tool": "run_qc",
+                "timestamp": ts,
+                "cells_before": before.get("n_cells"),
+                "cells_after": after.get("n_cells"),
+                "genes_before": before.get("n_genes"),
+                "genes_after": after.get("n_genes"),
+                "cells_removed": metrics.get("cells_removed"),
+                "genes_removed": metrics.get("genes_removed"),
+                "mt_threshold": decisions.get("mt_threshold") or decisions.get("pct_counts_mt"),
+                "min_genes": decisions.get("min_genes"),
+                "max_genes": decisions.get("max_genes"),
+                "min_counts": decisions.get("min_counts"),
+                "doublet_rate": metrics.get("doublet_rate"),
+                "median_pct_mt": metrics.get("median_pct_mt"),
+            }
+
+        if tool_name == "normalize_and_hvg":
+            return {
+                "tool": "normalize_and_hvg",
+                "timestamp": ts,
+                "target_sum": 10000,
+                "n_hvg_selected": result.get("n_hvg"),
+            }
+
+        if tool_name == "run_dimred":
+            return {
+                "tool": "run_dimred",
+                "timestamp": ts,
+                "n_pcs": result.get("n_pcs"),
+                "n_neighbors": result.get("n_neighbors"),
+                "variance_explained": result.get("variance_explained"),
+            }
+
+        if tool_name == "run_clustering":
+            return {
+                "tool": "run_clustering",
+                "timestamp": ts,
+                "method": result.get("method"),
+                "resolution": result.get("resolution"),
+                "n_clusters": result.get("n_clusters"),
+                "cluster_key": result.get("cluster_key"),
+            }
+
+        if tool_name == "compare_clusterings":
+            return {
+                "tool": "compare_clusterings",
+                "timestamp": ts,
+                "method": result.get("method"),
+                "resolutions_tested": result.get("resolutions_tested"),
+                "selected_resolution": result.get("selected_resolution"),
+                "n_clusters": result.get("n_clusters"),
+                "cluster_key": result.get("cluster_key"),
+            }
+
+        if tool_name == "run_batch_correction":
+            return {
+                "tool": "run_batch_correction",
+                "timestamp": ts,
+                "method": result.get("method"),
+                "batch_key": result.get("batch_key"),
+                "n_pcs": result.get("n_pcs"),
+            }
+
+        if tool_name in {"run_celltypist", "run_scimilarity"}:
+            return {
+                "tool": tool_name,
+                "timestamp": ts,
+                "model": result.get("model") or result.get("celltypist_model"),
+                "majority_voting": result.get("majority_voting"),
+                "n_cell_types": result.get("n_cell_types"),
+                "label_key": result.get("label_key") or result.get("annotation_key"),
+            }
+
+        if tool_name == "run_deg":
+            return {
+                "tool": "run_deg",
+                "timestamp": ts,
+                "groupby": result.get("groupby"),
+                "method": result.get("method"),
+                "n_genes": result.get("n_genes"),
+            }
+
+        if tool_name == "run_gsea":
+            return {
+                "tool": "run_gsea",
+                "timestamp": ts,
+                "gene_sets": result.get("gene_sets"),
+                "groupby": result.get("groupby"),
+            }
+
+        return None
