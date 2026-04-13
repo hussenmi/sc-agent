@@ -457,6 +457,25 @@ def get_tools() -> List[Dict[str, Any]]:
                 "required": []
             }
         },
+        {
+            "name": "read_file",
+            "description": (
+                "Read and return the text content of a file. Supports PDF (extracts text from all or selected pages), "
+                "plain text, Markdown, CSV, TSV, and JSON. Use this to read a paper, protocol, metadata table, "
+                "marker gene list, or any other reference document the user provides. "
+                "For large PDFs, use pages to read specific sections (e.g. methods). "
+                "The extracted text is returned directly into context for immediate use."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative path to the file."},
+                    "pages": {"type": "string", "description": "For PDFs: page range to extract, e.g. '1-5' or '3' or '2,4,6'. Default: all pages."},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return (default: 20000). Increase for longer documents."}
+                },
+                "required": ["path"]
+            }
+        },
     ]
 
     return action_tools + meta_tools + inspection_tools
@@ -3700,6 +3719,83 @@ def process_tool_call(
                     verification_checks,
                 ),
             )
+
+        elif tool_name == "read_file":
+            import re as _re
+            file_path = Path(tool_input["path"]).expanduser()
+            if not file_path.exists():
+                return json.dumps({"status": "error", "tool": "read_file",
+                                   "message": f"File not found: {file_path}"}), adata
+
+            max_chars = int(tool_input.get("max_chars") or 20000)
+            suffix = file_path.suffix.lower()
+
+            if suffix == ".pdf":
+                try:
+                    from pypdf import PdfReader
+                except ImportError:
+                    return json.dumps({"status": "error", "tool": "read_file",
+                                       "message": "pypdf not installed. Run: pip install pypdf"}), adata
+
+                reader = PdfReader(str(file_path))
+                n_pages = len(reader.pages)
+
+                # Parse page selection
+                pages_param = tool_input.get("pages", "").strip()
+                if pages_param:
+                    selected = set()
+                    for part in _re.split(r"[,\s]+", pages_param):
+                        if "-" in part:
+                            a, b = part.split("-", 1)
+                            selected.update(range(int(a) - 1, int(b)))
+                        elif part.isdigit():
+                            selected.add(int(part) - 1)
+                    page_indices = sorted(p for p in selected if 0 <= p < n_pages)
+                else:
+                    page_indices = list(range(n_pages))
+
+                parts = []
+                for i in page_indices:
+                    text = reader.pages[i].extract_text() or ""
+                    text = text.strip()
+                    if text:
+                        parts.append(f"[Page {i+1}]\n{text}")
+
+                full_text = "\n\n".join(parts)
+                truncated = len(full_text) > max_chars
+                content = full_text[:max_chars]
+
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "read_file",
+                    "path": str(file_path),
+                    "type": "pdf",
+                    "total_pages": n_pages,
+                    "pages_read": [i + 1 for i in page_indices],
+                    "truncated": truncated,
+                    "chars_returned": len(content),
+                    "content": content,
+                }, indent=2), adata
+
+            else:
+                # Plain text, markdown, CSV, TSV, JSON, etc.
+                try:
+                    raw = file_path.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    return json.dumps({"status": "error", "tool": "read_file",
+                                       "message": str(e)}), adata
+
+                truncated = len(raw) > max_chars
+                content = raw[:max_chars]
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "read_file",
+                    "path": str(file_path),
+                    "type": suffix.lstrip(".") or "text",
+                    "truncated": truncated,
+                    "chars_returned": len(content),
+                    "content": content,
+                }, indent=2), adata
 
         else:
             return json.dumps({

@@ -2268,6 +2268,7 @@ class SCAgent:
         "web_search_docs":      "Searching",
         "search_papers":        "Searching papers",
         "review_artifact":      "Reviewing artifact",
+        "read_file":            "Reading file",
     }
 
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
