@@ -135,14 +135,21 @@ class RunManager:
         self._step_counter = 0
 
     def create(self):
-        """Create the run directory structure."""
-        for name, path in self.dirs.items():
-            path.mkdir(parents=True, exist_ok=True)
+        """Create the run root directory and initial manifest.
 
-        # Save initial manifest
+        Subdirectories (figures/, reports/, logs/, gsea/) are created lazily
+        the first time something is written to them — so a session that only
+        inspects data produces a clean directory with just manifest.json.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         self._save_manifest()
-
         return self
+
+    @staticmethod
+    def _ensure(path: Path) -> Path:
+        """Create a directory and its parents if they don't exist."""
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _save_manifest(self):
         """Save manifest to disk."""
@@ -151,7 +158,7 @@ class RunManager:
 
     def append_log(self, message: str, filename: str = "agent.log"):
         """Append a line to a run log file."""
-        log_path = self.dirs["logs"] / filename
+        log_path = self._ensure(self.dirs["logs"]) / filename
         timestamp = datetime.now().isoformat()
         with open(log_path, "a") as f:
             f.write(f"[{timestamp}] {message}\n")
@@ -251,16 +258,16 @@ class RunManager:
         return str(self.dirs["intermediate"] / filename)
 
     def get_figure_path(self, name: str, ext: str = "png") -> str:
-        """Get path for a figure."""
-        return str(self.dirs["figures"] / f"{name}.{ext}")
+        """Get path for a figure. Creates figures/ on first use."""
+        return str(self._ensure(self.dirs["figures"]) / f"{name}.{ext}")
 
     def get_report_path(self, name: str, ext: str = "csv") -> str:
-        """Get path for a report file."""
-        return str(self.dirs["reports"] / f"{name}.{ext}")
+        """Get path for a report file. Creates reports/ on first use."""
+        return str(self._ensure(self.dirs["reports"]) / f"{name}.{ext}")
 
     def write_text_report(self, name: str, content: str, ext: str = "md") -> str:
         """Write a text report into the reports directory and register it."""
-        path = self.dirs["reports"] / f"{name}.{ext}"
+        path = self._ensure(self.dirs["reports"]) / f"{name}.{ext}"
         with open(path, "w") as f:
             f.write(content)
         self.add_output(str(path))
@@ -268,7 +275,7 @@ class RunManager:
 
     def write_json_report(self, name: str, payload: Dict[str, Any]) -> str:
         """Write a JSON report into the reports directory and register it."""
-        path = self.dirs["reports"] / f"{name}.json"
+        path = self._ensure(self.dirs["reports"]) / f"{name}.json"
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
         self.add_output(str(path))
@@ -307,13 +314,13 @@ class RunManager:
         self._save_manifest()
 
     def append_findings(self, request: str, summary: str, tools_used: List[str]) -> str:
-        """Append one turn's findings to the running findings log (findings.md).
+        """Append one turn's findings to the running findings log (conversation.md).
 
         This is called automatically at the end of every completed turn so the
         file grows into a readable research journal.  It is separate from
         summary.md which is only written when the user explicitly requests it.
         """
-        findings_path = self.dirs["reports"] / "findings.md"
+        findings_path = self._ensure(self.dirs["reports"]) / "conversation.md"
         is_new = not findings_path.exists()
 
         with open(findings_path, "a") as f:
@@ -341,7 +348,7 @@ class RunManager:
 
         Does NOT write summary.md — that is a curated document the user
         requests explicitly (e.g. 'give me a summary of what we've done').
-        The findings log (findings.md) is the auto-maintained research journal.
+        The findings log (conversation.md) is the auto-maintained research journal.
         """
         self.manifest.status = "completed"
         self._save_manifest()
@@ -355,7 +362,7 @@ class RunManager:
         if summary and turn_request:
             self.append_findings(turn_request, summary, recent_tools)
 
-        return str(self.dirs["reports"] / "findings.md")
+        return str(self.dirs["reports"] / "conversation.md")
 
     def fail(self, error: str):
         """Mark run as failed."""

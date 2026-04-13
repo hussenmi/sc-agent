@@ -576,6 +576,12 @@ def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
         if name in adata.layers and _is_integer_matrix(adata.layers[name]):
             return True, name
 
+    # Check adata.raw — but only if it actually contains integer counts.
+    # adata.raw is often log-normalized data stored before HVG selection,
+    # not true raw counts. Verify before reporting it as a raw counts source.
+    if adata.raw is not None and _is_integer_matrix(adata.raw.X):
+        return True, "__raw__"
+
     return False, ""
 
 

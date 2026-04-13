@@ -54,10 +54,29 @@ NON_FAILURE_PATTERNS = [
     r"\bwithout errors?\b",
     r"\b0 errors?\b",
 ]
+# If any of these are present the response is considered complete, even if failure
+# keywords appear (e.g. the agent correctly explains a fallback and offers next steps).
+SUCCESS_OVERRIDE_PATTERNS = [
+    r"\bwhat would you like\b",
+    r"\bwhat would you like to do next\b",
+    r"\breadyfor\b",  # "ready for downstream"
+    r"\bready for\b",
+    r"\bsuccessfully applied\b",
+    r"\bsuccessfully completed\b",
+    r"\bsuccessfully run\b",
+    r"\bsuccessfully computed\b",
+    r"\bconverged after\b",
+    r"\bbatch.corrected and ready\b",
+    r"\bnow batch.corrected\b",
+    # Numbered next-step lists at end of response ("1 Run Leiden" / "1. Run Leiden")
+    r"\b1[\.\)]\s+run\b",
+    r"\b1[\.\)]\s+visuali[sz]e\b",
+]
 AUTO_RECOVERY_ATTEMPTS = 2
 
 ACTION_TOOL_NAMES = {
     "run_qc",
+    "run_decontx",
     "normalize_and_hvg",
     "run_dimred",
     "run_clustering",
@@ -65,10 +84,15 @@ ACTION_TOOL_NAMES = {
     "run_celltypist",
     "run_scimilarity",
     "run_batch_correction",
+    "score_integration",
+    "benchmark_integration",
     "run_deg",
+    "run_pseudobulk_deg",
     "run_gsea",
+    "run_spectra",
     "save_data",
     "run_code",
+    "run_shell",
     "install_package",
 }
 
@@ -206,6 +230,8 @@ class SCAgent:
         self._last_actual_tokens: int = 0   # exact count from API response usage field
         self.show_context_usage: bool = show_context_usage
 
+        self._silence_noisy_loggers()
+
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
         elif provider == "openai":
@@ -224,6 +250,32 @@ class SCAgent:
             raise ValueError(
                 f"Unknown provider: {provider}. Use 'anthropic', 'openai', 'groq', or 'codex'."
             )
+
+    @staticmethod
+    def _silence_noisy_loggers() -> None:
+        """Suppress INFO-level chatter from third-party libraries.
+
+        Libraries like httpx, lightning, and openai log routine HTTP requests
+        and training progress at INFO level, which clutters the terminal when
+        the root logger is set to INFO (e.g. after scVI/lightning initialise).
+        We push them to WARNING so only genuine problems surface.
+        """
+        import logging as _logging
+        for name in (
+            "httpx",
+            "httpcore",
+            "httpcore.http11",
+            "httpcore.connection",
+            "openai",
+            "openai._base_client",
+            "anthropic",
+            "anthropic._base_client",
+            "lightning",
+            "lightning.pytorch",
+            "pytorch_lightning",
+            "harmonypy",
+        ):
+            _logging.getLogger(name).setLevel(_logging.WARNING)
 
     def _init_anthropic(self, api_key: Optional[str], model: Optional[str]):
         """Initialize Anthropic client."""
@@ -276,6 +328,42 @@ class SCAgent:
         self.model = codex_model or "codex-default"
         self.tools = get_openai_tools()
 
+    # LaTeX math symbols that LLMs sometimes emit — replace with Unicode equivalents
+    # so they render correctly in the terminal instead of showing as literal $…$.
+    _LATEX_REPLACEMENTS = [
+        (r"\$\\rightarrow\$", "→"),
+        (r"\$\\leftarrow\$", "←"),
+        (r"\$\\Rightarrow\$", "⇒"),
+        (r"\$\\Leftarrow\$", "⇐"),
+        (r"\$\\leftrightarrow\$", "↔"),
+        (r"\$\\uparrow\$", "↑"),
+        (r"\$\\downarrow\$", "↓"),
+        (r"\$\\approx\$", "≈"),
+        (r"\$\\geq\$", "≥"),
+        (r"\$\\leq\$", "≤"),
+        (r"\$\\neq\$", "≠"),
+        (r"\$\\times\$", "×"),
+        (r"\$\\pm\$", "±"),
+        (r"\$\\cdot\$", "·"),
+        (r"\$\\alpha\$", "α"),
+        (r"\$\\beta\$", "β"),
+        (r"\$\\gamma\$", "γ"),
+        (r"\$\\delta\$", "δ"),
+        (r"\$\\lambda\$", "λ"),
+        (r"\$\\mu\$", "μ"),
+        (r"\$\\sigma\$", "σ"),
+        (r"\$\\infty\$", "∞"),
+    ]
+
+    @classmethod
+    def _delatex(cls, text: str) -> str:
+        """Replace LaTeX math symbols with Unicode equivalents."""
+        if not text or "$" not in text:
+            return text
+        for pattern, replacement in cls._LATEX_REPLACEMENTS:
+            text = re.sub(pattern, replacement, text)
+        return text
+
     def _print(self, message: str, style: str = None, markdown: bool = False):
         """Print message if verbose using rich formatting.
 
@@ -285,6 +373,7 @@ class SCAgent:
             from rich.console import Console
             from rich.markdown import Markdown
             console = Console()
+            message = self._delatex(message)
 
             # Auto-detect markdown if not explicitly set
             if not markdown and message:
@@ -1338,9 +1427,18 @@ class SCAgent:
         return result_data
 
     def _looks_like_failure(self, message: str) -> bool:
-        """Heuristic for assistant responses that likely need recovery."""
+        """Heuristic for assistant responses that likely need recovery.
+
+        Returns False immediately when the response contains clear completion
+        indicators (next-step options, success confirmations) even if it also
+        mentions past failures that were handled gracefully.
+        """
         normalized = " ".join((message or "").lower().split())
         if not normalized:
+            return False
+        # If the response ends with next-step options or confirms success, the
+        # agent has already resolved any issues — no recovery needed.
+        if any(re.search(p, normalized) for p in SUCCESS_OVERRIDE_PATTERNS):
             return False
         scrubbed = normalized
         for pattern in NON_FAILURE_PATTERNS:
@@ -1642,10 +1740,20 @@ class SCAgent:
             cols, rows = size.columns, size.lines
             if cols <= 0 or rows <= 0:
                 return
+
+            # Full bar: " ▓▓▓░░░░░░░ 28% · 21K/77K " (~26 chars)
             bar = f" {self._context_bar_str()} "
-            col = max(1, cols - len(bar) + 1)
-            # Write directly to the terminal device — bypasses Rich's stdout wrapping
-            # \0337 / \0338 = DEC save/restore cursor (wider compat than \033[s/\033[u)
+            if len(bar) > cols:
+                # Compact: just percentage and counts, no block bar
+                used = self._last_actual_tokens or self._last_estimated_tokens
+                pct = min(used / self._context_limit, 1.0)
+                used_k = f"{used // 1000}K" if used >= 1000 else str(used)
+                limit_k = f"{self._context_limit // 1000}K" if self._context_limit >= 1000 else str(self._context_limit)
+                bar = f" {pct:.0%} {used_k}/{limit_k} "
+            if len(bar) > cols:
+                return  # terminal too narrow even for compact form
+
+            col = cols - len(bar) + 1
             with open("/dev/tty", "w") as tty:
                 tty.write(f"\0337\033[{rows};{col}H\033[2m{bar}\033[0m\0338")
                 tty.flush()
@@ -2037,6 +2145,8 @@ class SCAgent:
             "current analysis state is reflected in the system prompt above]"
         )
 
+        trimmed_before = token_basis
+
         # Pass 1: replace large tool results
         for i in range(first_trimmable, protected_from):
             msg = messages[i]
@@ -2088,10 +2198,26 @@ class SCAgent:
                     messages[i] = {**msg, "content": new_blocks}
 
         remaining = self._estimate_tokens(messages)
+        freed = trimmed_before - remaining
+        if freed > 0:
+            limit_k = f"{self._context_limit // 1000}K" if self._context_limit >= 1000 else str(self._context_limit)
+            self._print(
+                f"[dim]⚡ Context compacted — freed ~{freed:,} tokens "
+                f"(was {trimmed_before:,}, now ~{remaining:,} / {limit_k}). "
+                f"Analysis state preserved in world state.[/dim]"
+            )
+            if self.run_manager:
+                self.run_manager.append_log(
+                    f"CONTEXT_COMPACT freed={freed} before={trimmed_before} after={remaining}"
+                )
         if remaining > threshold:
             logger.warning(
                 f"Context still large after trimming ({remaining:,} tokens estimated). "
                 f"Limit: {self._context_limit:,}. Session may be approaching its limit."
+            )
+            self._print(
+                f"[yellow]⚠ Context still large after compaction (~{remaining:,} tokens). "
+                f"Consider starting a new session if responses degrade.[/yellow]"
             )
 
         return messages
@@ -2253,6 +2379,9 @@ class SCAgent:
 
     _TOOL_LABELS = {
         "run_qc":               "Running QC",
+        "run_decontx":          "Ambient RNA removal (DecontX)",
+        "score_integration":    "Scoring integration quality",
+        "benchmark_integration": "Benchmarking integration (scib-metrics)",
         "normalize_and_hvg":    "Normalizing",
         "run_dimred":           "Dimensionality reduction",
         "run_clustering":       "Clustering",
@@ -2261,8 +2390,11 @@ class SCAgent:
         "run_scimilarity":      "Scimilarity annotation",
         "run_batch_correction": "Batch correction",
         "run_deg":              "Differential expression",
+        "run_pseudobulk_deg":  "Pseudobulk DEG (DESeq2)",
         "run_gsea":             "GSEA",
+        "run_spectra":          "Spectra factor analysis",
         "run_code":             "Running code",
+        "run_shell":            "Running shell command",
         "generate_figure":      "Generating figure",
         "inspect_data":         "Inspecting data",
         "web_search_docs":      "Searching",
@@ -2278,7 +2410,7 @@ class SCAgent:
         from pathlib import Path
 
         console = Console()
-        logger.info(f"Tool call: {tool_name} with {tool_input}")
+        logger.debug("Tool call: %s with %s", tool_name, tool_input)
 
         # Only block truly pipeline-progressing tools when checkpoint pending
         # Allow flexible tools (run_code, inspection, visualization) to proceed
@@ -2328,20 +2460,20 @@ class SCAgent:
                             )
 
             if tool_name == "run_qc" and not tool_input.get("figure_dir"):
-                tool_input["figure_dir"] = str(self.run_manager.dirs["figures"])
+                tool_input["figure_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
 
             if tool_name == "compare_clusterings" and tool_input.get("generate_figures") and not tool_input.get("figure_dir"):
-                tool_input["figure_dir"] = str(self.run_manager.dirs["figures"])
+                tool_input["figure_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
 
             if tool_name == "run_gsea":
                 requested_dir = tool_input.get("output_dir")
                 if not requested_dir:
-                    tool_input["output_dir"] = str(self.run_manager.dirs["gsea"])
+                    tool_input["output_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["gsea"]))
                 else:
                     requested_path = Path(requested_dir)
                     if not requested_path.is_absolute():
                         if requested_path == Path(".") or requested_path.name == run_root.name:
-                            tool_input["output_dir"] = str(self.run_manager.dirs["gsea"])
+                            tool_input["output_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["gsea"]))
 
             # When save_checkpoints is False, NEVER save intermediate h5ad files
             # Only save when save_checkpoints is True OR when it's save_data tool
@@ -2542,12 +2674,15 @@ class SCAgent:
                 pass  # Handled by ask_user
             elif status == "error":
                 self._print(f"    [red]✗ Error:[/red] {result_data.get('message', '')}")
-            verification_status = (result_data.get("verification") or {}).get("status")
-            if verification_status in {"warning", "failed"}:
-                self._print(
-                    f"    [yellow]Verification {verification_status}:[/yellow] "
-                    f"{result_data['verification'].get('summary', '')}"
-                )
+            # Only show verification failures when the tool didn't already report
+            # an error — otherwise we'd print two lines saying the same thing.
+            if status != "error":
+                verification_status = (result_data.get("verification") or {}).get("status")
+                if verification_status in {"warning", "failed"}:
+                    self._print(
+                        f"    [yellow]Verification {verification_status}:[/yellow] "
+                        f"{result_data['verification'].get('summary', '')}"
+                    )
 
         except json.JSONDecodeError:
             pass

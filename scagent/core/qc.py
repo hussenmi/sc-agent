@@ -316,6 +316,117 @@ def detect_doublets(
         return adata
 
 
+def run_decontx(
+    adata: AnnData,
+    z: Optional[str] = None,
+    batch: Optional[str] = None,
+    layer: str = "raw_counts",
+    contamination_threshold: float = 0.2,
+    store_corrected: bool = True,
+    inplace: bool = True,
+) -> Optional[AnnData]:
+    """
+    Estimate per-cell ambient RNA contamination using DecontX.
+
+    DecontX fits a Bayesian mixture model that separates endogenous from
+    ambient counts for every cell. Should be run on individual samples
+    BEFORE concatenation (lab best practice from workshop session 2).
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object. Raw integer counts must be in ``layer`` (default
+        ``'raw_counts'``) or in ``adata.X`` if the layer is absent.
+    z : str, optional
+        obs column with cluster labels. Pre-clustering improves accuracy
+        because DecontX uses cluster identity to model endogenous signal.
+    batch : str, optional
+        obs column with batch/sample labels. When provided, DecontX runs
+        per-batch so each batch has its own ambient profile.
+    layer : str, default 'raw_counts'
+        Layer containing raw integer counts.
+    contamination_threshold : float, default 0.2
+        Cells whose estimated contamination exceeds this fraction are
+        flagged in ``adata.obs['decontX_high_contamination']``.
+    store_corrected : bool, default True
+        Store the decontaminated count matrix in
+        ``adata.layers['decontX_counts']``.
+    inplace : bool, default True
+        Modify adata in place.
+
+    Returns
+    -------
+    AnnData or None
+    """
+    try:
+        import celda
+    except ImportError:
+        raise ImportError(
+            "celda is required for DecontX. Install with: pip install celda"
+        )
+
+    import scipy.sparse as sp
+    import anndata as ad
+
+    if not inplace:
+        adata = adata.copy()
+
+    # Build an AnnData with raw counts for DecontX
+    if layer and layer in adata.layers:
+        counts_X = adata.layers[layer]
+        adata_input = ad.AnnData(X=counts_X, obs=adata.obs.copy(), var=adata.var.copy())
+        logger.info(f"Using layer '{layer}' as input for DecontX.")
+    else:
+        logger.warning(
+            f"Layer '{layer}' not found — using adata.X. "
+            "DecontX expects raw integer counts; results may be degraded if X is normalized."
+        )
+        adata_input = adata
+
+    z_labels = adata.obs[z].astype(str).values if (z and z in adata.obs.columns) else None
+    batch_labels = adata.obs[batch].astype(str).values if (batch and batch in adata.obs.columns) else None
+
+    logger.info("Running DecontX ambient RNA estimation...")
+    result = celda.decontX(adata_input, z=z_labels, batch=batch_labels)
+
+    # Contamination scores
+    if "decontX_contamination" in result.obs.columns:
+        adata.obs["decontX_contamination"] = result.obs["decontX_contamination"].values
+    else:
+        raise RuntimeError(
+            "DecontX did not produce 'decontX_contamination' in obs. "
+            "Check celda installation and input data."
+        )
+
+    # Decontaminated counts
+    if store_corrected:
+        if "decontX_counts" in result.layers:
+            adata.layers["decontX_counts"] = result.layers["decontX_counts"]
+        elif "decontX_counts" in result.obsm:
+            adata.layers["decontX_counts"] = result.obsm["decontX_counts"]
+        else:
+            logger.warning("DecontX decontaminated counts not found; skipping layer storage.")
+
+    # Flag high-contamination cells
+    contamination = adata.obs["decontX_contamination"]
+    adata.obs["decontX_high_contamination"] = contamination > contamination_threshold
+
+    n_flagged = int(adata.obs["decontX_high_contamination"].sum())
+    median_contamination = float(contamination.median())
+
+    logger.info(
+        "DecontX complete. Median contamination: %.1f%%. "
+        "%d cells (%.1f%%) flagged above %.0f%% threshold.",
+        median_contamination * 100,
+        n_flagged,
+        n_flagged / adata.n_obs * 100,
+        contamination_threshold * 100,
+    )
+
+    if not inplace:
+        return adata
+
+
 def run_qc_pipeline(
     adata: AnnData,
     mt_threshold: Optional[float] = None,

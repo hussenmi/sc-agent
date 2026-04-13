@@ -214,6 +214,15 @@ class AgentWorldState:
             if not processing.get("has_qc_metrics"):
                 available_actions.append("run_qc")
 
+            # DecontX — available when raw counts present and not yet decontaminated
+            _decontx_done = adata is not None and "decontX_contamination" in adata.obs.columns
+            if processing.get("has_raw_counts") and not _decontx_done and not processing.get("is_normalized"):
+                available_actions.append("run_decontx")
+            elif _decontx_done:
+                pass  # Already done — don't re-advertise
+            elif not processing.get("has_raw_counts"):
+                blocked_actions.append({"action": "run_decontx", "needs": "raw counts (must run before normalization)"})
+
             # Normalization - available if we have raw counts and not yet normalized
             if processing.get("has_raw_counts") and not processing.get("is_normalized"):
                 available_actions.append("normalize_and_hvg")
@@ -247,6 +256,14 @@ class AgentWorldState:
             else:
                 blocked_actions.append({"action": "run_deg", "needs": "clusters or annotations"})
 
+            # Pseudobulk DEG — needs groups to aggregate AND raw counts for DESeq2
+            if (processing.get("has_clusters") or self.annotation_sources) and processing.get("has_raw_counts"):
+                available_actions.append("run_pseudobulk_deg")
+            elif not (processing.get("has_clusters") or self.annotation_sources):
+                blocked_actions.append({"action": "run_pseudobulk_deg", "needs": "clusters or annotations"})
+            else:
+                blocked_actions.append({"action": "run_pseudobulk_deg", "needs": "raw counts layer (required for DESeq2 aggregation)"})
+
             # GSEA
             if deg_available:
                 available_actions.append("run_gsea")
@@ -260,6 +277,25 @@ class AgentWorldState:
             # Batch correction
             if processing.get("is_normalized"):
                 available_actions.append("run_batch_correction")
+
+            # Spectra — needs annotations/clusters for cell_type_key, normalized data
+            if (processing.get("has_clusters") or self.annotation_sources) and processing.get("is_normalized"):
+                available_actions.append("run_spectra")
+            else:
+                blocked_actions.append({"action": "run_spectra", "needs": "normalized data and cell type labels or clusters"})
+
+            # Integration scoring and benchmarking
+            _has_corrected_rep = adata is not None and any(
+                k in adata.obsm for k in ("X_pca_harmony", "X_scVI", "X_scanorama")
+            )
+            _has_batch_key = bool(self.data_summary.get("batch_key"))
+            if _has_batch_key and (processing.get("has_pca") or _has_corrected_rep):
+                available_actions.append("score_integration")
+            # scib benchmark needs a label_key (clusters or annotations) + corrected embedding
+            if _has_corrected_rep and _has_batch_key and (
+                processing.get("has_clusters") or self.annotation_sources
+            ):
+                available_actions.append("benchmark_integration")
 
         return {
             "has_raw_counts": bool(processing.get("has_raw_counts")),
@@ -541,6 +577,44 @@ class AgentWorldState:
 
         ts = _utc_now_iso()
 
+        if tool_name == "run_decontx":
+            return {
+                "tool": "run_decontx",
+                "timestamp": ts,
+                "layer_used": result.get("layer_used"),
+                "z_used": result.get("z_used"),
+                "batch_used": result.get("batch_used"),
+                "median_contamination": result.get("median_contamination"),
+                "mean_contamination": result.get("mean_contamination"),
+                "n_cells_flagged": result.get("n_cells_flagged"),
+                "pct_cells_flagged": result.get("pct_cells_flagged"),
+                "contamination_threshold": result.get("contamination_threshold"),
+                "decontX_counts_stored": result.get("decontX_counts_stored"),
+            }
+
+        if tool_name == "score_integration":
+            return {
+                "tool": "score_integration",
+                "timestamp": ts,
+                "use_rep": result.get("use_rep"),
+                "batch_key": result.get("batch_key"),
+                "n_neighbors": result.get("n_neighbors"),
+                "entropy_mean": result.get("entropy_mean"),
+                "entropy_median": result.get("entropy_median"),
+                "interpretation": result.get("interpretation"),
+            }
+
+        if tool_name == "benchmark_integration":
+            return {
+                "tool": "benchmark_integration",
+                "timestamp": ts,
+                "batch_key": result.get("batch_key"),
+                "label_key": result.get("label_key"),
+                "embeddings_benchmarked": result.get("embeddings_benchmarked"),
+                "scores_by_embedding": result.get("scores_by_embedding"),
+                "best_method": result.get("best_method"),
+            }
+
         if tool_name == "run_qc":
             before = result.get("before", {})
             after = result.get("after", {})
@@ -603,13 +677,18 @@ class AgentWorldState:
             }
 
         if tool_name == "run_batch_correction":
-            return {
+            entry = {
                 "tool": "run_batch_correction",
                 "timestamp": ts,
                 "method": result.get("method"),
                 "batch_key": result.get("batch_key"),
-                "n_pcs": result.get("n_pcs"),
+                "n_batches": result.get("n_batches"),
+                "corrected_embedding": result.get("corrected_embedding"),
             }
+            if result.get("method") == "scvi":
+                entry["n_latent"] = result.get("n_latent")
+                entry["max_epochs"] = result.get("max_epochs")
+            return entry
 
         if tool_name in {"run_celltypist", "run_scimilarity"}:
             return {
@@ -630,12 +709,37 @@ class AgentWorldState:
                 "n_genes": result.get("n_genes"),
             }
 
+        if tool_name == "run_pseudobulk_deg":
+            return {
+                "tool": "run_pseudobulk_deg",
+                "timestamp": ts,
+                "cell_type": result.get("cell_type"),
+                "sample_col": result.get("sample_col"),
+                "condition_col": result.get("condition_col"),
+                "condition_a": result.get("condition_a"),
+                "condition_b": result.get("condition_b"),
+                "n_samples": result.get("n_samples"),
+                "n_genes_tested": result.get("n_genes_tested"),
+                "n_significant": result.get("n_significant"),
+                "alpha": result.get("alpha"),
+            }
+
         if tool_name == "run_gsea":
             return {
                 "tool": "run_gsea",
                 "timestamp": ts,
                 "gene_sets": result.get("gene_sets"),
                 "groupby": result.get("groupby"),
+            }
+
+        if tool_name == "run_spectra":
+            return {
+                "tool": "run_spectra",
+                "timestamp": ts,
+                "cell_type_key": result.get("cell_type_key"),
+                "n_factors": result.get("n_factors"),
+                "factor_labels": result.get("factor_labels"),
+                "model_path": result.get("model_path"),
             }
 
         return None

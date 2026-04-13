@@ -72,3 +72,4 @@ test_data/
 # some files
 test*.py
 scagent/agent/prompts_backup.py
+*.pdf

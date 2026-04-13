@@ -51,6 +51,49 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "run_decontx",
+            "description": (
+                "Estimate and remove ambient RNA contamination per cell using DecontX. "
+                "Uses a Bayesian mixture model to assign each cell a contamination probability "
+                "and optionally store decontaminated counts. "
+                "Run this on individual samples BEFORE concatenation and BEFORE normalization. "
+                "Stores 'decontX_contamination' in obs (0–1 fraction) and flags cells above "
+                "the contamination threshold. Use the decontX_counts layer for downstream "
+                "normalization if heavy contamination is detected (median > 0.2). "
+                "Requires: celda package (pip install celda)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "z": {
+                        "type": "string",
+                        "description": "obs column with cluster labels. Pre-clustering before DecontX improves accuracy; use leiden or phenograph cluster key if available."
+                    },
+                    "batch": {
+                        "type": "string",
+                        "description": "obs column with batch/sample labels. When provided, each batch gets its own ambient RNA profile (recommended for multi-sample data)."
+                    },
+                    "layer": {
+                        "type": "string",
+                        "description": "Layer with raw integer counts (default: 'raw_counts'). DecontX requires non-normalized counts."
+                    },
+                    "contamination_threshold": {
+                        "type": "number",
+                        "description": "Fraction above which cells are flagged as highly contaminated (default: 0.2 = 20%)."
+                    },
+                    "store_corrected": {
+                        "type": "boolean",
+                        "description": "Store decontaminated counts in layers['decontX_counts'] (default: true). Use this layer instead of raw_counts for normalization if contamination is high."
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Path to save h5ad after DecontX (optional)."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
             "name": "normalize_and_hvg",
             "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in layer.",
             "input_schema": {
@@ -140,16 +183,100 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_batch_correction",
-            "description": "Correct batch effects using Harmony or Scanorama.",
+            "description": (
+                "Correct batch effects using Harmony, Scanorama, or scVI. "
+                "Harmony: fast, corrects PCA embeddings, good for mild batch effects. "
+                "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
+                "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
+                "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
+                "After correction, neighbors and UMAP are automatically recomputed on the corrected embedding."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
-                    "batch_key": {"type": "string", "description": "Batch column name"},
-                    "method": {"type": "string", "enum": ["harmony", "scanorama"], "description": "Method (default: harmony)"}
+                    "batch_key": {"type": "string", "description": "Column in adata.obs containing batch labels"},
+                    "method": {
+                        "type": "string",
+                        "enum": ["harmony", "scanorama", "scvi"],
+                        "description": "Correction method (default: harmony). Use scvi for complex batch effects when raw_counts layer is available."
+                    },
+                    "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
+                    "max_epochs": {"type": "integer", "description": "scVI only: training epochs (default: 200; use fewer only for quick tests)"},
+                    "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "score_integration",
+            "description": (
+                "Score batch integration quality using neighborhood batch mixing entropy. "
+                "For each cell, examines its k nearest neighbors in the chosen embedding and "
+                "computes the Shannon entropy of batch labels — high entropy means batches are "
+                "well-mixed. The score is normalized to [0, 1] where 1 = perfect mixing. "
+                "Call this after run_batch_correction to quantify whether integration worked. "
+                "Can also be called on uncorrected embeddings (use_rep='X_pca') as a baseline "
+                "to compare before/after. Stores per-cell scores in obs['integration_entropy']."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "batch_key": {
+                        "type": "string",
+                        "description": "obs column with batch labels (same key used for batch correction)."
+                    },
+                    "use_rep": {
+                        "type": "string",
+                        "description": "Embedding to evaluate (default: 'X_umap'). Use the corrected embedding for post-integration score, or 'X_pca' for pre-integration baseline."
+                    },
+                    "n_neighbors": {
+                        "type": "integer",
+                        "description": "Neighborhood size for entropy calculation (default: 50). Larger = stabler but slower."
+                    }
+                },
+                "required": ["batch_key"]
+            }
+        },
+        {
+            "name": "benchmark_integration",
+            "description": (
+                "Benchmark batch integration quality using scib-metrics — the same evaluation "
+                "used in workshop session 5 to decide which correction method to keep. "
+                "Computes bio-conservation metrics (NMI, ARI, silhouette label, cLISI) and "
+                "batch-correction metrics (silhouette batch, iLISI, kBET, graph connectivity, PCR) "
+                "across all corrected embeddings present in adata.obsm, always including X_pca as "
+                "the uncorrected baseline. Returns a ranked table and the best-performing method. "
+                "Requires: scib-metrics (pip install scib-metrics), a label_key with cell type or "
+                "cluster annotations, and at least one corrected embedding from run_batch_correction."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "batch_key": {
+                        "type": "string",
+                        "description": "obs column with batch labels (same as used for batch correction)."
+                    },
+                    "label_key": {
+                        "type": "string",
+                        "description": "obs column with cell type or cluster labels for bio-conservation metrics (e.g. 'leiden', 'cell_type', 'celltypist_cell_type')."
+                    },
+                    "embedding_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "obsm keys to benchmark. Auto-detected if omitted (includes X_pca baseline + any corrected embeddings present)."
+                    },
+                    "fast": {
+                        "type": "boolean",
+                        "description": "Skip slow metrics (kBET) for a quicker result (default: false)."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory to save results CSV and results-table figure (optional but recommended)."
+                    }
+                },
+                "required": ["batch_key", "label_key"]
             }
         },
         {
@@ -166,6 +293,64 @@ def get_tools() -> List[Dict[str, Any]]:
                     "target_geneset": {"type": "string", "description": "Target gene set database for compatibility check (default: MSigDB_Hallmark_2020)"}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "run_pseudobulk_deg",
+            "description": (
+                "Run pseudobulk differential expression analysis using DESeq2. "
+                "Aggregates raw counts to the sample level (one observation per biological replicate "
+                "per cell type) before running statistics — this respects replicate independence and "
+                "is strongly preferred over single-cell Wilcoxon when biological replicates are available. "
+                "Requires: raw integer counts in a layer (default 'raw_counts'), a sample column with "
+                "≥ 2 replicates per condition, and a condition column. "
+                "Use run_deg (Wilcoxon) when no replicates are available."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sample_col": {
+                        "type": "string",
+                        "description": "Column in adata.obs identifying biological replicates (e.g. 'sample_id', 'donor'). Each unique value must be an independent sample."
+                    },
+                    "condition_col": {
+                        "type": "string",
+                        "description": "Column in adata.obs defining the condition to compare (e.g. 'disease', 'treatment', 'timepoint')."
+                    },
+                    "condition_a": {
+                        "type": "string",
+                        "description": "Reference condition (denominator in log fold change, e.g. 'healthy', 'control')."
+                    },
+                    "condition_b": {
+                        "type": "string",
+                        "description": "Test condition (numerator in log fold change, e.g. 'disease', 'treated'). Positive LFC means upregulated here."
+                    },
+                    "groups_col": {
+                        "type": "string",
+                        "description": "Column in adata.obs containing cell type or cluster labels (e.g. 'leiden', 'cell_type'). Used to subset to a specific cell type."
+                    },
+                    "cell_type": {
+                        "type": "string",
+                        "description": "Specific cell type label from groups_col to analyze. If omitted, runs on all cells together (use when adata is already subset)."
+                    },
+                    "layer": {
+                        "type": "string",
+                        "description": "Layer containing raw integer counts (default: 'raw_counts'). DESeq2 requires non-normalized counts."
+                    },
+                    "min_cells": {
+                        "type": "integer",
+                        "description": "Minimum cells a sample must contribute to pseudobulk to be retained (default: 10). Samples below this threshold are dropped."
+                    },
+                    "alpha": {
+                        "type": "number",
+                        "description": "Adjusted p-value threshold for significance reporting (default: 0.05)."
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Path to save full results as CSV (optional)."
+                    }
+                },
+                "required": ["sample_col", "condition_col", "condition_a", "condition_b", "groups_col"]
             }
         },
         {
@@ -202,6 +387,67 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "run_spectra",
+            "description": (
+                "Run Spectra semi-supervised factor analysis to discover gene programs. "
+                "Spectra fits a factor model guided by cell-type-specific gene set priors — "
+                "it produces both gene-set-guided factors (e.g. a T cell exhaustion program) "
+                "and de novo factors that explain residual variation not covered by the priors. "
+                "Outputs per-cell factor scores in obsm['SPECTRA_cell_scores'] (visualizable on UMAP), "
+                "top marker genes per factor in uns['SPECTRA_markers'], and gene loadings in uns['SPECTRA_factors']. "
+                "Requires: log-normalized counts in adata.X, a cell_type_key, and the Spectra-sc package. "
+                "Gene set dictionary format: JSON with cell type keys (one entry per cell type, even if empty {}) "
+                "plus a 'global' key. If none provided, runs in de novo mode (unsupervised). "
+                "Workshop note: num_epochs=100 for demos, 10000 for serious analysis."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cell_type_key": {
+                        "type": "string",
+                        "description": "obs column with cell type labels (e.g. 'celltypist_cell_type', 'leiden'). Every unique value must have an entry in the gene set dictionary."
+                    },
+                    "gene_set_dict_path": {
+                        "type": "string",
+                        "description": "Path to a JSON file containing the gene set dictionary. Format: {cell_type: {gene_set_name: [gene, ...]}, 'global': {gene_set_name: [gene, ...]}}. Missing cell types are auto-filled with empty entries."
+                    },
+                    "use_default_gene_sets": {
+                        "type": "boolean",
+                        "description": "Use Spectra's built-in default gene sets instead of a custom dictionary (default: false)."
+                    },
+                    "lam": {
+                        "type": "number",
+                        "description": "Regularization toward input gene sets (default: 0.1). Lower = stronger adherence to provided gene sets. Range: 0.001–0.5."
+                    },
+                    "num_epochs": {
+                        "type": "integer",
+                        "description": "Training iterations (default: 1000). Use 100 for a quick test, 10000 for publication-quality results."
+                    },
+                    "n_top_vals": {
+                        "type": "integer",
+                        "description": "Top genes per factor stored in SPECTRA_markers (default: 50)."
+                    },
+                    "use_highly_variable": {
+                        "type": "boolean",
+                        "description": "Restrict to highly variable genes plus gene set genes (default: true)."
+                    },
+                    "use_cell_types": {
+                        "type": "boolean",
+                        "description": "Fit cell-type-specific factors in addition to global factors (default: true)."
+                    },
+                    "overlap_threshold": {
+                        "type": "number",
+                        "description": "Minimum overlap coefficient to label a factor with a gene set name (default: 0.2)."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory to save the Spectra model and UMAP factor score figures (recommended)."
+                    }
+                },
+                "required": ["cell_type_key"]
+            }
+        },
+        {
             "name": "save_data",
             "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete.",
             "input_schema": {
@@ -232,6 +478,38 @@ def get_tools() -> List[Dict[str, Any]]:
                     "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
                 },
                 "required": ["code", "description"]
+            }
+        },
+        {
+            "name": "run_shell",
+            "description": (
+                "Run a shell command and return stdout/stderr. Use for system checks, "
+                "CLI tools, and anything that isn't Python. "
+                "Examples: 'nvidia-smi' (GPU availability and memory), 'free -h' (RAM), "
+                "'df -h .' (disk space), 'which cellbender' (tool installed?), "
+                "'cellbender remove-background --input raw.h5 --output clean.h5' (run CellBender), "
+                "'pip show scib-metrics' (package version), 'ls -lh /path/to/data'. "
+                "stdout and stderr are both captured and returned. "
+                "Commands that modify or delete files outside the output directory, "
+                "write to device files, or escalate privileges are blocked."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run. Executed via bash -c. Use absolute paths for reliability."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default: 60). Use a longer value for slow CLI tools like CellBender."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Working directory for the command (default: current session output directory)."
+                    }
+                },
+                "required": ["command"]
             }
         },
         {
@@ -567,7 +845,7 @@ def process_tool_call(
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import run_celltypist, run_scimilarity
-    from ..batch import run_scanorama, run_harmony
+    from ..batch import run_scanorama, run_harmony, run_scvi
     from ..analysis import infer_biological_context
     from .decision_policy import (
         decision_for_batch_strategy,
@@ -860,6 +1138,59 @@ def process_tool_call(
                 return os_module.path.join(output_path, "final_result.h5ad")
             return None
         return output_path
+
+    def _resolve_integer_counts_layer(adata, requested_layer: str = "raw_counts"):
+        """
+        Find a layer with true integer counts, or raise a clear ValueError.
+
+        Checks (in order):
+        1. The explicitly requested layer name
+        2. Common raw layer names (raw_counts, raw_data, counts)
+        3. adata.raw — but ONLY if it contains integer values
+
+        Returns (layer_name_or_sentinel, X_matrix) where layer_name_or_sentinel
+        is either a key in adata.layers or '__raw__' if adata.raw is the source.
+        Raises ValueError with a user-facing message if no integer counts found.
+        """
+        from ..core.inspector import _is_integer_matrix
+
+        # 1. Explicitly requested layer
+        if requested_layer and requested_layer in adata.layers:
+            if _is_integer_matrix(adata.layers[requested_layer]):
+                return requested_layer, adata.layers[requested_layer]
+            else:
+                raise ValueError(
+                    f"Layer '{requested_layer}' exists but does not contain integer counts "
+                    f"(found float values — likely already normalized). "
+                    f"This tool requires raw UMI/read counts. "
+                    f"Available layers: {list(adata.layers.keys())}"
+                )
+
+        # 2. Common raw layer names
+        for name in ["raw_counts", "raw_data", "counts"]:
+            if name in adata.layers and _is_integer_matrix(adata.layers[name]):
+                return name, adata.layers[name]
+
+        # 3. adata.raw — only if truly integer
+        if adata.raw is not None:
+            if _is_integer_matrix(adata.raw.X):
+                return "__raw__", adata.raw.X
+            else:
+                raise ValueError(
+                    "adata.raw exists but contains non-integer values (likely log-normalized). "
+                    "This tool requires raw UMI/read counts. "
+                    "The original integer counts are not present in this object — "
+                    "reload from the source file or use a checkpoint saved before normalization."
+                )
+
+        # 4. Nothing found
+        raise ValueError(
+            "No integer count layer found. "
+            f"Checked: layer '{requested_layer}', 'raw_counts', 'raw_data', 'counts', and adata.raw. "
+            f"Available layers: {list(adata.layers.keys())}. "
+            "This tool requires raw UMI/read counts. Save them with normalize_and_hvg "
+            "which preserves raw counts in layers['raw_counts'] before normalizing."
+        )
 
     def _state_preservation_warning(tool_input, existing_adata):
         if existing_adata is not None and tool_input.get("data_path") not in (None, "memory"):
@@ -1867,6 +2198,72 @@ def process_tool_call(
             fetched["tool"] = "fetch_url"
             return json.dumps(fetched, indent=2), adata
 
+        elif tool_name == "run_shell":
+            import subprocess
+            import shlex
+
+            command = tool_input.get("command", "").strip()
+            timeout = int(tool_input.get("timeout", 60))
+            workdir = tool_input.get("workdir") or tool_input.get("output_dir") or "."
+
+            # Block destructive patterns — focused on things that can't be undone
+            _blocked = [
+                ("rm -rf /", "recursive deletion of root"),
+                ("rm -rf ~", "recursive deletion of home directory"),
+                ("rm -rf $HOME", "recursive deletion of home directory"),
+                ("> /dev/", "writing to device file"),
+                ("dd if=/dev/zero of=/dev/", "disk overwrite"),
+                ("mkfs", "filesystem formatting"),
+                (":(){ :|:& };:", "fork bomb"),
+                ("sudo rm", "privileged deletion"),
+                ("chmod -R 777 /", "global permission change"),
+            ]
+            for pattern, reason in _blocked:
+                if pattern in command:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "run_shell",
+                        "message": f"Blocked: {reason}.",
+                        "command": command,
+                    }, indent=2), adata
+
+            try:
+                proc = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=workdir,
+                )
+                stdout = proc.stdout.strip()
+                stderr = proc.stderr.strip()
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_shell",
+                    "message": f"Command timed out after {timeout}s.",
+                    "command": command,
+                }, indent=2), adata
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_shell",
+                    "message": str(e),
+                    "command": command,
+                }, indent=2), adata
+
+            return json.dumps({
+                "status": "ok" if returncode == 0 else "error",
+                "tool": "run_shell",
+                "command": command,
+                "returncode": returncode,
+                "stdout": stdout[:8000] if stdout else "",
+                "stderr": stderr[:2000] if stderr else "",
+                "truncated": len(stdout) > 8000,
+            }, indent=2), adata
+
         elif tool_name == "install_package":
             # Request package installation - requires user approval
             package = tool_input["package"]
@@ -2814,6 +3211,108 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "run_decontx":
+            from ..core.qc import run_decontx
+
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            z = tool_input.get("z")
+            batch = tool_input.get("batch")
+            layer = tool_input.get("layer", "raw_counts")
+            contamination_threshold = float(tool_input.get("contamination_threshold", 0.2))
+            store_corrected = bool(tool_input.get("store_corrected", True))
+
+            # Validate z and batch columns exist if provided
+            if z and z not in adata.obs.columns:
+                warnings.append(f"z column '{z}' not found in obs — running DecontX without cluster labels.")
+                z = None
+            if batch and batch not in adata.obs.columns:
+                warnings.append(f"batch column '{batch}' not found in obs — running without batch stratification.")
+                batch = None
+
+            # Validate integer counts before calling DecontX
+            try:
+                _resolve_integer_counts_layer(adata, layer)
+            except ValueError as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_decontx",
+                    "message": str(e),
+                }, indent=2), adata
+
+            try:
+                run_decontx(
+                    adata,
+                    z=z,
+                    batch=batch,
+                    layer=layer,
+                    contamination_threshold=contamination_threshold,
+                    store_corrected=store_corrected,
+                    inplace=True,
+                )
+            except ImportError as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_decontx",
+                    "message": str(e),
+                    "install_hint": "pip install celda",
+                }, indent=2), adata
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_decontx",
+                    "message": str(e),
+                }, indent=2), adata
+
+            contamination = adata.obs["decontX_contamination"]
+            n_flagged = int(adata.obs["decontX_high_contamination"].sum())
+            output_path = fix_output_path(tool_input.get("output_path"), "run_decontx")
+            if output_path:
+                write_h5ad_safe(adata, output_path)
+
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "run_decontx",
+                    "output_path": output_path,
+                    "saved": output_path is not None,
+                    "layer_used": layer if layer in adata.layers else "X",
+                    "z_used": z,
+                    "batch_used": batch,
+                    "contamination_threshold": contamination_threshold,
+                    "median_contamination": round(float(contamination.median()), 4),
+                    "mean_contamination": round(float(contamination.mean()), 4),
+                    "n_cells_flagged": n_flagged,
+                    "pct_cells_flagged": round(n_flagged / adata.n_obs * 100, 1),
+                    "decontX_counts_stored": "decontX_counts" in adata.layers,
+                    "note": (
+                        "Use layers['decontX_counts'] instead of raw_counts for normalization "
+                        "if median contamination is high (> 0.2)."
+                    ) if "decontX_counts" in adata.layers else "",
+                    "warnings": warnings,
+                    "state": make_state(adata),
+                },
+                adata,
+                dataset_changed=True,
+                summary=f"DecontX estimated ambient RNA contamination (median {float(contamination.median()):.1%}, {n_flagged} cells flagged).",
+                verification=_build_verification(
+                    "passed",
+                    "DecontX completed successfully.",
+                    [
+                        _check(
+                            "contamination_scores_present",
+                            "decontX_contamination" in adata.obs.columns,
+                            "decontX_contamination scores written to adata.obs.",
+                        ),
+                        _check(
+                            "flag_column_present",
+                            "decontX_high_contamination" in adata.obs.columns,
+                            f"{n_flagged} cells flagged above {contamination_threshold:.0%} threshold.",
+                        ),
+                    ],
+                ),
+            )
+
         elif tool_name == "normalize_and_hvg":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
@@ -3257,6 +3756,105 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "run_spectra":
+            from ..analysis.spectra import run_spectra
+
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+
+            cell_type_key = tool_input.get("cell_type_key")
+            if not cell_type_key or cell_type_key not in adata.obs.columns:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_spectra",
+                    "message": f"cell_type_key '{cell_type_key}' not found in adata.obs.",
+                    "available_columns": list(adata.obs.columns[:30]),
+                }, indent=2), adata
+
+            output_dir = fix_output_path(tool_input.get("output_dir"), "run_spectra")
+
+            try:
+                result = run_spectra(
+                    adata,
+                    cell_type_key=cell_type_key,
+                    gene_set_dict_path=tool_input.get("gene_set_dict_path"),
+                    use_default_gene_sets=bool(tool_input.get("use_default_gene_sets", False)),
+                    lam=float(tool_input.get("lam", 0.1)),
+                    rho=0.001,
+                    num_epochs=int(tool_input.get("num_epochs", 1000)),
+                    n_top_vals=int(tool_input.get("n_top_vals", 50)),
+                    use_highly_variable=bool(tool_input.get("use_highly_variable", True)),
+                    use_weights=True,
+                    use_cell_types=bool(tool_input.get("use_cell_types", True)),
+                    label_factors=True,
+                    overlap_threshold=float(tool_input.get("overlap_threshold", 0.2)),
+                    output_dir=output_dir,
+                )
+            except ImportError as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_spectra",
+                    "message": str(e),
+                    "install_hint": "pip install Spectra-sc",
+                }, indent=2), adata
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_spectra",
+                    "message": str(e),
+                }, indent=2), adata
+
+            artifacts_created = []
+            if result.get("figure_path"):
+                artifact = _artifact_payload(
+                    result["figure_path"],
+                    role="figure",
+                    metadata={"kind": "spectra_factor_umaps"},
+                )
+                if artifact:
+                    artifacts_created.append(artifact)
+
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "run_spectra",
+                    "cell_type_key": cell_type_key,
+                    "n_factors": result["n_factors"],
+                    "factor_labels": result["factor_labels"],
+                    "top_markers_per_factor": result["top_markers_per_factor"],
+                    "model_path": result.get("model_path"),
+                    "figure_path": result.get("figure_path"),
+                    "obsm_key": "SPECTRA_cell_scores",
+                    "note": (
+                        "Factor scores in adata.obsm['SPECTRA_cell_scores'] — "
+                        "color UMAP by individual columns to visualize each gene program. "
+                        "Top marker genes per factor are in adata.uns['SPECTRA_markers']."
+                    ),
+                    "warnings": warnings,
+                    "state": make_state(adata),
+                },
+                adata,
+                dataset_changed=True,
+                summary=f"Spectra discovered {result['n_factors']} gene program factors using '{cell_type_key}' as cell type key.",
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "Spectra completed successfully.",
+                    [
+                        _check(
+                            "cell_scores_present",
+                            "SPECTRA_cell_scores" in adata.obsm,
+                            f"Factor scores written to adata.obsm['SPECTRA_cell_scores'] ({result['n_factors']} factors).",
+                        ),
+                        _check(
+                            "markers_present",
+                            "SPECTRA_markers" in adata.uns,
+                            "Top marker genes stored in adata.uns['SPECTRA_markers'].",
+                        ),
+                    ],
+                ),
+            )
+
         elif tool_name == "save_data":
             if adata is None:
                 return json.dumps({
@@ -3317,10 +3915,32 @@ def process_tool_call(
 
             if method == "harmony":
                 run_harmony(adata, batch_key=batch_key)
-                corrected_rep = 'X_pca_harmony'
+                corrected_rep = "X_pca_harmony"
+            elif method == "scvi":
+                n_latent = int(tool_input.get("n_latent") or 30)
+                max_epochs = int(tool_input.get("max_epochs") or 200)
+                store_normalized = bool(tool_input.get("store_normalized", False))
+                # scVI requires raw integer counts — validate before training
+                try:
+                    _resolve_integer_counts_layer(adata, "raw_counts")
+                except ValueError as e:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "run_batch_correction",
+                        "method": "scvi",
+                        "message": str(e),
+                    }, indent=2), adata
+                run_scvi(
+                    adata,
+                    batch_key=batch_key,
+                    n_latent=n_latent,
+                    max_epochs=max_epochs,
+                    store_normalized=store_normalized,
+                )
+                corrected_rep = "X_scVI"
             else:
                 run_scanorama(adata, batch_key=batch_key)
-                corrected_rep = 'X_scanorama'
+                corrected_rep = "X_scanorama"
 
             # Recompute neighbors and UMAP on corrected embedding
             compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
@@ -3352,6 +3972,11 @@ def process_tool_call(
             )
             if batch_decision is not None:
                 decisions.append(batch_decision)
+            extra = {}
+            if method == "scvi":
+                extra["n_latent"] = int(tool_input.get("n_latent") or 30)
+                extra["max_epochs"] = int(tool_input.get("max_epochs") or 200)
+                extra["scvi_normalized_stored"] = bool(tool_input.get("store_normalized", False))
             batch_result = {
                 "status": "ok",
                 "tool": "run_batch_correction",
@@ -3365,7 +3990,8 @@ def process_tool_call(
                 "umap_recomputed": True,
                 "note": f"UMAP recomputed using corrected {corrected_rep} embedding",
                 "warnings": warnings,
-                "state": make_state(adata)
+                "state": make_state(adata),
+                **extra,
             }
             return _finalize_result(
                 batch_result,
@@ -3381,6 +4007,166 @@ def process_tool_call(
                         _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists in adata.obs."),
                         _check("corrected_embedding_present", corrected_rep in adata.obsm, f"Corrected embedding '{corrected_rep}' exists in adata.obsm."),
                         _check("umap_present", "X_umap" in adata.obsm, "UMAP was recomputed after correction."),
+                    ],
+                ),
+            )
+
+        elif tool_name == "score_integration":
+            from ..batch.entropy import compute_batch_entropy
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            batch_key = tool_input.get("batch_key")
+            use_rep = tool_input.get("use_rep", "X_umap")
+            n_neighbors = int(tool_input.get("n_neighbors", 50))
+
+            if not batch_key or batch_key not in adata.obs.columns:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "score_integration",
+                    "message": f"batch_key '{batch_key}' not found in adata.obs. Available: {list(adata.obs.columns[:20])}",
+                }, indent=2), adata
+
+            try:
+                result = compute_batch_entropy(
+                    adata,
+                    batch_key=batch_key,
+                    use_rep=use_rep,
+                    n_neighbors=n_neighbors,
+                )
+            except (ValueError, ImportError) as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "score_integration",
+                    "message": str(e),
+                }, indent=2), adata
+
+            # Store per-cell entropy in obs for downstream visualization
+            adata.obs["integration_entropy"] = result["per_cell_entropy"]
+
+            entropy_mean = result["entropy_mean"]
+            if entropy_mean >= 0.8:
+                interpretation = "Excellent mixing — batches are well-integrated."
+            elif entropy_mean >= 0.6:
+                interpretation = "Good mixing — minor batch structure may remain."
+            elif entropy_mean >= 0.4:
+                interpretation = "Moderate mixing — consider a stronger correction method (e.g. scVI)."
+            else:
+                interpretation = "Poor mixing — strong batch structure persists. Try scVI or check batch_key."
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "score_integration",
+                "use_rep": use_rep,
+                "batch_key": batch_key,
+                "n_neighbors": result["n_neighbors"],
+                "n_batches": result["n_batches"],
+                "entropy_mean": round(entropy_mean, 4),
+                "entropy_median": round(result["entropy_median"], 4),
+                "entropy_per_batch": {k: round(v, 4) for k, v in result["entropy_per_batch"].items()},
+                "interpretation": interpretation,
+                "note": (
+                    "Per-cell scores stored in adata.obs['integration_entropy']. "
+                    "Color UMAP by 'integration_entropy' to see spatial mixing patterns."
+                ),
+                "state": make_state(adata),
+            }, indent=2), adata
+
+        elif tool_name == "benchmark_integration":
+            from ..batch.scib import run_scib_benchmark
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            batch_key = tool_input.get("batch_key")
+            label_key = tool_input.get("label_key")
+            embedding_keys = tool_input.get("embedding_keys") or None
+            fast = bool(tool_input.get("fast", False))
+            output_dir = fix_output_path(tool_input.get("output_dir"), "benchmark_integration")
+
+            for col, name in [(batch_key, "batch_key"), (label_key, "label_key")]:
+                if not col or col not in adata.obs.columns:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "benchmark_integration",
+                        "message": f"{name} '{col}' not found in adata.obs.",
+                        "available_columns": list(adata.obs.columns[:30]),
+                    }, indent=2), adata
+
+            try:
+                bench = run_scib_benchmark(
+                    adata,
+                    batch_key=batch_key,
+                    label_key=label_key,
+                    embedding_keys=embedding_keys,
+                    fast=fast,
+                    output_dir=output_dir,
+                )
+            except ImportError as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "benchmark_integration",
+                    "message": str(e),
+                    "install_hint": "pip install scib-metrics",
+                }, indent=2), adata
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "benchmark_integration",
+                    "message": str(e),
+                }, indent=2), adata
+
+            artifacts_created = []
+            if bench.get("output_figure"):
+                artifact = _artifact_payload(
+                    bench["output_figure"],
+                    role="figure",
+                    metadata={"kind": "scib_benchmark_table"},
+                )
+                if artifact:
+                    artifacts_created.append(artifact)
+            if bench.get("output_csv"):
+                artifact = _artifact_payload(
+                    bench["output_csv"],
+                    role="artifact",
+                    metadata={"kind": "scib_results_csv"},
+                )
+                if artifact:
+                    artifacts_created.append(artifact)
+
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "benchmark_integration",
+                    "batch_key": batch_key,
+                    "label_key": label_key,
+                    "embeddings_benchmarked": bench["embeddings_benchmarked"],
+                    "scores_by_embedding": bench["scores_by_embedding"],
+                    "best_method": bench["best_method"],
+                    "results_table": bench["results_table"],
+                    "output_csv": bench.get("output_csv"),
+                    "output_figure": bench.get("output_figure"),
+                    "note": (
+                        f"Best embedding by total scib score: {bench['best_method']}. "
+                        "Use run_batch_correction with the corresponding method if not already applied."
+                    ) if bench["best_method"] else "",
+                    "state": make_state(adata),
+                },
+                adata,
+                dataset_changed=False,
+                summary=f"scib-metrics benchmark complete across {len(bench['embeddings_benchmarked'])} embeddings. Best: {bench['best_method']}.",
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "scib-metrics benchmark completed successfully.",
+                    [
+                        _check(
+                            "embeddings_benchmarked",
+                            len(bench["embeddings_benchmarked"]) > 0,
+                            f"Benchmarked {len(bench['embeddings_benchmarked'])} embeddings.",
+                        ),
+                        _check(
+                            "best_method_identified",
+                            bench["best_method"] is not None,
+                            f"Best method: {bench['best_method']}.",
+                        ),
                     ],
                 ),
             )
@@ -3501,6 +4287,59 @@ def process_tool_call(
                 "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
+
+        elif tool_name == "run_pseudobulk_deg":
+            from ..analysis.pseudobulk import run_pseudobulk_deg
+
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+
+            sample_col = tool_input["sample_col"]
+            condition_col = tool_input["condition_col"]
+            condition_a = tool_input["condition_a"]
+            condition_b = tool_input["condition_b"]
+            groups_col = tool_input["groups_col"]
+            cell_type = tool_input.get("cell_type")
+            layer = tool_input.get("layer", "raw_counts")
+            min_cells = int(tool_input.get("min_cells") or 10)
+            alpha = float(tool_input.get("alpha") or 0.05)
+            output_path = tool_input.get("output_path")
+
+            # Validate integer counts before aggregating
+            try:
+                _resolve_integer_counts_layer(adata, layer)
+            except ValueError as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_pseudobulk_deg",
+                    "message": str(e),
+                }, indent=2), adata
+
+            try:
+                result = run_pseudobulk_deg(
+                    adata,
+                    sample_col=sample_col,
+                    condition_col=condition_col,
+                    condition_a=condition_a,
+                    condition_b=condition_b,
+                    groups_col=groups_col,
+                    cell_type=cell_type,
+                    layer=layer,
+                    min_cells=min_cells,
+                    alpha=alpha,
+                    output_path=output_path,
+                )
+            except (ImportError, ValueError) as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_pseudobulk_deg",
+                    "message": str(e),
+                    "warnings": warnings,
+                }, indent=2), adata
+
+            result["warnings"] = warnings
+            result["state"] = make_state(adata)
+            return json.dumps(result, indent=2), adata
 
         elif tool_name == "run_gsea":
             import scanpy as sc

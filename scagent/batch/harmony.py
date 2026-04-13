@@ -64,13 +64,40 @@ def run_harmony(
 
     logger.info(f"Running Harmony batch correction on {basis}")
 
-    sc.external.pp.harmony_integrate(
-        adata,
-        key=batch_key,
-        basis=basis,
-        adjusted_basis=adjusted_basis,
-        max_iter_harmony=max_iter,
-    )
+    import numpy as np
+
+    # Call harmonypy directly rather than through sc.external.pp.harmony_integrate.
+    # Some harmonypy versions return Z_corr as (n_pcs, n_cells) and the scanpy
+    # wrapper sets adata.obsm before transposing, which AnnData rejects.
+    # Calling harmonypy directly lets us transpose before the assignment.
+    try:
+        import harmonypy
+        pca_matrix = np.array(adata.obsm[basis])
+        meta_data = adata.obs[[batch_key]].copy()
+        ho = harmonypy.run_harmony(
+            pca_matrix,
+            meta_data,
+            batch_key,
+            max_iter_harmony=max_iter,
+        )
+        Z_corr = np.array(ho.Z_corr)
+        # Z_corr shape is (n_pcs, n_cells) — transpose to (n_cells, n_pcs)
+        if Z_corr.shape[0] != adata.n_obs and Z_corr.shape[1] == adata.n_obs:
+            Z_corr = Z_corr.T
+        adata.obsm[adjusted_basis] = Z_corr
+    except ImportError:
+        # Fall back to scanpy wrapper if harmonypy is not directly importable
+        sc.external.pp.harmony_integrate(
+            adata,
+            key=batch_key,
+            basis=basis,
+            adjusted_basis=adjusted_basis,
+            max_iter_harmony=max_iter,
+        )
+        # Post-hoc transpose check in case the wrapper stored it transposed
+        emb = np.array(adata.obsm[adjusted_basis])
+        if emb.shape[0] != adata.n_obs and emb.shape[1] == adata.n_obs:
+            adata.obsm[adjusted_basis] = emb.T
 
     logger.info(f"Harmony-corrected embedding stored in adata.obsm['{adjusted_basis}']")
 

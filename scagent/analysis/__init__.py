@@ -54,6 +54,8 @@ from .interpretation import (
     pathway_function_hint,
     infer_pathway_interpretation,
 )
+from .pseudobulk import run_pseudobulk_deg
+from .spectra import run_spectra
 
 __all__ = [
     # Enums
@@ -95,4 +97,8 @@ __all__ = [
     "PathwayInterpretation",
     "pathway_function_hint",
     "infer_pathway_interpretation",
+    # Pseudobulk DEG
+    "run_pseudobulk_deg",
+    # Spectra factor analysis
+    "run_spectra",
 ]
