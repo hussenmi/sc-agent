@@ -162,13 +162,48 @@ def run_scib_benchmark(
         logger.info("Saved scib results to %s", csv_path)
 
         try:
-            import matplotlib
-            matplotlib.use("Agg")
-            fig = bm.plot_results_table(min_max_scale=False)
+            # plot_results_table returns a great_tables GT object, not a Figure.
+            # Save it via GT.as_raw_html() → selenium/webshot, or fall back to
+            # a plain matplotlib heatmap from the results DataFrame.
             fig_path = out / "scib_benchmark_table.png"
-            fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-            output_figure = str(fig_path)
-            logger.info("Saved scib results figure to %s", fig_path)
+            table_obj = bm.plot_results_table(min_max_scale=False)
+            saved = False
+
+            # Try great_tables / GT save path
+            try:
+                table_obj.save(str(fig_path))
+                saved = True
+            except Exception:
+                pass
+
+            if not saved:
+                # Fallback: draw results_df as a matplotlib table
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(
+                    figsize=(max(6, len(embedding_keys) * 2), max(4, len(results_df) * 0.5 + 1))
+                )
+                ax.axis("off")
+                tbl = ax.table(
+                    cellText=results_df.round(3).values,
+                    rowLabels=results_df.index,
+                    colLabels=results_df.columns,
+                    cellLoc="center",
+                    loc="center",
+                )
+                tbl.auto_set_font_size(False)
+                tbl.set_fontsize(8)
+                tbl.auto_set_column_width(col=list(range(len(results_df.columns))))
+                ax.set_title("scib-metrics benchmark", pad=12)
+                fig.tight_layout()
+                fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                saved = True
+
+            if saved:
+                output_figure = str(fig_path)
+                logger.info("Saved scib results figure to %s", fig_path)
         except Exception as e:
             logger.warning("Could not save scib results figure: %s", e)
 

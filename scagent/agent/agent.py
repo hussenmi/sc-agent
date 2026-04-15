@@ -90,6 +90,8 @@ ACTION_TOOL_NAMES = {
     "run_pseudobulk_deg",
     "run_gsea",
     "run_spectra",
+    "score_gene_signature",
+    "query_cells",
     "save_data",
     "run_code",
     "run_shell",
@@ -1767,7 +1769,6 @@ class SCAgent:
             "Working...",
             "Thinking...",
             'Doing...',
-            'Crunching numbers...',
             'Thinkering...',
             'Processing...',
         ]
@@ -2393,6 +2394,8 @@ class SCAgent:
         "run_pseudobulk_deg":  "Pseudobulk DEG (DESeq2)",
         "run_gsea":             "GSEA",
         "run_spectra":          "Spectra factor analysis",
+        "score_gene_signature": "Scoring gene signature",
+        "query_cells":          "Querying Scimilarity reference database",
         "run_code":             "Running code",
         "run_shell":            "Running shell command",
         "generate_figure":      "Generating figure",
@@ -2401,6 +2404,20 @@ class SCAgent:
         "search_papers":        "Searching papers",
         "review_artifact":      "Reviewing artifact",
         "read_file":            "Reading file",
+    }
+
+    # Tools that produce their own tqdm/progress output. Using Rich's console.status()
+    # (Live display) on these conflicts with tqdm and makes the terminal appear blank.
+    # For these tools we print a start line and let the tool's own output flow through.
+    _STREAMING_TOOLS = {
+        "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
+        "run_dimred",             # UMAP can take minutes on large datasets
+        "run_qc",                 # Scrublet progress on large datasets
+        "benchmark_integration",  # scib-metrics runs many metrics
+        "run_deg",                # rank_genes_groups can be slow
+        "run_pseudobulk_deg",     # DESeq2 fitting
+        "run_gsea",               # GSEA permutations
+        "run_code",               # unknown — user code may print progress
     }
 
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
@@ -2507,22 +2524,22 @@ class SCAgent:
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
             result_json = self._handle_install_package(tool_input)
-        # Special handling for run_code - pass output dir before executing
-        elif tool_name == "run_code":
-            if self.run_manager:
+        else:
+            # For run_code, inject the output_dir before dispatch
+            if tool_name == "run_code" and self.run_manager:
                 tool_input["output_dir"] = str(self.run_manager.run_dir)
-            description = tool_input.get('description', 'Running code')
-            label = self._TOOL_LABELS.get(tool_name, description)
-            if self.verbose:
-                with console.status(f"{label}...", spinner="dots"):
-                    result_json, self.adata = process_tool_call(
-                        tool_name,
-                        tool_input,
-                        self.adata,
-                        world_state=self.world_state,
-                        run_manager=self.run_manager,
-                    )
+
+            # Build the display label
+            if tool_name == "run_code":
+                label = self._TOOL_LABELS.get(tool_name, tool_input.get('description', 'Running code'))
             else:
+                label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
+
+            if self.verbose and tool_name in self._STREAMING_TOOLS:
+                # Streaming tools produce their own tqdm/progress output. Using
+                # Rich's Live (console.status) fights with tqdm and blanks the
+                # terminal. Print a start line and let the tool's output flow.
+                console.print(f"[cyan]▶[/cyan] {label}...")
                 result_json, self.adata = process_tool_call(
                     tool_name,
                     tool_input,
@@ -2530,10 +2547,8 @@ class SCAgent:
                     world_state=self.world_state,
                     run_manager=self.run_manager,
                 )
-        else:
-            # All other tools — single spinner, friendly label
-            label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
-            if self.verbose:
+                console.print(f"[green]✓[/green] {label} done")
+            elif self.verbose:
                 with console.status(f"{label}...", spinner="dots"):
                     result_json, self.adata = process_tool_call(
                         tool_name,

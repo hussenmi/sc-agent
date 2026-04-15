@@ -278,6 +278,19 @@ class AgentWorldState:
             if processing.get("is_normalized"):
                 available_actions.append("run_batch_correction")
 
+            # Cell query — available when Scimilarity embedding is present
+            _has_scimilarity_emb = adata is not None and "X_scimilarity" in adata.obsm
+            if _has_scimilarity_emb:
+                available_actions.append("query_cells")
+            else:
+                blocked_actions.append({"action": "query_cells", "needs": "X_scimilarity embedding (run run_scimilarity first)"})
+
+            # Gene signature scoring — needs normalized data
+            if processing.get("is_normalized"):
+                available_actions.append("score_gene_signature")
+            else:
+                blocked_actions.append({"action": "score_gene_signature", "needs": "normalized data"})
+
             # Spectra — needs annotations/clusters for cell_type_key, normalized data
             if (processing.get("has_clusters") or self.annotation_sources) and processing.get("is_normalized"):
                 available_actions.append("run_spectra")
@@ -741,5 +754,37 @@ class AgentWorldState:
                 "factor_labels": result.get("factor_labels"),
                 "model_path": result.get("model_path"),
             }
+
+        if tool_name == "query_cells":
+            return {
+                "tool": "query_cells",
+                "timestamp": ts,
+                "query_type": result.get("query_type"),
+                "n_query_cells": result.get("n_query_cells"),
+                "k": result.get("k"),
+                "n_results": result.get("n_results"),
+                "mean_dist": result.get("mean_dist"),
+                "coherence": result.get("coherence"),
+                "top_celltypes": result.get("top_celltypes"),
+                "top_tissues": result.get("top_tissues"),
+            }
+
+        if tool_name == "score_gene_signature":
+            entry: Dict[str, Any] = {
+                "tool": "score_gene_signature",
+                "timestamp": ts,
+                "mode": result.get("mode"),
+            }
+            if result.get("mode") == "cell_cycle":
+                entry["phase_distribution"] = result.get("phase_distribution")
+                entry["s_genes_matched"] = result.get("s_genes_matched")
+                entry["g2m_genes_matched"] = result.get("g2m_genes_matched")
+            else:
+                entry["score_name"] = result.get("score_name")
+                entry["genes_matched"] = result.get("genes_matched")
+                entry["genes_requested"] = result.get("genes_requested")
+                entry["coverage_pct"] = result.get("coverage_pct")
+                entry["score_stats"] = result.get("score_stats")
+            return entry
 
         return None

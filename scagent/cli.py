@@ -89,7 +89,7 @@ Examples:
     start_parser.add_argument(
         "--context-usage",
         action="store_true",
-        default=False,
+        default=True,
         help="Show context window usage in the spinner during each model call"
     )
     # === analyze command ===

@@ -23,6 +23,42 @@ from anndata import AnnData
 logger = logging.getLogger(__name__)
 
 
+def _preload_nvrtc_builtins() -> None:
+    """
+    Pre-load libnvrtc-builtins into the global symbol table before scVI GPU training.
+
+    PyTorch's CUDA JIT compiler calls dlopen("libnvrtc-builtins.so.X") by bare name
+    at compile time.  In HPC environments the library lives inside a pip-installed
+    nvidia package (site-packages/nvidia/cu*/lib/) that is not on LD_LIBRARY_PATH,
+    so dlopen fails with "failed to open libnvrtc-builtins.so.X".
+
+    Loading the library via ctypes with RTLD_GLOBAL before training causes glibc's
+    dynamic linker to satisfy the subsequent bare-name dlopen from the already-loaded
+    handle, bypassing the LD_LIBRARY_PATH lookup entirely.
+    """
+    import ctypes, glob, os, sys
+
+    searched = []
+    for sp in sys.path:
+        for pattern in [
+            os.path.join(sp, "nvidia", "cu*", "lib", "libnvrtc-builtins.so.*"),
+            os.path.join(sp, "nvidia", "cuda_nvrtc", "lib", "libnvrtc-builtins.so.*"),
+        ]:
+            for lib in sorted(glob.glob(pattern), reverse=True):  # prefer highest version
+                searched.append(lib)
+                if not os.path.exists(lib):
+                    continue
+                try:
+                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+                    logger.debug("Pre-loaded nvrtc builtins: %s", lib)
+                    return
+                except OSError:
+                    pass
+
+    logger.debug("libnvrtc-builtins not found in site-packages (searched %d paths); "
+                 "GPU training may fail if the library is not on LD_LIBRARY_PATH.", len(searched))
+
+
 def run_scvi(
     adata: AnnData,
     batch_key: str,
@@ -121,12 +157,21 @@ def run_scvi(
         except ImportError:
             logger.info("torch not importable — using CPU for scVI training")
 
-    # Setup AnnData for scVI (registers the dataset with the model)
+    # Setup AnnData for scVI (registers the dataset with the model).
+    # batch_key triggers scVI's proper batch integration (batch-specific decoder
+    # parameters + batch-conditioned ELBO). Using categorical_covariate_keys instead
+    # would treat batch as a weak covariate and produce worse correction.
     scvi_tools.model.SCVI.setup_anndata(
         adata,
         layer=layer,
-        categorical_covariate_keys=[batch_key],
+        batch_key=batch_key,
     )
+
+    # Pre-load nvrtc builtins so GPU JIT compilation can find them by name
+    if accelerator == "gpu":
+        _preload_nvrtc_builtins()
+        import torch
+        torch.set_float32_matmul_precision("medium")  # use Tensor Cores on A100/H100
 
     # Build and train the model
     model = scvi_tools.model.SCVI(adata, n_latent=n_latent)

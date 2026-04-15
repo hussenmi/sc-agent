@@ -58,6 +58,8 @@ These are validated defaults from our single-cell workshop:
 
 4. **Clustering keys**: When comparing resolutions, use explicit keys like `leiden_res_0_5` to avoid overwriting
 
+5. **Batch integration benchmarking**: Always try `benchmark_integration` first — it auto-detects corrected embeddings and handles the scib-metrics API correctly. Only fall back to `run_code` if the tool itself returns an error. If you do use `run_code` for scib-metrics, **do not guess the API** — use `inspect.signature(Benchmarker)` or `dir(scib_metrics.metrics)` in a short introspection call first, then write the actual benchmark code in a second call. The correct kwarg is `embedding_obsm_keys=` (not `embedding_keys=`). Do not attempt blind retries of the same wrong call.
+
 ## Using run_code
 
 `run_code` is your most powerful tool. Use it for:

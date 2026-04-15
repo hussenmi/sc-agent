@@ -448,6 +448,110 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "query_cells",
+            "description": (
+                "Search the Scimilarity reference database (~24M cells) for cells most similar to a query. "
+                "Two modes:\n"
+                "- 'cells': query using specific cells (by obs_names list or a boolean obs column). "
+                "Uses the mean Scimilarity embedding of the selected cells.\n"
+                "- 'centroid': query using the centroid of a cluster or cell type group "
+                "(provide group_key + group_value). More robust for heterogeneous populations.\n"
+                "Returns the top-k matching reference cells with their metadata: cell type, tissue, disease, study, distance. "
+                "Useful for: validating ambiguous annotations, finding analogous cell states in other datasets, "
+                "characterising novel populations. "
+                "Requires Scimilarity to be installed and run_scimilarity to have been run (or X_scimilarity in obsm). "
+                "For centroid mode, raw counts must be available."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query_type": {
+                        "type": "string",
+                        "enum": ["cells", "centroid"],
+                        "description": "'cells' (default): query by specific cells. 'centroid': query by cluster/celltype centroid."
+                    },
+                    "cell_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of obs_names to use as query (cells mode). Use this for querying a specific set of cells."
+                    },
+                    "obs_column": {
+                        "type": "string",
+                        "description": "obs column where True/1 marks query cells (cells mode). Alternative to cell_ids."
+                    },
+                    "group_key": {
+                        "type": "string",
+                        "description": "obs column containing group labels (centroid mode), e.g. 'leiden' or 'celltypist_majority_voting'."
+                    },
+                    "group_value": {
+                        "type": "string",
+                        "description": "Which group to use as the centroid query (centroid mode), e.g. '3' or 'Macrophage'."
+                    },
+                    "k": {
+                        "type": "integer",
+                        "description": "Number of nearest reference cells to retrieve (default: 50). Increase to 500+ for broader characterisation."
+                    },
+                    "raw_layer": {
+                        "type": "string",
+                        "description": "Layer with raw integer counts (used in centroid mode). Leave unset to auto-detect."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "score_gene_signature",
+            "description": (
+                "Score each cell for a gene signature using Scanpy's implementation of the Seurat method "
+                "(average expression of the gene list minus the average of a random control set of similar "
+                "expression level). Scores are stored in adata.obs under 'score_name'. "
+                "Optionally run cell cycle scoring (S/G2M/G1 phases) as a special case. "
+                "Works on normalized data; no raw counts required. "
+                "Use for: cell cycle regression, pathway activity, viral signature, stress response, etc."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "gene_list": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of gene names to score. Genes not found in the dataset are silently dropped; the tool reports how many were matched."
+                    },
+                    "score_name": {
+                        "type": "string",
+                        "description": "Column name to store the score in adata.obs (default: 'gene_signature_score'). Use a descriptive name, e.g. 'IFN_response_score'."
+                    },
+                    "cell_cycle": {
+                        "type": "boolean",
+                        "description": "If true, run cell cycle scoring instead. Requires s_genes and g2m_genes. Adds 'S_score', 'G2M_score', and 'phase' to adata.obs."
+                    },
+                    "s_genes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "S-phase gene list for cell cycle scoring (only used when cell_cycle=true)."
+                    },
+                    "g2m_genes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "G2M-phase gene list for cell cycle scoring (only used when cell_cycle=true)."
+                    },
+                    "layer": {
+                        "type": "string",
+                        "description": "Layer to use for scoring. Defaults to adata.X (normalized counts). Do not use raw counts — the score uses expression levels, not counts."
+                    },
+                    "n_bins": {
+                        "type": "integer",
+                        "description": "Number of expression bins for control gene sampling (default: 25). Increase if you have very few genes."
+                    },
+                    "ctrl_size": {
+                        "type": "integer",
+                        "description": "Number of control genes sampled per bin (default: 50). Set to len(gene_list) for a tighter control."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
             "name": "save_data",
             "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete.",
             "input_schema": {
@@ -738,18 +842,22 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "read_file",
             "description": (
-                "Read and return the text content of a file. Supports PDF (extracts text from all or selected pages), "
+                "Read and return the content of a file. Supports PDF (text extraction and optional page rendering), "
                 "plain text, Markdown, CSV, TSV, and JSON. Use this to read a paper, protocol, metadata table, "
                 "marker gene list, or any other reference document the user provides. "
                 "For large PDFs, use pages to read specific sections (e.g. methods). "
-                "The extracted text is returned directly into context for immediate use."
+                "Set render_pages=true to render PDF pages as images — the first page is sent directly to the vision "
+                "model so figures and plots embedded in the document are visible. Additional rendered pages are saved "
+                "to figures/pdf_pages/ and can be reviewed with review_figure. "
+                "Rendered pages are the right approach for scanned PDFs or pages where the content is primarily visual."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute or relative path to the file."},
                     "pages": {"type": "string", "description": "For PDFs: page range to extract, e.g. '1-5' or '3' or '2,4,6'. Default: all pages."},
-                    "max_chars": {"type": "integer", "description": "Maximum characters to return (default: 20000). Increase for longer documents."}
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return (default: 20000). Increase for longer documents."},
+                    "render_pages": {"type": "boolean", "description": "PDF only. Render pages as images (108 DPI PNG) in addition to text extraction. The first rendered page is sent to the vision model inline; others are saved to figures/pdf_pages/ for review_figure. Use when the document has figures, plots, or is scanned. Default: false."},
                 },
                 "required": ["path"]
             }
@@ -3756,6 +3864,260 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "query_cells":
+            from ..annotation.scimilarity import query_cells as _query_cells, DEFAULT_MODEL_PATH
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "query_cells",
+                    "message": "No data loaded. Load a dataset first.",
+                }, indent=2), adata
+
+            query_type = tool_input.get("query_type", "cells")
+            k = tool_input.get("k", 50)
+            raw_layer = tool_input.get("raw_layer")
+
+            # Validate mode-specific inputs early for a clear error
+            if query_type == "centroid":
+                if not tool_input.get("group_key") or not tool_input.get("group_value"):
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "query_cells",
+                        "message": "centroid mode requires group_key and group_value.",
+                    }, indent=2), adata
+            else:
+                if not tool_input.get("cell_ids") and not tool_input.get("obs_column"):
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "query_cells",
+                        "message": "cells mode requires either cell_ids (list of obs_names) or obs_column.",
+                    }, indent=2), adata
+
+            try:
+                result = _query_cells(
+                    adata,
+                    query_type=query_type,
+                    cell_ids=tool_input.get("cell_ids"),
+                    obs_column=tool_input.get("obs_column"),
+                    group_key=tool_input.get("group_key"),
+                    group_value=tool_input.get("group_value"),
+                    k=k,
+                    model_path=DEFAULT_MODEL_PATH,
+                    raw_layer=raw_layer,
+                )
+            except (FileNotFoundError, ImportError) as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "query_cells",
+                    "message": str(e),
+                }, indent=2), adata
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "query_cells",
+                    "message": f"Cell query failed: {e}",
+                }, indent=2), adata
+
+            # Build a human-readable summary
+            top_ct = result.get("top_celltypes", {})
+            top_tissue = result.get("top_tissues", {})
+            top_disease = result.get("top_diseases", {})
+            coherence = result.get("coherence")
+            mean_dist = result.get("mean_dist")
+
+            summary_parts = [
+                f"Retrieved {result['n_results']} reference cells (k={k}).",
+                f"Mean distance: {mean_dist:.4f}." if mean_dist is not None else "",
+                f"Query coherence: {coherence}%." if coherence is not None else "",
+                "Top cell types: " + ", ".join(f"{ct} ({n})" for ct, n in list(top_ct.items())[:5]) + "." if top_ct else "",
+                "Top tissues: " + ", ".join(f"{t} ({n})" for t, n in list(top_tissue.items())[:5]) + "." if top_tissue else "",
+            ]
+            summary = " ".join(p for p in summary_parts if p)
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "query_cells",
+                **result,
+                "message": summary,
+            }, indent=2), adata
+
+        elif tool_name == "score_gene_signature":
+            import numpy as np
+            import scanpy as sc
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "score_gene_signature",
+                    "message": "No data loaded. Load a dataset first.",
+                }, indent=2), adata
+
+            from ..core.inspector import inspect_data as _inspect_for_norm
+            _norm_state = _inspect_for_norm(adata)
+            if not _norm_state.is_normalized:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "score_gene_signature",
+                    "message": (
+                        "Data does not appear to be normalized. score_gene_signature works on "
+                        "log-normalized expression values (adata.X), not raw counts. "
+                        "Run normalize_and_hvg first."
+                    ),
+                }, indent=2), adata
+
+            cell_cycle = tool_input.get("cell_cycle", False)
+
+            if cell_cycle:
+                # ---- Cell cycle scoring ----
+                s_genes = tool_input.get("s_genes") or []
+                g2m_genes = tool_input.get("g2m_genes") or []
+                if not s_genes or not g2m_genes:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "score_gene_signature",
+                        "message": (
+                            "cell_cycle=true requires both s_genes and g2m_genes. "
+                            "Provide lists of S-phase and G2M-phase marker genes."
+                        ),
+                    }, indent=2), adata
+
+                # Filter to genes present in the dataset
+                var_names = set(adata.var_names)
+                s_found = [g for g in s_genes if g in var_names]
+                g2m_found = [g for g in g2m_genes if g in var_names]
+
+                if not s_found or not g2m_found:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "score_gene_signature",
+                        "message": (
+                            f"Cell cycle scoring failed: found {len(s_found)}/{len(s_genes)} S-phase genes "
+                            f"and {len(g2m_found)}/{len(g2m_genes)} G2M-phase genes in the dataset. "
+                            "Need at least one gene per phase. Check gene name format (human HGNC symbols)."
+                        ),
+                    }, indent=2), adata
+
+                try:
+                    sc.tl.score_genes_cell_cycle(
+                        adata,
+                        s_genes=s_found,
+                        g2m_genes=g2m_found,
+                    )
+                except Exception as e:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "score_gene_signature",
+                        "message": f"Cell cycle scoring failed: {e}",
+                    }, indent=2), adata
+
+                phase_counts = adata.obs["phase"].value_counts().to_dict()
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "score_gene_signature",
+                    "mode": "cell_cycle",
+                    "s_genes_matched": len(s_found),
+                    "s_genes_total": len(s_genes),
+                    "g2m_genes_matched": len(g2m_found),
+                    "g2m_genes_total": len(g2m_genes),
+                    "scores_added": ["S_score", "G2M_score", "phase"],
+                    "phase_distribution": phase_counts,
+                    "message": (
+                        f"Cell cycle scoring complete. Phase distribution: "
+                        + ", ".join(f"{k}: {v}" for k, v in sorted(phase_counts.items()))
+                        + ". Scores stored in adata.obs['S_score'], ['G2M_score'], ['phase']."
+                    ),
+                }, indent=2), adata
+
+            else:
+                # ---- Generic gene signature scoring ----
+                gene_list = tool_input.get("gene_list") or []
+                if not gene_list:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "score_gene_signature",
+                        "message": "Provide gene_list (list of gene names) or set cell_cycle=true.",
+                    }, indent=2), adata
+
+                score_name = tool_input.get("score_name", "gene_signature_score")
+                layer = tool_input.get("layer")
+                n_bins = tool_input.get("n_bins", 25)
+                ctrl_size = tool_input.get("ctrl_size", 50)
+
+                # Validate layer if provided
+                if layer and layer not in adata.layers:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "score_gene_signature",
+                        "message": (
+                            f"Layer '{layer}' not found. Available layers: {list(adata.layers.keys())}. "
+                            "Leave layer unset to use adata.X (recommended)."
+                        ),
+                    }, indent=2), adata
+
+                # Filter gene_list to genes present in the dataset and report coverage
+                var_names = set(adata.var_names)
+                matched = [g for g in gene_list if g in var_names]
+                missing = [g for g in gene_list if g not in var_names]
+
+                if not matched:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "score_gene_signature",
+                        "message": (
+                            f"None of the {len(gene_list)} provided genes were found in the dataset. "
+                            f"Check gene name format — dataset uses: {list(adata.var_names[:5])}..."
+                        ),
+                        "genes_not_found": gene_list[:20],
+                    }, indent=2), adata
+
+                # Warn if coverage is low but still proceed
+                coverage_pct = len(matched) / len(gene_list) * 100
+
+                try:
+                    sc.tl.score_genes(
+                        adata,
+                        gene_list=matched,
+                        score_name=score_name,
+                        n_bins=n_bins,
+                        ctrl_size=ctrl_size,
+                        layer=layer,
+                    )
+                except Exception as e:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "score_gene_signature",
+                        "message": f"Gene scoring failed: {e}",
+                    }, indent=2), adata
+
+                scores = adata.obs[score_name]
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "score_gene_signature",
+                    "mode": "signature",
+                    "score_name": score_name,
+                    "genes_requested": len(gene_list),
+                    "genes_matched": len(matched),
+                    "genes_missing": len(missing),
+                    "coverage_pct": round(coverage_pct, 1),
+                    "missing_genes": missing[:20] if missing else [],
+                    "score_stats": {
+                        "mean": round(float(scores.mean()), 4),
+                        "std": round(float(scores.std()), 4),
+                        "min": round(float(scores.min()), 4),
+                        "max": round(float(scores.max()), 4),
+                        "pct_positive": round(float((scores > 0).mean() * 100), 1),
+                    },
+                    "message": (
+                        f"Scored {len(matched)}/{len(gene_list)} genes ({coverage_pct:.0f}% coverage). "
+                        f"Score stored in adata.obs['{score_name}']. "
+                        f"Mean score: {scores.mean():.4f}, "
+                        f"{(scores > 0).mean() * 100:.1f}% of cells are positive."
+                        + (f" Warning: {len(missing)} genes not found in dataset." if missing else "")
+                    ),
+                }, indent=2), adata
+
         elif tool_name == "run_spectra":
             from ..analysis.spectra import run_spectra
 
@@ -4571,13 +4933,13 @@ def process_tool_call(
 
             if suffix == ".pdf":
                 try:
-                    from pypdf import PdfReader
+                    import fitz  # pymupdf
                 except ImportError:
                     return json.dumps({"status": "error", "tool": "read_file",
-                                       "message": "pypdf not installed. Run: pip install pypdf"}), adata
+                                       "message": "pymupdf not installed. Run: pip install pymupdf"}), adata
 
-                reader = PdfReader(str(file_path))
-                n_pages = len(reader.pages)
+                doc = fitz.open(str(file_path))
+                n_pages = len(doc)
 
                 # Parse page selection
                 pages_param = tool_input.get("pages", "").strip()
@@ -4593,10 +4955,10 @@ def process_tool_call(
                 else:
                     page_indices = list(range(n_pages))
 
+                # Text extraction
                 parts = []
                 for i in page_indices:
-                    text = reader.pages[i].extract_text() or ""
-                    text = text.strip()
+                    text = doc[i].get_text().strip()
                     if text:
                         parts.append(f"[Page {i+1}]\n{text}")
 
@@ -4604,7 +4966,7 @@ def process_tool_call(
                 truncated = len(full_text) > max_chars
                 content = full_text[:max_chars]
 
-                return json.dumps({
+                result = {
                     "status": "ok",
                     "tool": "read_file",
                     "path": str(file_path),
@@ -4614,7 +4976,45 @@ def process_tool_call(
                     "truncated": truncated,
                     "chars_returned": len(content),
                     "content": content,
-                }, indent=2), adata
+                }
+
+                # Optional page rendering — lets vision model see figures and plots
+                render_pages = bool(tool_input.get("render_pages", False))
+                if render_pages:
+                    import base64 as _b64
+                    if run_manager is not None:
+                        pdf_pages_dir = run_manager.dirs["figures"] / "pdf_pages"
+                    else:
+                        import tempfile
+                        pdf_pages_dir = Path(tempfile.mkdtemp())
+                    pdf_pages_dir.mkdir(parents=True, exist_ok=True)
+
+                    rendered_paths = []
+                    for i in page_indices:
+                        page = doc[i]
+                        mat = fitz.Matrix(1.5, 1.5)  # 108 DPI — good quality, reasonable size
+                        pix = page.get_pixmap(matrix=mat)
+                        out_path = pdf_pages_dir / f"page_{i + 1}.png"
+                        pix.save(str(out_path))
+                        rendered_paths.append(str(out_path))
+
+                    if rendered_paths:
+                        # First page goes to the vision pipeline via _pending_image
+                        result["image_base64"] = _b64.b64encode(
+                            open(rendered_paths[0], "rb").read()
+                        ).decode()
+                        result["image_mime"] = "image/png"
+                        result["image_context"] = {"output_path": rendered_paths[0]}
+                        result["rendered_page_paths"] = rendered_paths
+                        if len(rendered_paths) > 1:
+                            result["note"] = (
+                                f"Page 1 sent to vision model inline. "
+                                f"Remaining {len(rendered_paths) - 1} page(s) saved to "
+                                f"figures/pdf_pages/ — use review_figure to inspect them."
+                            )
+
+                doc.close()
+                return json.dumps(result, indent=2), adata
 
             else:
                 # Plain text, markdown, CSV, TSV, JSON, etc.

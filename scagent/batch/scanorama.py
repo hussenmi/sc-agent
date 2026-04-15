@@ -68,14 +68,22 @@ def run_scanorama(
 
     logger.info(f"Running Scanorama batch correction with dimred={dimred}, knn={knn}")
 
-    # Split by batch
+    # Split by batch — filter to HVGs if available (matches workshop approach;
+    # running on all genes is slow and reduces alignment quality)
     batches = adata.obs[batch_key].unique()
-    adatas = [adata[adata.obs[batch_key] == batch].copy() for batch in batches]
+    if "highly_variable" in adata.var.columns:
+        hvg_mask = adata.var["highly_variable"]
+        adatas = [adata[adata.obs[batch_key] == batch, hvg_mask].copy() for batch in batches]
+        logger.info(f"Running Scanorama on {hvg_mask.sum()} HVGs")
+    else:
+        adatas = [adata[adata.obs[batch_key] == batch].copy() for batch in batches]
+        logger.info(f"No HVGs found — running Scanorama on all {adata.n_vars} genes")
 
     logger.info(f"Processing {len(batches)} batches: {list(batches)}")
 
-    # Run Scanorama
-    corrected = scanorama.correct_scanpy(
+    # Run Scanorama — correct_scanpy returns a list of adatas (one per batch),
+    # each with obsm["X_scanorama"] when return_dimred=True
+    corrected_adatas = scanorama.correct_scanpy(
         adatas,
         return_dimred=return_dimred,
         verbose=True,
@@ -83,21 +91,45 @@ def run_scanorama(
         knn=knn,
     )
 
-    # Concatenate corrected data
-    import anndata
-    adata_corrected = anndata.concat(corrected, axis=0)
-
-    # Reorder to match original
-    adata_corrected = adata_corrected[adata.obs_names]
-
-    # Transfer results back to original adata
-    if return_dimred and key_added in adata_corrected.obsm:
-        adata.obsm[key_added] = adata_corrected.obsm[key_added]
+    # Reassemble embedding in original cell order
+    if return_dimred:
+        scanorama_emb = np.zeros((adata.n_obs, dimred))
+        for i, batch in enumerate(batches):
+            mask = adata.obs[batch_key] == batch
+            scanorama_emb[mask] = corrected_adatas[i].obsm[key_added]
+        adata.obsm[key_added] = scanorama_emb
         logger.info(f"Scanorama embedding stored in adata.obsm['{key_added}']")
 
-    # Store corrected expression
-    adata.layers['X_scanorama_corr'] = adata_corrected.X.copy()
-    logger.info("Scanorama-corrected expression stored in adata.layers['X_scanorama_corr']")
+    # Reassemble corrected expression in original cell order.
+    # Scanorama only corrects the genes it was run on (HVGs when available).
+    # The corrected matrix must be padded to adata.n_vars for layers storage;
+    # non-HVG positions stay at zero.
+    import scipy.sparse as _sp
+    n_hvg = corrected_adatas[0].n_vars
+    # Build a full-width matrix (n_cells × all_genes) padded with zeros
+    corr_expr = np.zeros((adata.n_obs, adata.n_vars), dtype=np.float32)
+    # Find which gene columns to fill
+    if "highly_variable" in adata.var.columns:
+        hvg_col_indices = np.where(adata.var["highly_variable"].values)[0]
+    else:
+        # Ran on all genes — no padding needed, columns match directly
+        hvg_col_indices = np.arange(adata.n_vars)
+    if n_hvg == len(hvg_col_indices):
+        for i, batch in enumerate(batches):
+            mask = adata.obs[batch_key] == batch
+            X_batch = corrected_adatas[i].X
+            X_batch_dense = X_batch.toarray() if _sp.issparse(X_batch) else X_batch
+            corr_expr[np.ix_(mask, hvg_col_indices)] = X_batch_dense
+        adata.layers['X_scanorama_corr'] = corr_expr
+        logger.info(
+            "Scanorama-corrected expression stored in adata.layers['X_scanorama_corr'] "
+            f"({n_hvg} HVG columns non-zero, {adata.n_vars - n_hvg} zero-padded)"
+        )
+    else:
+        logger.warning(
+            "Skipping X_scanorama_corr: corrected gene count (%d) doesn't match "
+            "HVG count (%d) — embedding only.", n_hvg, len(hvg_col_indices)
+        )
 
     logger.info("Scanorama batch correction complete")
 

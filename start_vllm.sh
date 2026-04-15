@@ -28,20 +28,26 @@ mkdir -p /data1/peerd/ibrahih3/tmp
 
 # ── Per-model settings ────────────────────────────────────────────────────────
 # Add a new model by appending a line here. Fields:
-#   HF repo ID | served name (used in .env) | weight size GB | KV KB/token | parser | max ctx K
-# max ctx K: model's native context limit from its config.json (not always 128K)
+#   HF repo ID | served name (used in .env) | weight size GB | KV KB/token | parser | max ctx K | quant
+# weight size GB: actual loaded size (use FP8 weight size for pre-quantized FP8 checkpoints)
+# quant: leave blank for BF16; set to "fp8" for pre-quantized FP8 checkpoints
+#   - blank: on H100, online FP8 quantization is applied (--quantization fp8); weight size
+#            must reflect BF16 size since BF16 is loaded first before quantizing
+#   - fp8:   vLLM auto-detects quantization; weight size reflects FP8 size (~half of BF16);
+#            larger context window is safe since weights load directly as FP8
 # The parser must match how the model was trained to emit tool calls.
 # Run `vllm --help` inside the container to list valid parser names.
 MODEL_TABLE=(
-  "Qwen/Qwen2.5-Coder-32B-Instruct          | Qwen2.5-Coder-32B-Instruct  |  64 | 256 | qwen3_xml   | 128"
-  "Qwen/Qwen2.5-72B-Instruct               | Qwen2.5-72B-Instruct        | 144 | 640 | qwen3_xml   |  32"
-  "Qwen/Qwen3-32B                           | Qwen3-32B                   |  64 | 256 | qwen3_xml   |  40"
-  "Qwen/Qwen3-30B-A3B                       | Qwen3-30B-A3B               |  60 | 192 | qwen3_coder | 128"
-  "meta-llama/Llama-3.3-70B-Instruct        | Llama-3.3-70B-Instruct      | 140 | 640 | llama3_json | 128"
-  "meta-llama/Llama-3.1-70B-Instruct        | Llama-3.1-70B-Instruct      | 140 | 640 | llama3_json | 128"
-  "google/gemma-4-31b-it                    | gemma-4-31b-it              |  62 | 1120 | gemma4      | 256"
-  "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-32B     |  64 | 256 | hermes      | 128"
-  "THUDM/glm-4-9b-chat                      | glm-4-9b-chat               |  18 |  64 | glm45       | 128"
+  "Qwen/Qwen2.5-Coder-32B-Instruct          | Qwen2.5-Coder-32B-Instruct  |  64 | 256  | qwen3_xml   | 128 |"
+  "Qwen/Qwen2.5-72B-Instruct               | Qwen2.5-72B-Instruct        | 144 | 640  | qwen3_xml   |  32 |"
+  "Qwen/Qwen3-32B                           | Qwen3-32B                   |  64 | 256  | qwen3_xml   |  40 |"
+  "Qwen/Qwen3-30B-A3B                       | Qwen3-30B-A3B               |  60 | 192  | qwen3_coder | 128 |"
+  "meta-llama/Llama-3.3-70B-Instruct        | Llama-3.3-70B-Instruct      | 140 | 640  | llama3_json | 128 |"
+  "meta-llama/Llama-3.1-70B-Instruct        | Llama-3.1-70B-Instruct      | 140 | 640  | llama3_json | 128 |"
+  "google/gemma-4-31b-it                    | gemma-4-31b-it              |  62 | 1120 | gemma4      | 256 |"
+  "RedHatAi/gemma-4-31B-it-FP8-Dynamic      | gemma-4-31b-it              |  31 | 1120 | gemma4      | 256 | fp8"
+  "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-32B     |  64 | 256  | hermes      | 128 |"
+  "THUDM/glm-4-9b-chat                      | glm-4-9b-chat               |  18 |  64  | glm45       | 128 |"
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -49,15 +55,17 @@ SERVED_NAME="$MODEL"
 MODEL_VRAM=64
 KV_KB=256
 PARSER="hermes"
+MODEL_QUANT=""
 
 for entry in "${MODEL_TABLE[@]}"; do
-  IFS='|' read -r repo name mvram kvkb parser ctx_k <<< "$entry"
+  IFS='|' read -r repo name mvram kvkb parser ctx_k quant <<< "$entry"
   repo=$(echo "$repo" | xargs)
   if [[ "$MODEL" == "$repo" ]]; then
-    SERVED_NAME=$(echo "$name"  | xargs)
-    MODEL_VRAM=$(echo "$mvram"  | xargs)
-    KV_KB=$(echo "$kvkb"        | xargs)
-    PARSER=$(echo "$parser"     | xargs)
+    SERVED_NAME=$(echo "$name"   | xargs)
+    MODEL_VRAM=$(echo "$mvram"   | xargs)
+    KV_KB=$(echo "$kvkb"         | xargs)
+    PARSER=$(echo "$parser"      | xargs)
+    MODEL_QUANT=$(echo "$quant"  | xargs)
     break
   fi
 done
@@ -77,6 +85,22 @@ if [[ "$GPUS" == "auto" ]]; then
   done
 else
   TP=$GPUS
+fi
+
+# Detect GPU and apply GPU-specific settings
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+FP8_FLAGS=""
+MEM_UTIL="0.90"
+EXTRA_FLAGS=""
+if [[ "$GPU_NAME" == *"H100"* ]]; then
+  # H100: CUDA graph compilation is more aggressive than A100 (batch sizes up to 8192 vs 2048),
+  # causing OOM during graph capture. enforce-eager disables CUDA graphs entirely — H100's
+  # raw tensor core throughput is fast enough without them for interactive workloads.
+  # VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS not needed when CUDA graphs are disabled.
+  EXTRA_FLAGS="--enforce-eager"
+  echo "GPU:      $GPU_NAME → eager mode (no CUDA graphs; avoids H100 graph OOM)"
+else
+  echo "GPU:      ${GPU_NAME:-unknown}"
 fi
 
 # Context window: KV budget → tokens, capped at model native max (128K)
@@ -123,8 +147,10 @@ singularity exec --nv \
   vllm serve "$MODEL" \
     --served-model-name "$SERVED_NAME" \
     --tensor-parallel-size "$TP" \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization "$MEM_UTIL" \
     --max-model-len "$CTX" \
+    $FP8_FLAGS \
+    $EXTRA_FLAGS \
     --enable-auto-tool-choice \
     --tool-call-parser "$PARSER" \
     --port "$PORT" \
@@ -135,7 +161,7 @@ PID=$!
 echo "PID: $PID"
 echo ""
 
-for i in $(seq 1 60); do
+for i in $(seq 1 120); do
   sleep 5
   if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
     echo "Server ready at http://localhost:$PORT/v1"
