@@ -15,8 +15,11 @@ os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
 from typing import List, Dict, Any
 import json
+import logging
 from pathlib import Path
 import re
+
+logger = logging.getLogger(__name__)
 
 
 def get_tools() -> List[Dict[str, Any]]:
@@ -184,12 +187,15 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "run_batch_correction",
             "description": (
-                "Correct batch effects using Harmony, Scanorama, or scVI. "
-                "Harmony: fast, corrects PCA embeddings, good for mild batch effects. "
+                "Correct batch effects using Harmony, BBKNN, Scanorama, or scVI. "
+                "Harmony: fast, corrects PCA embeddings, good for mild-to-moderate batch effects. "
+                "BBKNN: fast, builds a batch-balanced k-NN graph in PCA space; correction lives in "
+                "the neighbor graph (not a separate embedding), so UMAP and clustering are "
+                "automatically batch-aware. Good default when you have many samples (e.g. >10 batches). "
                 "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
                 "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
                 "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
-                "After correction, neighbors and UMAP are automatically recomputed on the corrected embedding."
+                "After correction, UMAP is automatically recomputed on the corrected representation."
             ),
             "input_schema": {
                 "type": "object",
@@ -199,9 +205,15 @@ def get_tools() -> List[Dict[str, Any]]:
                     "batch_key": {"type": "string", "description": "Column in adata.obs containing batch labels"},
                     "method": {
                         "type": "string",
-                        "enum": ["harmony", "scanorama", "scvi"],
-                        "description": "Correction method (default: harmony). Use scvi for complex batch effects when raw_counts layer is available."
+                        "enum": ["harmony", "bbknn", "scanorama", "scvi"],
+                        "description": (
+                            "Correction method (default: harmony). "
+                            "bbknn: batch-balanced graph, good for many batches (>10 samples). "
+                            "scvi: best for complex effects but needs raw_counts layer."
+                        )
                     },
+                    "n_pcs": {"type": "integer", "description": "BBKNN only: number of PCA components to use (default: 30)"},
+                    "neighbors_within_batch": {"type": "integer", "description": "BBKNN only: neighbors contributed per batch per cell (default: 3; total = n_batches × this value)"},
                     "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
                     "max_epochs": {"type": "integer", "description": "scVI only: training epochs (default: 200; use fewer only for quick tests)"},
                     "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
@@ -577,7 +589,7 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Python code to execute. Has access to: adata, sc, plt, np, pd, output_dir, Path, ensure_dir(), write_report(). Key helpers: ensure_dir(path) creates the dir and returns a Path — use it for figures: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'. write_report(name, content) saves a markdown report to reports/name.md and returns the path — always use this instead of open() when saving text results, never write .txt files. Do NOT import os."},
+                    "code": {"type": "string", "description": "Python code to execute. Has access to: adata, sc, plt, np, pd, output_dir, Path, ensure_dir(), write_report(). Key helpers: ensure_dir(path) creates the dir and returns a Path — use it for figures: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'. write_report(name, content) saves a markdown report to reports/name.md and returns the path — always use this instead of open() when saving text results, never write .txt files. Do NOT import os. When loading 10x h5 files with sc.read_10x_h5(), always call .var_names_make_unique() on each AnnData before concatenating. Use series.iloc[pos] not series[pos] for positional pandas access."},
                     "description": {"type": "string", "description": "Brief description of what the code does"},
                     "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
                 },
@@ -696,7 +708,7 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
+                    "data_path": {"type": "string", "description": "Path to a single h5ad or 10x h5 file (optional - uses in-memory data). Do NOT pass a directory; for multi-sample loading use run_code."},
                     "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"},
                     "context": {"type": "string", "description": "Optional biological context hint from the user or file path (e.g., 'PBMC healthy human cells')"}
                 },
@@ -953,7 +965,7 @@ def process_tool_call(
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import run_celltypist, run_scimilarity
-    from ..batch import run_scanorama, run_harmony, run_scvi
+    from ..batch import run_scanorama, run_harmony, run_scvi, run_bbknn
     from ..analysis import infer_biological_context
     from .decision_policy import (
         decision_for_batch_strategy,
@@ -1216,6 +1228,37 @@ def process_tool_call(
             ),
         )
 
+    def _error_result(
+        *,
+        tool: str,
+        message: str,
+        adata_obj=None,
+        recovery_options: List[str] | None = None,
+        install_hint: str | None = None,
+        extra: Dict[str, Any] | None = None,
+    ):
+        """Return a standardized error tuple ``(json_str, adata)``.
+
+        Every tool error should go through this helper so the LLM always
+        sees the same shape: ``{status, tool, message, recovery_options,
+        available_columns}``.  ``install_hint`` is a shortcut that appends
+        a "pip install …" option automatically.
+        """
+        opts = list(recovery_options or [])
+        if install_hint:
+            opts.append(f"Install the missing package: {install_hint}")
+        payload: Dict[str, Any] = {
+            "status": "error",
+            "tool": tool,
+            "message": message,
+            "recovery_options": opts,
+        }
+        if adata_obj is not None:
+            payload["available_columns"] = list(adata_obj.obs.columns[:30])
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, indent=2), adata_obj
+
     def get_adata(tool_input, existing_adata, update_memory: bool = True, prefer_memory: bool = False):
         """Get adata from memory or load from disk.
 
@@ -1454,8 +1497,18 @@ def process_tool_call(
             "color_by": color_by,
         }
         if include_image:
-            result["image_base64"] = encode_image_base64(output_path)
-            result["image_mime"] = get_image_mime_type(output_path)
+            try:
+                result["image_base64"] = encode_image_base64(output_path)
+                result["image_mime"] = get_image_mime_type(output_path)
+            except Exception as enc_err:
+                # Don't let an encoding failure blow up the whole tool call —
+                # the figure is already written to disk and the path is in
+                # the result. Log and continue without the inline blob.
+                logger.warning(
+                    "Failed to encode figure %s as base64 (%s); returning path only.",
+                    output_path, enc_err,
+                )
+                result["image_encode_error"] = str(enc_err)
         return result
 
     def _stringify_dataframe_columns(df):
@@ -2106,11 +2159,15 @@ def process_tool_call(
                         "os.system", "os.popen", "os.exec"]
             for f in forbidden:
                 if f in code:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "run_code",
-                        "message": f"Forbidden operation: {f}. Use Path from namespace for file operations."
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="run_code",
+                        message=f"Forbidden operation: {f}. Use Path from namespace for file operations.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Rewrite the code using the provided namespace (Path, ensure_dir, write_report).",
+                            "For shell commands, use the run_shell tool instead.",
+                        ],
+                    )
 
             # Load data if needed
             if adata is None and "data_path" in tool_input:
@@ -2166,16 +2223,40 @@ def process_tool_call(
             # Capture any figures created
             plt.close('all')
 
+            import warnings as _warnings
             exec_error = None
+            _caught = []
             try:
                 sys.stdout = stdout_capture
-                exec(code, namespace)
+                with _warnings.catch_warnings(record=True) as _caught:
+                    _warnings.simplefilter("always")
+                    exec(code, namespace)
             except Exception as _exec_err:
                 exec_error = _exec_err
             finally:
                 sys.stdout = old_stdout
 
             captured_output = stdout_capture.getvalue()
+
+            # Append actionable warnings to captured output so the agent sees and acts on them.
+            # Suppress purely cosmetic pandas FutureWarnings that require no action.
+            _cosmetic = {
+                "Series.__getitem__ treating keys as positions",
+                "The default of observed=False",
+            }
+            for w in _caught:
+                msg = str(w.message)
+                if not any(c in msg for c in _cosmetic):
+                    captured_output += f"\nWarning ({w.category.__name__}): {msg}"
+
+            # After execution, ensure var_names are unique on the live adata.
+            # 10x h5 files can contain duplicate gene symbols; anndata.concat() propagates
+            # them. Leaving duplicates causes silent wrong-gene indexing downstream.
+            var_names_fixed = False
+            adata = namespace.get("adata", adata)
+            if adata is not None and not adata.var_names.is_unique:
+                adata.var_names_make_unique()
+                var_names_fixed = True
 
             if exec_error is not None:
                 err_type = type(exec_error).__name__
@@ -2200,9 +2281,9 @@ def process_tool_call(
                     "tool": "run_code",
                     "description": description,
                     "error_type": err_type,
-                    "error": err_msg,
+                    "message": f"{err_type}: {err_msg}",
                     "output": captured_output[:500] if captured_output else None,
-                    "recovery_hint": hint,
+                    "recovery_options": [hint],
                 }, indent=2), adata
 
             adata = namespace.get("adata", adata)
@@ -2328,12 +2409,13 @@ def process_tool_call(
             ]
             for pattern, reason in _blocked:
                 if pattern in command:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "run_shell",
-                        "message": f"Blocked: {reason}.",
-                        "command": command,
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="run_shell",
+                        message=f"Blocked: {reason}.",
+                        adata_obj=adata,
+                        recovery_options=["Rewrite the command to avoid destructive operations."],
+                        extra={"command": command},
+                    )
 
             try:
                 proc = subprocess.run(
@@ -2348,19 +2430,24 @@ def process_tool_call(
                 stderr = proc.stderr.strip()
                 returncode = proc.returncode
             except subprocess.TimeoutExpired:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_shell",
-                    "message": f"Command timed out after {timeout}s.",
-                    "command": command,
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_shell",
+                    message=f"Command timed out after {timeout}s.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        f"Increase the timeout (currently {timeout}s).",
+                        "Break the command into smaller steps.",
+                    ],
+                    extra={"command": command},
+                )
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_shell",
-                    "message": str(e),
-                    "command": command,
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_shell",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=["Check command syntax and that required tools are installed."],
+                    extra={"command": command},
+                )
 
             return json.dumps({
                 "status": "ok" if returncode == 0 else "error",
@@ -2576,7 +2663,15 @@ def process_tool_call(
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             key = tool_input.get("cluster_key", "leiden")
             if key not in working_adata.obs:
-                return json.dumps({"status": "error", "message": f"No cluster column '{key}'"}), updated_adata
+                return _error_result(
+                    tool="get_cluster_sizes",
+                    message=f"No cluster column '{key}'.",
+                    adata_obj=working_adata,
+                    recovery_options=[
+                        "Run clustering first, then request cluster sizes.",
+                        "Use list_obs_columns to find the correct cluster key.",
+                    ],
+                )
 
             sizes = working_adata.obs[key].value_counts().to_dict()
             return json.dumps({
@@ -2746,8 +2841,15 @@ def process_tool_call(
 
             if artifact_kind == "figure":
                 if include_image:
-                    result["image_base64"] = encode_image_base64(artifact_path)
-                    result["image_mime"] = get_image_mime_type(artifact_path)
+                    try:
+                        result["image_base64"] = encode_image_base64(artifact_path)
+                        result["image_mime"] = get_image_mime_type(artifact_path)
+                    except Exception as enc_err:
+                        logger.warning(
+                            "Failed to encode artifact %s as base64 (%s); returning path only.",
+                            artifact_path, enc_err,
+                        )
+                        result["image_encode_error"] = str(enc_err)
             elif artifact_kind == "json":
                 with open(artifact_path) as handle:
                     payload = json.load(handle)
@@ -3342,11 +3444,14 @@ def process_tool_call(
             try:
                 _resolve_integer_counts_layer(adata, layer)
             except ValueError as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_decontx",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_decontx",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ensure raw integer counts exist in adata.layers (normalize_and_hvg preserves them automatically).",
+                    ],
+                )
 
             try:
                 run_decontx(
@@ -3359,18 +3464,22 @@ def process_tool_call(
                     inplace=True,
                 )
             except ImportError as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_decontx",
-                    "message": str(e),
-                    "install_hint": "pip install celda",
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_decontx",
+                    message=str(e),
+                    adata_obj=adata,
+                    install_hint="pip install celda",
+                )
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_decontx",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_decontx",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify the layer contains valid integer counts.",
+                        "If using cluster labels (z), check that the column has the expected categories.",
+                    ],
+                )
 
             contamination = adata.obs["decontX_contamination"]
             n_flagged = int(adata.obs["decontX_high_contamination"].sum())
@@ -3424,9 +3533,24 @@ def process_tool_call(
         elif tool_name == "normalize_and_hvg":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            normalize_data(adata)
             n_hvg = tool_input.get("n_hvg", 4000)
-            select_hvg(adata, n_top_genes=n_hvg)
+            try:
+                normalize_data(adata)
+                select_hvg(adata, n_top_genes=n_hvg)
+            except ValueError as e:
+                return _error_result(
+                    tool="normalize_and_hvg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "If the dataset was already normalized in this session, "
+                        "do not re-run normalize_and_hvg — call select_hvg "
+                        "directly via run_code if you only need to change HVG settings.",
+                        "If the dataset was loaded already-normalized from disk, "
+                        "load the raw-counts version instead, or place raw "
+                        "counts into adata.layers['raw_counts'] before retrying.",
+                    ],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "normalize_and_hvg")
             if output_path:
@@ -3724,12 +3848,29 @@ def process_tool_call(
                     context="cluster_key",
                 )
 
-            run_celltypist(
-                adata,
-                model=model,
-                majority_voting=majority,
-                over_clustering=cluster_key if majority else None,
-            )
+            try:
+                run_celltypist(
+                    adata,
+                    model=model,
+                    majority_voting=majority,
+                    over_clustering=cluster_key if majority else None,
+                )
+            except ValueError as e:
+                # Most often: missing raw-counts layer when adata.X is already
+                # log-normalized. Surface a recoverable error rather than
+                # crashing the tool loop.
+                return _error_result(
+                    tool="run_celltypist",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ensure raw integer counts are in adata.layers['raw_counts'] "
+                        "before running CellTypist (normalize_and_hvg preserves them "
+                        "automatically; data loaded externally may not).",
+                        "If you have raw counts under a different layer name, "
+                        "pass it as raw_layer when invoking via run_code.",
+                    ],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_celltypist")
             if output_path:
@@ -3869,11 +4010,11 @@ def process_tool_call(
 
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             if adata is None:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "query_cells",
-                    "message": "No data loaded. Load a dataset first.",
-                }, indent=2), adata
+                return _error_result(
+                    tool="query_cells",
+                    message="No data loaded. Load a dataset first.",
+                    recovery_options=["Load data with inspect_data or provide a data_path."],
+                )
 
             query_type = tool_input.get("query_type", "cells")
             k = tool_input.get("k", 50)
@@ -3882,18 +4023,25 @@ def process_tool_call(
             # Validate mode-specific inputs early for a clear error
             if query_type == "centroid":
                 if not tool_input.get("group_key") or not tool_input.get("group_value"):
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "query_cells",
-                        "message": "centroid mode requires group_key and group_value.",
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="query_cells",
+                        message="centroid mode requires group_key and group_value.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide both group_key (obs column) and group_value (category within it).",
+                            "Use list_obs_columns to find available grouping columns.",
+                        ],
+                    )
             else:
                 if not tool_input.get("cell_ids") and not tool_input.get("obs_column"):
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "query_cells",
-                        "message": "cells mode requires either cell_ids (list of obs_names) or obs_column.",
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="query_cells",
+                        message="cells mode requires either cell_ids (list of obs_names) or obs_column.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide a list of cell_ids (obs_names) or an obs_column to select cells from.",
+                        ],
+                    )
 
             try:
                 result = _query_cells(
@@ -3908,17 +4056,24 @@ def process_tool_call(
                     raw_layer=raw_layer,
                 )
             except (FileNotFoundError, ImportError) as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "query_cells",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="query_cells",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify the SCimilarity model path exists (see download_model.sh).",
+                    ],
+                    install_hint="pip install scimilarity" if "Import" in type(e).__name__ else None,
+                )
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "query_cells",
-                    "message": f"Cell query failed: {e}",
-                }, indent=2), adata
+                return _error_result(
+                    tool="query_cells",
+                    message=f"Cell query failed: {e}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify adata has raw counts (raw_layer) and correct obs structure.",
+                    ],
+                )
 
             # Build a human-readable summary
             top_ct = result.get("top_celltypes", {})
@@ -3948,24 +4103,25 @@ def process_tool_call(
             import scanpy as sc
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             if adata is None:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "score_gene_signature",
-                    "message": "No data loaded. Load a dataset first.",
-                }, indent=2), adata
+                return _error_result(
+                    tool="score_gene_signature",
+                    message="No data loaded. Load a dataset first.",
+                    recovery_options=["Load data with inspect_data or provide a data_path."],
+                )
 
             from ..core.inspector import inspect_data as _inspect_for_norm
             _norm_state = _inspect_for_norm(adata)
             if not _norm_state.is_normalized:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "score_gene_signature",
-                    "message": (
+                return _error_result(
+                    tool="score_gene_signature",
+                    message=(
                         "Data does not appear to be normalized. score_gene_signature works on "
                         "log-normalized expression values (adata.X), not raw counts. "
                         "Run normalize_and_hvg first."
                     ),
-                }, indent=2), adata
+                    adata_obj=adata,
+                    recovery_options=["Run normalize_and_hvg before scoring gene signatures."],
+                )
 
             cell_cycle = tool_input.get("cell_cycle", False)
 
@@ -3974,14 +4130,18 @@ def process_tool_call(
                 s_genes = tool_input.get("s_genes") or []
                 g2m_genes = tool_input.get("g2m_genes") or []
                 if not s_genes or not g2m_genes:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "score_gene_signature",
-                        "message": (
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
                             "cell_cycle=true requires both s_genes and g2m_genes. "
                             "Provide lists of S-phase and G2M-phase marker genes."
                         ),
-                    }, indent=2), adata
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide both s_genes and g2m_genes lists.",
+                            "Use standard Tirosh et al. 2016 cell cycle gene sets (search_papers can find them).",
+                        ],
+                    )
 
                 # Filter to genes present in the dataset
                 var_names = set(adata.var_names)
@@ -3989,15 +4149,19 @@ def process_tool_call(
                 g2m_found = [g for g in g2m_genes if g in var_names]
 
                 if not s_found or not g2m_found:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "score_gene_signature",
-                        "message": (
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
                             f"Cell cycle scoring failed: found {len(s_found)}/{len(s_genes)} S-phase genes "
                             f"and {len(g2m_found)}/{len(g2m_genes)} G2M-phase genes in the dataset. "
                             "Need at least one gene per phase. Check gene name format (human HGNC symbols)."
                         ),
-                    }, indent=2), adata
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Verify gene names match the dataset format (inspect sample var_names with inspect_data).",
+                            "Genes may be in mouse format (e.g., Ccnb1) vs. human (CCNB1) — convert if needed.",
+                        ],
+                    )
 
                 try:
                     sc.tl.score_genes_cell_cycle(
@@ -4006,11 +4170,12 @@ def process_tool_call(
                         g2m_genes=g2m_found,
                     )
                 except Exception as e:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "score_gene_signature",
-                        "message": f"Cell cycle scoring failed: {e}",
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=f"Cell cycle scoring failed: {e}",
+                        adata_obj=adata,
+                        recovery_options=["Check gene name formats and ensure data is log-normalized."],
+                    )
 
                 phase_counts = adata.obs["phase"].value_counts().to_dict()
                 return json.dumps({
@@ -4034,11 +4199,15 @@ def process_tool_call(
                 # ---- Generic gene signature scoring ----
                 gene_list = tool_input.get("gene_list") or []
                 if not gene_list:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "score_gene_signature",
-                        "message": "Provide gene_list (list of gene names) or set cell_cycle=true.",
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message="Provide gene_list (list of gene names) or set cell_cycle=true.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide a gene_list of marker genes to score.",
+                            "Set cell_cycle=true with s_genes and g2m_genes for cell cycle scoring.",
+                        ],
+                    )
 
                 score_name = tool_input.get("score_name", "gene_signature_score")
                 layer = tool_input.get("layer")
@@ -4047,14 +4216,15 @@ def process_tool_call(
 
                 # Validate layer if provided
                 if layer and layer not in adata.layers:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "score_gene_signature",
-                        "message": (
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
                             f"Layer '{layer}' not found. Available layers: {list(adata.layers.keys())}. "
                             "Leave layer unset to use adata.X (recommended)."
                         ),
-                    }, indent=2), adata
+                        adata_obj=adata,
+                        recovery_options=["Use one of the available layers or omit layer to use adata.X."],
+                    )
 
                 # Filter gene_list to genes present in the dataset and report coverage
                 var_names = set(adata.var_names)
@@ -4062,15 +4232,19 @@ def process_tool_call(
                 missing = [g for g in gene_list if g not in var_names]
 
                 if not matched:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "score_gene_signature",
-                        "message": (
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
                             f"None of the {len(gene_list)} provided genes were found in the dataset. "
                             f"Check gene name format — dataset uses: {list(adata.var_names[:5])}..."
                         ),
-                        "genes_not_found": gene_list[:20],
-                    }, indent=2), adata
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Verify gene name format matches the dataset (human HGNC vs. mouse, Ensembl IDs vs. symbols).",
+                            "Use inspect_data to see example var_names.",
+                        ],
+                        extra={"genes_not_found": gene_list[:20]},
+                    )
 
                 # Warn if coverage is low but still proceed
                 coverage_pct = len(matched) / len(gene_list) * 100
@@ -4085,11 +4259,12 @@ def process_tool_call(
                         layer=layer,
                     )
                 except Exception as e:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "score_gene_signature",
-                        "message": f"Gene scoring failed: {e}",
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=f"Gene scoring failed: {e}",
+                        adata_obj=adata,
+                        recovery_options=["Verify gene list and layer contain valid expression data."],
+                    )
 
                 scores = adata.obs[score_name]
                 return json.dumps({
@@ -4126,12 +4301,15 @@ def process_tool_call(
 
             cell_type_key = tool_input.get("cell_type_key")
             if not cell_type_key or cell_type_key not in adata.obs.columns:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_spectra",
-                    "message": f"cell_type_key '{cell_type_key}' not found in adata.obs.",
-                    "available_columns": list(adata.obs.columns[:30]),
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_spectra",
+                    message=f"cell_type_key '{cell_type_key}' not found in adata.obs.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Run cell type annotation (run_celltypist or run_scimilarity) first.",
+                        "Use list_obs_columns to find the correct annotation column.",
+                    ],
+                )
 
             output_dir = fix_output_path(tool_input.get("output_dir"), "run_spectra")
 
@@ -4153,18 +4331,21 @@ def process_tool_call(
                     output_dir=output_dir,
                 )
             except ImportError as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_spectra",
-                    "message": str(e),
-                    "install_hint": "pip install Spectra-sc",
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_spectra",
+                    message=str(e),
+                    adata_obj=adata,
+                    install_hint="pip install Spectra-sc",
+                )
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_spectra",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_spectra",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify cell_type_key is valid and gene set paths are correct.",
+                    ],
+                )
 
             artifacts_created = []
             if result.get("figure_path"):
@@ -4219,19 +4400,20 @@ def process_tool_call(
 
         elif tool_name == "save_data":
             if adata is None:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "save_data",
-                    "message": "No in-memory data available to save. Run an analysis tool first."
-                }, indent=2), adata
+                return _error_result(
+                    tool="save_data",
+                    message="No in-memory data available to save. Run an analysis tool first.",
+                    recovery_options=["Load and process data before saving."],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "save_data")
             if not output_path:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "save_data",
-                    "message": "Provide an .h5ad output_path or a directory where the final_result.h5ad can be written."
-                }, indent=2), adata
+                return _error_result(
+                    tool="save_data",
+                    message="Provide an .h5ad output_path or a directory where the final_result.h5ad can be written.",
+                    adata_obj=adata,
+                    recovery_options=["Provide output_path as a .h5ad file path or directory."],
+                )
 
             save_details = write_h5ad_safe(adata, output_path)
             artifact = _artifact_payload(output_path, role="saved_dataset", metadata={"save_mode": save_details.get("save_mode", "direct")})
@@ -4278,6 +4460,27 @@ def process_tool_call(
             if method == "harmony":
                 run_harmony(adata, batch_key=batch_key)
                 corrected_rep = "X_pca_harmony"
+            elif method == "bbknn":
+                n_pcs = int(tool_input.get("n_pcs") or 30)
+                neighbors_within_batch = int(tool_input.get("neighbors_within_batch") or 3)
+                # BBKNN requires PCA — validate before running
+                if "X_pca" not in adata.obsm:
+                    return _error_result(
+                        tool="run_batch_correction",
+                        message="BBKNN requires PCA in adata.obsm['X_pca']. Run run_dimred first.",
+                        adata_obj=adata,
+                        recovery_options=["Run run_dimred to compute PCA, then retry BBKNN."],
+                        extra={"method": "bbknn"},
+                    )
+                run_bbknn(
+                    adata,
+                    batch_key=batch_key,
+                    n_pcs=n_pcs,
+                    neighbors_within_batch=neighbors_within_batch,
+                )
+                # BBKNN correction lives in the neighbor graph, not an obsm key.
+                # corrected_rep=None signals the UMAP step below to skip recomputing neighbors.
+                corrected_rep = None
             elif method == "scvi":
                 n_latent = int(tool_input.get("n_latent") or 30)
                 max_epochs = int(tool_input.get("max_epochs") or 200)
@@ -4286,12 +4489,17 @@ def process_tool_call(
                 try:
                     _resolve_integer_counts_layer(adata, "raw_counts")
                 except ValueError as e:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "run_batch_correction",
-                        "method": "scvi",
-                        "message": str(e),
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="run_batch_correction",
+                        message=str(e),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Ensure raw integer counts are in adata.layers['raw_counts'] "
+                            "(normalize_and_hvg preserves them automatically).",
+                            "Try method='harmony' or 'bbknn' instead — they work on PCA embeddings and do not need raw counts.",
+                        ],
+                        extra={"method": "scvi"},
+                    )
                 run_scvi(
                     adata,
                     batch_key=batch_key,
@@ -4304,8 +4512,11 @@ def process_tool_call(
                 run_scanorama(adata, batch_key=batch_key)
                 corrected_rep = "X_scanorama"
 
-            # Recompute neighbors and UMAP on corrected embedding
-            compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
+            # Recompute neighbors and UMAP on the corrected representation.
+            # For BBKNN, the neighbor graph is already batch-corrected — skip
+            # recomputing neighbors (that would overwrite the BBKNN graph).
+            if corrected_rep is not None:
+                compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
             compute_umap(adata)
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
@@ -4339,6 +4550,23 @@ def process_tool_call(
                 extra["n_latent"] = int(tool_input.get("n_latent") or 30)
                 extra["max_epochs"] = int(tool_input.get("max_epochs") or 200)
                 extra["scvi_normalized_stored"] = bool(tool_input.get("store_normalized", False))
+            elif method == "bbknn":
+                extra["n_pcs"] = int(tool_input.get("n_pcs") or 30)
+                extra["neighbors_within_batch"] = int(tool_input.get("neighbors_within_batch") or 3)
+                extra["total_neighbors_per_cell"] = len(batch_sizes) * extra["neighbors_within_batch"]
+
+            # BBKNN correction lives in the neighbor graph (adata.obsp), not an obsm key
+            corrected_embedding_label = (
+                "BBKNN graph (adata.obsp['connectivities'])"
+                if corrected_rep is None
+                else corrected_rep
+            )
+            umap_note = (
+                "UMAP recomputed from batch-corrected BBKNN neighbor graph"
+                if corrected_rep is None
+                else f"UMAP recomputed using corrected {corrected_rep} embedding"
+            )
+
             batch_result = {
                 "status": "ok",
                 "tool": "run_batch_correction",
@@ -4348,13 +4576,22 @@ def process_tool_call(
                 "batch_key": batch_key,
                 "n_batches": len(batch_sizes),
                 "batch_sizes": {str(k): int(v) for k, v in batch_sizes.items()},
-                "corrected_embedding": corrected_rep,
+                "corrected_embedding": corrected_embedding_label,
                 "umap_recomputed": True,
-                "note": f"UMAP recomputed using corrected {corrected_rep} embedding",
+                "note": umap_note,
                 "warnings": warnings,
                 "state": make_state(adata),
                 **extra,
             }
+
+            # For BBKNN the correction is in the neighbor graph, not an obsm key
+            if corrected_rep is None:
+                corrected_present = adata.uns.get("bbknn_batch_key") == batch_key
+                corrected_check_label = "BBKNN neighbor graph stored in adata.obsp['connectivities']."
+            else:
+                corrected_present = corrected_rep in adata.obsm
+                corrected_check_label = f"Corrected embedding '{corrected_rep}' exists in adata.obsm."
+
             return _finalize_result(
                 batch_result,
                 adata,
@@ -4364,10 +4601,10 @@ def process_tool_call(
                 decisions_raised=decisions,
                 verification=_build_verification(
                     "passed",
-                    "Batch correction completed and the corrected embedding is available.",
+                    "Batch correction completed and the corrected representation is available.",
                     [
                         _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists in adata.obs."),
-                        _check("corrected_embedding_present", corrected_rep in adata.obsm, f"Corrected embedding '{corrected_rep}' exists in adata.obsm."),
+                        _check("corrected_embedding_present", corrected_present, corrected_check_label),
                         _check("umap_present", "X_umap" in adata.obsm, "UMAP was recomputed after correction."),
                     ],
                 ),
@@ -4382,11 +4619,15 @@ def process_tool_call(
             n_neighbors = int(tool_input.get("n_neighbors", 50))
 
             if not batch_key or batch_key not in adata.obs.columns:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "score_integration",
-                    "message": f"batch_key '{batch_key}' not found in adata.obs. Available: {list(adata.obs.columns[:20])}",
-                }, indent=2), adata
+                return _error_result(
+                    tool="score_integration",
+                    message=f"batch_key '{batch_key}' not found in adata.obs.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Use list_obs_columns to find the correct batch column name.",
+                        "Confirm the batch column with the user before scoring.",
+                    ],
+                )
 
             try:
                 result = compute_batch_entropy(
@@ -4396,11 +4637,14 @@ def process_tool_call(
                     n_neighbors=n_neighbors,
                 )
             except (ValueError, ImportError) as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "score_integration",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="score_integration",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify batch_key has ≥2 unique values and use_rep embedding exists in adata.obsm.",
+                    ],
+                )
 
             # Store per-cell entropy in obs for downstream visualization
             adata.obs["integration_entropy"] = result["per_cell_entropy"]
@@ -4445,12 +4689,15 @@ def process_tool_call(
 
             for col, name in [(batch_key, "batch_key"), (label_key, "label_key")]:
                 if not col or col not in adata.obs.columns:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "benchmark_integration",
-                        "message": f"{name} '{col}' not found in adata.obs.",
-                        "available_columns": list(adata.obs.columns[:30]),
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="benchmark_integration",
+                        message=f"{name} '{col}' not found in adata.obs.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Use list_obs_columns to find valid batch and label columns.",
+                            "Run cell type annotation first if label_key is missing.",
+                        ],
+                    )
 
             try:
                 bench = run_scib_benchmark(
@@ -4462,18 +4709,21 @@ def process_tool_call(
                     output_dir=output_dir,
                 )
             except ImportError as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "benchmark_integration",
-                    "message": str(e),
-                    "install_hint": "pip install scib-metrics",
-                }, indent=2), adata
+                return _error_result(
+                    tool="benchmark_integration",
+                    message=str(e),
+                    adata_obj=adata,
+                    install_hint="pip install scib-metrics",
+                )
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "benchmark_integration",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="benchmark_integration",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify batch/label keys and that embeddings are properly formatted.",
+                    ],
+                )
 
             artifacts_created = []
             if bench.get("output_figure"):
@@ -4584,11 +4834,15 @@ def process_tool_call(
                     inplace=True,
                 )
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_deg",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_deg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify groupby column is valid and has ≥2 groups.",
+                        "If a layer was specified, ensure it exists and contains valid expression data.",
+                    ],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_deg")
             if output_path:
@@ -4671,11 +4925,14 @@ def process_tool_call(
             try:
                 _resolve_integer_counts_layer(adata, layer)
             except ValueError as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_pseudobulk_deg",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_pseudobulk_deg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ensure raw integer counts are in the specified layer (normalize_and_hvg preserves them).",
+                    ],
+                )
 
             try:
                 result = run_pseudobulk_deg(
@@ -4692,12 +4949,16 @@ def process_tool_call(
                     output_path=output_path,
                 )
             except (ImportError, ValueError) as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_pseudobulk_deg",
-                    "message": str(e),
-                    "warnings": warnings,
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_pseudobulk_deg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify sample_col, condition_col, and groups_col exist and are valid.",
+                        "Ensure ≥2 samples per condition for DESeq2 replication.",
+                    ],
+                    install_hint="pip install decoupler pydeseq2" if "Import" in type(e).__name__ else None,
+                )
 
             result["warnings"] = warnings
             result["state"] = make_state(adata)
@@ -4718,12 +4979,12 @@ def process_tool_call(
 
             # Check DEG results exist
             if 'rank_genes_groups' not in adata.uns:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_gsea",
-                    "message": "No DEG results found. Run run_deg first.",
-                    "warnings": warnings,
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_gsea",
+                    message="No DEG results found. Run run_deg first.",
+                    adata_obj=adata,
+                    recovery_options=["Run run_deg to generate rank_genes_groups before running GSEA."],
+                )
 
             # Get DEG validity info for caveats
             deg_validity = get_deg_validity(adata)
@@ -4732,12 +4993,12 @@ def process_tool_call(
             try:
                 import gseapy
             except ImportError:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_gsea",
-                    "message": "gseapy not installed. Use install_package tool first.",
-                    "install_command": "pip install gseapy"
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_gsea",
+                    message="gseapy not installed.",
+                    adata_obj=adata,
+                    install_hint="pip install gseapy",
+                )
 
             os.makedirs(output_dir, exist_ok=True)
 
@@ -4925,8 +5186,12 @@ def process_tool_call(
             import re as _re
             file_path = Path(tool_input["path"]).expanduser()
             if not file_path.exists():
-                return json.dumps({"status": "error", "tool": "read_file",
-                                   "message": f"File not found: {file_path}"}), adata
+                return _error_result(
+                    tool="read_file",
+                    message=f"File not found: {file_path}",
+                    adata_obj=adata,
+                    recovery_options=["Verify the file path exists and is accessible."],
+                )
 
             max_chars = int(tool_input.get("max_chars") or 20000)
             suffix = file_path.suffix.lower()
@@ -4935,8 +5200,12 @@ def process_tool_call(
                 try:
                     import fitz  # pymupdf
                 except ImportError:
-                    return json.dumps({"status": "error", "tool": "read_file",
-                                       "message": "pymupdf not installed. Run: pip install pymupdf"}), adata
+                    return _error_result(
+                        tool="read_file",
+                        message="pymupdf not installed.",
+                        adata_obj=adata,
+                        install_hint="pip install pymupdf",
+                    )
 
                 doc = fitz.open(str(file_path))
                 n_pages = len(doc)
@@ -5021,8 +5290,12 @@ def process_tool_call(
                 try:
                     raw = file_path.read_text(encoding="utf-8", errors="replace")
                 except Exception as e:
-                    return json.dumps({"status": "error", "tool": "read_file",
-                                       "message": str(e)}), adata
+                    return _error_result(
+                        tool="read_file",
+                        message=str(e),
+                        adata_obj=adata,
+                        recovery_options=["Verify the file is readable and in a supported text format."],
+                    )
 
                 truncated = len(raw) > max_chars
                 content = raw[:max_chars]
@@ -5037,15 +5310,18 @@ def process_tool_call(
                 }, indent=2), adata
 
         else:
-            return json.dumps({
-                "status": "error",
-                "message": f"Unknown tool: {tool_name}"
-            }), adata
+            return _error_result(
+                tool=tool_name,
+                message=f"Unknown tool: {tool_name}",
+                adata_obj=adata,
+                recovery_options=["Check tool name spelling or use inspect_session to list available tools."],
+            )
 
     except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "tool": tool_name,
-            "message": str(e),
-            "error_type": type(e).__name__
-        }, indent=2), adata
+        return _error_result(
+            tool=tool_name,
+            message=str(e),
+            adata_obj=adata,
+            recovery_options=["Review the error and tool input parameters before retrying."],
+            extra={"error_type": type(e).__name__},
+        )

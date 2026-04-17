@@ -298,8 +298,9 @@ class AgentWorldState:
                 blocked_actions.append({"action": "run_spectra", "needs": "normalized data and cell type labels or clusters"})
 
             # Integration scoring and benchmarking
-            _has_corrected_rep = adata is not None and any(
-                k in adata.obsm for k in ("X_pca_harmony", "X_scVI", "X_scanorama")
+            _has_corrected_rep = adata is not None and (
+                any(k in adata.obsm for k in ("X_pca_harmony", "X_scVI", "X_scanorama"))
+                or adata.uns.get("bbknn_batch_key") is not None
             )
             _has_batch_key = bool(self.data_summary.get("batch_key"))
             if _has_batch_key and (processing.get("has_pca") or _has_corrected_rep):
@@ -370,7 +371,10 @@ class AgentWorldState:
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions[-5:]],
             "latest_verification": self.latest_verification,
             "last_action": self.last_action,
-            "step_log": self.step_log,
+            # Cap in the system-prompt snapshot to keep context small on long
+            # sessions. The full step_log is still available via to_dict() for
+            # notebook generation and reporting.
+            "step_log": self.step_log[-25:],
         }
 
     def render_runtime_context(self) -> str:
@@ -578,9 +582,15 @@ class AgentWorldState:
         # generation and retrospective questions about what was done.
         entry = self._extract_step_entry(tool_name, result)
         if entry:
-            # Replace any prior entry for the same tool (re-running a step updates it)
-            self.step_log = [e for e in self.step_log if e.get("tool") != tool_name]
+            # Append every successful run so re-running a step with different
+            # parameters preserves the full history (important for notebook
+            # generation and "what thresholds did we try?" follow-ups).
+            # The snapshot() view is capped separately to keep the system
+            # prompt compact; to_dict() keeps the full log for reporting.
             self.step_log.append(entry)
+            # Guard against unbounded growth on very long sessions.
+            if len(self.step_log) > 200:
+                self.step_log = self.step_log[-200:]
 
     @staticmethod
     def _extract_step_entry(tool_name: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:

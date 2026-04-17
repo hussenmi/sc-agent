@@ -192,11 +192,14 @@ def run_scvi(
                 "Retrying on CPU — this will be slower.",
                 err_str[:200],
             )
-            # Re-build the model (training state is corrupt after a CUDA crash)
+            # Re-build the model (training state is corrupt after a CUDA crash).
+            # Use the same batch_key setup as the GPU path — see comment above
+            # setup_anndata call; categorical_covariate_keys would silently
+            # produce weaker batch correction.
             scvi_tools.model.SCVI.setup_anndata(
                 adata,
                 layer=layer,
-                categorical_covariate_keys=[batch_key],
+                batch_key=batch_key,
             )
             model = scvi_tools.model.SCVI(adata, n_latent=n_latent)
             model.train(max_epochs=max_epochs, accelerator="cpu", devices=1)

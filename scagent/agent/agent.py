@@ -59,6 +59,13 @@ NON_FAILURE_PATTERNS = [
 SUCCESS_OVERRIDE_PATTERNS = [
     r"\bwhat would you like\b",
     r"\bwhat would you like to do next\b",
+    r"\bhow would you like\b",
+    r"\bwhat do you think\b",
+    r"\bwould you like me to\b",
+    r"\bif you want.*i can\b",
+    r"\bi can proceed\b",
+    r"\bone of these ways\b",
+    r"\bone of the following\b",
     r"\breadyfor\b",  # "ready for downstream"
     r"\bready for\b",
     r"\bsuccessfully applied\b",
@@ -68,9 +75,8 @@ SUCCESS_OVERRIDE_PATTERNS = [
     r"\bconverged after\b",
     r"\bbatch.corrected and ready\b",
     r"\bnow batch.corrected\b",
-    # Numbered next-step lists at end of response ("1 Run Leiden" / "1. Run Leiden")
-    r"\b1[\.\)]\s+run\b",
-    r"\b1[\.\)]\s+visuali[sz]e\b",
+    # Any numbered next-step list ("1 Run", "1 Bypass", "1 Inspect", etc.)
+    r"\b1[\.\)]\s+\w+\b.*\b2[\.\)]\s+\w+\b",
 ]
 AUTO_RECOVERY_ATTEMPTS = 2
 
@@ -330,40 +336,70 @@ class SCAgent:
         self.model = codex_model or "codex-default"
         self.tools = get_openai_tools()
 
-    # LaTeX math symbols that LLMs sometimes emit — replace with Unicode equivalents
-    # so they render correctly in the terminal instead of showing as literal $…$.
-    _LATEX_REPLACEMENTS = [
-        (r"\$\\rightarrow\$", "→"),
-        (r"\$\\leftarrow\$", "←"),
-        (r"\$\\Rightarrow\$", "⇒"),
-        (r"\$\\Leftarrow\$", "⇐"),
-        (r"\$\\leftrightarrow\$", "↔"),
-        (r"\$\\uparrow\$", "↑"),
-        (r"\$\\downarrow\$", "↓"),
-        (r"\$\\approx\$", "≈"),
-        (r"\$\\geq\$", "≥"),
-        (r"\$\\leq\$", "≤"),
-        (r"\$\\neq\$", "≠"),
-        (r"\$\\times\$", "×"),
-        (r"\$\\pm\$", "±"),
-        (r"\$\\cdot\$", "·"),
-        (r"\$\\alpha\$", "α"),
-        (r"\$\\beta\$", "β"),
-        (r"\$\\gamma\$", "γ"),
-        (r"\$\\delta\$", "δ"),
-        (r"\$\\lambda\$", "λ"),
-        (r"\$\\mu\$", "μ"),
-        (r"\$\\sigma\$", "σ"),
-        (r"\$\\infty\$", "∞"),
-    ]
+
+    # Map of LaTeX commands to Unicode/text used inside inline math blocks
+    _LATEX_COMMANDS = {
+        r"\rightarrow": "→",
+        r"\leftarrow": "←",
+        r"\Rightarrow": "⇒",
+        r"\Leftarrow": "⇐",
+        r"\leftrightarrow": "↔",
+        r"\uparrow": "↑",
+        r"\downarrow": "↓",
+        r"\approx": "≈",
+        r"\geq": "≥",
+        r"\leq": "≤",
+        r"\neq": "≠",
+        r"\times": "×",
+        r"\pm": "±",
+        r"\cdot": "·",
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\gamma": "γ",
+        r"\delta": "δ",
+        r"\lambda": "λ",
+        r"\mu": "μ",
+        r"\sigma": "σ",
+        r"\infty": "∞",
+        r"\sum": "Σ",
+        r"\prod": "Π",
+        r"\in": "∈",
+        r"\notin": "∉",
+        r"\subset": "⊂",
+        r"\cup": "∪",
+        r"\cap": "∩",
+        r"\sqrt": "√",
+        r"\log": "log",
+        r"\exp": "exp",
+    }
+
+    @classmethod
+    def _resolve_inline_math(cls, math_content: str) -> str:
+        """Convert the interior of a $...$ block to readable plain text."""
+        result = math_content
+        # Replace known LaTeX commands (longest first to avoid partial matches)
+        for cmd, uni in sorted(cls._LATEX_COMMANDS.items(), key=lambda x: -len(x[0])):
+            result = result.replace(cmd, uni)
+        # Strip any remaining backslash commands we don't know (e.g. \text{...} → content)
+        result = re.sub(r"\\text\{([^}]*)\}", r"\1", result)
+        result = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", result)
+        result = re.sub(r"\{([^}]*)\}", r"\1", result)  # bare braces → content
+        result = re.sub(r"\\[a-zA-Z]+", "", result)     # drop unknown commands
+        return result.strip()
 
     @classmethod
     def _delatex(cls, text: str) -> str:
-        """Replace LaTeX math symbols with Unicode equivalents."""
+        """Replace LaTeX math expressions with readable Unicode equivalents.
+
+        Handles both single-symbol blocks ($\\times$) and compound inline
+        math expressions ($151,370 \\times 0.00035 \\approx 53$).
+        """
         if not text or "$" not in text:
             return text
-        for pattern, replacement in cls._LATEX_REPLACEMENTS:
-            text = re.sub(pattern, replacement, text)
+        # Replace compound inline math $...$ blocks (non-greedy, no newlines inside)
+        def _replace_math(m):
+            return cls._resolve_inline_math(m.group(1))
+        text = re.sub(r"\$([^$\n]+?)\$", _replace_math, text)
         return text
 
     def _print(self, message: str, style: str = None, markdown: bool = False):
@@ -2688,7 +2724,13 @@ class SCAgent:
             elif status == "needs_input":
                 pass  # Handled by ask_user
             elif status == "error":
-                self._print(f"    [red]✗ Error:[/red] {result_data.get('message', '')}")
+                err_msg = result_data.get('message') or result_data.get('error', '')
+                err_short = err_msg[:120] + ("…" if len(err_msg) > 120 else "")
+                self._print(f"    [red]✗ Error:[/red] {err_short}")
+                # Show captured output before the crash if available
+                pre_crash = result_data.get('output', '')
+                if pre_crash and pre_crash.strip():
+                    self._print(f"    [dim]Output before error:[/dim] {pre_crash.strip()[:200]}")
             # Only show verification failures when the tool didn't already report
             # an error — otherwise we'd print two lines saying the same thing.
             if status != "error":

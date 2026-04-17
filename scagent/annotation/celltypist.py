@@ -54,7 +54,25 @@ def prepare_for_celltypist(
         logger.info(f"Using raw counts from layer '{raw_layer}'")
         X = adata.layers[raw_layer].copy()
     else:
-        logger.warning("No raw counts layer found, using adata.X")
+        # Falling back to adata.X is dangerous: by the time CellTypist is
+        # called, adata.X is almost always log-normalized. Running
+        # normalize_total + log1p on it produces log(1 + log1p_X / Σ * 10000)
+        # — a transformation CellTypist was never trained on. The model
+        # still returns confident-looking labels, but they are systematically
+        # wrong. Refuse rather than silently mis-annotate.
+        if 'log1p' in adata.uns:
+            raise ValueError(
+                "CellTypist requires raw integer counts, but no raw-counts "
+                "layer was found and adata.X is already log-normalized "
+                "(adata.uns['log1p'] is set). Re-normalizing log1p data would "
+                "produce wrong predictions. Place raw counts into "
+                "adata.layers['raw_counts'] before calling run_celltypist, "
+                "or pass raw_layer explicitly."
+            )
+        logger.warning(
+            "No raw-counts layer found and adata.X is not flagged as "
+            "log-normalized; assuming adata.X holds raw counts."
+        )
         X = adata.X.copy()
 
     # Create new AnnData with raw counts
@@ -159,6 +177,16 @@ def run_celltypist(
         cols_to_transfer = ['predicted_labels', 'conf_score']
         if majority_voting:
             cols_to_transfer.extend(['majority_voting', 'over_clustering'])
+
+        # CellTypist should preserve obs_names, but guard against silent
+        # misalignment — reindexing .loc against a mismatched index returns
+        # NaNs instead of raising, which would corrupt downstream labels.
+        if set(adata_preds.obs_names) != set(adata.obs_names):
+            raise ValueError(
+                "CellTypist predictions obs_names do not match input adata "
+                "obs_names; refusing to transfer labels to avoid silent "
+                "misalignment."
+            )
 
         for col in cols_to_transfer:
             if col in adata_preds.obs.columns:

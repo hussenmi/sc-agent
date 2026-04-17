@@ -70,6 +70,8 @@ def run_harmony(
     # Some harmonypy versions return Z_corr as (n_pcs, n_cells) and the scanpy
     # wrapper sets adata.obsm before transposing, which AnnData rejects.
     # Calling harmonypy directly lets us transpose before the assignment.
+    n_obs = adata.n_obs
+    n_pcs = adata.obsm[basis].shape[1]
     try:
         import harmonypy
         pca_matrix = np.array(adata.obsm[basis])
@@ -81,9 +83,14 @@ def run_harmony(
             max_iter_harmony=max_iter,
         )
         Z_corr = np.array(ho.Z_corr)
-        # Z_corr shape is (n_pcs, n_cells) — transpose to (n_cells, n_pcs)
-        if Z_corr.shape[0] != adata.n_obs and Z_corr.shape[1] == adata.n_obs:
+        # harmonypy typically returns (n_pcs, n_cells); transpose if needed.
+        if Z_corr.shape == (n_pcs, n_obs):
             Z_corr = Z_corr.T
+        if Z_corr.shape != (n_obs, n_pcs):
+            raise ValueError(
+                f"Harmony output has unexpected shape {Z_corr.shape}; "
+                f"expected ({n_obs}, {n_pcs}) or ({n_pcs}, {n_obs})."
+            )
         adata.obsm[adjusted_basis] = Z_corr
     except ImportError:
         # Fall back to scanpy wrapper if harmonypy is not directly importable
@@ -94,10 +101,15 @@ def run_harmony(
             adjusted_basis=adjusted_basis,
             max_iter_harmony=max_iter,
         )
-        # Post-hoc transpose check in case the wrapper stored it transposed
         emb = np.array(adata.obsm[adjusted_basis])
-        if emb.shape[0] != adata.n_obs and emb.shape[1] == adata.n_obs:
-            adata.obsm[adjusted_basis] = emb.T
+        if emb.shape == (n_pcs, n_obs):
+            emb = emb.T
+        if emb.shape != (n_obs, n_pcs):
+            raise ValueError(
+                f"Harmony (scanpy wrapper) output has unexpected shape "
+                f"{emb.shape}; expected ({n_obs}, {n_pcs})."
+            )
+        adata.obsm[adjusted_basis] = emb
 
     logger.info(f"Harmony-corrected embedding stored in adata.obsm['{adjusted_basis}']")
 

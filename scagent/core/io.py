@@ -58,8 +58,27 @@ def load_data(
             format = 'h5ad_gz'
         elif path.suffix.lower() == '.h5':
             format = '10x_h5'
-        elif path.suffix.lower() in ['.mtx'] or path.is_dir():
+        elif path.suffix.lower() in ['.mtx']:
             format = 'mtx'
+        elif path.is_dir():
+            # Validate that this looks like a 10x MTX directory before assuming MTX format.
+            # Directories containing h5 files (e.g. per-sample download folders) are not MTX.
+            mtx_candidates = list(path.glob("matrix.mtx*"))
+            h5_candidates = list(path.glob("*.h5"))
+            if mtx_candidates:
+                format = 'mtx'
+            elif h5_candidates:
+                raise ValueError(
+                    f"'{path}' is a directory containing {len(h5_candidates)} .h5 file(s), "
+                    "not a 10x MTX directory. To load multiple samples, use run_code to load "
+                    "each file individually with sc.read_10x_h5() and concatenate with "
+                    "anndata.concat(). Call .var_names_make_unique() on each before concatenating."
+                )
+            else:
+                raise ValueError(
+                    f"'{path}' is a directory but does not contain matrix.mtx or matrix.mtx.gz. "
+                    "Expected a 10x MTX directory with matrix.mtx.gz, barcodes.tsv.gz, and features.tsv.gz."
+                )
         elif path.suffix.lower() == '.gz':
             # .gz but not .h5ad.gz — assume MTX directory (e.g. matrix.mtx.gz passed directly)
             format = 'mtx'

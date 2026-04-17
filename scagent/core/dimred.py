@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def run_pca(
     adata: AnnData,
     n_comps: int = DIMRED_DEFAULTS.n_pcs,
-    use_highly_variable: bool = True,
+    mask_var: Optional[str] = "highly_variable",
     random_state: int = 0,
     inplace: bool = True,
 ) -> Optional[AnnData]:
@@ -34,8 +34,10 @@ def run_pca(
         AnnData object (should be normalized and log-transformed).
     n_comps : int, default 30
         Number of principal components to compute.
-    use_highly_variable : bool, default True
-        Use only highly variable genes for PCA.
+    mask_var : str or None, default 'highly_variable'
+        Boolean column in adata.var selecting genes for PCA. The default
+        restricts to HVGs; pass None to use all genes. (Replaces the old
+        deprecated `use_highly_variable` flag.)
     random_state : int, default 0
         Random seed for reproducibility.
     inplace : bool, default True
@@ -49,12 +51,13 @@ def run_pca(
     if not inplace:
         adata = adata.copy()
 
-    # Translate use_highly_variable to the mask_var API (use_highly_variable is deprecated)
-    if use_highly_variable and 'highly_variable' in adata.var.columns:
-        mask_var = 'highly_variable'
-    else:
-        if use_highly_variable:
-            logger.warning("No HVGs found, running PCA on all genes")
+    # Resolve mask: if the caller requested HVGs but the column is missing,
+    # fall back to all genes with a warning rather than failing.
+    if mask_var is not None and mask_var not in adata.var.columns:
+        logger.warning(
+            "mask_var=%r not found in adata.var; running PCA on all genes",
+            mask_var,
+        )
         mask_var = None
 
     logger.info(f"Running PCA with {n_comps} components")

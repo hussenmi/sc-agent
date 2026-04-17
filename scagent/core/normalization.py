@@ -64,6 +64,13 @@ def normalize_data(
     """
     Normalize and optionally log-transform data.
 
+    If ``adata`` has already been normalized (scanpy sets ``adata.uns['log1p']``
+    after ``sc.pp.log1p``), this function resets ``adata.X`` from the raw-counts
+    layer before normalizing again. This prevents silent double-normalization
+    when the tool is re-run with different parameters. If no raw-counts layer
+    is available in that situation, ``ValueError`` is raised rather than
+    producing a corrupt matrix.
+
     Parameters
     ----------
     adata : AnnData
@@ -83,11 +90,40 @@ def normalize_data(
     -------
     AnnData or None
         Returns AnnData if inplace=False, None otherwise.
+
+    Raises
+    ------
+    ValueError
+        If ``adata.X`` appears already-normalized and no raw-counts layer
+        is available to reset from.
     """
     if not inplace:
         adata = adata.copy()
 
-    # Preserve raw counts
+    already_normalized = 'log1p' in adata.uns
+
+    if already_normalized:
+        if raw_layer_name in adata.layers:
+            logger.warning(
+                "adata.uns['log1p'] is set — resetting adata.X from "
+                "layers['%s'] before re-normalizing to avoid double "
+                "normalization.",
+                raw_layer_name,
+            )
+            adata.X = adata.layers[raw_layer_name].copy()
+            # Clear the log1p marker so scanpy does not refuse log1p again
+            # and so downstream tools do not think X is still log-scaled.
+            adata.uns.pop('log1p', None)
+        else:
+            raise ValueError(
+                "adata appears already normalized (adata.uns['log1p'] is set) "
+                f"and no raw-counts layer named '{raw_layer_name}' is available "
+                "to reset from. Re-normalizing would corrupt adata.X. "
+                "Load the dataset fresh from raw counts, or copy raw counts "
+                f"into adata.layers['{raw_layer_name}'] before retrying."
+            )
+
+    # Preserve raw counts (after any reset, the current X is the raw matrix)
     if preserve_raw and raw_layer_name not in adata.layers:
         preserve_raw_counts(adata, layer_name=raw_layer_name, inplace=True)
 
@@ -140,17 +176,22 @@ def select_hvg(
     if not inplace:
         adata = adata.copy()
 
-    # For seurat_v3, we need raw counts
+    # For seurat_v3, we need raw integer counts. Falling back to a
+    # log-normalized adata.X silently produces wrong HVGs, so refuse
+    # rather than warn-and-continue.
     if flavor == 'seurat_v3' and layer is None:
-        # Try to find raw counts layer
         for name in ['raw_counts', 'raw_data', 'counts']:
             if name in adata.layers:
                 layer = name
                 break
         if layer is None:
-            logger.warning(
-                "No raw counts layer found for seurat_v3 flavor. "
-                "Results may be suboptimal."
+            raise ValueError(
+                "select_hvg(flavor='seurat_v3') requires raw integer counts "
+                "in a layer (looked for 'raw_counts', 'raw_data', 'counts'). "
+                "adata.X is likely log-normalized, which would silently "
+                "produce wrong HVGs. Either pass an explicit `layer=`, copy "
+                "raw counts into adata.layers['raw_counts'], or use a "
+                "log-friendly flavor like 'seurat' / 'cell_ranger'."
             )
 
     logger.info(f"Selecting {n_top_genes} HVGs with {flavor} flavor")

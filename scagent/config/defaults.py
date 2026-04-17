@@ -110,6 +110,10 @@ class BatchDefaults:
     harmony_basis: str = 'X_pca'
     harmony_adjusted_basis: str = 'X_pca_harmony'
 
+    # BBKNN
+    bbknn_n_pcs: int = 30
+    bbknn_neighbors_within_batch: int = 3
+
 
 @dataclass(frozen=True)
 class DEGDefaults:

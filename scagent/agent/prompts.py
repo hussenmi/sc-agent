@@ -127,6 +127,63 @@ Always use proper Markdown: `##` section headers, bold for key values, code-form
 - Only save at the end with `save_data` or when user explicitly asks
 - Figures go to `output_dir + '/figures/'` - use `ensure_dir()` to create it
 
+## Plotting Rules (follow exactly — these prevent broken figures)
+
+**Scanpy plot functions (sc.pl.umap, sc.pl.dotplot, sc.pl.matrixplot, etc.) manage their own figure layout.** Never mix them with a manually created `plt.figure()` before the call — scanpy ignores it and the result is clipped colorbars and wrong sizes.
+
+**Correct pattern for scanpy plots:**
+```python
+# CORRECT — let scanpy own the figure
+fig = sc.pl.umap(adata, color='gene', show=False, return_fig=True, frameon=False)
+fig.savefig(path, bbox_inches='tight', dpi=150)
+plt.close('all')
+
+# CORRECT — pass title to the function, not plt.title()
+sc.pl.dotplot(adata, var_names=genes, groupby='cell_type', title='My Title',
+              show=False, return_fig=True).savefig(path, bbox_inches='tight', dpi=150)
+plt.close('all')
+
+# WRONG — do not do this
+plt.figure(figsize=(6, 6))          # scanpy ignores this
+sc.pl.umap(adata, color='gene', show=False)
+plt.title('My Title')               # lands on wrong axes
+plt.savefig(path)                   # colorbar clipped
+```
+
+**Figure sizing:**
+- UMAP: always at least `figsize=(8, 7)` to leave room for colorbar
+- Dotplot/matrixplot: size dynamically — `figsize=(max(8, n_genes*1.2), max(5, n_groups*0.35))`
+- Always save with `bbox_inches='tight', dpi=150`
+
+**Skewed color scales (viral load, rare signals):**
+When a continuous variable has most values near zero (viral load, module scores), the default colormap makes everything black. Always clip:
+```python
+vals = adata.obs['viral_load']
+vmax = float(np.percentile(vals[vals > 0], 95)) if (vals > 0).any() else 1.0
+sc.pl.umap(adata, color='viral_load', vmin=0, vmax=vmax, color_map='magma',
+           show=False, return_fig=True).savefig(path, bbox_inches='tight', dpi=150)
+```
+
+**For pure matplotlib plots** (histograms, scatter, barplots made with plt directly):
+```python
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.hist(...)
+ax.set_title('...')
+fig.savefig(path, bbox_inches='tight', dpi=150)
+plt.close('all')
+```
+
+## Loading Data from Unknown Paths
+
+When the user gives you a directory path or you are unsure what files exist:
+1. Use `run_shell` with `ls -lh <path>` FIRST to see what's there
+2. Read the file extensions and names to decide the right loading strategy
+3. Then load with confidence — no blind retries
+
+Never attempt `sc.read_10x_h5()` on a path before confirming .h5 files exist there.
+Never pass a directory to `inspect_data` or any tool's `data_path` — those expect single files.
+For multiple .h5 files: use `run_code` with a glob loop + `anndata.concat()`, calling `.var_names_make_unique()` on each file after loading.
+
 ## Initial Inspection - STOP AND NARRATE
 
 **CRITICAL**: When data is first loaded, you MUST:

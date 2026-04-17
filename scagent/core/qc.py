@@ -231,6 +231,76 @@ def filter_genes(
         return adata
 
 
+def _run_scrublet_per_batch(
+    adata: AnnData,
+    batch_key: str,
+    expected_doublet_rate: float,
+    sim_doublet_ratio: float,
+    n_prin_comps: int,
+    random_state: int,
+) -> None:
+    """
+    Run Scrublet independently on each batch and write scores back by positional index.
+
+    sc.pp.scrublet(batch_key=...) reassigns scores via adata.obs.loc[sub.obs_names],
+    which raises KeyError when obs_names contain non-standard separators (e.g.
+    'BARCODE-1-Sample_3'). This function avoids that by tracking batch positions
+    as a boolean mask and writing results directly into pre-allocated arrays.
+    """
+    import scrublet as scr
+    import scipy.sparse as sp
+
+    doublet_scores = np.zeros(adata.n_obs, dtype=np.float64)
+    predicted_doublets = np.zeros(adata.n_obs, dtype=bool)
+
+    batches = adata.obs[batch_key].unique()
+    logger.info(f"Running Scrublet on {len(batches)} batches via per-batch loop")
+
+    for batch in batches:
+        mask = (adata.obs[batch_key] == batch).values
+        sub = adata[mask]
+
+        X = sub.X
+        if sp.issparse(X):
+            X = X.toarray()
+        X = np.asarray(X, dtype=np.float32)
+
+        safe_n = min(n_prin_comps, X.shape[1] - 1, X.shape[0] - 1)
+        if safe_n < 2:
+            logger.warning(
+                "Batch '%s' too small for Scrublet (cells=%d, genes=%d) — skipping.",
+                batch, X.shape[0], X.shape[1],
+            )
+            continue
+
+        try:
+            scrub = scr.Scrublet(
+                X,
+                expected_doublet_rate=expected_doublet_rate,
+                sim_doublet_ratio=sim_doublet_ratio,
+                random_state=random_state,
+            )
+            scores, doublets = scrub.scrub_doublets(
+                n_prin_comps=safe_n,
+                verbose=False,
+            )
+            doublet_scores[mask] = scores
+            predicted_doublets[mask] = doublets
+            n_batch_doublets = doublets.sum()
+            logger.info(
+                "Batch '%s': %d/%d cells flagged as doublets (%.1f%%)",
+                batch, n_batch_doublets, mask.sum(), n_batch_doublets / mask.sum() * 100,
+            )
+        except Exception as e:
+            logger.warning(
+                "Scrublet failed for batch '%s' (%s) — scores set to 0 for this batch.",
+                batch, e,
+            )
+
+    adata.obs['doublet_score'] = doublet_scores
+    adata.obs['predicted_doublet'] = predicted_doublets
+
+
 def detect_doublets(
     adata: AnnData,
     batch_key: Optional[str] = None,
@@ -299,14 +369,27 @@ def detect_doublets(
             safe_n_prin_comps,
         )
 
-    sc.pp.scrublet(
-        adata,
-        batch_key=batch_key,
-        sim_doublet_ratio=sim_doublet_ratio,
-        expected_doublet_rate=expected_doublet_rate,
-        n_prin_comps=safe_n_prin_comps,
-        random_state=random_state,
-    )
+    if batch_key and batch_key in adata.obs.columns:
+        # Run Scrublet per-batch using a manual loop instead of sc.pp.scrublet(batch_key=...).
+        # sc.pp.scrublet's batch_key implementation reassigns scores via adata.obs.loc[sub.obs_names],
+        # which fails with a KeyError when obs_names contain non-standard separators (e.g.
+        # "BARCODE-1-Sample_3"). Running the loop ourselves sidesteps that fragility entirely.
+        _run_scrublet_per_batch(
+            adata,
+            batch_key=batch_key,
+            expected_doublet_rate=expected_doublet_rate,
+            sim_doublet_ratio=sim_doublet_ratio,
+            n_prin_comps=safe_n_prin_comps,
+            random_state=random_state,
+        )
+    else:
+        sc.pp.scrublet(
+            adata,
+            sim_doublet_ratio=sim_doublet_ratio,
+            expected_doublet_rate=expected_doublet_rate,
+            n_prin_comps=safe_n_prin_comps,
+            random_state=random_state,
+        )
 
     n_doublets = adata.obs['predicted_doublet'].sum()
     doublet_rate = n_doublets / adata.n_obs * 100
