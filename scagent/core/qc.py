@@ -237,6 +237,9 @@ def _run_scrublet_per_batch(
     expected_doublet_rate: float,
     sim_doublet_ratio: float,
     n_prin_comps: int,
+    scrublet_min_counts: int,
+    scrublet_min_cells: int,
+    scrublet_min_gene_variability_pctl: float,
     random_state: int,
 ) -> None:
     """
@@ -262,8 +265,9 @@ def _run_scrublet_per_batch(
 
         X = sub.X
         if sp.issparse(X):
-            X = X.toarray()
-        X = np.asarray(X, dtype=np.float32)
+            X = X.tocsc().astype(np.float32)
+        else:
+            X = np.asarray(X, dtype=np.float32)
 
         safe_n = min(n_prin_comps, X.shape[1] - 1, X.shape[0] - 1)
         if safe_n < 2:
@@ -281,7 +285,11 @@ def _run_scrublet_per_batch(
                 random_state=random_state,
             )
             scores, doublets = scrub.scrub_doublets(
+                min_counts=scrublet_min_counts,
+                min_cells=scrublet_min_cells,
+                min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
                 n_prin_comps=safe_n,
+                log_transform=True,
                 verbose=False,
             )
             doublet_scores[mask] = scores
@@ -307,6 +315,9 @@ def detect_doublets(
     expected_doublet_rate: float = QC_DEFAULTS.scrublet_expected_doublet_rate,
     sim_doublet_ratio: float = QC_DEFAULTS.scrublet_sim_ratio,
     n_prin_comps: int = QC_DEFAULTS.scrublet_n_prin_comps,
+    scrublet_min_counts: int = 2,
+    scrublet_min_cells: int = 3,
+    scrublet_min_gene_variability_pctl: float = 85.0,
     random_state: int = QC_DEFAULTS.scrublet_random_state,
     inplace: bool = True,
 ) -> Optional[AnnData]:
@@ -329,6 +340,12 @@ def detect_doublets(
         Number of simulated doublets relative to observed cells.
     n_prin_comps : int, default 30
         Number of principal components for KNN.
+    scrublet_min_counts : int, default 2
+        Scrublet preprocessing minimum counts per gene.
+    scrublet_min_cells : int, default 3
+        Scrublet preprocessing minimum cells per gene.
+    scrublet_min_gene_variability_pctl : float, default 85.0
+        Scrublet preprocessing gene variability percentile.
     random_state : int, default 0
         Random seed for reproducibility.
     inplace : bool, default True
@@ -380,130 +397,117 @@ def detect_doublets(
             expected_doublet_rate=expected_doublet_rate,
             sim_doublet_ratio=sim_doublet_ratio,
             n_prin_comps=safe_n_prin_comps,
+            scrublet_min_counts=scrublet_min_counts,
+            scrublet_min_cells=scrublet_min_cells,
+            scrublet_min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
             random_state=random_state,
         )
     else:
-        sc.pp.scrublet(
-            adata,
-            sim_doublet_ratio=sim_doublet_ratio,
+        import scrublet as scr
+        import scipy.sparse as sp
+
+        X = adata.X
+        if sp.issparse(X):
+            X = X.tocsc().astype(np.float32)
+        else:
+            X = np.asarray(X, dtype=np.float32)
+
+        scrub = scr.Scrublet(
+            X,
             expected_doublet_rate=expected_doublet_rate,
-            n_prin_comps=safe_n_prin_comps,
+            sim_doublet_ratio=sim_doublet_ratio,
             random_state=random_state,
         )
+        scores, doublets = scrub.scrub_doublets(
+            min_counts=scrublet_min_counts,
+            min_cells=scrublet_min_cells,
+            min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
+            n_prin_comps=safe_n_prin_comps,
+            log_transform=True,
+            verbose=False,
+        )
+        adata.obs['doublet_score'] = scores
+        adata.obs['predicted_doublet'] = doublets
 
     n_doublets = adata.obs['predicted_doublet'].sum()
     doublet_rate = n_doublets / adata.n_obs * 100
+    adata.uns["scrublet_params"] = {
+        "batch_key": batch_key,
+        "expected_doublet_rate": float(expected_doublet_rate),
+        "sim_doublet_ratio": float(sim_doublet_ratio),
+        "n_prin_comps": int(n_prin_comps),
+        "n_prin_comps_used": int(safe_n_prin_comps),
+        "min_counts": int(scrublet_min_counts),
+        "min_cells": int(scrublet_min_cells),
+        "min_gene_variability_pctl": float(scrublet_min_gene_variability_pctl),
+        "random_state": int(random_state),
+    }
     logger.info(f"Detected {n_doublets:,} doublets ({doublet_rate:.1f}%)")
 
     if not inplace:
         return adata
 
 
-def run_decontx(
+def filter_cells_by_genes(
     adata: AnnData,
-    z: Optional[str] = None,
-    batch: Optional[str] = None,
-    layer: str = "raw_counts",
-    contamination_threshold: float = 0.2,
-    store_corrected: bool = True,
+    min_genes: Optional[int] = None,
     inplace: bool = True,
 ) -> Optional[AnnData]:
     """
-    Estimate per-cell ambient RNA contamination using DecontX.
-
-    DecontX fits a Bayesian mixture model that separates endogenous from
-    ambient counts for every cell. Should be run on individual samples
-    BEFORE concatenation (lab best practice from workshop session 2).
+    Filter cells based on the number of detected genes.
 
     Parameters
     ----------
     adata : AnnData
-        AnnData object. Raw integer counts must be in ``layer`` (default
-        ``'raw_counts'``) or in ``adata.X`` if the layer is absent.
-    z : str, optional
-        obs column with cluster labels. Pre-clustering improves accuracy
-        because DecontX uses cluster identity to model endogenous signal.
-    batch : str, optional
-        obs column with batch/sample labels. When provided, DecontX runs
-        per-batch so each batch has its own ambient profile.
-    layer : str, default 'raw_counts'
-        Layer containing raw integer counts.
-    contamination_threshold : float, default 0.2
-        Cells whose estimated contamination exceeds this fraction are
-        flagged in ``adata.obs['decontX_high_contamination']``.
-    store_corrected : bool, default True
-        Store the decontaminated count matrix in
-        ``adata.layers['decontX_counts']``.
+        AnnData object with QC metrics calculated.
+    min_genes : int, optional
+        Minimum number of detected genes per cell. If None, no filtering is applied.
     inplace : bool, default True
         Modify adata in place.
-
-    Returns
-    -------
-    AnnData or None
     """
-    try:
-        import celda
-    except ImportError:
-        raise ImportError(
-            "celda is required for DecontX. Install with: pip install celda"
-        )
+    if min_genes is None:
+        return None if inplace else adata.copy()
 
-    import scipy.sparse as sp
-    import anndata as ad
+    if 'n_genes_by_counts' not in adata.obs.columns:
+        raise ValueError("Cell gene-count metrics not calculated. Run calculate_qc_metrics first.")
 
     if not inplace:
         adata = adata.copy()
 
-    # Build an AnnData with raw counts for DecontX
-    if layer and layer in adata.layers:
-        counts_X = adata.layers[layer]
-        adata_input = ad.AnnData(X=counts_X, obs=adata.obs.copy(), var=adata.var.copy())
-        logger.info(f"Using layer '{layer}' as input for DecontX.")
-    else:
-        logger.warning(
-            f"Layer '{layer}' not found — using adata.X. "
-            "DecontX expects raw integer counts; results may be degraded if X is normalized."
-        )
-        adata_input = adata
-
-    z_labels = adata.obs[z].astype(str).values if (z and z in adata.obs.columns) else None
-    batch_labels = adata.obs[batch].astype(str).values if (batch and batch in adata.obs.columns) else None
-
-    logger.info("Running DecontX ambient RNA estimation...")
-    result = celda.decontX(adata_input, z=z_labels, batch=batch_labels)
-
-    # Contamination scores
-    if "decontX_contamination" in result.obs.columns:
-        adata.obs["decontX_contamination"] = result.obs["decontX_contamination"].values
-    else:
-        raise RuntimeError(
-            "DecontX did not produce 'decontX_contamination' in obs. "
-            "Check celda installation and input data."
-        )
-
-    # Decontaminated counts
-    if store_corrected:
-        if "decontX_counts" in result.layers:
-            adata.layers["decontX_counts"] = result.layers["decontX_counts"]
-        elif "decontX_counts" in result.obsm:
-            adata.layers["decontX_counts"] = result.obsm["decontX_counts"]
-        else:
-            logger.warning("DecontX decontaminated counts not found; skipping layer storage.")
-
-    # Flag high-contamination cells
-    contamination = adata.obs["decontX_contamination"]
-    adata.obs["decontX_high_contamination"] = contamination > contamination_threshold
-
-    n_flagged = int(adata.obs["decontX_high_contamination"].sum())
-    median_contamination = float(contamination.median())
-
+    n_before = adata.n_obs
+    adata._inplace_subset_obs(adata.obs['n_genes_by_counts'] >= min_genes)
+    n_after = adata.n_obs
     logger.info(
-        "DecontX complete. Median contamination: %.1f%%. "
-        "%d cells (%.1f%%) flagged above %.0f%% threshold.",
-        median_contamination * 100,
-        n_flagged,
-        n_flagged / adata.n_obs * 100,
-        contamination_threshold * 100,
+        "Filtered cells by min_genes=%d: %d -> %d (%d removed)",
+        min_genes,
+        n_before,
+        n_after,
+        n_before - n_after,
+    )
+
+    if not inplace:
+        return adata
+
+
+def filter_doublets(
+    adata: AnnData,
+    inplace: bool = True,
+) -> Optional[AnnData]:
+    """Remove cells marked as Scrublet predicted doublets."""
+    if 'predicted_doublet' not in adata.obs.columns:
+        raise ValueError("Doublet predictions not available. Run detect_doublets first.")
+
+    if not inplace:
+        adata = adata.copy()
+
+    n_before = adata.n_obs
+    adata._inplace_subset_obs(~adata.obs['predicted_doublet'].astype(bool))
+    n_after = adata.n_obs
+    logger.info(
+        "Filtered predicted doublets: %d -> %d (%d removed)",
+        n_before,
+        n_after,
+        n_before - n_after,
     )
 
     if not inplace:
@@ -513,10 +517,21 @@ def run_decontx(
 def run_qc_pipeline(
     adata: AnnData,
     mt_threshold: Optional[float] = None,
+    filter_mt: bool = True,
+    min_genes: Optional[int] = None,
     min_cells: Optional[float] = None,
     remove_ribo: bool = True,
     detect_doublets_flag: bool = True,
+    remove_doublets: bool = False,
     batch_key: Optional[str] = None,
+    scrublet_expected_doublet_rate: float = QC_DEFAULTS.scrublet_expected_doublet_rate,
+    scrublet_sim_doublet_ratio: float = QC_DEFAULTS.scrublet_sim_ratio,
+    scrublet_n_prin_comps: int = QC_DEFAULTS.scrublet_n_prin_comps,
+    scrublet_min_counts: int = 2,
+    scrublet_min_cells: int = 3,
+    scrublet_min_gene_variability_pctl: float = 85.0,
+    scrublet_random_state: int = QC_DEFAULTS.scrublet_random_state,
+    force_doublet_recompute: bool = False,
     inplace: bool = True,
 ) -> Optional[AnnData]:
     """
@@ -525,7 +540,7 @@ def run_qc_pipeline(
     This is a convenience function that runs:
     1. QC metrics calculation
     2. Doublet detection (on raw counts)
-    3. Cell filtering by MT content
+    3. Optional cell filtering by detected genes, MT content, and doublet calls
     4. Gene filtering
 
     Parameters
@@ -534,12 +549,18 @@ def run_qc_pipeline(
         AnnData object with raw counts.
     mt_threshold : float, optional
         Maximum MT percentage. Auto-detected based on data type if None.
+    filter_mt : bool, default True
+        If false, calculate/report MT metrics but do not remove cells by MT percentage.
+    min_genes : int, optional
+        Minimum detected genes per cell. If None, no cell-level gene-count filtering is applied.
     min_cells : float, optional
         Minimum cells per gene. Default is exp(4) ~ 55.
     remove_ribo : bool, default True
         Remove ribosomal genes.
     detect_doublets_flag : bool, default True
         Run Scrublet doublet detection.
+    remove_doublets : bool, default False
+        Remove cells marked as predicted doublets after detection.
     batch_key : str, optional
         Batch key for batch-aware doublet detection.
     inplace : bool, default True
@@ -555,17 +576,55 @@ def run_qc_pipeline(
 
     logger.info("Starting QC pipeline...")
 
-    # Step 1: Calculate QC metrics
-    calculate_qc_metrics(adata, inplace=True)
+    # Step 1: Calculate QC metrics (skip if already present — idempotent guard)
+    if 'pct_counts_mt' not in adata.obs.columns:
+        calculate_qc_metrics(adata, inplace=True)
+    else:
+        logger.info("QC metrics already present in adata.obs; skipping recalculation.")
 
-    # Step 2: Doublet detection (before any filtering)
-    if detect_doublets_flag:
-        detect_doublets(adata, batch_key=batch_key, inplace=True)
+    # Step 2: Doublet detection (skip if scores already present)
+    if force_doublet_recompute:
+        for col in ("doublet_score", "predicted_doublet"):
+            if col in adata.obs.columns:
+                del adata.obs[col]
 
-    # Step 3: Filter cells by MT content
-    filter_cells_by_mt(adata, mt_threshold=mt_threshold, inplace=True)
+    if detect_doublets_flag and 'predicted_doublet' not in adata.obs.columns:
+        detect_doublets(
+            adata,
+            batch_key=batch_key,
+            expected_doublet_rate=scrublet_expected_doublet_rate,
+            sim_doublet_ratio=scrublet_sim_doublet_ratio,
+            n_prin_comps=scrublet_n_prin_comps,
+            scrublet_min_counts=scrublet_min_counts,
+            scrublet_min_cells=scrublet_min_cells,
+            scrublet_min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
+            random_state=scrublet_random_state,
+            inplace=True,
+        )
+    elif detect_doublets_flag:
+        logger.info("Doublet scores already present in adata.obs; skipping Scrublet re-run.")
+
+    # Step 3: Optional cell filters
+    filter_cells_by_genes(adata, min_genes=min_genes, inplace=True)
+    if filter_mt:
+        filter_cells_by_mt(adata, mt_threshold=mt_threshold, inplace=True)
+    else:
+        logger.info("Skipping hard MT% cell filtering; MT metrics remain available for QC review.")
+    if remove_doublets:
+        filter_doublets(adata, inplace=True)
 
     # Step 4: Filter genes
+    # Workshop uses np.exp(5) (~148) for multi-sample data and np.exp(4) (~55)
+    # for single-sample data. Scale automatically when batch_key is present.
+    if min_cells is None and batch_key and batch_key in adata.obs.columns:
+        n_batches = adata.obs[batch_key].nunique()
+        if n_batches > 1:
+            min_cells = float(np.exp(5))
+            logger.info(
+                "Multi-sample data (%d batches) — using min_cells=exp(5)~148 "
+                "instead of exp(4)~55 (workshop session 5 practice).",
+                n_batches,
+            )
     filter_genes(adata, min_cells=min_cells, remove_ribo=remove_ribo, inplace=True)
 
     logger.info(f"QC pipeline complete. Final shape: {adata.n_obs:,} x {adata.n_vars:,}")

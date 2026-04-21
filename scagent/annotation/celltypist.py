@@ -78,6 +78,49 @@ def prepare_for_celltypist(
     # Create new AnnData with raw counts
     adata_ct = AnnData(X, obs=adata.obs.copy(), var=adata.var.copy())
 
+    # Ensure var_names are gene symbols, not Ensembl IDs.
+    # CellTypist will silently fail ("no features overlap") if given Ensembl IDs.
+    import re as _re
+    # --- Strip genome-prefix from multi-genome CellRanger references ---
+    # e.g. "GRCh38_CD3D" or "GRCh38___CD3D" → "CD3D"
+    _genome_prefix_re = _re.compile(r'^[A-Za-z0-9]+_{1,10}([A-Z].+)$')
+    _sample = list(adata_ct.var_names[:200])
+    _n_prefixed = sum(1 for v in _sample if _genome_prefix_re.match(str(v)))
+    if _n_prefixed > 100:
+        _cleaned = [_genome_prefix_re.sub(r'\1', v) for v in adata_ct.var_names]
+        adata_ct.var_names = _cleaned
+        adata_ct.var_names_make_unique()
+        logger.info(f"Stripped genome prefix from var_names (e.g. 'GRCh38_CD3D' → 'CD3D')")
+
+    # --- Swap Ensembl IDs to gene symbols if needed ---
+    _ensembl_re = _re.compile(r'^ENSG\d{5,}')
+    _n_ensembl = sum(1 for v in list(adata_ct.var_names[:200]) if _ensembl_re.match(str(v)))
+    if _n_ensembl > 100:
+        for _col in ['gene_symbols', 'gene_names', 'feature_name', 'Gene', 'Symbol']:
+            if _col in adata_ct.var.columns:
+                adata_ct.var_names = adata_ct.var[_col].astype(str).values
+                adata_ct.var_names_make_unique()
+                logger.info(f"Swapped var_names from Ensembl IDs to gene symbols using var['{_col}']")
+                break
+        else:
+            logger.warning("var_names look like Ensembl IDs but no gene-symbol column found in var; CellTypist may fail.")
+
+    # --- Strip -N suffixes added by var_names_make_unique (e.g. CD3D-1 → CD3D) ---
+    _suffixed = _re.compile(r'^(.+)-\d+$')
+    _base_names = [_suffixed.sub(r'\1', v) for v in adata_ct.var_names]
+    _seen: set = set()
+    _keep = []
+    for i, (orig, base) in enumerate(zip(adata_ct.var_names, _base_names)):
+        if base not in _seen:
+            _seen.add(base)
+            _keep.append(i)
+    if len(_keep) < len(adata_ct.var_names):
+        n_dropped = len(adata_ct.var_names) - len(_keep)
+        adata_ct = adata_ct[:, _keep].copy()
+        new_names = [_suffixed.sub(r'\1', v) for v in adata_ct.var_names]
+        adata_ct.var_names = new_names
+        logger.info(f"Stripped var_names_make_unique suffixes: dropped {n_dropped} duplicate-suffix genes")
+
     # Normalize to target_sum=10000 (CellTypist requirement)
     sc.pp.normalize_total(adata_ct, target_sum=target_sum, inplace=True)
 
@@ -190,7 +233,12 @@ def run_celltypist(
 
         for col in cols_to_transfer:
             if col in adata_preds.obs.columns:
-                adata.obs[f'celltypist_{col}'] = adata_preds.obs[col].loc[adata.obs_names]
+                val = adata_preds.obs[col].loc[adata.obs_names]
+                # Guard against CellTypist returning a DataFrame instead of a Series
+                # (happens with some model/version combinations for majority_voting)
+                if hasattr(val, 'squeeze'):
+                    val = val.squeeze()
+                adata.obs[f'celltypist_{col}'] = val
 
         logger.info("CellTypist results transferred to adata.obs")
 

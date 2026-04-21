@@ -308,4 +308,4 @@ def get_top_markers(
     if key not in adata.uns:
         raise ValueError(f"DE results not found at key '{key}'. Run differential expression first.")
 
-    return sc.get.rank_genes_groups_df(adata, group=group).head(n_genes)
+    return sc.get.rank_genes_groups_df(adata, group=group, key=key).head(n_genes)

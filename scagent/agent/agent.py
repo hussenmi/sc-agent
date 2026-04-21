@@ -82,9 +82,11 @@ AUTO_RECOVERY_ATTEMPTS = 2
 
 ACTION_TOOL_NAMES = {
     "run_qc",
-    "run_decontx",
     "normalize_and_hvg",
     "run_dimred",
+    "run_pca",
+    "run_neighbors",
+    "run_umap",
     "run_clustering",
     "compare_clusterings",
     "run_celltypist",
@@ -117,7 +119,7 @@ INSPECTION_TOOL_NAMES = {
     "review_artifact",
     "inspect_run_state",
     "inspect_workspace",
-    "web_search_docs",
+    "read_file",
     "search_papers",
     "fetch_url",
     "web_search",
@@ -402,6 +404,34 @@ class SCAgent:
         text = re.sub(r"\$([^$\n]+?)\$", _replace_math, text)
         return text
 
+    # Patterns produced by local models' internal thinking/channel tokens that leak
+    # into assistant text content and should be stripped before display.
+    _ARTIFACT_PATTERNS = [
+        # Gemma 4 / Gemma-style channel tokens:  <|channel>thought\n...\n<channel|>
+        re.compile(r"<\|channel\>[^\|]*\n.*?<channel\|>\n?", re.DOTALL),
+        # Qwen / DeepSeek thinking blocks: <think>...</think>
+        re.compile(r"<think>.*?</think>\n?", re.DOTALL),
+        # Generic angle-bracket model tokens: <|...|> on their own line
+        re.compile(r"^<\|[^|]+\|>\s*$", re.MULTILINE),
+    ]
+
+    # Capturing versions of the above — used to extract thinking content for display.
+    _THINKING_EXTRACT_PATTERNS = [
+        # Gemma 4: <|channel>thought\n{content}\n<channel|>
+        re.compile(r"<\|channel\>[^\|]*\n(.*?)<channel\|>\n?", re.DOTALL),
+        # Qwen / DeepSeek: <think>{content}</think>
+        re.compile(r"<think>(.*?)</think>\n?", re.DOTALL),
+    ]
+
+    @classmethod
+    def _strip_model_artifacts(cls, text: str) -> str:
+        """Remove internal thinking/channel tokens that local models sometimes leak."""
+        if not text:
+            return text
+        for pat in cls._ARTIFACT_PATTERNS:
+            text = pat.sub("", text)
+        return text.strip()
+
     def _print(self, message: str, style: str = None, markdown: bool = False):
         """Print message if verbose using rich formatting.
 
@@ -411,6 +441,7 @@ class SCAgent:
             from rich.console import Console
             from rich.markdown import Markdown
             console = Console()
+            message = self._strip_model_artifacts(message)
             message = self._delatex(message)
 
             # Auto-detect markdown if not explicitly set
@@ -428,12 +459,23 @@ class SCAgent:
                 console.print(message)
 
     def _print_thinking(self, message: str):
-        """Print agent thinking/reasoning."""
-        if self.verbose:
-            from rich.console import Console
-            from rich.panel import Panel
-            console = Console()
-            console.print(f"[dim]💭[/dim] [italic]{message}[/italic]")
+        """Print agent narration before a tool call."""
+        if not message or not message.strip():
+            return
+        from rich.console import Console
+        from rich.markdown import Markdown
+        console = Console()
+        message = self._strip_model_artifacts(message)
+        message = self._delatex(message)
+        if not message.strip():
+            return
+        # Render as markdown if it contains markdown patterns, otherwise inline
+        md_patterns = ["**", "##", "```", "- ", "1. "]
+        if any(p in message for p in md_patterns):
+            console.print("[cyan]…[/cyan]")
+            console.print(Markdown(message))
+        else:
+            console.print(f"[cyan]…[/cyan] {message}")
 
     def _print_error(self, message: str):
         """Print error message."""
@@ -458,6 +500,9 @@ class SCAgent:
         payload["recent_questions"] = self._interaction_state["asked_questions"][-3:]
         payload["pending_checkpoint"] = self._pending_checkpoint
         return json.dumps(payload, indent=2)
+
+    def _is_gemma_model(self) -> bool:
+        return "gemma" in (self.model or "").lower()
 
     def _is_action_tool(self, tool_name: str) -> bool:
         return tool_name in ACTION_TOOL_NAMES
@@ -682,7 +727,7 @@ class SCAgent:
         "review_artifact",
         "generate_figure",  # Visualization doesn't change state
         "save_data",  # Saving is always ok
-        "web_search_docs",
+        "read_file",
         "search_papers",
         "fetch_url",
         "web_search",
@@ -733,10 +778,17 @@ class SCAgent:
                 # Get doublet count from the correct location
                 qc_decisions = result_data.get("qc_decisions", {})
                 doublet_count = int(qc_decisions.get("doublet_detection", {}).get("cells_flagged", 0))
-                high_mt_cells = int(qc_decisions.get("mt_threshold", {}).get("cells_flagged", 0))
+                mt_decision = qc_decisions.get("mt_threshold", {})
+                filter_mt = bool(mt_decision.get("filter_enabled", True))
+                high_mt_cells = int(mt_decision.get("cells_flagged", 0))
+                min_genes_cells = int(qc_decisions.get("min_genes", {}).get("cells_flagged", 0))
                 before_cells = result_data.get("before", {}).get("n_cells", 0)
-                # Projected = before - high_mt (doublets are flagged but not auto-removed)
-                projected_cells = before_cells - high_mt_cells if before_cells else "?"
+                # Projected = before minus the filters that are enabled by the preview.
+                # Doublets are still flagged by default unless remove_doublets is explicitly true.
+                projected_removals = min_genes_cells + (high_mt_cells if filter_mt else 0)
+                if qc_decisions.get("doublet_detection", {}).get("remove_on_apply", False):
+                    projected_removals += doublet_count
+                projected_cells = before_cells - projected_removals if before_cells else "?"
                 question = (
                     "QC preview is complete. I summarized the proposed removals and saved the QC figures. "
                     "What should I do next?"
@@ -757,8 +809,9 @@ class SCAgent:
                     ("Something else", "custom"),
                 ])
                 summary = (
-                    f"QC preview: {high_mt_cells} high-MT cells to remove, {doublet_count} doublets flagged. "
-                    f"Estimated {projected_cells} cells retained after MT filtering."
+                    f"QC preview: {min_genes_cells} low-gene cells flagged, "
+                    f"{high_mt_cells} high-MT cells {'to remove' if filter_mt else 'reported only'}, "
+                    f"{doublet_count} doublets flagged. Estimated {projected_cells} cells retained."
                 )
                 checkpoint = {
                     "kind": "qc_preview",
@@ -772,10 +825,21 @@ class SCAgent:
                     "action_inputs": {
                         "run_qc_apply": {
                             "mt_threshold": tool_input.get("mt_threshold"),
+                            "filter_mt": tool_input.get("filter_mt", True),
+                            "min_genes": tool_input.get("min_genes"),
                             "min_cells": tool_input.get("min_cells"),
                             "remove_ribo": tool_input.get("remove_ribo", True),
                             "remove_mt": tool_input.get("remove_mt", False),
                             "detect_doublets_flag": tool_input.get("detect_doublets_flag", True),
+                            "remove_doublets": tool_input.get("remove_doublets", False),
+                            "scrublet_expected_doublet_rate": tool_input.get("scrublet_expected_doublet_rate"),
+                            "scrublet_sim_doublet_ratio": tool_input.get("scrublet_sim_doublet_ratio"),
+                            "scrublet_n_prin_comps": tool_input.get("scrublet_n_prin_comps"),
+                            "scrublet_min_counts": tool_input.get("scrublet_min_counts"),
+                            "scrublet_min_cells": tool_input.get("scrublet_min_cells"),
+                            "scrublet_min_gene_variability_pctl": tool_input.get("scrublet_min_gene_variability_pctl"),
+                            "scrublet_random_state": tool_input.get("scrublet_random_state"),
+                            "force_doublet_recompute": tool_input.get("force_doublet_recompute", False),
                             "batch_key": tool_input.get("batch_key"),
                         }
                     },
@@ -1170,7 +1234,19 @@ class SCAgent:
 
     def _build_system_prompt(self) -> str:
         """Attach runtime state to the static system prompt."""
-        return f"{SYSTEM_PROMPT}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
+        prompt = SYSTEM_PROMPT
+        if self._is_gemma_model():
+            # Gemma 4 puts all output inside thinking blocks and produces no narration
+            # text outside them. This instruction mirrors how Claude/GPT behave: brief
+            # narration sentence after thinking, before the tool call.
+            prompt += (
+                "\n\n## Narration Requirement\n"
+                "After your thinking block, always write one brief sentence describing "
+                "what you are about to do (e.g. 'I'll inspect the data to check QC metrics.'), "
+                "then call the appropriate tool. Do not include this sentence inside the "
+                "thinking block — write it as plain response text after the closing tag."
+            )
+        return f"{prompt}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
 
     def _current_capabilities(self) -> Dict[str, Any]:
         return (self.world_state.data_summary or {}).get("capabilities", {})
@@ -1418,6 +1494,9 @@ class SCAgent:
                     "run_qc",
                     "normalize_and_hvg",
                     "run_dimred",
+                    "run_pca",
+                    "run_neighbors",
+                    "run_umap",
                     "run_clustering",
                     "compare_clusterings",
                     "run_celltypist",
@@ -1496,12 +1575,17 @@ class SCAgent:
             "a concise follow-up question."
         )
 
-    def _print_auto_recovery_notice(self, attempt: int) -> None:
+    def _print_auto_recovery_notice(self, attempt: int, error_snippet: str = "") -> None:
         """Tell the user the agent is trying to recover automatically."""
-        if self.verbose:
-            self._print(
-                f"[yellow]Issue detected. Trying to recover automatically ({attempt}/{AUTO_RECOVERY_ATTEMPTS})...[/yellow]"
-            )
+        from rich.console import Console
+        console = Console()
+        if error_snippet:
+            # Trim to one line for display
+            first_line = error_snippet.strip().splitlines()[0][:120]
+            console.print(f"[yellow]↺ Error:[/yellow] {first_line}")
+        console.print(
+            f"[yellow]  Trying to recover automatically ({attempt}/{AUTO_RECOVERY_ATTEMPTS})...[/yellow]"
+        )
 
     def _maybe_continue_after_failure(
         self,
@@ -1521,7 +1605,7 @@ class SCAgent:
                 next_attempt,
                 AUTO_RECOVERY_ATTEMPTS,
             )
-            self._print_auto_recovery_notice(next_attempt)
+            self._print_auto_recovery_notice(next_attempt, error_snippet=final_result)
             messages.append({
                 "role": "user",
                 "content": self._build_auto_recovery_instruction(final_result, next_attempt),
@@ -1953,8 +2037,7 @@ class SCAgent:
                     for content in response.content:
                         if content.type == "text":
                             assistant_content.append(content)
-                            if self.verbose:
-                                self._print_thinking(content.text)
+                            self._print_thinking(content.text)
 
                         elif content.type == "tool_use":
                             assistant_content.append(content)
@@ -2273,6 +2356,12 @@ class SCAgent:
             ]
         final_result = ""
         auto_recovery_attempts = 0
+        # Gemma 4 requires enable_thinking=True in the chat template to generate
+        # thinking blocks — without it the model skips the reasoning step entirely.
+        gemma_extra = (
+            {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
+            if self._is_gemma_model() else {}
+        )
 
         try:
             for iteration in range(max_iterations):
@@ -2285,6 +2374,7 @@ class SCAgent:
                         max_completion_tokens=4096,
                         tools=self.tools,
                         messages=messages,
+                        **gemma_extra,
                     )
                 )
 
@@ -2416,11 +2506,13 @@ class SCAgent:
 
     _TOOL_LABELS = {
         "run_qc":               "Running QC",
-        "run_decontx":          "Ambient RNA removal (DecontX)",
         "score_integration":    "Scoring integration quality",
         "benchmark_integration": "Benchmarking integration (scib-metrics)",
         "normalize_and_hvg":    "Normalizing",
         "run_dimred":           "Dimensionality reduction",
+        "run_pca":              "Running PCA",
+        "run_neighbors":        "Computing neighbors",
+        "run_umap":             "Computing UMAP",
         "run_clustering":       "Clustering",
         "compare_clusterings":  "Comparing clusterings",
         "run_celltypist":       "Cell type annotation",
@@ -2436,8 +2528,9 @@ class SCAgent:
         "run_shell":            "Running shell command",
         "generate_figure":      "Generating figure",
         "inspect_data":         "Inspecting data",
-        "web_search_docs":      "Searching",
         "search_papers":        "Searching papers",
+        "research_findings":    "Searching literature",
+        "web_search":           "Searching web",
         "review_artifact":      "Reviewing artifact",
         "read_file":            "Reading file",
     }
@@ -2448,6 +2541,7 @@ class SCAgent:
     _STREAMING_TOOLS = {
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
         "run_dimred",             # UMAP can take minutes on large datasets
+        "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets
         "benchmark_integration",  # scib-metrics runs many metrics
         "run_deg",                # rank_genes_groups can be slow
@@ -2487,6 +2581,9 @@ class SCAgent:
                 "run_qc",
                 "normalize_and_hvg",
                 "run_dimred",
+                "run_pca",
+                "run_neighbors",
+                "run_umap",
                 "run_clustering",
                 "run_celltypist",
                 "run_scimilarity",
@@ -3424,9 +3521,11 @@ class SCAgent:
                         {"role": "system", "content": self._build_system_prompt()},
                         {"role": "user", "content": message},
                     ],
+                    **({"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
+                       if self._is_gemma_model() else {}),
                 )
             )
-            return response.choices[0].message.content or ""
+            return self._strip_model_artifacts(response.choices[0].message.content or "")
         elif self.provider == "codex":
             messages = [{
                 "role": "user",

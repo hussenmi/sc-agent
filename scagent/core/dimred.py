@@ -22,6 +22,7 @@ def run_pca(
     adata: AnnData,
     n_comps: int = DIMRED_DEFAULTS.n_pcs,
     mask_var: Optional[str] = "highly_variable",
+    svd_solver: str = "arpack",
     random_state: int = 0,
     inplace: bool = True,
 ) -> Optional[AnnData]:
@@ -38,6 +39,8 @@ def run_pca(
         Boolean column in adata.var selecting genes for PCA. The default
         restricts to HVGs; pass None to use all genes. (Replaces the old
         deprecated `use_highly_variable` flag.)
+    svd_solver : str, default 'arpack'
+        SVD solver passed to scanpy.tl.pca.
     random_state : int, default 0
         Random seed for reproducibility.
     inplace : bool, default True
@@ -66,6 +69,7 @@ def run_pca(
         adata,
         n_comps=n_comps,
         mask_var=mask_var,
+        svd_solver=svd_solver,
         random_state=random_state,
     )
 
@@ -233,6 +237,7 @@ def run_dimensionality_reduction(
     n_pcs: int = DIMRED_DEFAULTS.n_pcs,
     n_neighbors: int = DIMRED_DEFAULTS.n_neighbors,
     umap_min_dist: float = DIMRED_DEFAULTS.umap_min_dist,
+    svd_solver: str = "arpack",
     compute_fdl: bool = False,
     random_state: int = 0,
     inplace: bool = True,
@@ -268,7 +273,7 @@ def run_dimensionality_reduction(
     logger.info("Running dimensionality reduction pipeline...")
 
     # PCA
-    run_pca(adata, n_comps=n_pcs, random_state=random_state, inplace=True)
+    run_pca(adata, n_comps=n_pcs, svd_solver=svd_solver, random_state=random_state, inplace=True)
 
     # Neighbors
     compute_neighbors(adata, n_neighbors=n_neighbors, inplace=True)

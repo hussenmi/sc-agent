@@ -20,7 +20,15 @@ from .inspector import (
     resolve_batch_metadata,
 )
 from .io import load_data, load_10x_h5, load_h5ad
-from .qc import run_qc_pipeline, calculate_qc_metrics, filter_cells_by_mt, filter_genes, detect_doublets, run_decontx
+from .qc import (
+    run_qc_pipeline,
+    calculate_qc_metrics,
+    filter_cells_by_genes,
+    filter_cells_by_mt,
+    filter_doublets,
+    filter_genes,
+    detect_doublets,
+)
 from .normalization import normalize_data, preserve_raw_counts
 from .dimred import run_pca, compute_neighbors, compute_umap
 from .clustering import run_leiden, run_phenograph
@@ -51,10 +59,11 @@ __all__ = [
     # QC
     "run_qc_pipeline",
     "calculate_qc_metrics",
+    "filter_cells_by_genes",
     "filter_cells_by_mt",
+    "filter_doublets",
     "filter_genes",
     "detect_doublets",
-    "run_decontx",
     # Normalization
     "normalize_data",
     "preserve_raw_counts",

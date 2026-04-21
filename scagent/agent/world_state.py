@@ -214,15 +214,6 @@ class AgentWorldState:
             if not processing.get("has_qc_metrics"):
                 available_actions.append("run_qc")
 
-            # DecontX — available when raw counts present and not yet decontaminated
-            _decontx_done = adata is not None and "decontX_contamination" in adata.obs.columns
-            if processing.get("has_raw_counts") and not _decontx_done and not processing.get("is_normalized"):
-                available_actions.append("run_decontx")
-            elif _decontx_done:
-                pass  # Already done — don't re-advertise
-            elif not processing.get("has_raw_counts"):
-                blocked_actions.append({"action": "run_decontx", "needs": "raw counts (must run before normalization)"})
-
             # Normalization - available if we have raw counts and not yet normalized
             if processing.get("has_raw_counts") and not processing.get("is_normalized"):
                 available_actions.append("normalize_and_hvg")
@@ -231,7 +222,11 @@ class AgentWorldState:
 
             # Dimensionality reduction
             if processing.get("is_normalized") or processing.get("has_hvg"):
-                available_actions.append("run_dimred")
+                available_actions.extend(["run_dimred", "run_pca"])
+                if processing.get("has_pca"):
+                    available_actions.append("run_neighbors")
+                if processing.get("has_neighbors"):
+                    available_actions.append("run_umap")
             else:
                 blocked_actions.append({"action": "run_dimred", "needs": "normalized data with HVGs"})
 
@@ -600,20 +595,7 @@ class AgentWorldState:
 
         ts = _utc_now_iso()
 
-        if tool_name == "run_decontx":
-            return {
-                "tool": "run_decontx",
-                "timestamp": ts,
-                "layer_used": result.get("layer_used"),
-                "z_used": result.get("z_used"),
-                "batch_used": result.get("batch_used"),
-                "median_contamination": result.get("median_contamination"),
-                "mean_contamination": result.get("mean_contamination"),
-                "n_cells_flagged": result.get("n_cells_flagged"),
-                "pct_cells_flagged": result.get("pct_cells_flagged"),
-                "contamination_threshold": result.get("contamination_threshold"),
-                "decontX_counts_stored": result.get("decontX_counts_stored"),
-            }
+
 
         if tool_name == "score_integration":
             return {
@@ -655,18 +637,43 @@ class AgentWorldState:
                 "genes_removed": metrics.get("genes_removed"),
                 "mt_threshold": decisions.get("mt_threshold") or decisions.get("pct_counts_mt"),
                 "min_genes": decisions.get("min_genes"),
+                "min_cells_per_gene": decisions.get("min_cells_per_gene"),
                 "max_genes": decisions.get("max_genes"),
                 "min_counts": decisions.get("min_counts"),
+                "doublet_detection": decisions.get("doublet_detection"),
                 "doublet_rate": metrics.get("doublet_rate"),
                 "median_pct_mt": metrics.get("median_pct_mt"),
             }
 
         if tool_name == "normalize_and_hvg":
+            hvg = result.get("hvg") or {}
+            exclusions = result.get("feature_exclusions") or {}
             return {
                 "tool": "normalize_and_hvg",
                 "timestamp": ts,
-                "target_sum": 10000,
+                "target_sum": result.get("target_sum"),
+                "log_transform": result.get("log_transform"),
+                "raw_layer_name": result.get("raw_layer_name"),
+                "raw_counts_present": result.get("raw_counts_present"),
+                "raw_counts_integer_like": result.get("raw_counts_integer_like"),
+                "adata_raw_set": result.get("adata_raw_set"),
+                "adata_raw_shape": result.get("adata_raw_shape"),
                 "n_hvg_selected": result.get("n_hvg"),
+                "hvg_method": hvg.get("method"),
+                "hvg_flavor": hvg.get("flavor"),
+                "hvg_requested_flavor": hvg.get("requested_flavor"),
+                "batch_key": hvg.get("batch_key"),
+                "hvg_layer": hvg.get("layer"),
+                "feature_exclusions": {
+                    "applied": exclusions.get("applied"),
+                    "patterns": exclusions.get("patterns"),
+                    "match_mode": exclusions.get("match_mode"),
+                    "mode": exclusions.get("mode"),
+                    "source": exclusions.get("source"),
+                    "n_excluded": exclusions.get("n_excluded"),
+                    "excluded_hvg_before_forcing": exclusions.get("excluded_hvg_before_forcing"),
+                    "excluded_hvg_after_forcing": exclusions.get("excluded_hvg_after_forcing"),
+                },
             }
 
         if tool_name == "run_dimred":
@@ -675,7 +682,44 @@ class AgentWorldState:
                 "timestamp": ts,
                 "n_pcs": result.get("n_pcs"),
                 "n_neighbors": result.get("n_neighbors"),
+                "svd_solver": result.get("svd_solver"),
+                "mask_var": result.get("mask_var"),
+                "umap_min_dist": result.get("umap_min_dist"),
                 "variance_explained": result.get("variance_explained"),
+            }
+
+        if tool_name == "run_pca":
+            return {
+                "tool": "run_pca",
+                "timestamp": ts,
+                "n_comps": result.get("n_comps"),
+                "svd_solver": result.get("svd_solver"),
+                "mask_var": result.get("mask_var"),
+                "variance_explained": result.get("variance_explained"),
+                "side_effects": result.get("side_effects"),
+            }
+
+        if tool_name == "run_neighbors":
+            return {
+                "tool": "run_neighbors",
+                "timestamp": ts,
+                "n_neighbors": result.get("n_neighbors"),
+                "n_pcs": result.get("n_pcs"),
+                "use_rep": result.get("use_rep"),
+                "neighbors_key": result.get("neighbors_key"),
+                "side_effects": result.get("side_effects"),
+            }
+
+        if tool_name == "run_umap":
+            return {
+                "tool": "run_umap",
+                "timestamp": ts,
+                "neighbors_key": result.get("neighbors_key"),
+                "min_dist": result.get("min_dist"),
+                "spread": result.get("spread"),
+                "n_components": result.get("n_components"),
+                "neighbor_graph_preserved": result.get("neighbor_graph_preserved"),
+                "side_effects": result.get("side_effects"),
             }
 
         if tool_name == "run_clustering":
@@ -686,6 +730,10 @@ class AgentWorldState:
                 "resolution": result.get("resolution"),
                 "n_clusters": result.get("n_clusters"),
                 "cluster_key": result.get("cluster_key"),
+                "created_obs_columns": result.get("created_obs_columns"),
+                "primary_alias": result.get("primary_alias"),
+                "primary_cluster_key": result.get("primary_cluster_key"),
+                "primary_alias_available": result.get("primary_alias_available"),
             }
 
         if tool_name == "compare_clusterings":
@@ -708,9 +756,17 @@ class AgentWorldState:
                 "n_batches": result.get("n_batches"),
                 "corrected_embedding": result.get("corrected_embedding"),
             }
+            if result.get("n_neighbors") is not None:
+                entry["n_neighbors"] = result.get("n_neighbors")
+            entry["neighbors_recomputed"] = result.get("neighbors_recomputed")
+            entry["umap_recomputed"] = result.get("umap_recomputed")
             if result.get("method") == "scvi":
                 entry["n_latent"] = result.get("n_latent")
                 entry["max_epochs"] = result.get("max_epochs")
+            if result.get("method") == "bbknn":
+                entry["n_pcs"] = result.get("n_pcs")
+                entry["neighbors_within_batch"] = result.get("neighbors_within_batch")
+                entry["total_neighbors_per_cell"] = result.get("total_neighbors_per_cell")
             return entry
 
         if tool_name in {"run_celltypist", "run_scimilarity"}:
@@ -730,6 +786,11 @@ class AgentWorldState:
                 "groupby": result.get("groupby"),
                 "method": result.get("method"),
                 "n_genes": result.get("n_genes"),
+                "key_added": result.get("key_added"),
+                "use_raw": result.get("use_raw"),
+                "layer_used": result.get("layer_used"),
+                "matrix_source": result.get("matrix_source"),
+                "matrix_type": result.get("matrix_type"),
             }
 
         if tool_name == "run_pseudobulk_deg":

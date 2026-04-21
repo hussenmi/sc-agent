@@ -42,56 +42,25 @@ def get_tools() -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
                     "output_path": {"type": "string", "description": "Optional path to save a processed h5ad. Prefer saving only final outputs unless the user explicitly asks for checkpoints."},
                     "preview_only": {"type": "boolean", "description": "If true, do not filter. Instead compute full QC metrics, estimate removals, and generate pre-filter QC figures."},
-                    "mt_threshold": {"type": "number", "description": "Max MT% (default: auto-detect)"},
-                    "min_cells": {"type": "integer", "description": "Minimum cells per gene before gene removal (default: ~55)"},
+                    "data_type": {"type": "string", "enum": ["single_cell", "single_nucleus"], "description": "Must be confirmed with the user before applying filters. 'single_cell'=25% MT threshold; 'single_nucleus'=5%. When omitted from preview, both options are shown so you can present them to the user and ask."},
+                    "mt_threshold": {"type": "number", "description": "Max MT% threshold. Overrides data_type if provided."},
+                    "filter_mt": {"type": "boolean", "description": "If false, compute and report MT metrics but do not apply a hard MT% cell filter. Use this for source pipelines that inspect MT but do not remove cells by MT%."},
+                    "min_genes": {"type": "integer", "description": "Minimum detected genes per cell before cell removal. This is cell-level filtering, distinct from min_cells per gene."},
+                    "min_cells": {"type": "integer", "description": "Minimum cells per gene before gene removal. Leave unset to auto-scale: ~55 (exp(4)) for single-sample data, ~148 (exp(5)) for multi-sample/batch data. Only set explicitly to override this behaviour."},
                     "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
                     "remove_mt": {"type": "boolean", "description": "Remove mitochondrial genes from the feature set (default: false)"},
                     "detect_doublets_flag": {"type": "boolean", "description": "Run Scrublet doublet detection (default: true)"},
+                    "remove_doublets": {"type": "boolean", "description": "If true, remove cells flagged as predicted doublets in apply mode. Preview mode reports the count only."},
+                    "scrublet_expected_doublet_rate": {"type": "number", "description": "Scrublet expected_doublet_rate (default: 0.06)."},
+                    "scrublet_sim_doublet_ratio": {"type": "number", "description": "Scrublet sim_doublet_ratio (default: 2.0)."},
+                    "scrublet_n_prin_comps": {"type": "integer", "description": "Scrublet n_prin_comps / PCA components (default: 30). Set to 40 to match some published pipelines."},
+                    "scrublet_min_counts": {"type": "integer", "description": "Scrublet scrub_doublets min_counts preprocessing parameter (default: 2)."},
+                    "scrublet_min_cells": {"type": "integer", "description": "Scrublet scrub_doublets min_cells preprocessing parameter (default: 3)."},
+                    "scrublet_min_gene_variability_pctl": {"type": "number", "description": "Scrublet scrub_doublets min_gene_variability_pctl preprocessing parameter (default: 85)."},
+                    "scrublet_random_state": {"type": "integer", "description": "Random seed for Scrublet (default: 0)."},
+                    "force_doublet_recompute": {"type": "boolean", "description": "If true, recompute Scrublet scores even if doublet columns already exist."},
                     "figure_dir": {"type": "string", "description": "Directory for QC figures. Plots are generated from the full pre-filter data."},
                     "batch_key": {"type": "string", "description": "Batch column for per-batch doublet detection"}
-                },
-                "required": []
-            }
-        },
-        {
-            "name": "run_decontx",
-            "description": (
-                "Estimate and remove ambient RNA contamination per cell using DecontX. "
-                "Uses a Bayesian mixture model to assign each cell a contamination probability "
-                "and optionally store decontaminated counts. "
-                "Run this on individual samples BEFORE concatenation and BEFORE normalization. "
-                "Stores 'decontX_contamination' in obs (0–1 fraction) and flags cells above "
-                "the contamination threshold. Use the decontX_counts layer for downstream "
-                "normalization if heavy contamination is detected (median > 0.2). "
-                "Requires: celda package (pip install celda)."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "z": {
-                        "type": "string",
-                        "description": "obs column with cluster labels. Pre-clustering before DecontX improves accuracy; use leiden or phenograph cluster key if available."
-                    },
-                    "batch": {
-                        "type": "string",
-                        "description": "obs column with batch/sample labels. When provided, each batch gets its own ambient RNA profile (recommended for multi-sample data)."
-                    },
-                    "layer": {
-                        "type": "string",
-                        "description": "Layer with raw integer counts (default: 'raw_counts'). DecontX requires non-normalized counts."
-                    },
-                    "contamination_threshold": {
-                        "type": "number",
-                        "description": "Fraction above which cells are flagged as highly contaminated (default: 0.2 = 20%)."
-                    },
-                    "store_corrected": {
-                        "type": "boolean",
-                        "description": "Store decontaminated counts in layers['decontX_counts'] (default: true). Use this layer instead of raw_counts for normalization if contamination is high."
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Path to save h5ad after DecontX (optional)."
-                    }
                 },
                 "required": []
             }
@@ -104,21 +73,85 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"}
+                    "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"},
+                    "target_sum": {"type": "number", "description": "Target counts per cell for normalize_total (default: 10000). Use source/paper value when reproducing a workflow."},
+                    "log_transform": {"type": "boolean", "description": "Apply log1p after normalize_total (default: true)."},
+                    "raw_layer_name": {"type": "string", "description": "Layer used to preserve/reset raw integer counts (default: raw_counts)."},
+                    "force_reset_from_raw": {"type": "boolean", "description": "If true, reset adata.X from raw_layer_name before normalization when available. Use for retries to avoid double-normalization (default: true)."},
+                    "set_raw_after_normalization": {"type": "boolean", "description": "If true, set adata.raw = adata.copy() after normalization/log1p and before later scaling/PCA (default: true)."},
+                    "hvg_flavor": {"type": "string", "enum": ["seurat", "seurat_v3", "cell_ranger"], "description": "Scanpy HVG flavor (default: seurat for batch-aware log-normalized workflows)."},
+                    "hvg_layer": {"type": "string", "description": "Optional layer for HVG calculation. seurat_v3 requires raw integer counts in a layer."},
+                    "batch_key": {"type": "string", "description": "obs column for batch-stratified HVG selection. Recommended for multi-sample data to avoid batch-specific HVGs."},
+                    "hvg_exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex pattern(s) for source-defined features that must not be marked highly_variable. Only pass evidence-backed source/workflow exclusions; do not invent dataset-specific patterns."},
+                    "hvg_exclusion_mode": {"type": "string", "enum": ["post", "pre"], "description": "How to apply source-defined HVG exclusions. 'post' runs HVG then forces excluded features to false; 'pre' computes HVGs only on allowed features (default: post)."},
+                    "hvg_exclude_match_mode": {"type": "string", "enum": ["match", "contains", "fullmatch"], "description": "Regex matching mode for hvg_exclude_patterns against var_names (default: match)."},
+                    "hvg_exclusion_source": {"type": "string", "description": "Short provenance for the feature-exclusion rule, e.g. source repo file/function/line or paper method."}
                 },
                 "required": []
             }
         },
         {
             "name": "run_dimred",
-            "description": "Run PCA, compute neighbor graph, and UMAP embedding.",
+            "description": "Compound convenience tool for PCA -> neighbors -> UMAP. Use only when the user requests all three steps together; use run_pca, run_neighbors, or run_umap for modular requests.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_pcs": {"type": "integer", "description": "Number of PCs (default: 30)"},
-                    "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"}
+                    "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"},
+                    "svd_solver": {"type": "string", "description": "PCA SVD solver (default: arpack)"},
+                    "mask_var": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Boolean var column for PCA feature mask, or null for all genes (default: highly_variable)"},
+                    "umap_min_dist": {"type": "number", "description": "UMAP min_dist (default: scagent config, usually 0.1)"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "run_pca",
+            "description": "Run PCA only. Does not compute neighbors, UMAP, clustering, or batch correction.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
+                    "n_comps": {"type": "integer", "description": "Number of PCA components (default: 30)"},
+                    "svd_solver": {"type": "string", "description": "SVD solver passed to scanpy.tl.pca (default: arpack)"},
+                    "mask_var": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Boolean var column for PCA feature mask, or null for all genes (default: highly_variable)"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "run_neighbors",
+            "description": "Compute a neighbor graph only. Does not run PCA, UMAP, clustering, or batch correction.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
+                    "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"},
+                    "n_pcs": {"type": "integer", "description": "Number of PCs to use from the representation (optional)"},
+                    "use_rep": {"type": "string", "description": "Representation in adata.obsm to use (default: X_pca)"},
+                    "metric": {"type": "string", "description": "Distance metric (default: euclidean)"},
+                    "key_added": {"type": "string", "description": "Optional alternate neighbors key. Omit to write the default graph."}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "run_umap",
+            "description": "Compute UMAP only from an existing neighbor graph. Does not recompute PCA, neighbors, batch correction, or clustering.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
+                    "min_dist": {"type": "number", "description": "UMAP min_dist (default: 0.5, Scanpy's default)"},
+                    "spread": {"type": "number", "description": "UMAP spread (default: 1.0)"},
+                    "n_components": {"type": "integer", "description": "Number of UMAP dimensions (default: 2)"},
+                    "neighbors_key": {"type": "string", "description": "Optional neighbors key to use. Omit to use adata.uns['neighbors']."},
+                    "random_state": {"type": "integer", "description": "Random seed (default: 0)"}
                 },
                 "required": []
             }
@@ -131,7 +164,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
+                    "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"},
                     "cluster_key": {"type": "string", "description": "Optional explicit obs column to store this clustering result. If omitted, scagent will keep primary aliases like 'leiden' stable and store comparisons under deterministic keys like 'leiden_res_0_5'."},
                     "make_primary": {"type": "boolean", "description": "If true, promote this clustering to the default alias for the method (for example 'leiden') while preserving the explicit result key."}
@@ -146,7 +179,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
-                    "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
+                    "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolutions": {"type": "array", "items": {"type": "number"}, "description": "List of resolutions to compare"},
                     "generate_figures": {"type": "boolean", "description": "If true and UMAP is present, save one figure per clustering"},
                     "figure_dir": {"type": "string", "description": "Optional directory for generated comparison figures"},
@@ -190,12 +223,12 @@ def get_tools() -> List[Dict[str, Any]]:
                 "Correct batch effects using Harmony, BBKNN, Scanorama, or scVI. "
                 "Harmony: fast, corrects PCA embeddings, good for mild-to-moderate batch effects. "
                 "BBKNN: fast, builds a batch-balanced k-NN graph in PCA space; correction lives in "
-                "the neighbor graph (not a separate embedding), so UMAP and clustering are "
-                "automatically batch-aware. Good default when you have many samples (e.g. >10 batches). "
+                "the neighbor graph (not a separate embedding). Run UMAP/clustering separately unless explicitly requested. "
+                "Good default when you have many samples (e.g. >10 batches). "
                 "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
                 "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
                 "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
-                "After correction, UMAP is automatically recomputed on the corrected representation."
+                "This tool is modular by default: it does not compute downstream UMAP unless compute_umap=true."
             ),
             "input_schema": {
                 "type": "object",
@@ -216,7 +249,10 @@ def get_tools() -> List[Dict[str, Any]]:
                     "neighbors_within_batch": {"type": "integer", "description": "BBKNN only: neighbors contributed per batch per cell (default: 3; total = n_batches × this value)"},
                     "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
                     "max_epochs": {"type": "integer", "description": "scVI only: training epochs (default: 200; use fewer only for quick tests)"},
-                    "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
+                    "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"},
+                    "compute_neighbors": {"type": "boolean", "description": "Harmony/Scanorama/scVI only: compute a neighbor graph on the corrected embedding after correction (default: false; forced true if compute_umap=true)."},
+                    "compute_umap": {"type": "boolean", "description": "Compute UMAP after correction (default: false). For BBKNN, uses the BBKNN graph; for embedding methods, computes neighbors first if needed."},
+                    "n_neighbors": {"type": "integer", "description": "Neighbors for optional post-correction graph computation (default: 30)."}
                 },
                 "required": []
             }
@@ -302,6 +338,9 @@ def get_tools() -> List[Dict[str, Any]]:
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
                     "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"},
                     "layer": {"type": "string", "description": "Optional expression layer to use for DEG (for example scran_norm)"},
+                    "use_raw": {"type": "boolean", "description": "Whether to use adata.raw for DEG when layer is not set. If omitted, follows Scanpy default (uses adata.raw when present)."},
+                    "key_added": {"type": "string", "description": "Key in adata.uns for DEG results (default: rank_genes_groups)"},
+                    "n_genes": {"type": "integer", "description": "Number of ranked genes to store per group (default: 100)"},
                     "target_geneset": {"type": "string", "description": "Target gene set database for compatibility check (default: MSigDB_Hallmark_2020)"}
                 },
                 "required": []
@@ -759,7 +798,8 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to h5ad with DEG results (optional - uses in-memory data)"},
                     "cluster": {"type": "string", "description": "Cluster ID"},
-                    "n_genes": {"type": "integer", "description": "Number of genes (default: 10)"}
+                    "n_genes": {"type": "integer", "description": "Number of genes (default: 10)"},
+                    "key": {"type": "string", "description": "DEG result key in adata.uns (default: rank_genes_groups)"}
                 },
                 "required": ["cluster"]
             }
@@ -872,6 +912,25 @@ def get_tools() -> List[Dict[str, Any]]:
                     "render_pages": {"type": "boolean", "description": "PDF only. Render pages as images (108 DPI PNG) in addition to text extraction. The first rendered page is sent to the vision model inline; others are saved to figures/pdf_pages/ for review_figure. Use when the document has figures, plots, or is scanned. Default: false."},
                 },
                 "required": ["path"]
+            }
+        },
+        {
+            "name": "research_findings",
+            "description": (
+                "Search PubMed for literature about a specific pathway or gene set in the context of a cell type. "
+                "Returns recent papers and review articles. Used internally after GSEA to ground pathway "
+                "interpretations in published evidence."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pathway": {"type": "string", "description": "Pathway or gene set name (e.g. 'HALLMARK_TNFA_SIGNALING_VIA_NFKB')."},
+                    "cell_type": {"type": "string", "description": "Cell type context for the search (e.g. 'CD8 T cells')."},
+                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Top leading-edge genes to include in the query."},
+                    "context": {"type": "string", "description": "Additional biological context (tissue, disease, species)."},
+                    "recent_years": {"type": "integer", "description": "Limit search to this many recent years (default: 3)."},
+                },
+                "required": ["pathway"]
             }
         },
     ]
@@ -1079,6 +1138,23 @@ def process_tool_call(
 
     def _check(name: str, passed: bool, details: str) -> Dict[str, Any]:
         return {"name": name, "status": "passed" if passed else "failed", "details": details}
+
+    def _neighbors_provenance(adata_obj) -> Dict[str, Any]:
+        neighbors = adata_obj.uns.get("neighbors", {}) if adata_obj is not None else {}
+        params = neighbors.get("params", {}) if isinstance(neighbors, dict) else {}
+        connectivities = adata_obj.obsp.get("connectivities") if adata_obj is not None and "connectivities" in adata_obj.obsp else None
+        distances = adata_obj.obsp.get("distances") if adata_obj is not None and "distances" in adata_obj.obsp else None
+        return {
+            "has_neighbors": bool(adata_obj is not None and "neighbors" in adata_obj.uns),
+            "params": _sanitize_uns_value(dict(params)) if isinstance(params, dict) else _sanitize_uns_value(params),
+            "connectivities_nnz": int(connectivities.nnz) if connectivities is not None and hasattr(connectivities, "nnz") else None,
+            "distances_nnz": int(distances.nnz) if distances is not None and hasattr(distances, "nnz") else None,
+            "connectivities_key": neighbors.get("connectivities_key") if isinstance(neighbors, dict) else None,
+            "distances_key": neighbors.get("distances_key") if isinstance(neighbors, dict) else None,
+        }
+
+    def _provenance_same(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+        return before == after
 
     def _finalize_result(
         result: Dict[str, Any],
@@ -1407,19 +1483,30 @@ def process_tool_call(
             created_by="tool",
         )
         primary_alias = default_cluster_key_for_method(normalized_method)
+        primary_cluster_key = primary_alias if primary_alias in adata_obj.obs.columns else ""
+        primary_alias_created = False
         if make_primary:
-            primary_alias = promote_clustering_to_primary(
+            primary_cluster_key = promote_clustering_to_primary(
                 adata_obj,
                 cluster_key=cluster_key,
                 method=normalized_method,
                 resolution=resolution,
                 created_by="tool",
             )
+            primary_alias_created = primary_cluster_key in adata_obj.obs.columns
+        primary_alias_available = bool(primary_cluster_key and primary_cluster_key in adata_obj.obs.columns)
+        created_obs_columns = [cluster_key]
+        if primary_alias_created and primary_cluster_key != cluster_key:
+            created_obs_columns.append(primary_cluster_key)
 
         sizes = adata_obj.obs[cluster_key].value_counts().to_dict()
         return {
             "cluster_key": cluster_key,
-            "primary_cluster_key": primary_alias,
+            "primary_alias": primary_alias,
+            "primary_cluster_key": primary_cluster_key,
+            "primary_alias_available": primary_alias_available,
+            "primary_alias_created": primary_alias_created,
+            "created_obs_columns": created_obs_columns,
             "method": normalized_method,
             "resolution": float(resolution),
             "n_clusters": len(sizes),
@@ -2249,14 +2336,19 @@ def process_tool_call(
                 if not any(c in msg for c in _cosmetic):
                     captured_output += f"\nWarning ({w.category.__name__}): {msg}"
 
-            # After execution, ensure var_names are unique on the live adata.
+            # After execution, ensure var_names and obs_names are unique on the live adata.
             # 10x h5 files can contain duplicate gene symbols; anndata.concat() propagates
             # them. Leaving duplicates causes silent wrong-gene indexing downstream.
+            # obs_names duplicates arise when concat is called without keys/suffixes.
             var_names_fixed = False
+            obs_names_fixed = False
             adata = namespace.get("adata", adata)
             if adata is not None and not adata.var_names.is_unique:
                 adata.var_names_make_unique()
                 var_names_fixed = True
+            if adata is not None and adata.obs_names.duplicated().any():
+                adata.obs_names_make_unique()
+                obs_names_fixed = True
 
             if exec_error is not None:
                 err_type = type(exec_error).__name__
@@ -2327,6 +2419,10 @@ def process_tool_call(
             }
             if adata is not None:
                 result["shape"] = {"n_cells": adata.n_obs, "n_genes": adata.n_vars}
+            if var_names_fixed:
+                result.setdefault("auto_fixes", []).append("var_names had duplicates — called .var_names_make_unique()")
+            if obs_names_fixed:
+                result.setdefault("auto_fixes", []).append("obs_names had duplicates — called .obs_names_make_unique()")
             if save_to:
                 result["ignored_save_to"] = save_to
             if save_warning:
@@ -2378,6 +2474,38 @@ def process_tool_call(
                 "years_searched": f"last {recent_years} years",
                 "count": len(results),
                 "results": results,
+            }, indent=2), adata
+
+        elif tool_name == "research_findings":
+            pathway = tool_input["pathway"]
+            cell_type = tool_input.get("cell_type", "")
+            genes = tool_input.get("genes", [])
+            context = tool_input.get("context", "")
+            recent_years = tool_input.get("recent_years", 3)
+
+            # Build a focused query: pathway + cell type + top genes
+            gene_str = " ".join(genes[:5]) if genes else ""
+            query_parts = [p for p in [pathway, cell_type, gene_str, context] if p]
+            query = " ".join(query_parts)
+
+            # Normalise GSEA-style pathway names before searching
+            import re as _re
+            query = _re.sub(r"^(HALLMARK|REACTOME|KEGG|GO|WP|BIOCARTA|PID|NABA)_", "", query, flags=_re.IGNORECASE)
+            query = query.replace("_", " ").strip()
+
+            recent_papers = search_pubmed(query=query, max_results=5, recent_years=recent_years, reviews_only=False)
+            reviews = search_pubmed(query=query, max_results=3, recent_years=recent_years, reviews_only=True)
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "research_findings",
+                "pathway": pathway,
+                "cell_type": cell_type,
+                "query": query,
+                "findings": {
+                    "selected_papers": recent_papers,
+                    "review_articles": reviews,
+                },
             }, indent=2), adata
 
         elif tool_name == "fetch_url":
@@ -2497,6 +2625,8 @@ def process_tool_call(
             if state.has_raw_layer:
                 raw_info["layers"].append(state.raw_layer_name)
 
+            from ..core.inspector import _characterize_features
+            feature_info = _characterize_features(working_adata)
             result = {
                 "status": "ok",
                 "tool": "inspect_data",
@@ -2510,8 +2640,19 @@ def process_tool_call(
                     "format": state.gene_id_format,
                     "has_symbols": state.has_gene_symbols,
                     "has_ensembl": state.has_ensembl_ids,
-                    "sample": state.sample_gene_names,
+                    "sample": feature_info["sample_gene_names"],
                     "var_columns": list(working_adata.var.columns)[:10],
+                    "genome_prefix": feature_info["genome_prefix"],
+                    "special_gene_populations": feature_info["special_gene_populations"],
+                    "mt_genes_detected": feature_info["mt_genes_detected"],
+                    "mt_gene_examples": feature_info["mt_gene_examples"],
+                    "ribo_genes_detected": feature_info["ribo_genes_detected"],
+                    "ribo_gene_examples": feature_info["ribo_gene_examples"],
+                },
+                "obs_names": {
+                    "format": feature_info["obs_names_format"],
+                    "sample": feature_info["obs_names_sample"],
+                    "suffixes_detected": feature_info["obs_names_suffixes_detected"],
                 },
                 "clustering": {
                     "has_clusters": state.has_clusters,
@@ -2686,8 +2827,9 @@ def process_tool_call(
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             cluster = tool_input["cluster"]
             n_genes = tool_input.get("n_genes", 10)
+            key = tool_input.get("key", "rank_genes_groups")
 
-            if "rank_genes_groups" not in working_adata.uns:
+            if key not in working_adata.uns:
                 return _smart_unavailable_result(
                     tool="get_top_markers",
                     message="Top markers are not available because differential expression has not been run yet.",
@@ -2697,16 +2839,17 @@ def process_tool_call(
                         "Run differential expression on the current clustering first.",
                         "Inspect available clusterings before choosing a DEG grouping.",
                     ],
-                    extra={"cluster": cluster},
+                    extra={"cluster": cluster, "key": key},
                 )
 
-            markers_df = get_top_markers(working_adata, group=cluster, n_genes=n_genes)
+            markers_df = get_top_markers(working_adata, group=cluster, n_genes=n_genes, key=key)
             markers = markers_df[['names', 'scores', 'logfoldchanges', 'pvals_adj']].to_dict('records')
 
             return json.dumps({
                 "status": "ok",
                 "tool": "get_top_markers",
                 "cluster": cluster,
+                "key": key,
                 "markers": markers
             }, indent=2), updated_adata
 
@@ -3020,9 +3163,30 @@ def process_tool_call(
             detect_doublets_flag = tool_input.get("detect_doublets_flag", True)
             remove_ribo = tool_input.get("remove_ribo", True)
             remove_mt = tool_input.get("remove_mt", False)
+            remove_doublets = bool(tool_input.get("remove_doublets", False))
+            filter_mt = bool(tool_input.get("filter_mt", True))
+            min_genes = tool_input.get("min_genes")
             min_cells = tool_input.get("min_cells")
             requested_mt_threshold = tool_input.get("mt_threshold")
             preview_only = bool(tool_input.get("preview_only", False))
+            scrublet_expected_doublet_rate = float(tool_input.get("scrublet_expected_doublet_rate") or 0.06)
+            scrublet_sim_doublet_ratio = float(tool_input.get("scrublet_sim_doublet_ratio") or 2.0)
+            scrublet_n_prin_comps = int(tool_input.get("scrublet_n_prin_comps") or 30)
+            scrublet_min_counts = int(tool_input.get("scrublet_min_counts") or 2)
+            scrublet_min_cells = int(tool_input.get("scrublet_min_cells") or 3)
+            scrublet_min_gene_variability_pctl = float(tool_input.get("scrublet_min_gene_variability_pctl") or 85.0)
+            scrublet_random_state = int(tool_input.get("scrublet_random_state") or 0)
+            force_doublet_recompute = bool(tool_input.get("force_doublet_recompute", False))
+            requested_scrublet_params = {
+                "expected_doublet_rate": scrublet_expected_doublet_rate,
+                "sim_doublet_ratio": scrublet_sim_doublet_ratio,
+                "n_prin_comps": scrublet_n_prin_comps,
+                "min_counts": scrublet_min_counts,
+                "min_cells": scrublet_min_cells,
+                "min_gene_variability_pctl": scrublet_min_gene_variability_pctl,
+                "random_state": scrublet_random_state,
+                "force_recompute": force_doublet_recompute,
+            }
             requested_batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
             if requested_batch_key and "batch_key" not in tool_input and _confirmed_decision_value("batch_key"):
                 warnings.append(
@@ -3051,38 +3215,169 @@ def process_tool_call(
                 elif batch_resolution.status == "no_candidate":
                     warnings.append(batch_resolution.reason)
 
-            qc_preview = adata.copy()
+            # Compute QC metrics directly on adata — these are non-destructive obs/var
+            # annotations (pct_counts_mt, doublet_score, etc.). Writing to adata here
+            # (not a throwaway copy) means apply mode can reuse them without recomputing.
+            # Actual cell/gene filtering only happens later if not preview_only.
+            _metrics_precomputed = 'pct_counts_mt' in adata.obs.columns
+            _doublets_precomputed = (
+                detect_doublets_flag
+                and 'predicted_doublet' in adata.obs.columns
+                and not force_doublet_recompute
+            )
+            doublet_predictions_source = (
+                "precomputed"
+                if _doublets_precomputed
+                else ("computed" if detect_doublets_flag else "not_run")
+            )
+            stored_scrublet_params = (
+                adata.uns.get("scrublet_params", {})
+                if _doublets_precomputed and isinstance(adata.uns.get("scrublet_params", {}), dict)
+                else {}
+            )
+            scrublet_params_for_report = requested_scrublet_params.copy()
+            if stored_scrublet_params:
+                scrublet_params_for_report = {
+                    "expected_doublet_rate": float(stored_scrublet_params.get("expected_doublet_rate", scrublet_expected_doublet_rate)),
+                    "sim_doublet_ratio": float(stored_scrublet_params.get("sim_doublet_ratio", scrublet_sim_doublet_ratio)),
+                    "n_prin_comps": int(stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps)),
+                    "n_prin_comps_used": int(stored_scrublet_params.get("n_prin_comps_used", stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps))),
+                    "min_counts": int(stored_scrublet_params.get("min_counts", scrublet_min_counts)),
+                    "min_cells": int(stored_scrublet_params.get("min_cells", scrublet_min_cells)),
+                    "min_gene_variability_pctl": float(stored_scrublet_params.get("min_gene_variability_pctl", scrublet_min_gene_variability_pctl)),
+                    "random_state": int(stored_scrublet_params.get("random_state", scrublet_random_state)),
+                    "force_recompute": force_doublet_recompute,
+                    "batch_key": stored_scrublet_params.get("batch_key", batch_key),
+                }
+                changed_requested_params = [
+                    key for key in (
+                        "scrublet_expected_doublet_rate",
+                        "scrublet_sim_doublet_ratio",
+                        "scrublet_n_prin_comps",
+                        "scrublet_min_counts",
+                        "scrublet_min_cells",
+                        "scrublet_min_gene_variability_pctl",
+                        "scrublet_random_state",
+                    )
+                    if key in tool_input
+                ]
+                if changed_requested_params:
+                    warnings.append(
+                        "Existing Scrublet predictions were reused. Requested Scrublet parameters "
+                        "were not recomputed; pass force_doublet_recompute=true to regenerate doublet calls."
+                    )
+
             try:
-                calculate_qc_metrics(qc_preview, inplace=True)
-                if detect_doublets_flag:
-                    detect_doublets(qc_preview, batch_key=batch_key, inplace=True)
+                if not _metrics_precomputed:
+                    calculate_qc_metrics(adata, inplace=True)
+                if detect_doublets_flag and not _doublets_precomputed:
+                    if force_doublet_recompute:
+                        for col in ("doublet_score", "predicted_doublet"):
+                            if col in adata.obs.columns:
+                                del adata.obs[col]
+                    detect_doublets(
+                        adata,
+                        batch_key=batch_key,
+                        expected_doublet_rate=scrublet_expected_doublet_rate,
+                        sim_doublet_ratio=scrublet_sim_doublet_ratio,
+                        n_prin_comps=scrublet_n_prin_comps,
+                        scrublet_min_counts=scrublet_min_counts,
+                        scrublet_min_cells=scrublet_min_cells,
+                        scrublet_min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
+                        random_state=scrublet_random_state,
+                        inplace=True,
+                    )
+                    doublet_predictions_source = "computed"
+                    stored_scrublet_params = adata.uns.get("scrublet_params", {}) if isinstance(adata.uns.get("scrublet_params", {}), dict) else {}
+                    if stored_scrublet_params:
+                        scrublet_params_for_report = {
+                            "expected_doublet_rate": float(stored_scrublet_params.get("expected_doublet_rate", scrublet_expected_doublet_rate)),
+                            "sim_doublet_ratio": float(stored_scrublet_params.get("sim_doublet_ratio", scrublet_sim_doublet_ratio)),
+                            "n_prin_comps": int(stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps)),
+                            "n_prin_comps_used": int(stored_scrublet_params.get("n_prin_comps_used", stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps))),
+                            "min_counts": int(stored_scrublet_params.get("min_counts", scrublet_min_counts)),
+                            "min_cells": int(stored_scrublet_params.get("min_cells", scrublet_min_cells)),
+                            "min_gene_variability_pctl": float(stored_scrublet_params.get("min_gene_variability_pctl", scrublet_min_gene_variability_pctl)),
+                            "random_state": int(stored_scrublet_params.get("random_state", scrublet_random_state)),
+                            "force_recompute": force_doublet_recompute,
+                            "batch_key": stored_scrublet_params.get("batch_key", batch_key),
+                        }
             except ValueError as e:
                 if detect_doublets_flag and "skimage is not installed" in str(e):
-                    warnings.append("Scrublet auto-threshold requires skimage; preview reran without doublet detection.")
+                    warnings.append("Scrublet auto-threshold requires skimage; reran without doublet detection.")
                     detect_doublets_flag = False
+                    doublet_predictions_source = "not_run"
+                    scrublet_params_for_report = requested_scrublet_params.copy()
+                    if not _metrics_precomputed:
+                        calculate_qc_metrics(adata, inplace=True)
                 else:
                     raise
 
-            if requested_mt_threshold is None:
-                median_mt_preview = float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else 0.0
-                auto_data_type = "nuclei" if median_mt_preview < 2.0 else "cells"
-                mt_threshold = 5.0 if auto_data_type == "nuclei" else 25.0
-                warnings.append(
-                    f"mt_threshold auto-selected as {mt_threshold:.1f}% based on median pct_counts_mt={median_mt_preview:.2f} ({auto_data_type}-like)."
-                )
-            else:
+            # Use adata directly — no copy needed, metrics are already there
+            qc_preview = adata
+
+            requested_data_type = tool_input.get("data_type")  # "single_cell" | "single_nucleus" | None
+            if requested_mt_threshold is not None:
                 mt_threshold = float(requested_mt_threshold)
-                auto_data_type = "user-specified"
+                data_type_confirmed = True
+            elif requested_data_type == "single_nucleus":
+                mt_threshold = 5.0
+                data_type_confirmed = True
+            elif requested_data_type == "single_cell":
+                mt_threshold = 25.0
+                data_type_confirmed = True
+            else:
+                # data_type not confirmed — compute preview with a placeholder and flag for user
+                median_mt_preview = float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else 0.0
+                mt_threshold = 5.0 if median_mt_preview < 2.0 else 25.0
+                data_type_confirmed = False
+                warnings.append(
+                    f"data_type not confirmed. Median MT={median_mt_preview:.2f}% suggests "
+                    f"{'single-nucleus (5% threshold)' if median_mt_preview < 2.0 else 'single-cell (25% threshold)'}, "
+                    "but this must be confirmed with the user before applying filters. "
+                    "Pass data_type='single_cell' or data_type='single_nucleus' after confirmation."
+                )
+            if not filter_mt:
+                warnings.append(
+                    "Hard MT% cell filtering is disabled for this run; MT metrics and reference thresholds "
+                    "are reported for QC review only."
+                )
 
             if min_cells is None:
                 from ..config.defaults import QC_DEFAULTS
-                min_cells = int(QC_DEFAULTS.min_cells_per_gene)
+                import math
+                # Workshop uses exp(5)~148 for multi-sample data, exp(4)~55 for single-sample.
+                # Include recommended_column so needs_confirmation datasets (where applied_column
+                # is None) still get the multi-sample threshold when a candidate batch key exists.
+                effective_batch = (
+                    batch_key
+                    or requested_batch_key
+                    or (batch_resolution.recommended_column if batch_resolution else None)
+                )
+                if (effective_batch and effective_batch in qc_preview.obs.columns
+                        and qc_preview.obs[effective_batch].nunique() > 1):
+                    min_cells = int(math.exp(5))
+                else:
+                    min_cells = int(QC_DEFAULTS.min_cells_per_gene)
 
             cells_over_mt = int((qc_preview.obs['pct_counts_mt'] >= mt_threshold).sum()) if 'pct_counts_mt' in qc_preview.obs else 0
+            # Precompute impact at both standard thresholds so the LLM can present both options to the user
+            _mt_col = qc_preview.obs['pct_counts_mt'] if 'pct_counts_mt' in qc_preview.obs else None
+            mt_threshold_options = {
+                "single_cell":    {"threshold": 25.0, "cells_flagged": int((_mt_col >= 25.0).sum()) if _mt_col is not None else 0, "pct_flagged": round(float((_mt_col >= 25.0).mean()) * 100, 1) if _mt_col is not None else 0},
+                "single_nucleus": {"threshold":  5.0, "cells_flagged": int((_mt_col >=  5.0).sum()) if _mt_col is not None else 0, "pct_flagged": round(float((_mt_col >=  5.0).mean()) * 100, 1) if _mt_col is not None else 0},
+            } if not data_type_confirmed else None
             predicted_doublets = int(qc_preview.obs['predicted_doublet'].sum()) if 'predicted_doublet' in qc_preview.obs else 0
             genes_low_cells = int((qc_preview.var['n_cells_by_counts'] < min_cells).sum()) if 'n_cells_by_counts' in qc_preview.var.columns else 0
+            cells_low_genes = (
+                int((qc_preview.obs['n_genes_by_counts'] < int(min_genes)).sum())
+                if min_genes is not None and 'n_genes_by_counts' in qc_preview.obs.columns
+                else 0
+            )
             ribo_genes = int(qc_preview.var['ribo'].sum()) if 'ribo' in qc_preview.var.columns and remove_ribo else 0
             mt_genes = int(qc_preview.var['mt'].sum()) if 'mt' in qc_preview.var.columns and remove_mt else 0
+            n_mt_genes_detected = int(qc_preview.var['mt'].sum()) if 'mt' in qc_preview.var.columns else 0
+            n_ribo_genes_detected = int(qc_preview.var['ribo'].sum()) if 'ribo' in qc_preview.var.columns else 0
 
             figure_outputs = []
             figure_dir = tool_input.get("figure_dir")
@@ -3091,7 +3386,7 @@ def process_tool_call(
                 import matplotlib.pyplot as plt
                 os.makedirs(figure_dir, exist_ok=True)
                 try:
-                    qc_plot_adata = qc_preview.copy()
+                    qc_plot_adata = adata.copy()
 
                     # Add log-transformed columns for visualization
                     if "total_counts" in qc_plot_adata.obs.columns:
@@ -3212,11 +3507,28 @@ def process_tool_call(
             qc_decisions = {
                 "mt_threshold": {
                     "value": mt_threshold,
+                    "filter_enabled": filter_mt,
+                    "data_type_confirmed": data_type_confirmed,
+                    **({"threshold_options": mt_threshold_options} if mt_threshold_options else {}),
                     "reason": (
-                        f"Cells with pct_counts_mt >= {mt_threshold:.1f}% are usually stressed, damaged, or dying; "
-                        "high mitochondrial RNA often indicates low-quality cells."
+                        f"Cells with pct_counts_mt >= {mt_threshold:.1f}% are flagged for review; "
+                        + (
+                            "this threshold will be applied in filtering."
+                            if filter_mt
+                            else "hard MT% filtering is disabled for this run."
+                        )
                     ),
                     "cells_flagged": cells_over_mt,
+                },
+                "min_genes": {
+                    "value": int(min_genes) if min_genes is not None else None,
+                    "enabled": min_genes is not None,
+                    "reason": (
+                        f"Cells with fewer than {int(min_genes)} detected genes are usually low-quality."
+                        if min_genes is not None
+                        else "No cell-level gene-count filter was requested."
+                    ),
+                    "cells_flagged": cells_low_genes,
                 },
                 "min_cells_per_gene": {
                     "value": int(min_cells),
@@ -3231,7 +3543,9 @@ def process_tool_call(
                         "Scrublet flags likely multiplets; these are reported so the user can decide whether to exclude them."
                     ),
                     "cells_flagged": predicted_doublets,
-                    "removal_default": False,
+                    "remove_on_apply": remove_doublets,
+                    "predictions_source": doublet_predictions_source,
+                    "parameters": scrublet_params_for_report,
                 },
                 "remove_ribo": {
                     "enabled": bool(remove_ribo),
@@ -3243,12 +3557,35 @@ def process_tool_call(
                     "reason": "Mitochondrial genes are often excluded from downstream feature selection to reduce QC-driven signal.",
                     "genes_flagged": mt_genes,
                 },
+                "gene_detection_counts": {
+                    "n_mt_genes_detected": n_mt_genes_detected,
+                    "n_ribo_genes_detected": n_ribo_genes_detected,
+                },
             }
 
+            cell_filter_bits = []
+            if min_genes is not None:
+                cell_filter_bits.append(
+                    f"removing {cells_low_genes} cells with fewer than {int(min_genes)} genes"
+                )
+            if filter_mt:
+                cell_filter_bits.append(
+                    f"filtering {cells_over_mt} cells with pct_counts_mt >= {mt_threshold:.1f}%"
+                )
+            else:
+                cell_filter_bits.append(
+                    f"reporting {cells_over_mt} cells with pct_counts_mt >= {mt_threshold:.1f}% without applying an MT filter"
+                )
+            doublet_action = "removing" if remove_doublets else "flagging"
             recommendation = (
-                f"I recommend filtering {cells_over_mt} high-MT cells with pct_counts_mt >= {mt_threshold:.1f}%, "
-                f"removing {genes_low_cells} low-detection genes, and "
-                f"{'flagging' if detect_doublets_flag else 'skipping'} doublets ({predicted_doublets} cells)."
+                "I recommend "
+                + ", ".join(cell_filter_bits)
+                + f", removing {genes_low_cells} low-detection genes, and "
+                + (
+                    f"{doublet_action} doublets ({predicted_doublets} cells)."
+                    if detect_doublets_flag
+                    else "skipping doublet detection."
+                )
             )
             if batch_resolution and batch_resolution.needs_user_confirmation and tool_input.get("batch_key"):
                 recommendation += (
@@ -3296,12 +3633,16 @@ def process_tool_call(
                     "mode": "preview",
                     "before": {"n_cells": n_before, "n_genes": g_before},
                     "after": {"n_cells": n_before, "n_genes": g_before},
-                    "recommended_data_type": auto_data_type,
+                    "data_type_confirmed": data_type_confirmed,
                     "recommendation": recommendation,
                     "qc_decisions": qc_decisions,
                     "metrics": {
                         "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
                         "doublet_rate": float(qc_preview.obs['predicted_doublet'].mean()) if 'predicted_doublet' in qc_preview.obs else None,
+                        "cells_below_min_genes": cells_low_genes,
+                        "genes_below_min_cells": genes_low_cells,
+                        "predicted_doublets": predicted_doublets,
+                        "cells_over_mt_threshold": cells_over_mt,
                     },
                     "warnings": warnings,
                     "figures": figure_outputs,
@@ -3342,10 +3683,21 @@ def process_tool_call(
                 run_qc_pipeline(
                     adata,
                     mt_threshold=mt_threshold,
+                    filter_mt=filter_mt,
+                    min_genes=int(min_genes) if min_genes is not None else None,
                     min_cells=min_cells,
                     remove_ribo=remove_ribo,
                     detect_doublets_flag=detect_doublets_flag,
+                    remove_doublets=remove_doublets,
                     batch_key=batch_key,
+                    scrublet_expected_doublet_rate=scrublet_expected_doublet_rate,
+                    scrublet_sim_doublet_ratio=scrublet_sim_doublet_ratio,
+                    scrublet_n_prin_comps=scrublet_n_prin_comps,
+                    scrublet_min_counts=scrublet_min_counts,
+                    scrublet_min_cells=scrublet_min_cells,
+                    scrublet_min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
+                    scrublet_random_state=scrublet_random_state,
+                    force_doublet_recompute=force_doublet_recompute,
                 )
             except ValueError as e:
                 if detect_doublets_flag and "skimage is not installed" in str(e):
@@ -3354,13 +3706,34 @@ def process_tool_call(
                     run_qc_pipeline(
                         adata,
                         mt_threshold=mt_threshold,
+                        filter_mt=filter_mt,
+                        min_genes=int(min_genes) if min_genes is not None else None,
                         min_cells=min_cells,
                         remove_ribo=remove_ribo,
                         detect_doublets_flag=False,
+                        remove_doublets=False,
                         batch_key=batch_key,
                     )
                 else:
                     raise
+
+            actual_cells_removed = n_before - adata.n_obs
+            actual_genes_removed = g_before - adata.n_vars
+            post_filter_doublets = int(adata.obs['predicted_doublet'].sum()) if 'predicted_doublet' in adata.obs else None
+            post_filter_doublet_rate = (
+                float(adata.obs['predicted_doublet'].mean())
+                if 'predicted_doublet' in adata.obs
+                else None
+            )
+            pre_filter_doublet_rate = (
+                float(predicted_doublets / n_before)
+                if detect_doublets_flag and n_before
+                else None
+            )
+            qc_decisions["min_cells_per_gene"]["genes_flagged_before_cell_filtering"] = genes_low_cells
+            qc_decisions["min_cells_per_gene"]["genes_removed_after_cell_filtering"] = actual_genes_removed
+            qc_decisions["doublet_detection"]["cells_flagged_before_filtering"] = predicted_doublets
+            qc_decisions["doublet_detection"]["cells_remaining_after_filtering"] = post_filter_doublets
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_qc")
             if output_path:
@@ -3381,10 +3754,19 @@ def process_tool_call(
                 "recommendation": recommendation,
                 "qc_decisions": qc_decisions,
                 "metrics": {
-                    "cells_removed": n_before - adata.n_obs,
-                    "genes_removed": g_before - adata.n_vars,
-                    "doublet_rate": float(adata.obs['predicted_doublet'].mean()) if 'predicted_doublet' in adata.obs else None,
+                    "cells_removed": actual_cells_removed,
+                    "genes_removed": actual_genes_removed,
+                    "doublet_rate": pre_filter_doublet_rate,
+                    "post_filter_doublet_rate": post_filter_doublet_rate,
                     "median_pct_mt": float(adata.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in adata.obs else None,
+                    "cells_below_min_genes": cells_low_genes,
+                    "genes_below_min_cells": genes_low_cells,
+                    "genes_below_min_cells_before_cell_filtering": genes_low_cells,
+                    "genes_removed_after_cell_filtering": actual_genes_removed,
+                    "predicted_doublets": predicted_doublets,
+                    "predicted_doublets_before_filtering": predicted_doublets,
+                    "predicted_doublets_remaining": post_filter_doublets,
+                    "cells_over_mt_threshold": cells_over_mt,
                 },
                 "warnings": warnings,
                 "figures": figure_outputs,
@@ -3421,134 +3803,73 @@ def process_tool_call(
                 ),
             )
 
-        elif tool_name == "run_decontx":
-            from ..core.qc import run_decontx
-
-            warnings = _state_preservation_warning(tool_input, adata)
-            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            z = tool_input.get("z")
-            batch = tool_input.get("batch")
-            layer = tool_input.get("layer", "raw_counts")
-            contamination_threshold = float(tool_input.get("contamination_threshold", 0.2))
-            store_corrected = bool(tool_input.get("store_corrected", True))
-
-            # Validate z and batch columns exist if provided
-            if z and z not in adata.obs.columns:
-                warnings.append(f"z column '{z}' not found in obs — running DecontX without cluster labels.")
-                z = None
-            if batch and batch not in adata.obs.columns:
-                warnings.append(f"batch column '{batch}' not found in obs — running without batch stratification.")
-                batch = None
-
-            # Validate integer counts before calling DecontX
-            try:
-                _resolve_integer_counts_layer(adata, layer)
-            except ValueError as e:
-                return _error_result(
-                    tool="run_decontx",
-                    message=str(e),
-                    adata_obj=adata,
-                    recovery_options=[
-                        "Ensure raw integer counts exist in adata.layers (normalize_and_hvg preserves them automatically).",
-                    ],
-                )
-
-            try:
-                run_decontx(
-                    adata,
-                    z=z,
-                    batch=batch,
-                    layer=layer,
-                    contamination_threshold=contamination_threshold,
-                    store_corrected=store_corrected,
-                    inplace=True,
-                )
-            except ImportError as e:
-                return _error_result(
-                    tool="run_decontx",
-                    message=str(e),
-                    adata_obj=adata,
-                    install_hint="pip install celda",
-                )
-            except Exception as e:
-                return _error_result(
-                    tool="run_decontx",
-                    message=str(e),
-                    adata_obj=adata,
-                    recovery_options=[
-                        "Verify the layer contains valid integer counts.",
-                        "If using cluster labels (z), check that the column has the expected categories.",
-                    ],
-                )
-
-            contamination = adata.obs["decontX_contamination"]
-            n_flagged = int(adata.obs["decontX_high_contamination"].sum())
-            output_path = fix_output_path(tool_input.get("output_path"), "run_decontx")
-            if output_path:
-                write_h5ad_safe(adata, output_path)
-
-            return _finalize_result(
-                {
-                    "status": "ok",
-                    "tool": "run_decontx",
-                    "output_path": output_path,
-                    "saved": output_path is not None,
-                    "layer_used": layer if layer in adata.layers else "X",
-                    "z_used": z,
-                    "batch_used": batch,
-                    "contamination_threshold": contamination_threshold,
-                    "median_contamination": round(float(contamination.median()), 4),
-                    "mean_contamination": round(float(contamination.mean()), 4),
-                    "n_cells_flagged": n_flagged,
-                    "pct_cells_flagged": round(n_flagged / adata.n_obs * 100, 1),
-                    "decontX_counts_stored": "decontX_counts" in adata.layers,
-                    "note": (
-                        "Use layers['decontX_counts'] instead of raw_counts for normalization "
-                        "if median contamination is high (> 0.2)."
-                    ) if "decontX_counts" in adata.layers else "",
-                    "warnings": warnings,
-                    "state": make_state(adata),
-                },
-                adata,
-                dataset_changed=True,
-                summary=f"DecontX estimated ambient RNA contamination (median {float(contamination.median()):.1%}, {n_flagged} cells flagged).",
-                verification=_build_verification(
-                    "passed",
-                    "DecontX completed successfully.",
-                    [
-                        _check(
-                            "contamination_scores_present",
-                            "decontX_contamination" in adata.obs.columns,
-                            "decontX_contamination scores written to adata.obs.",
-                        ),
-                        _check(
-                            "flag_column_present",
-                            "decontX_high_contamination" in adata.obs.columns,
-                            f"{n_flagged} cells flagged above {contamination_threshold:.0%} threshold.",
-                        ),
-                    ],
-                ),
-            )
-
         elif tool_name == "normalize_and_hvg":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            n_hvg = tool_input.get("n_hvg", 4000)
+            n_hvg = int(tool_input.get("n_hvg", 4000))
+            target_sum = tool_input.get("target_sum", 10000)
+            target_sum = float(target_sum) if target_sum is not None else None
+            log_transform = bool(tool_input.get("log_transform", True))
+            raw_layer_name = tool_input.get("raw_layer_name", "raw_counts")
+            force_reset_from_raw = bool(tool_input.get("force_reset_from_raw", True))
+            set_raw_after_normalization = bool(tool_input.get("set_raw_after_normalization", True))
+            hvg_flavor = tool_input.get("hvg_flavor", "seurat")
+            hvg_layer = tool_input.get("hvg_layer")
+            batch_key = tool_input.get("batch_key")
+            hvg_exclude_patterns = tool_input.get("hvg_exclude_patterns") or []
+            if isinstance(hvg_exclude_patterns, str):
+                hvg_exclude_patterns = [hvg_exclude_patterns]
+            hvg_exclusion_mode = tool_input.get("hvg_exclusion_mode", "post")
+            hvg_exclude_match_mode = tool_input.get("hvg_exclude_match_mode", "match")
+            hvg_exclusion_source = tool_input.get("hvg_exclusion_source")
+
+            before_shape = (adata.n_obs, adata.n_vars)
+
+            def _integer_like_matrix(matrix, n_rows: int = 100, n_cols: int = 100) -> bool:
+                if matrix is None:
+                    return False
+                sample = matrix[:min(n_rows, matrix.shape[0]), :min(n_cols, matrix.shape[1])]
+                if hasattr(sample, "toarray"):
+                    sample = sample.toarray()
+                sample = np.asarray(sample)
+                return bool(np.allclose(sample, np.round(sample)))
+
             try:
-                normalize_data(adata)
-                select_hvg(adata, n_top_genes=n_hvg)
+                normalize_data(
+                    adata,
+                    target_sum=target_sum,
+                    log_transform=log_transform,
+                    preserve_raw=True,
+                    raw_layer_name=raw_layer_name,
+                    force_reset_from_raw=force_reset_from_raw,
+                )
+                if set_raw_after_normalization:
+                    adata.raw = adata.copy()
+                select_hvg(
+                    adata,
+                    n_top_genes=n_hvg,
+                    flavor=hvg_flavor,
+                    layer=hvg_layer,
+                    batch_key=batch_key,
+                    exclude_patterns=hvg_exclude_patterns,
+                    exclusion_mode=hvg_exclusion_mode,
+                    exclude_match_mode=hvg_exclude_match_mode,
+                    exclusion_source=hvg_exclusion_source,
+                )
             except ValueError as e:
                 return _error_result(
                     tool="normalize_and_hvg",
                     message=str(e),
                     adata_obj=adata,
                     recovery_options=[
+                        "Retry normalize_and_hvg with force_reset_from_raw=true "
+                        f"so adata.X is restored from layers['{raw_layer_name}'] before normalization.",
                         "If the dataset was already normalized in this session, "
-                        "do not re-run normalize_and_hvg — call select_hvg "
-                        "directly via run_code if you only need to change HVG settings.",
+                        "do not call scanpy normalize/log1p manually on the current X; "
+                        "reset from raw counts first.",
                         "If the dataset was loaded already-normalized from disk, "
                         "load the raw-counts version instead, or place raw "
-                        "counts into adata.layers['raw_counts'] before retrying.",
+                        f"counts into adata.layers['{raw_layer_name}'] before retrying.",
                     ],
                 )
 
@@ -3556,25 +3877,294 @@ def process_tool_call(
             if output_path:
                 write_h5ad_safe(adata, output_path)
 
-            return json.dumps({
+            artifact_payloads = []
+            if output_path:
+                artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
+                if artifact is not None:
+                    artifact_payloads.append(artifact)
+
+            hvg_meta = adata.uns.get("hvg", {})
+            exclusion_meta = hvg_meta.get("feature_exclusions", {})
+            raw_counts_present = raw_layer_name in adata.layers
+            raw_counts_integer_like = (
+                _integer_like_matrix(adata.layers[raw_layer_name])
+                if raw_counts_present
+                else False
+            )
+            raw_shape = list(adata.raw.shape) if adata.raw is not None else None
+            normalized_counts_target = None
+            if log_transform:
+                import scipy.sparse as sp
+                if sp.issparse(adata.X):
+                    X_counts = adata.X.copy()
+                    X_counts.data = np.expm1(X_counts.data)
+                    normalized_counts_target = float(np.median(np.asarray(X_counts.sum(axis=1)).ravel()))
+                else:
+                    X_counts = np.expm1(np.asarray(adata.X))
+                    normalized_counts_target = float(np.median(X_counts.sum(axis=1)))
+
+            result_payload = {
                 "status": "ok",
                 "tool": "normalize_and_hvg",
                 "output_path": output_path,
                 "saved": output_path is not None,
+                "before": {"n_cells": before_shape[0], "n_genes": before_shape[1]},
+                "after": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
+                "target_sum": target_sum,
+                "log_transform": log_transform,
+                "normalization": adata.uns.get("normalization", {}),
+                "raw_layer_name": raw_layer_name,
+                "raw_counts_present": raw_counts_present,
+                "raw_counts_integer_like": raw_counts_integer_like,
+                "adata_raw_set": adata.raw is not None,
+                "adata_raw_shape": raw_shape,
+                "set_raw_after_normalization": set_raw_after_normalization,
                 "n_hvg": int(adata.var['highly_variable'].sum()),
+                "hvg": {
+                    "requested_flavor": hvg_meta.get("requested_flavor", hvg_flavor),
+                    "flavor": hvg_meta.get("flavor", hvg_flavor),
+                    "method": "scanpy.pp.highly_variable_genes",
+                    "n_top_genes": int(hvg_meta.get("n_top_genes", n_hvg)),
+                    "batch_key": hvg_meta.get("batch_key", batch_key),
+                    "layer": hvg_meta.get("layer", hvg_layer),
+                    "n_hvg_selected": int(adata.var['highly_variable'].sum()),
+                },
+                "feature_exclusions": exclusion_meta,
+                "metrics": {
+                    "n_hvg_selected": int(adata.var['highly_variable'].sum()),
+                    "normalized_counts_target_median": normalized_counts_target,
+                    "n_excluded_features": int(exclusion_meta.get("n_excluded", 0) or 0),
+                    "excluded_features_marked_hvg": int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0),
+                },
                 "warnings": warnings,
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            verification_checks = [
+                _check(
+                    "raw_counts_present",
+                    raw_counts_present,
+                    f"Raw counts layer '{raw_layer_name}' is present.",
+                ),
+                _check(
+                    "raw_counts_integer_like",
+                    raw_counts_integer_like,
+                    f"Raw counts layer '{raw_layer_name}' appears integer-like in a matrix sample.",
+                ),
+                _check(
+                    "hvg_count",
+                    int(adata.var['highly_variable'].sum()) > 0,
+                    f"{int(adata.var['highly_variable'].sum())} HVGs are marked.",
+                ),
+                _check(
+                    "excluded_features_not_hvg",
+                    int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0) == 0,
+                    "No excluded features remain marked highly_variable.",
+                ),
+            ]
+            if set_raw_after_normalization:
+                verification_checks.append(
+                    _check(
+                        "adata_raw_set",
+                        adata.raw is not None,
+                        "adata.raw was set after normalization/log1p.",
+                    )
+                )
+            return _finalize_result(
+                result_payload,
+                adata,
+                dataset_changed=True,
+                summary=(
+                    f"Normalized data to target_sum={target_sum}, "
+                    f"selected {int(adata.var['highly_variable'].sum())} HVGs, "
+                    f"and applied {int(exclusion_meta.get('n_excluded', 0) or 0)} source-defined feature exclusions."
+                ),
+                artifacts_created=artifact_payloads,
+                verification=_build_verification(
+                    "passed",
+                    "Normalization and HVG selection completed with provenance checks.",
+                    verification_checks,
+                ),
+            )
+
+        elif tool_name == "run_pca":
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            n_comps = int(tool_input.get("n_comps") or tool_input.get("n_pcs") or 30)
+            svd_solver = tool_input.get("svd_solver", "arpack")
+            mask_var = tool_input.get("mask_var", "highly_variable")
+
+            run_pca(adata, n_comps=n_comps, mask_var=mask_var, svd_solver=svd_solver)
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_pca")
+            if output_path:
+                write_h5ad_safe(adata, output_path)
+
+            result = {
+                "status": "ok",
+                "tool": "run_pca",
+                "output_path": output_path,
+                "saved": output_path is not None,
+                "n_comps": n_comps,
+                "svd_solver": svd_solver,
+                "mask_var": mask_var,
+                "variance_explained": float(adata.uns["pca"]["variance_ratio"].sum()),
+                "side_effects": {
+                    "pca_computed": True,
+                    "neighbors_recomputed": False,
+                    "umap_recomputed": False,
+                    "clustering_recomputed": False,
+                },
+                "warnings": warnings,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=True,
+                summary=f"Ran PCA only with n_comps={n_comps} and svd_solver={svd_solver}.",
+                verification=_build_verification(
+                    "passed",
+                    "PCA was computed without downstream graph or embedding side effects.",
+                    [
+                        _check("pca_present", "X_pca" in adata.obsm, "PCA embedding exists in adata.obsm['X_pca']."),
+                        _check("no_umap_side_effect", "X_umap" not in adata.obsm or starting_state.get("has_umap"), "run_pca did not create a new UMAP embedding."),
+                    ],
+                ),
+            )
+
+        elif tool_name == "run_neighbors":
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            n_neighbors = int(tool_input.get("n_neighbors") or 30)
+            n_pcs = tool_input.get("n_pcs")
+            n_pcs = int(n_pcs) if n_pcs is not None else None
+            use_rep = tool_input.get("use_rep", "X_pca")
+            metric = tool_input.get("metric", "euclidean")
+            key_added = tool_input.get("key_added")
+
+            compute_neighbors(
+                adata,
+                n_neighbors=n_neighbors,
+                n_pcs=n_pcs,
+                use_rep=use_rep,
+                metric=metric,
+                key_added=key_added,
+            )
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_neighbors")
+            if output_path:
+                write_h5ad_safe(adata, output_path)
+
+            graph_key = key_added or "neighbors"
+            result = {
+                "status": "ok",
+                "tool": "run_neighbors",
+                "output_path": output_path,
+                "saved": output_path is not None,
+                "n_neighbors": n_neighbors,
+                "n_pcs": n_pcs,
+                "use_rep": use_rep,
+                "metric": metric,
+                "neighbors_key": graph_key,
+                "neighbors_provenance": _neighbors_provenance(adata) if key_added is None else _sanitize_uns_value(adata.uns.get(key_added, {})),
+                "side_effects": {
+                    "pca_recomputed": False,
+                    "neighbors_recomputed": True,
+                    "umap_recomputed": False,
+                    "clustering_recomputed": False,
+                },
+                "warnings": warnings,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=True,
+                summary=f"Computed neighbors only using {use_rep} with n_neighbors={n_neighbors}.",
+                verification=_build_verification(
+                    "passed",
+                    "Neighbor graph was computed without UMAP or clustering side effects.",
+                    [
+                        _check("neighbors_present", graph_key in adata.uns, f"Neighbors key '{graph_key}' exists in adata.uns."),
+                        _check("no_umap_side_effect", "X_umap" not in adata.obsm or starting_state.get("has_umap"), "run_neighbors did not create a new UMAP embedding."),
+                    ],
+                ),
+            )
+
+        elif tool_name == "run_umap":
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            neighbors_before = _neighbors_provenance(adata)
+            min_dist = float(tool_input.get("min_dist", 0.5))
+            spread = float(tool_input.get("spread", 1.0))
+            n_components = int(tool_input.get("n_components", 2))
+            neighbors_key = tool_input.get("neighbors_key")
+            random_state = int(tool_input.get("random_state", 0))
+
+            compute_umap(
+                adata,
+                min_dist=min_dist,
+                spread=spread,
+                n_components=n_components,
+                neighbors_key=neighbors_key,
+                random_state=random_state,
+            )
+            neighbors_after = _neighbors_provenance(adata)
+            graph_preserved = _provenance_same(neighbors_before, neighbors_after)
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_umap")
+            if output_path:
+                write_h5ad_safe(adata, output_path)
+
+            result = {
+                "status": "ok",
+                "tool": "run_umap",
+                "output_path": output_path,
+                "saved": output_path is not None,
+                "min_dist": min_dist,
+                "spread": spread,
+                "n_components": n_components,
+                "neighbors_key": neighbors_key or "neighbors",
+                "random_state": random_state,
+                "neighbors_before": neighbors_before,
+                "neighbors_after": neighbors_after,
+                "neighbor_graph_preserved": graph_preserved,
+                "side_effects": {
+                    "pca_recomputed": False,
+                    "neighbors_recomputed": False,
+                    "umap_recomputed": True,
+                    "clustering_recomputed": False,
+                },
+                "warnings": warnings,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=True,
+                summary=f"Computed UMAP only from the existing neighbor graph with min_dist={min_dist}.",
+                verification=_build_verification(
+                    "passed" if graph_preserved else "warning",
+                    "UMAP was computed from the existing neighbor graph.",
+                    [
+                        _check("umap_present", "X_umap" in adata.obsm, "UMAP embedding exists in adata.obsm['X_umap']."),
+                        _check("neighbor_graph_preserved", graph_preserved, "Neighbor graph provenance and sparsity were unchanged by run_umap."),
+                    ],
+                ),
+            )
 
         elif tool_name == "run_dimred":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             n_pcs = tool_input.get("n_pcs", 30)
             n_neighbors = tool_input.get("n_neighbors", 30)
+            svd_solver = tool_input.get("svd_solver", "arpack")
+            mask_var = tool_input.get("mask_var", "highly_variable")
+            umap_min_dist = float(tool_input.get("umap_min_dist", 0.1))
 
-            run_pca(adata, n_comps=n_pcs)
+            run_pca(adata, n_comps=n_pcs, mask_var=mask_var, svd_solver=svd_solver)
             compute_neighbors(adata, n_neighbors=n_neighbors)
-            compute_umap(adata)
+            compute_umap(adata, min_dist=umap_min_dist)
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_dimred")
             if output_path:
@@ -3587,7 +4177,16 @@ def process_tool_call(
                 "saved": output_path is not None,
                 "n_pcs": n_pcs,
                 "n_neighbors": n_neighbors,
+                "svd_solver": svd_solver,
+                "mask_var": mask_var,
+                "umap_min_dist": umap_min_dist,
                 "variance_explained": float(adata.uns['pca']['variance_ratio'].sum()),
+                "side_effects": {
+                    "pca_recomputed": True,
+                    "neighbors_recomputed": True,
+                    "umap_recomputed": True,
+                    "clustering_recomputed": False,
+                },
                 "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
@@ -3638,7 +4237,11 @@ def process_tool_call(
                 "method": result_payload["method"],
                 "resolution": result_payload["resolution"],
                 "cluster_key": result_payload["cluster_key"],
+                "created_obs_columns": result_payload["created_obs_columns"],
+                "primary_alias": result_payload["primary_alias"],
                 "primary_cluster_key": result_payload["primary_cluster_key"],
+                "primary_alias_available": result_payload["primary_alias_available"],
+                "primary_alias_created": result_payload["primary_alias_created"],
                 "make_primary": bool(make_primary),
                 "n_clusters": result_payload["n_clusters"],
                 "cluster_sizes": result_payload["cluster_sizes"],
@@ -3647,6 +4250,19 @@ def process_tool_call(
                 "state": make_state(adata)
             }
             primary_key = result_payload["primary_cluster_key"]
+            primary_check = (
+                _check(
+                    "primary_alias_available",
+                    result_payload["primary_alias_available"],
+                    f"Primary clustering alias '{primary_key}' is available.",
+                )
+                if bool(make_primary)
+                else _check(
+                    "primary_alias_not_requested",
+                    True,
+                    "Primary alias was not requested; no alias availability is implied.",
+                )
+            )
             verification_checks = [
                 _check(
                     "cluster_key_created",
@@ -3658,11 +4274,7 @@ def process_tool_call(
                     adata.obs[result_payload["cluster_key"]].nunique() == result_payload["n_clusters"],
                     "Reported cluster count matches the stored clustering column.",
                 ),
-                _check(
-                    "primary_alias_available",
-                    primary_key in adata.obs.columns,
-                    f"Primary clustering alias '{primary_key}' is available.",
-                ),
+                primary_check,
             ]
             return _finalize_result(
                 clustering_result,
@@ -4456,6 +5068,8 @@ def process_tool_call(
 
             # Get batch sizes for output
             batch_sizes = adata.obs[batch_key].value_counts().to_dict()
+            compute_umap_after = bool(tool_input.get("compute_umap", False))
+            compute_neighbors_after = bool(tool_input.get("compute_neighbors", False)) or compute_umap_after
 
             if method == "harmony":
                 run_harmony(adata, batch_key=batch_key)
@@ -4479,8 +5093,12 @@ def process_tool_call(
                     neighbors_within_batch=neighbors_within_batch,
                 )
                 # BBKNN correction lives in the neighbor graph, not an obsm key.
-                # corrected_rep=None signals the UMAP step below to skip recomputing neighbors.
+                # corrected_rep=None signals downstream logic to use the BBKNN graph as-is.
                 corrected_rep = None
+                if tool_input.get("compute_neighbors"):
+                    warnings.append(
+                        "compute_neighbors was ignored for BBKNN because BBKNN itself creates the batch-balanced neighbor graph."
+                    )
             elif method == "scvi":
                 n_latent = int(tool_input.get("n_latent") or 30)
                 max_epochs = int(tool_input.get("max_epochs") or 200)
@@ -4512,12 +5130,25 @@ def process_tool_call(
                 run_scanorama(adata, batch_key=batch_key)
                 corrected_rep = "X_scanorama"
 
-            # Recompute neighbors and UMAP on the corrected representation.
-            # For BBKNN, the neighbor graph is already batch-corrected — skip
-            # recomputing neighbors (that would overwrite the BBKNN graph).
-            if corrected_rep is not None:
-                compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
-            compute_umap(adata)
+            n_neighbors = None
+            neighbors_recomputed = method == "bbknn"
+            umap_recomputed = False
+
+            # Modular behavior: do not run downstream graph/UMAP steps unless
+            # explicitly requested. For embedding-based corrections, UMAP
+            # requires a graph on the corrected representation, so compute it
+            # when compute_umap=true.
+            if corrected_rep is not None and compute_neighbors_after:
+                n_neighbors = int(tool_input.get("n_neighbors") or 30)
+                compute_neighbors(adata, n_neighbors=n_neighbors, use_rep=corrected_rep)
+                neighbors_recomputed = True
+            if compute_umap_after:
+                compute_umap(adata)
+                umap_recomputed = True
+            elif "X_umap" in adata.obsm:
+                warnings.append(
+                    "Batch correction was run without compute_umap=true. Existing X_umap was left unchanged and may not reflect the newly corrected representation/graph."
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
             if output_path:
@@ -4546,6 +5177,8 @@ def process_tool_call(
             if batch_decision is not None:
                 decisions.append(batch_decision)
             extra = {}
+            if corrected_rep is not None and n_neighbors is not None:
+                extra["n_neighbors"] = n_neighbors
             if method == "scvi":
                 extra["n_latent"] = int(tool_input.get("n_latent") or 30)
                 extra["max_epochs"] = int(tool_input.get("max_epochs") or 200)
@@ -4563,8 +5196,10 @@ def process_tool_call(
             )
             umap_note = (
                 "UMAP recomputed from batch-corrected BBKNN neighbor graph"
-                if corrected_rep is None
+                if corrected_rep is None and umap_recomputed
                 else f"UMAP recomputed using corrected {corrected_rep} embedding"
+                if umap_recomputed
+                else "UMAP was not recomputed; run run_umap explicitly when ready."
             )
 
             batch_result = {
@@ -4577,7 +5212,10 @@ def process_tool_call(
                 "n_batches": len(batch_sizes),
                 "batch_sizes": {str(k): int(v) for k, v in batch_sizes.items()},
                 "corrected_embedding": corrected_embedding_label,
-                "umap_recomputed": True,
+                "compute_neighbors_requested": bool(tool_input.get("compute_neighbors", False)),
+                "compute_umap_requested": compute_umap_after,
+                "neighbors_recomputed": neighbors_recomputed,
+                "umap_recomputed": umap_recomputed,
                 "note": umap_note,
                 "warnings": warnings,
                 "state": make_state(adata),
@@ -4596,7 +5234,10 @@ def process_tool_call(
                 batch_result,
                 adata,
                 dataset_changed=True,
-                summary=f"Applied {method} batch correction using '{batch_key}' and recomputed the neighborhood graph.",
+                summary=(
+                    f"Applied {method} batch correction using '{batch_key}'. "
+                    f"Downstream UMAP recomputed: {umap_recomputed}."
+                ),
                 artifacts_created=artifacts_created,
                 decisions_raised=decisions,
                 verification=_build_verification(
@@ -4605,8 +5246,11 @@ def process_tool_call(
                     [
                         _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists in adata.obs."),
                         _check("corrected_embedding_present", corrected_present, corrected_check_label),
-                        _check("umap_present", "X_umap" in adata.obsm, "UMAP was recomputed after correction."),
-                    ],
+                    ] + (
+                        [_check("umap_present", "X_umap" in adata.obsm, "UMAP was recomputed after correction.")]
+                        if compute_umap_after else
+                        [_check("no_umap_side_effect", not umap_recomputed, "UMAP was not recomputed because compute_umap=false.")]
+                    ),
                 ),
             )
 
@@ -4814,6 +5458,9 @@ def process_tool_call(
             )
             method = tool_input.get("method", "wilcoxon")
             layer = tool_input.get("layer")
+            use_raw = tool_input.get("use_raw")
+            key_added = tool_input.get("key_added", "rank_genes_groups")
+            n_genes = int(tool_input.get("n_genes", 100))
             target_geneset = tool_input.get("target_geneset", DEG_DEFAULTS.default_geneset)
 
             # Run validated DEG - this validates inputs, runs rank_genes_groups,
@@ -4823,12 +5470,15 @@ def process_tool_call(
                     adata,
                     groupby=groupby,
                     method=method,
+                    n_genes=n_genes,
                     layer=layer,
+                    use_raw=use_raw,
+                    key_added=key_added,
                     target_geneset=target_geneset,
                     min_cluster_size=DEG_DEFAULTS.min_cluster_size,
                     warn_cluster_size=DEG_DEFAULTS.warn_cluster_size,
                     imbalance_ratio=DEG_DEFAULTS.max_imbalance_ratio,
-                    block_on_errors=False,  # Don't block, let agent see issues
+                    block_on_errors=True,
                     batch_confound_threshold=DEG_DEFAULTS.batch_confound_threshold,
                     max_logfc=DEG_DEFAULTS.max_logfc_sanity,
                     inplace=True,
@@ -4853,7 +5503,7 @@ def process_tool_call(
             top_markers_summary = {}
             for group in groups[:15]:  # Limit to first 15 clusters for response size
                 try:
-                    markers_df = get_top_markers(adata, group=str(group), n_genes=5)
+                    markers_df = get_top_markers(adata, group=str(group), n_genes=5, key=key_added)
                     top_markers_summary[str(group)] = [
                         {
                             "gene": row['names'],
@@ -4872,6 +5522,9 @@ def process_tool_call(
                 "n_errors": len(validity_report.errors),
                 "n_warnings": len(validity_report.warnings),
                 "matrix_type": validity_report.matrix_type,
+                "matrix_source": validity_report.matrix_source,
+                "use_raw": validity_report.use_raw,
+                "layer_used": validity_report.layer_used,
                 "data_species": validity_report.data_species,
                 "gene_id_format": validity_report.gene_id_format,
             }
@@ -4892,9 +5545,15 @@ def process_tool_call(
                 "saved": output_path is not None,
                 "groupby": groupby,
                 "method": method,
+                "key_added": key_added,
+                "n_genes": n_genes,
                 "n_groups": len(groups),
                 "requested_layer": layer,
+                "requested_use_raw": use_raw,
                 "layer_used": validity_report.layer_used,
+                "use_raw": validity_report.use_raw,
+                "matrix_source": validity_report.matrix_source,
+                "matrix_type": validity_report.matrix_type,
                 "cluster_sizes": validity_report.cluster_sizes,
                 "validity": validity_summary,
                 "caveats_for_gsea": deg_caveats,
@@ -5087,9 +5746,8 @@ def process_tool_call(
                 "clusters_analyzed": clusters_to_analyze,
                 "results": all_results,
                 "recommended_next_steps": [
-                    "Use research_findings on the most significant pathway terms for biological interpretation.",
-                    "Use search_papers for broader literature questions or recent reviews.",
-                    "Use web_search_docs for pathway database or software documentation questions."
+                    "Use search_papers on the most significant pathway terms for biological interpretation and recent reviews.",
+                    "Use web_search for pathway database or software documentation questions."
                 ],
                 "note": "NES > 0 means pathway upregulated in this cluster. FDR < 0.25 is typically significant.",
             }

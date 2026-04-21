@@ -188,17 +188,16 @@ def compute_umap_from_scanorama(
         key_added=neighbors_key,
     )
 
-    # Compute UMAP
+    # Compute UMAP directly into umap_key — sc.tl.umap without key_added always
+    # writes to 'X_umap', so we must pass key_added to avoid overwriting any
+    # existing uncorrected UMAP before we can copy it.
     sc.tl.umap(
         adata,
         neighbors_key=neighbors_key,
         min_dist=min_dist,
+        key_added=umap_key,
     )
-
-    # Rename UMAP to avoid overwriting
-    if 'X_umap' in adata.obsm:
-        adata.obsm[umap_key] = adata.obsm['X_umap'].copy()
-        logger.info(f"UMAP stored in adata.obsm['{umap_key}']")
+    logger.info(f"UMAP stored in adata.obsm['{umap_key}']")
 
     if not inplace:
         return adata

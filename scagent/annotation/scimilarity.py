@@ -75,11 +75,12 @@ def prepare_for_scimilarity(
         logger.warning("No raw counts layer found, using adata.X")
         X = adata.X
 
-    # Create minimal AnnData for Scimilarity
+    # Create minimal AnnData for Scimilarity — copy all obs/var so any cluster
+    # key (leiden, phenograph, etc.) is available for centroid queries.
     adata_sci = AnnData(
         X,
-        obs=adata.obs[['leiden']] if 'leiden' in adata.obs.columns else adata.obs[[]],
-        var=adata.var[['gene_ids']] if 'gene_ids' in adata.var.columns else adata.var[[]],
+        obs=adata.obs.copy(),
+        var=adata.var.copy(),
     )
 
     # Copy UMAP if available

@@ -591,34 +591,133 @@ def _detect_gene_id_format(adata: AnnData) -> Tuple[str, bool, bool, List[str]]:
 
     Returns: (format, has_symbols, has_ensembl, sample_names)
     """
-    gene_names = adata.var_names.tolist()
-    sample = gene_names[:20]
-
-    ensembl_pattern = re.compile(r"^ENS[A-Z]{0,3}G\d{11}")
-    entrez_pattern = re.compile(r"^\d{1,8}$")
-    symbol_pattern = re.compile(r"^[A-Z][A-Z0-9-]{1,15}$", re.IGNORECASE)
-
-    ensembl_count = sum(1 for gene in sample if ensembl_pattern.match(str(gene)))
-    entrez_count = sum(1 for gene in sample if entrez_pattern.match(str(gene)))
-    symbol_count = sum(
-        1
-        for gene in sample
-        if symbol_pattern.match(str(gene)) and not ensembl_pattern.match(str(gene))
+    info = _characterize_features(adata)
+    return (
+        info["gene_id_format"],
+        info["has_gene_symbols"],
+        info["has_ensembl_ids"],
+        info["sample_gene_names"],
     )
 
-    has_symbols = "gene_symbols" in adata.var.columns or "gene_name" in adata.var.columns
-    has_ensembl = "gene_ids" in adata.var.columns or "ensembl_id" in adata.var.columns
 
-    if ensembl_count > len(sample) * 0.5:
+def _characterize_features(adata: AnnData) -> dict:
+    """
+    Comprehensive characterization of var_names and obs_names for the LLM.
+
+    Returns a dict that is embedded directly into the inspect_data result so
+    the agent has everything it needs to decide whether gene names need
+    transformation before QC or annotation.
+    """
+    gene_names = adata.var_names.tolist()
+    sample_size = min(200, len(gene_names))
+    sample = gene_names[:sample_size]
+
+    ensembl_re = re.compile(r"^ENS[A-Z]{0,3}G\d{11}")
+    entrez_re = re.compile(r"^\d{1,8}$")
+    symbol_re = re.compile(r"^[A-Z][A-Z0-9\-\.]{1,20}$", re.IGNORECASE)
+    genome_prefix_re = re.compile(r"^([A-Za-z0-9]+_{2,})")
+
+    # --- genome prefix detection ---
+    prefix_counts: dict = {}
+    for g in sample:
+        m = genome_prefix_re.match(str(g))
+        if m:
+            prefix_counts[m.group(1)] = prefix_counts.get(m.group(1), 0) + 1
+    genome_prefix = None
+    if prefix_counts:
+        top_prefix, top_count = max(prefix_counts.items(), key=lambda x: x[1])
+        if top_count > sample_size * 0.3:
+            genome_prefix = top_prefix
+
+    # strip prefix for downstream pattern matching
+    def _strip(name: str) -> str:
+        return genome_prefix_re.sub("", name) if genome_prefix else name
+
+    stripped = [_strip(g) for g in sample]
+
+    ensembl_count = sum(1 for g in stripped if ensembl_re.match(g))
+    entrez_count = sum(1 for g in stripped if entrez_re.match(g))
+    symbol_count = sum(1 for g in stripped if symbol_re.match(g) and not ensembl_re.match(g))
+
+    has_symbols_col = "gene_symbols" in adata.var.columns or "gene_name" in adata.var.columns
+    has_ensembl_col = "gene_ids" in adata.var.columns or "ensembl_id" in adata.var.columns
+
+    if ensembl_count > sample_size * 0.5:
         fmt = "ensembl"
-    elif entrez_count > len(sample) * 0.5:
+    elif entrez_count > sample_size * 0.5:
         fmt = "entrez"
-    elif symbol_count > len(sample) * 0.3:
+    elif symbol_count > sample_size * 0.3:
         fmt = "symbol"
     else:
         fmt = "mixed" if (ensembl_count > 0 and symbol_count > 0) else "unknown"
 
-    return fmt, has_symbols or fmt == "symbol", has_ensembl or fmt == "ensembl", sample[:5]
+    # --- special / non-human gene populations ---
+    special_populations: List[dict] = []
+    all_genes_set = set(gene_names)
+
+    # viral / custom genomes — anything with a prefix different from the main one
+    alt_prefixes: dict = {}
+    for g in gene_names:
+        m = genome_prefix_re.match(str(g))
+        if m:
+            p = m.group(1)
+            if p != genome_prefix:
+                alt_prefixes[p] = alt_prefixes.get(p, 0) + 1
+    for p, cnt in alt_prefixes.items():
+        special_populations.append({"prefix": p, "n_genes": cnt,
+                                     "example": next(g for g in gene_names if g.startswith(p))})
+
+    # SARS-CoV-2 / viral genes without clean prefix
+    sars_genes = [g for g in gene_names if "SARS" in g or "CoV" in g]
+    if sars_genes and not any(p.get("prefix", "").startswith("SARS") for p in special_populations):
+        special_populations.append({"prefix": "SARS-CoV-2 (inline)", "n_genes": len(sars_genes),
+                                     "example": sars_genes[0]})
+
+    # --- MT / ribo detectability ---
+    mt_genes_found = [g for g in gene_names if re.search(r'(?:^|_)MT-', g)]
+    ribo_genes_found = [g for g in gene_names if re.search(r'(?:^|_)(?:RPS|RPL)', g)]
+
+    mt_warning = None
+    ribo_warning = None
+    if len(mt_genes_found) == 0:
+        mt_warning = (
+            f"No MT- genes found with standard prefix search. "
+            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — strip it before QC.' if genome_prefix else 'Inspect var_names format before running QC.'}"
+        )
+    if len(ribo_genes_found) == 0:
+        ribo_warning = (
+            f"No RPS/RPL genes found with standard prefix search. "
+            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — strip it before QC.' if genome_prefix else 'Inspect var_names format before running QC.'}"
+        )
+
+    # --- obs_names (barcode) characterization ---
+    obs_sample = adata.obs_names.tolist()[:10]
+    tenx_re = re.compile(r'^[ACGT]{16}(-\d+)?$')
+    n_tenx = sum(1 for b in obs_sample if tenx_re.match(b))
+    obs_format = "10x_barcode" if n_tenx > 7 else "custom"
+    suffixes = set()
+    for b in obs_sample:
+        m = re.search(r'-(\d+)$', b)
+        if m:
+            suffixes.add(m.group(1))
+
+    return {
+        # gene id format (backwards-compat with existing callers)
+        "gene_id_format": fmt,
+        "has_gene_symbols": has_symbols_col or fmt == "symbol",
+        "has_ensembl_ids": has_ensembl_col or fmt == "ensembl",
+        "sample_gene_names": gene_names[:10],
+        # extended info for LLM — raw facts, no pre-interpreted flags
+        "genome_prefix": genome_prefix,
+        "special_gene_populations": special_populations,
+        "mt_genes_detected": len(mt_genes_found),
+        "mt_gene_examples": mt_genes_found[:3],
+        "ribo_genes_detected": len(ribo_genes_found),
+        "ribo_gene_examples": ribo_genes_found[:3],
+        "obs_names_format": obs_format,
+        "obs_names_sample": obs_sample,
+        "obs_names_suffixes_detected": sorted(suffixes),
+    }
 
 
 def _detect_normalization(adata: AnnData) -> Tuple[bool, bool, str]:
