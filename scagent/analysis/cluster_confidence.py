@@ -58,6 +58,15 @@ def get_best_annotation_key(adata: AnnData, candidates: Optional[List[str]] = No
     for key in candidates or DEFAULT_ANNOTATION_PRIORITY:
         if key in adata.obs.columns:
             return key
+    try:
+        from ..core.inspector import rank_obs_semantic_candidates
+
+        semantic = rank_obs_semantic_candidates(adata, roles={"cell_type"})
+        ranked = semantic.get("cell_type", [])
+        if ranked:
+            return ranked[0].column
+    except Exception:
+        pass
     return None
 
 

@@ -15,6 +15,7 @@ from ..core.inspector import (
     clustering_record_to_dict,
     inspect_data,
     metadata_candidate_to_dict,
+    semantic_roles_to_dict,
 )
 from ..analysis import infer_biological_context
 
@@ -88,6 +89,7 @@ def make_state_dict(state: DataState) -> Dict[str, bool]:
         "has_neighbors": state.has_neighbors,
         "has_umap": state.has_umap,
         "has_clusters": state.has_clusters,
+        "has_celltypes": state.has_celltype_annotations,
     }
 
 
@@ -143,6 +145,11 @@ def build_inspect_return(adata: AnnData, goal: str = None) -> InspectReturn:
                 for record in state.clusterings
             ],
         },
+        biological_context={
+            **biological_context.to_dict(),
+            "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
+            "cell_type_key": state.cell_type_key,
+        },
         batch_info={
             "batch_key": state.batch_key,
             "n_batches": state.n_batches,
@@ -152,6 +159,5 @@ def build_inspect_return(adata: AnnData, goal: str = None) -> InspectReturn:
                 for candidate in state.metadata_candidates
             ],
         },
-        biological_context=biological_context.to_dict(),
         recommended_next_steps=recommend_next_steps(state, goal) if goal else [],
     )

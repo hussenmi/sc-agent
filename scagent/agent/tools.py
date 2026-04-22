@@ -42,6 +42,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
                     "output_path": {"type": "string", "description": "Optional path to save a processed h5ad. Prefer saving only final outputs unless the user explicitly asks for checkpoints."},
                     "preview_only": {"type": "boolean", "description": "If true, do not filter. Instead compute full QC metrics, estimate removals, and generate pre-filter QC figures."},
+                    "confirm_filtering": {"type": "boolean", "description": "Required to apply cell/gene filtering. Set true only after the user has explicitly confirmed the previewed thresholds, parameters, and removal counts."},
                     "data_type": {"type": "string", "enum": ["single_cell", "single_nucleus"], "description": "Must be confirmed with the user before applying filters. 'single_cell'=25% MT threshold; 'single_nucleus'=5%. When omitted from preview, both options are shown so you can present them to the user and ask."},
                     "mt_threshold": {"type": "number", "description": "Max MT% threshold. Overrides data_type if provided."},
                     "filter_mt": {"type": "boolean", "description": "If false, compute and report MT metrics but do not apply a hard MT% cell filter. Use this for source pipelines that inspect MT but do not remove cells by MT%."},
@@ -980,6 +981,36 @@ def get_image_mime_type(image_path: str) -> str:
     return mime_types.get(ext, "image/png")
 
 
+def _dataframe_preview(df, n: int = 5, max_cols: int = 20) -> dict:
+    """Return a JSON-serialisable head() preview of a DataFrame for LLM display."""
+    import math
+    subset = df.iloc[:n, :max_cols]
+    truncated_cols = df.shape[1] > max_cols
+
+    def _clean(v):
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        try:
+            # Categorical → string so json.dumps doesn't choke
+            return v.item() if hasattr(v, "item") else str(v) if not isinstance(v, (int, float, bool, type(None))) else v
+        except Exception:
+            return str(v)
+
+    rows = []
+    for idx, row in subset.iterrows():
+        entry = {"_index": str(idx)}
+        entry.update({col: _clean(val) for col, val in row.items()})
+        rows.append(entry)
+
+    return {
+        "columns": ["_index"] + list(subset.columns),
+        "rows": rows,
+        "total_rows": df.shape[0],
+        "total_cols": df.shape[1],
+        "truncated_cols": truncated_cols,
+    }
+
+
 def process_tool_call(
     tool_name: str,
     tool_input: Dict[str, Any],
@@ -1008,9 +1039,11 @@ def process_tool_call(
         metadata_resolution_to_dict,
         promote_clustering_to_primary,
         rank_obs_metadata_candidates,
+        rank_obs_semantic_candidates,
         recommend_next_steps,
         register_clustering,
         resolve_batch_metadata,
+        semantic_roles_to_dict,
         run_qc_pipeline,
         normalize_data,
         run_pca,
@@ -1048,7 +1081,7 @@ def process_tool_call(
             "has_neighbors": state.has_neighbors,
             "has_umap": state.has_umap,
             "has_clusters": state.has_clusters,
-            "has_celltypes": state.has_celltypist or state.has_scimilarity,
+            "has_celltypes": state.has_celltype_annotations,
         }
 
     starting_state = make_state(adata) if adata is not None else {}
@@ -1247,11 +1280,13 @@ def process_tool_call(
         }
 
     def _available_annotation_keys(adata_obj) -> List[str]:
-        return [
-            column
-            for column in adata_obj.obs.columns
-            if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label"))
-        ]
+        semantic = rank_obs_semantic_candidates(adata_obj, roles={"cell_type"})
+        keys = [candidate.column for candidate in semantic.get("cell_type", [])]
+        for column in adata_obj.obs.columns:
+            if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label")):
+                if column not in keys:
+                    keys.append(column)
+        return keys
 
     def _available_plot_colors(adata_obj) -> List[str]:
         preferred = [
@@ -2660,6 +2695,34 @@ def process_tool_call(
                     "n_clusters": state.n_clusters,
                     "available_clusterings": _clusterings_payload(working_adata),
                 },
+                "annotations": {
+                    "has_celltypes": state.has_celltype_annotations,
+                    "cell_type_key": state.cell_type_key,
+                    "cell_type_candidates": [
+                        metadata_candidate_to_dict(candidate)
+                        for candidate in state.cell_type_candidates
+                    ],
+                    "sources": [
+                        source
+                        for source, present in (
+                            ("celltypist", state.has_celltypist),
+                            ("scimilarity", state.has_scimilarity),
+                            (
+                                "external_or_manual",
+                                bool(state.cell_type_candidates)
+                                and not (state.has_celltypist or state.has_scimilarity),
+                            ),
+                        )
+                        if present
+                    ],
+                },
+                "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
+                "metadata_interpretation": {
+                    "note": (
+                        "semantic_obs_roles are ranked deterministic candidates for the LLM/user to "
+                        "choose from when column meaning is ambiguous."
+                    )
+                },
                 "batch": {
                     "confirmed_batch_key": confirmed_batch_key,
                     "inferred_batch_key": state.batch_key,
@@ -2684,6 +2747,8 @@ def process_tool_call(
                 "available_clusterings": _clusterings_payload(working_adata),
                 "biological_context": biological_context.to_dict(),
                 "analysis_guidance": guidance,
+                "obs_preview": _dataframe_preview(working_adata.obs),
+                "var_preview": _dataframe_preview(working_adata.var),
             }
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)
@@ -2857,20 +2922,77 @@ def process_tool_call(
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
 
             metrics = {}
-            for col in ['total_counts', 'n_genes_by_counts', 'pct_counts_mt', 'doublet_score']:
+            semantic_qc = rank_obs_semantic_candidates(
+                working_adata,
+                roles={
+                    "qc_total_counts",
+                    "qc_n_genes",
+                    "qc_pct_mt",
+                    "qc_pct_ribo",
+                    "doublet_score",
+                    "doublet_label",
+                },
+            )
+            metric_columns = []
+            canonical_metric_columns = [
+                'total_counts',
+                'n_genes_by_counts',
+                'pct_counts_mt',
+                'pct_counts_ribo',
+                'doublet_score',
+            ]
+            for col in canonical_metric_columns:
                 if col in working_adata.obs:
-                    metrics[col] = {
-                        "median": float(working_adata.obs[col].median()),
-                        "mean": float(working_adata.obs[col].mean()),
-                        "min": float(working_adata.obs[col].min()),
-                        "max": float(working_adata.obs[col].max())
-                    }
+                    metric_columns.append((col, col, None))
+            semantic_metric_by_column = {}
+            for role, candidates in semantic_qc.items():
+                if role == "doublet_label" or not candidates:
+                    continue
+                for candidate in candidates:
+                    existing = semantic_metric_by_column.get(candidate.column)
+                    if existing is None or candidate.confidence > existing[1].confidence:
+                        semantic_metric_by_column[candidate.column] = (role, candidate)
+            existing_columns = {existing[0] for existing in metric_columns}
+            for column, (role, candidate) in semantic_metric_by_column.items():
+                if column not in existing_columns:
+                    metric_columns.append((column, role, candidate))
+
+            for col, role, candidate in metric_columns:
+                values = working_adata.obs[col]
+                if not hasattr(values, "median"):
+                    continue
+                metrics[role] = {
+                    "column": col,
+                    "median": float(values.median()),
+                    "mean": float(values.mean()),
+                    "min": float(values.min()),
+                    "max": float(values.max())
+                }
+                if candidate is not None:
+                    metrics[role]["candidate"] = metadata_candidate_to_dict(candidate)
 
             doublet_info = {}
-            if 'predicted_doublet' in working_adata.obs:
+            doublet_label = (
+                'predicted_doublet'
+                if 'predicted_doublet' in working_adata.obs
+                else (
+                    semantic_qc.get("doublet_label", [{}])[0].column
+                    if semantic_qc.get("doublet_label")
+                    else None
+                )
+            )
+            if doublet_label and doublet_label in working_adata.obs:
+                labels = working_adata.obs[doublet_label]
+                if labels.dtype == bool:
+                    positive = labels
+                else:
+                    positive = labels.astype(str).str.lower().isin(
+                        {"true", "1", "doublet", "multiplet", "positive"}
+                    )
                 doublet_info = {
-                    "n_doublets": int(working_adata.obs['predicted_doublet'].sum()),
-                    "doublet_rate": float(working_adata.obs['predicted_doublet'].mean())
+                    "column": doublet_label,
+                    "n_doublets": int(positive.sum()),
+                    "doublet_rate": float(positive.mean())
                 }
 
             return json.dumps({
@@ -2886,12 +3008,44 @@ def process_tool_call(
 
             # Find annotation column
             key = tool_input.get("annotation_key")
+            cell_type_candidates = rank_obs_semantic_candidates(
+                working_adata,
+                roles={"cell_type"},
+            ).get("cell_type", [])
             if not key:
-                for candidate in ['celltypist_majority_voting', 'celltypist_predicted_labels',
-                                  'scimilarity_representative_prediction', 'cell_type', 'celltype']:
-                    if candidate in working_adata.obs:
-                        key = candidate
-                        break
+                if cell_type_candidates:
+                    top = cell_type_candidates[0]
+                    gap = (
+                        top.confidence - cell_type_candidates[1].confidence
+                        if len(cell_type_candidates) > 1
+                        else top.confidence
+                    )
+                    if top.confidence >= 0.72 and gap >= 0.08:
+                        key = top.column
+                    elif len(cell_type_candidates) == 1 and top.confidence >= 0.55:
+                        key = top.column
+                    else:
+                        return _finalize_result(
+                            {
+                                "status": "needs_choice",
+                                "tool": "get_celltypes",
+                                "message": (
+                                    "Multiple obs columns look like possible cell type annotations. "
+                                    "Choose one and call get_celltypes with annotation_key."
+                                ),
+                                "cell_type_candidates": [
+                                    metadata_candidate_to_dict(candidate)
+                                    for candidate in cell_type_candidates
+                                ],
+                                "recovery_options": [
+                                    "Call get_celltypes again with annotation_key set to the intended column.",
+                                    "Ask the user whether they want broad, fine, automated, or manual labels.",
+                                ],
+                            },
+                            updated_adata,
+                            dataset_changed=False,
+                            summary="Cell type annotation column needs disambiguation.",
+                        )
 
             if not key or key not in working_adata.obs:
                 return _smart_unavailable_result(
@@ -2901,8 +3055,14 @@ def process_tool_call(
                     missing_prerequisites=["annotation"],
                     recovery_options=[
                         "Run cell type annotation on the current clustering.",
-                        "Inspect available clustering keys before annotating.",
+                        "Inspect semantic_obs_roles from inspect_data for possible annotation columns.",
                     ],
+                    extra={
+                        "cell_type_candidates": [
+                            metadata_candidate_to_dict(candidate)
+                            for candidate in cell_type_candidates
+                        ],
+                    },
                 )
 
             counts = working_adata.obs[key].value_counts()
@@ -2946,6 +3106,9 @@ def process_tool_call(
                     metadata_candidate_to_dict(candidate)
                     for candidate in rank_obs_metadata_candidates(working_adata)
                 ],
+                "semantic_obs_roles": semantic_roles_to_dict(
+                    rank_obs_semantic_candidates(working_adata)
+                ),
             }, indent=2), updated_adata
 
         elif tool_name in {"review_figure", "review_artifact"}:
@@ -3151,6 +3314,8 @@ def process_tool_call(
 
         # ===== ACTION TOOLS =====
         elif tool_name == "run_qc":
+            import pandas as pd
+
             warnings = []
             if adata is not None and tool_input.get("data_path") not in (None, "memory"):
                 warnings.append(
@@ -3169,6 +3334,7 @@ def process_tool_call(
             min_cells = tool_input.get("min_cells")
             requested_mt_threshold = tool_input.get("mt_threshold")
             preview_only = bool(tool_input.get("preview_only", False))
+            confirm_filtering = bool(tool_input.get("confirm_filtering", False))
             scrublet_expected_doublet_rate = float(tool_input.get("scrublet_expected_doublet_rate") or 0.06)
             scrublet_sim_doublet_ratio = float(tool_input.get("scrublet_sim_doublet_ratio") or 2.0)
             scrublet_n_prin_comps = int(tool_input.get("scrublet_n_prin_comps") or 30)
@@ -3379,6 +3545,26 @@ def process_tool_call(
             n_mt_genes_detected = int(qc_preview.var['mt'].sum()) if 'mt' in qc_preview.var.columns else 0
             n_ribo_genes_detected = int(qc_preview.var['ribo'].sum()) if 'ribo' in qc_preview.var.columns else 0
 
+            cell_removal_mask = pd.Series(False, index=qc_preview.obs_names)
+            if min_genes is not None and 'n_genes_by_counts' in qc_preview.obs.columns:
+                cell_removal_mask |= qc_preview.obs['n_genes_by_counts'] < int(min_genes)
+            if filter_mt and 'pct_counts_mt' in qc_preview.obs.columns:
+                cell_removal_mask |= qc_preview.obs['pct_counts_mt'] >= mt_threshold
+            if remove_doublets and 'predicted_doublet' in qc_preview.obs.columns:
+                cell_removal_mask |= qc_preview.obs['predicted_doublet'].astype(bool)
+            projected_cells_removed = int(cell_removal_mask.sum())
+            projected_cells_retained = int(n_before - projected_cells_removed)
+
+            gene_removal_mask = pd.Series(False, index=qc_preview.var_names)
+            if 'n_cells_by_counts' in qc_preview.var.columns:
+                gene_removal_mask |= qc_preview.var['n_cells_by_counts'] < int(min_cells)
+            if remove_ribo and 'ribo' in qc_preview.var.columns:
+                gene_removal_mask |= qc_preview.var['ribo'].astype(bool)
+            if remove_mt and 'mt' in qc_preview.var.columns:
+                gene_removal_mask |= qc_preview.var['mt'].astype(bool)
+            projected_genes_removed = int(gene_removal_mask.sum())
+            projected_genes_retained = int(g_before - projected_genes_removed)
+
             figure_outputs = []
             figure_dir = tool_input.get("figure_dir")
             if figure_dir:
@@ -3562,6 +3748,71 @@ def process_tool_call(
                     "n_ribo_genes_detected": n_ribo_genes_detected,
                 },
             }
+            filtering_plan = {
+                "confirmation_required": not preview_only and not confirm_filtering,
+                "confirmed": bool(confirm_filtering and not preview_only),
+                "parameters": {
+                    "mt_threshold": mt_threshold,
+                    "filter_mt": filter_mt,
+                    "data_type": requested_data_type,
+                    "data_type_confirmed": data_type_confirmed,
+                    "min_genes": int(min_genes) if min_genes is not None else None,
+                    "min_cells_per_gene": int(min_cells),
+                    "remove_ribo": bool(remove_ribo),
+                    "remove_mt_genes": bool(remove_mt),
+                    "detect_doublets": bool(detect_doublets_flag),
+                    "remove_doublets": bool(remove_doublets),
+                    "batch_key_for_doublets": batch_key,
+                    "scrublet": scrublet_params_for_report,
+                },
+                "cell_filters": {
+                    "low_genes": {
+                        "enabled": min_genes is not None,
+                        "threshold": int(min_genes) if min_genes is not None else None,
+                        "cells_flagged": cells_low_genes,
+                        "will_remove": min_genes is not None,
+                    },
+                    "high_mt": {
+                        "enabled": bool(filter_mt),
+                        "threshold_pct": mt_threshold,
+                        "cells_flagged": cells_over_mt,
+                        "will_remove": bool(filter_mt),
+                    },
+                    "doublets": {
+                        "enabled": bool(detect_doublets_flag),
+                        "cells_flagged": predicted_doublets,
+                        "will_remove": bool(remove_doublets),
+                    },
+                },
+                "gene_filters": {
+                    "low_cells": {
+                        "enabled": True,
+                        "threshold": int(min_cells),
+                        "genes_flagged": genes_low_cells,
+                        "will_remove": True,
+                    },
+                    "ribosomal": {
+                        "enabled": bool(remove_ribo),
+                        "genes_flagged": ribo_genes,
+                        "will_remove": bool(remove_ribo),
+                    },
+                    "mitochondrial": {
+                        "enabled": bool(remove_mt),
+                        "genes_flagged": mt_genes,
+                        "will_remove": bool(remove_mt),
+                    },
+                },
+                "projected_after_filtering": {
+                    "cells_removed": projected_cells_removed,
+                    "cells_retained": projected_cells_retained,
+                    "genes_removed_before_cell_filtering": projected_genes_removed,
+                    "genes_retained_before_cell_filtering": projected_genes_retained,
+                    "note": (
+                        "Gene removals are estimated before cell filtering; final gene removals can change "
+                        "after cells are removed."
+                    ),
+                },
+            }
 
             cell_filter_bits = []
             if min_genes is not None:
@@ -3635,6 +3886,7 @@ def process_tool_call(
                     "after": {"n_cells": n_before, "n_genes": g_before},
                     "data_type_confirmed": data_type_confirmed,
                     "recommendation": recommendation,
+                    "filtering_plan": filtering_plan,
                     "qc_decisions": qc_decisions,
                     "metrics": {
                         "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
@@ -3676,6 +3928,54 @@ def process_tool_call(
                         "passed",
                         "QC preview completed and reported a concrete batch strategy.",
                         verification_checks,
+                    ),
+                )
+
+            if not confirm_filtering:
+                confirmation_result = {
+                    "status": "needs_confirmation",
+                    "tool": "run_qc",
+                    "mode": "confirmation_required",
+                    "message": (
+                        "QC filtering was not applied. Review the thresholds, parameters, and removal "
+                        "counts, then confirm before I remove cells or genes."
+                    ),
+                    "required_next_action": "ask_user",
+                    "before": {"n_cells": n_before, "n_genes": g_before},
+                    "after": {"n_cells": n_before, "n_genes": g_before},
+                    "recommendation": recommendation,
+                    "filtering_plan": filtering_plan,
+                    "qc_decisions": qc_decisions,
+                    "metrics": {
+                        "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
+                        "doublet_rate": float(qc_preview.obs['predicted_doublet'].mean()) if 'predicted_doublet' in qc_preview.obs else None,
+                        "cells_below_min_genes": cells_low_genes,
+                        "genes_below_min_cells": genes_low_cells,
+                        "predicted_doublets": predicted_doublets,
+                        "cells_over_mt_threshold": cells_over_mt,
+                    },
+                    "warnings": warnings,
+                    "figures": figure_outputs,
+                    "batch_strategy": batch_strategy,
+                    "state": make_state(adata),
+                }
+                return _finalize_result(
+                    confirmation_result,
+                    adata,
+                    dataset_changed=False,
+                    summary="Prepared a QC filtering plan and paused for explicit confirmation.",
+                    artifacts_created=artifact_payloads,
+                    decisions_raised=decisions,
+                    verification=_build_verification(
+                        "passed",
+                        "QC filtering did not modify the dataset because confirmation is required.",
+                        [
+                            _check(
+                                "dataset_unchanged",
+                                adata.n_obs == n_before and adata.n_vars == g_before,
+                                "No cells or genes were removed before confirmation.",
+                            )
+                        ],
                     ),
                 )
 
@@ -3752,6 +4052,7 @@ def process_tool_call(
                 "before": {"n_cells": n_before, "n_genes": g_before},
                 "after": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "recommendation": recommendation,
+                "filtering_plan": filtering_plan,
                 "qc_decisions": qc_decisions,
                 "metrics": {
                     "cells_removed": actual_cells_removed,

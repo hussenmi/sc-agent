@@ -6,6 +6,7 @@ and recommends what analysis steps are needed to reach a user's goal.
 """
 
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -81,6 +82,158 @@ METADATA_ROLE_ALIASES = {
 }
 
 PARTITION_ROLES = {"batch", "sample", "donor"}
+
+SEMANTIC_OBS_ROLE_ALIASES = {
+    **METADATA_ROLE_ALIASES,
+    "cell_type": {
+        "cell_type",
+        "celltype",
+        "celltypes",
+        "cell_type_label",
+        "cell_type_labels",
+        "cell_label",
+        "cell_labels",
+        "cell_identity",
+        "identity",
+        "annotation",
+        "annotations",
+        "manual_annotation",
+        "manual_annotations",
+        "manual_labels",
+        "author_cell_type",
+        "author_celltype",
+        "broad_cell_type",
+        "fine_cell_type",
+        "predicted_labels",
+        "majority_voting",
+        "celltypist_predicted_labels",
+        "celltypist_majority_voting",
+        "predictions_unconstrained",
+        "representative_prediction",
+        "scimilarity_predictions_unconstrained",
+        "scimilarity_representative_prediction",
+        "cell_ontology_class",
+        "cell_ontology_term",
+    },
+    "cluster": {
+        "cluster",
+        "clusters",
+        "cluster_id",
+        "clusterid",
+        "clustering",
+        "leiden",
+        "louvain",
+        "phenograph",
+        "pheno_leiden",
+        "seurat_clusters",
+        "seurat_cluster",
+        "snn_res",
+        "rna_snn_res",
+        "integrated_snn_res",
+        "res",
+        "resolution",
+    },
+    "disease": {
+        "disease",
+        "disease_status",
+        "diagnosis",
+        "pathology",
+        "phenotype",
+    },
+    "tissue": {
+        "tissue",
+        "tissue_type",
+        "organ",
+        "site",
+        "anatomical_site",
+        "compartment",
+    },
+    "qc_total_counts": {
+        "total_counts",
+        "n_counts",
+        "ncounts",
+        "n_count",
+        "ncount_rna",
+        "ncount",
+        "umi_counts",
+        "n_umi",
+    },
+    "qc_n_genes": {
+        "n_genes_by_counts",
+        "n_genes",
+        "num_genes",
+        "n_feature",
+        "n_features",
+        "nfeature_rna",
+        "nfeature",
+        "genes_detected",
+    },
+    "qc_pct_mt": {
+        "pct_counts_mt",
+        "percent_mt",
+        "percent.mt",
+        "pct_mt",
+        "mt_pct",
+        "mito_pct",
+        "percent_mito",
+        "percent_mitochondrial",
+    },
+    "qc_pct_ribo": {
+        "pct_counts_ribo",
+        "percent_ribo",
+        "percent.ribo",
+        "pct_ribo",
+        "ribo_pct",
+        "percent_ribosomal",
+    },
+    "doublet_score": {
+        "doublet_score",
+        "doubletscore",
+        "scrublet_score",
+        "scrublet_doublet_score",
+    },
+    "doublet_label": {
+        "predicted_doublet",
+        "doublet",
+        "is_doublet",
+        "doublet_call",
+        "doublet_label",
+        "doublet_class",
+    },
+}
+
+NUMERIC_SEMANTIC_ROLES = {
+    "qc_total_counts",
+    "qc_n_genes",
+    "qc_pct_mt",
+    "qc_pct_ribo",
+    "doublet_score",
+}
+
+CELL_TYPE_VALUE_PATTERNS = [
+    r"\bt\s*cell\b",
+    r"\bb\s*cell\b",
+    r"\bnk\b",
+    r"\bcd4\b",
+    r"\bcd8\b",
+    r"\bmonocyte\b",
+    r"\bmacrophage\b",
+    r"\bdendritic\b",
+    r"\bplasma\b",
+    r"\bmast\b",
+    r"\bneutrophil\b",
+    r"\bgranulocyte\b",
+    r"\bepithelial\b",
+    r"\bendothelial\b",
+    r"\bfibroblast\b",
+    r"\bastrocyte\b",
+    r"\bmicroglia\b",
+    r"\bneuron\b",
+    r"\bhepatocyte\b",
+    r"\bkeratinocyte\b",
+    r"\bmyeloid\b",
+    r"\blymphocyte\b",
+]
 
 
 @dataclass
@@ -179,6 +332,10 @@ class DataState:
     has_celltypist: bool = False
     celltypist_model: str = ""
     has_scimilarity: bool = False
+    has_celltype_annotations: bool = False
+    cell_type_key: str = ""
+    cell_type_candidates: List[MetadataCandidate] = field(default_factory=list)
+    semantic_obs_roles: Dict[str, List[MetadataCandidate]] = field(default_factory=dict)
 
     # Batch info
     batch_key: Optional[str] = None
@@ -240,6 +397,17 @@ def metadata_candidate_to_dict(candidate: MetadataCandidate) -> Dict[str, Any]:
     }
 
 
+def semantic_roles_to_dict(
+    roles: Dict[str, List[MetadataCandidate]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Serialize semantic obs-role candidates for LLM-facing responses."""
+    return {
+        role: [metadata_candidate_to_dict(candidate) for candidate in candidates]
+        for role, candidates in roles.items()
+        if candidates
+    }
+
+
 def metadata_resolution_to_dict(resolution: MetadataResolution) -> Dict[str, Any]:
     """Serialize a metadata resolution decision for tool responses."""
     return {
@@ -284,6 +452,13 @@ def _is_integer_matrix(X) -> bool:
     return bool(np.allclose(sample, np.round(sample)))
 
 
+def _is_subdtype(dtype, kind) -> bool:
+    try:
+        return bool(np.issubdtype(dtype, kind))
+    except TypeError:
+        return False
+
+
 def _detect_data_type(adata: AnnData) -> str:
     """
     Detect if data is from cells or nuclei based on MT content distribution.
@@ -309,16 +484,27 @@ def _normalize_column_name(column: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
 
 
-def _column_name_role_scores(column: str) -> Dict[str, float]:
+def _column_name_role_scores(
+    column: str,
+    aliases_by_role: Optional[Dict[str, Iterable[str]]] = None,
+    *,
+    fuzzy: bool = False,
+) -> Dict[str, float]:
     """Score how strongly a column name suggests each metadata role."""
+    aliases_by_role = aliases_by_role or METADATA_ROLE_ALIASES
     normalized = _normalize_column_name(column)
+    compact = normalized.replace("_", "")
     tokens = set(filter(None, normalized.split("_")))
     scores: Dict[str, float] = {}
 
-    for role, aliases in METADATA_ROLE_ALIASES.items():
+    for role, aliases in aliases_by_role.items():
         normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
+        compact_aliases = {alias.replace("_", "") for alias in normalized_aliases}
         if normalized in normalized_aliases:
             scores[role] = 1.0
+            continue
+        if compact in compact_aliases:
+            scores[role] = max(scores.get(role, 0.0), 0.96)
             continue
 
         alias_tokens = {
@@ -330,6 +516,21 @@ def _column_name_role_scores(column: str) -> Dict[str, float]:
         overlap = len(tokens & alias_tokens)
         if overlap:
             scores[role] = min(0.85, 0.45 + 0.18 * overlap)
+
+        if compact and fuzzy:
+            best_ratio = max(
+                (SequenceMatcher(None, compact, alias).ratio() for alias in compact_aliases),
+                default=0.0,
+            )
+            if best_ratio >= 0.88:
+                scores[role] = max(scores.get(role, 0.0), min(0.92, best_ratio))
+            elif best_ratio >= 0.80 and len(compact) >= 5:
+                scores[role] = max(scores.get(role, 0.0), 0.72)
+
+        if len(compact) >= 5:
+            for alias in compact_aliases:
+                if len(alias) >= 5 and (compact in alias or alias in compact):
+                    scores[role] = max(scores.get(role, 0.0), 0.78)
 
     if normalized.endswith("_id"):
         if "sample" in normalized or "orig" in normalized:
@@ -384,6 +585,204 @@ def _is_discrete_obs_column(adata: AnnData, column: str) -> bool:
         return np.allclose(non_na.to_numpy(), np.round(non_na.to_numpy()))
 
     return False
+
+
+def _categorical_structure_score(series, n_obs: int, role: str) -> float:
+    n_unique = int(series.nunique(dropna=True))
+    if n_unique <= 1 or n_unique >= n_obs:
+        return 0.0
+
+    unique_fraction = n_unique / max(1, n_obs)
+    dtype_name = str(series.dtype)
+    score = 0.0
+    if dtype_name == "category" or dtype_name == "bool" or "string" in dtype_name or dtype_name == "object":
+        score += 0.3
+    elif _is_subdtype(series.dtype, np.integer):
+        score += 0.22
+    elif _is_subdtype(series.dtype, np.floating):
+        non_na = series.dropna()
+        if non_na.empty or not np.allclose(non_na.to_numpy(), np.round(non_na.to_numpy())):
+            return 0.0
+        score += 0.12
+
+    if role == "cell_type":
+        if 2 <= n_unique <= min(200, max(8, int(n_obs * 0.35))):
+            score += 0.32
+        elif unique_fraction < 0.65:
+            score += 0.16
+    elif role == "cluster":
+        if 2 <= n_unique <= min(80, max(3, int(n_obs * 0.25))):
+            score += 0.34
+        elif unique_fraction < 0.35:
+            score += 0.12
+    else:
+        if n_unique <= min(24, max(3, int(n_obs * 0.2))):
+            score += 0.3
+        elif unique_fraction <= 0.3:
+            score += 0.14
+
+    if unique_fraction <= 0.05:
+        score += 0.18
+    elif unique_fraction <= 0.2:
+        score += 0.1
+
+    return min(1.0, score)
+
+
+def _numeric_structure_score(series, role: str) -> float:
+    if not _is_subdtype(series.dtype, np.number):
+        return 0.0
+    non_na = series.dropna()
+    if non_na.empty:
+        return 0.0
+
+    score = 0.45
+    values = non_na.to_numpy()
+    if role in {"qc_pct_mt", "qc_pct_ribo", "doublet_score"}:
+        finite = values[np.isfinite(values)]
+        if len(finite) and float(np.nanmin(finite)) >= 0:
+            score += 0.15
+        if len(finite) and float(np.nanmax(finite)) <= 100:
+            score += 0.12
+    elif role in {"qc_total_counts", "qc_n_genes"}:
+        if float(np.nanmax(values)) > 10:
+            score += 0.12
+        if np.allclose(values[: min(1000, len(values))], np.round(values[: min(1000, len(values))])):
+            score += 0.08
+    return min(1.0, score)
+
+
+def _semantic_value_score(series, role: str) -> float:
+    values = [str(value).strip().lower() for value in series.dropna().unique().tolist()[:50]]
+    if not values:
+        return 0.0
+
+    if role == "cell_type":
+        text = " | ".join(values)
+        matches = sum(1 for pattern in CELL_TYPE_VALUE_PATTERNS if re.search(pattern, text))
+        if matches >= 3:
+            return 0.45
+        if matches == 2:
+            return 0.34
+        if matches == 1:
+            return 0.22
+        if any("cell" in value for value in values):
+            return 0.14
+
+    if role == "cluster":
+        numeric_like = 0
+        for value in values:
+            try:
+                float(value)
+                numeric_like += 1
+            except ValueError:
+                if value.startswith(("cluster", "clust", "c")):
+                    numeric_like += 1
+        if numeric_like and numeric_like / len(values) >= 0.75:
+            return 0.32
+
+    if role == "doublet_label":
+        normalized_values = {value.replace(" ", "_") for value in values}
+        known = {"true", "false", "0", "1", "doublet", "singlet", "multiplet", "negative", "positive"}
+        if normalized_values and normalized_values <= known:
+            return 0.35
+
+    return 0.0
+
+
+def _semantic_min_confidence(role: str) -> float:
+    if role in {"cell_type", "cluster"}:
+        return 0.38
+    if role in NUMERIC_SEMANTIC_ROLES:
+        return 0.48
+    return 0.34
+
+
+def _score_obs_semantic_candidate(
+    adata: AnnData,
+    column: str,
+    role: str,
+) -> Optional[MetadataCandidate]:
+    series = adata.obs[column]
+    n_obs = max(1, adata.n_obs)
+    n_unique = int(series.nunique(dropna=True))
+    if n_unique <= 1:
+        return None
+
+    name_score = _column_name_role_scores(
+        column,
+        SEMANTIC_OBS_ROLE_ALIASES,
+        fuzzy=True,
+    ).get(role, 0.0)
+    if role in NUMERIC_SEMANTIC_ROLES and name_score < 0.7:
+        return None
+
+    if role in NUMERIC_SEMANTIC_ROLES:
+        structure_score = _numeric_structure_score(series, role)
+        value_score = 0.0
+    else:
+        structure_score = _categorical_structure_score(series, n_obs, role)
+        value_score = _semantic_value_score(series, role)
+
+    if structure_score == 0.0 and name_score < 0.9:
+        return None
+
+    confidence = min(0.99, 0.56 * name_score + 0.27 * structure_score + 0.17 * value_score)
+    if name_score == 0.0:
+        confidence *= 0.72
+    if confidence < _semantic_min_confidence(role):
+        return None
+
+    examples = _series_examples(series.dropna().unique().tolist(), limit=4)
+    rationale_parts = [f"{n_unique} unique values"]
+    if name_score >= 0.9:
+        rationale_parts.append(f"name strongly suggests {role}")
+    elif name_score >= 0.65:
+        rationale_parts.append(f"name resembles {role}")
+    elif name_score > 0:
+        rationale_parts.append(f"name weakly suggests {role}")
+    if structure_score >= 0.55:
+        rationale_parts.append("values have the expected structure")
+    elif structure_score > 0:
+        rationale_parts.append("values are structurally plausible")
+    if value_score > 0:
+        rationale_parts.append("example values support the role")
+    if examples:
+        rationale_parts.append("examples: " + ", ".join(examples))
+
+    return MetadataCandidate(
+        column=str(column),
+        role=role,
+        n_unique=n_unique,
+        unique_fraction=n_unique / n_obs,
+        confidence=round(confidence, 3),
+        rationale="; ".join(rationale_parts),
+        dtype=str(series.dtype),
+        examples=examples,
+    )
+
+
+def rank_obs_semantic_candidates(
+    adata: AnnData,
+    *,
+    roles: Optional[Iterable[str]] = None,
+    limit_per_role: int = 6,
+) -> Dict[str, List[MetadataCandidate]]:
+    """Rank obs columns by semantic role using names, structure, and examples."""
+    roles_set = set(roles) if roles is not None else set(SEMANTIC_OBS_ROLE_ALIASES)
+    ranked: Dict[str, List[MetadataCandidate]] = {}
+
+    for column in adata.obs.columns:
+        for role in roles_set:
+            candidate = _score_obs_semantic_candidate(adata, column, role)
+            if candidate is not None:
+                ranked.setdefault(role, []).append(candidate)
+
+    for role, candidates in list(ranked.items()):
+        candidates.sort(key=lambda candidate: candidate.confidence, reverse=True)
+        ranked[role] = candidates[:limit_per_role]
+
+    return ranked
 
 
 def rank_obs_metadata_candidates(
@@ -667,12 +1066,6 @@ def _characterize_features(adata: AnnData) -> dict:
         special_populations.append({"prefix": p, "n_genes": cnt,
                                      "example": next(g for g in gene_names if g.startswith(p))})
 
-    # SARS-CoV-2 / viral genes without clean prefix
-    sars_genes = [g for g in gene_names if "SARS" in g or "CoV" in g]
-    if sars_genes and not any(p.get("prefix", "").startswith("SARS") for p in special_populations):
-        special_populations.append({"prefix": "SARS-CoV-2 (inline)", "n_genes": len(sars_genes),
-                                     "example": sars_genes[0]})
-
     # --- MT / ribo detectability ---
     mt_genes_found = [g for g in gene_names if re.search(r'(?:^|_)MT-', g)]
     ribo_genes_found = [g for g in gene_names if re.search(r'(?:^|_)(?:RPS|RPL)', g)]
@@ -835,6 +1228,25 @@ def _infer_obs_clustering_entries(adata: AnnData) -> List[ClusteringRecord]:
         )
         seen.add(text)
 
+    semantic_clusters = rank_obs_semantic_candidates(adata, roles={"cluster"}).get("cluster", [])
+    for candidate in semantic_clusters:
+        if candidate.column in seen:
+            continue
+        n_clusters = int(adata.obs[candidate.column].nunique(dropna=True))
+        if n_clusters <= 1:
+            continue
+        entries.append(
+            ClusteringRecord(
+                key=candidate.column,
+                method="inferred",
+                n_clusters=n_clusters,
+                resolution=None,
+                is_primary=False,
+                created_by="inferred",
+            )
+        )
+        seen.add(candidate.column)
+
     return entries
 
 
@@ -979,6 +1391,7 @@ def inspect_data(adata: AnnData) -> DataState:
     state.layers = list(adata.layers.keys())
     state.obsm_keys = list(adata.obsm.keys())
     state.obsp_keys = list(adata.obsp.keys())
+    state.semantic_obs_roles = rank_obs_semantic_candidates(adata)
 
     state.has_raw_layer, state.raw_layer_name = _detect_raw_layer(adata)
     if adata.raw is not None:
@@ -992,12 +1405,20 @@ def inspect_data(adata: AnnData) -> DataState:
     state.has_ensembl_ids = has_ens
     state.sample_gene_names = sample_genes
 
+    qc_roles = state.semantic_obs_roles
     qc_obs_cols = ["n_genes_by_counts", "total_counts", "n_genes"]
-    state.has_qc_metrics = any(column in adata.obs.columns for column in qc_obs_cols)
-    state.has_mt_metrics = "pct_counts_mt" in adata.obs.columns
-    state.has_ribo_metrics = "pct_counts_ribo" in adata.obs.columns
+    state.has_qc_metrics = any(column in adata.obs.columns for column in qc_obs_cols) or bool(
+        qc_roles.get("qc_total_counts") or qc_roles.get("qc_n_genes") or qc_roles.get("qc_pct_mt")
+    )
+    state.has_mt_metrics = "pct_counts_mt" in adata.obs.columns or bool(qc_roles.get("qc_pct_mt"))
+    state.has_ribo_metrics = "pct_counts_ribo" in adata.obs.columns or bool(qc_roles.get("qc_pct_ribo"))
 
-    if "doublet_score" in adata.obs.columns or "predicted_doublet" in adata.obs.columns:
+    if (
+        "doublet_score" in adata.obs.columns
+        or "predicted_doublet" in adata.obs.columns
+        or qc_roles.get("doublet_score")
+        or qc_roles.get("doublet_label")
+    ):
         state.has_doublet_scores = True
         state.doublet_detection_method = "scrublet" if "scrublet" in adata.uns else "unknown"
 
@@ -1052,6 +1473,12 @@ def inspect_data(adata: AnnData) -> DataState:
     ]
     if any(column in adata.obs.columns for column in scimilarity_cols):
         state.has_scimilarity = True
+    state.cell_type_candidates = state.semantic_obs_roles.get("cell_type", [])
+    if state.cell_type_candidates:
+        state.cell_type_key = state.cell_type_candidates[0].column
+    state.has_celltype_annotations = bool(
+        state.cell_type_candidates or state.has_celltypist or state.has_scimilarity
+    )
 
     batch_resolution = resolve_batch_metadata(adata)
     state.metadata_candidates = batch_resolution.candidates

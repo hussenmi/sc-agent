@@ -17,7 +17,7 @@ from datetime import datetime
 import re
 
 from .codex_bridge import CODEX_DECISION_SCHEMA, CodexCLIClient, CodexCLIError
-from .tools import get_tools, get_openai_tools, process_tool_call
+from .tools import get_tools, get_openai_tools, process_tool_call, encode_image_base64, get_image_mime_type
 from .prompts import SYSTEM_PROMPT
 from .run_manager import RunManager, create_run
 from .decision_policy import (
@@ -224,7 +224,7 @@ class SCAgent:
         self.run_manager: Optional[RunManager] = None
         self.world_state = AgentWorldState()
         self.biological_context: Optional[Dict[str, Any]] = None
-        self._pending_image: Optional[Dict[str, str]] = None  # For vision support
+        self._pending_images: List[Dict[str, str]] = []  # For vision support (list of figure dicts)
         self._next_llm_status_message: Optional[str] = None
         self._conversation_history: List[Dict[str, Any]] = []  # For interactive mode
         self._active_request: str = ""
@@ -510,6 +510,42 @@ class SCAgent:
     def _is_inspection_tool(self, tool_name: str) -> bool:
         return tool_name in INSPECTION_TOOL_NAMES
 
+    def _build_image_message(self, images: List[Dict[str, str]], provider: str) -> Dict[str, Any]:
+        """Build a user message containing one or more figures with a role-aware prompt."""
+        roles = {img.get("role", "figure") for img in images}
+        paths_str = ", ".join(img["path"] for img in images)
+        if "qc_figure" in roles:
+            prompt_text = (
+                f"Here {'is the QC figure' if len(images) == 1 else 'are the QC figures'} ({paths_str}). "
+                "Look at the distributions carefully and suggest specific filtering thresholds based on what you see — "
+                "e.g. an MT% cutoff that captures the low-quality tail, a min_genes value that separates "
+                "empty droplets from real cells, whether doublet removal looks warranted. "
+                "Cite the specific values visible in the plots. "
+                "Present these as your suggestions with projected removal counts, and ask the user to confirm before applying."
+            )
+        else:
+            n = len(images)
+            prompt_text = (
+                f"Here {'is the' if n == 1 else 'are the'} generated "
+                f"figure{'s' if n > 1 else ''} ({paths_str}). "
+                "Interpret it in the context of the current analysis — what does it show, "
+                "what are the key observations, and is there anything the user should act on?"
+            )
+
+        content: List[Any] = [{"type": "text", "text": prompt_text}]
+        for img in images:
+            if provider == "anthropic":
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": img["mime"], "data": img["base64"]},
+                })
+            else:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img['mime']};base64,{img['base64']}"},
+                })
+        return {"role": "user", "content": content}
+
     def _checkpoint_artifact_paths(self, result_data: Dict[str, Any]) -> List[str]:
         paths: List[str] = []
         for artifact in result_data.get("artifacts_created", []) or []:
@@ -590,6 +626,7 @@ class SCAgent:
         if selected_action == "run_qc_apply":
             qc_input = dict(action_inputs.get("run_qc_apply", {}))
             qc_input["preview_only"] = False
+            qc_input["confirm_filtering"] = True
             run_step("run_qc", qc_input)
             return {"selected_action": selected_action, "steps": steps}
 
@@ -774,28 +811,35 @@ class SCAgent:
 
         if tool_name == "run_qc":
             if tool_input.get("preview_only", False):
-                mt_threshold = tool_input.get("mt_threshold", "auto")
                 # Get doublet count from the correct location
                 qc_decisions = result_data.get("qc_decisions", {})
+                filtering_plan = result_data.get("filtering_plan", {})
+                plan_params = filtering_plan.get("parameters", {})
+                projected = filtering_plan.get("projected_after_filtering", {})
+                mt_threshold = plan_params.get("mt_threshold", tool_input.get("mt_threshold", "auto"))
+                min_cells = plan_params.get("min_cells_per_gene")
+                min_genes = plan_params.get("min_genes")
                 doublet_count = int(qc_decisions.get("doublet_detection", {}).get("cells_flagged", 0))
                 mt_decision = qc_decisions.get("mt_threshold", {})
                 filter_mt = bool(mt_decision.get("filter_enabled", True))
                 high_mt_cells = int(mt_decision.get("cells_flagged", 0))
                 min_genes_cells = int(qc_decisions.get("min_genes", {}).get("cells_flagged", 0))
                 before_cells = result_data.get("before", {}).get("n_cells", 0)
-                # Projected = before minus the filters that are enabled by the preview.
-                # Doublets are still flagged by default unless remove_doublets is explicitly true.
-                projected_removals = min_genes_cells + (high_mt_cells if filter_mt else 0)
-                if qc_decisions.get("doublet_detection", {}).get("remove_on_apply", False):
-                    projected_removals += doublet_count
-                projected_cells = before_cells - projected_removals if before_cells else "?"
+                projected_removals = projected.get("cells_removed")
+                projected_cells = projected.get("cells_retained")
+                if projected_cells is None:
+                    projected_cells = before_cells - projected_removals if before_cells and projected_removals else "?"
+                projected_genes_removed = projected.get("genes_removed_before_cell_filtering")
                 question = (
-                    "QC preview is complete. I summarized the proposed removals and saved the QC figures. "
+                    "QC preview is complete. I summarized the thresholds, parameters, and proposed removals. "
                     "What should I do next?"
                 )
                 options, option_actions = self._checkpoint_options([
                     (
-                        f"Apply the proposed QC filters ({projected_cells} projected cells retained)",
+                        (
+                            "Apply the proposed QC filters "
+                            f"({projected_removals} cells and ~{projected_genes_removed} genes projected for removal)"
+                        ),
                         "run_qc_apply",
                     ),
                     (
@@ -809,9 +853,12 @@ class SCAgent:
                     ("Something else", "custom"),
                 ])
                 summary = (
-                    f"QC preview: {min_genes_cells} low-gene cells flagged, "
+                    f"QC preview: parameters mt_threshold={mt_threshold}, "
+                    f"min_genes={min_genes}, min_cells_per_gene={min_cells}; "
+                    f"{min_genes_cells} low-gene cells flagged, "
                     f"{high_mt_cells} high-MT cells {'to remove' if filter_mt else 'reported only'}, "
-                    f"{doublet_count} doublets flagged. Estimated {projected_cells} cells retained."
+                    f"{doublet_count} doublets flagged. Estimated {projected_cells} cells retained "
+                    f"and ~{projected_genes_removed} genes removed before cell filtering."
                 )
                 checkpoint = {
                     "kind": "qc_preview",
@@ -841,6 +888,7 @@ class SCAgent:
                             "scrublet_random_state": tool_input.get("scrublet_random_state"),
                             "force_doublet_recompute": tool_input.get("force_doublet_recompute", False),
                             "batch_key": tool_input.get("batch_key"),
+                            "confirm_filtering": True,
                         }
                     },
                     "artifacts": artifacts,
@@ -1960,16 +2008,16 @@ class SCAgent:
                         "content": result_json,
                     })
 
-                    if self._pending_image:
+                    if self._pending_images:
+                        paths = ", ".join(img["path"] for img in self._pending_images)
                         messages.append({
                             "role": "user",
                             "content": (
-                                "A figure was generated at "
-                                f"{self._pending_image['path']}. The Codex CLI bridge did not "
-                                "send inline image bytes; call review_figure if visual review is needed."
+                                f"Figure(s) generated at {paths}. The Codex CLI bridge does not "
+                                "support inline image bytes; call review_figure if visual review is needed."
                             ),
                         })
-                        self._pending_image = None
+                        self._pending_images = []
                     continue
 
                 if kind == "final":
@@ -2052,25 +2100,11 @@ class SCAgent:
                     messages.append({"role": "assistant", "content": assistant_content})
                     messages.append({"role": "user", "content": tool_results})
 
-                    # If there's a pending image, add it as a user message with vision
-                    if self._pending_image:
-                        image_msg = {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": f"Here is the generated figure ({self._pending_image['path']}). Please analyze it:"},
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": self._pending_image['mime'],
-                                        "data": self._pending_image['base64']
-                                    }
-                                }
-                            ]
-                        }
-                        messages.append(image_msg)
-                        self._next_llm_status_message = "Analyzing image..."
-                        self._pending_image = None
+                    # If there are pending figures, inject them as a vision user message
+                    if self._pending_images:
+                        messages.append(self._build_image_message(self._pending_images, "anthropic"))
+                        self._next_llm_status_message = "Analyzing figure..."
+                        self._pending_images = []
 
                 elif response.stop_reason == "end_turn":
                     # Add final assistant message to history
@@ -2405,23 +2439,11 @@ class SCAgent:
                             "content": result_json,
                         })
 
-                    # If there's a pending image, add it as a user message with vision
-                    if self._pending_image:
-                        image_msg = {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": f"Here is the generated figure ({self._pending_image['path']}). Please analyze it:"},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{self._pending_image['mime']};base64,{self._pending_image['base64']}"
-                                    }
-                                }
-                            ]
-                        }
-                        messages.append(image_msg)
-                        self._next_llm_status_message = "Analyzing image..."
-                        self._pending_image = None
+                    # If there are pending figures, inject them as a vision user message
+                    if self._pending_images:
+                        messages.append(self._build_image_message(self._pending_images, "openai"))
+                        self._next_llm_status_message = "Analyzing figure..."
+                        self._pending_images = []
 
                 elif choice.finish_reason == "stop":
                     # Check for XML tool calls in text (local models like Qwen2.5-Coder
@@ -2601,13 +2623,12 @@ class SCAgent:
                 else:
                     requested_path = Path(requested)
                     if not requested_path.is_absolute():
-                        if requested_path.parent == Path(".") or (
-                            requested_path.parts and requested_path.parts[0] == run_root.name
-                        ):
-                            tool_input["output_path"] = self.run_manager.get_figure_path(
-                                _sanitize_name(requested_path.stem),
-                                ext=requested_path.suffix.lstrip(".") or "png",
-                            )
+                        # Any relative path (e.g. "figures/umap.png", "umap.png") gets
+                        # routed through the run manager so the directory always exists.
+                        tool_input["output_path"] = self.run_manager.get_figure_path(
+                            _sanitize_name(requested_path.stem),
+                            ext=requested_path.suffix.lstrip(".") or "png",
+                        )
 
             if tool_name == "run_qc" and not tool_input.get("figure_dir"):
                 tool_input["figure_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
@@ -2668,36 +2689,41 @@ class SCAgent:
             else:
                 label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
 
-            if self.verbose and tool_name in self._STREAMING_TOOLS:
-                # Streaming tools produce their own tqdm/progress output. Using
-                # Rich's Live (console.status) fights with tqdm and blanks the
-                # terminal. Print a start line and let the tool's output flow.
-                console.print(f"[cyan]▶[/cyan] {label}...")
-                result_json, self.adata = process_tool_call(
-                    tool_name,
-                    tool_input,
-                    self.adata,
-                    world_state=self.world_state,
-                    run_manager=self.run_manager,
-                )
-                console.print(f"[green]✓[/green] {label} done")
-            elif self.verbose:
-                with console.status(f"{label}...", spinner="dots"):
-                    result_json, self.adata = process_tool_call(
+            def _dispatch():
+                """Call process_tool_call with warning capture."""
+                import warnings as _warnings
+                with _warnings.catch_warnings(record=True) as _caught:
+                    _warnings.simplefilter("always")
+                    _rj, _ad = process_tool_call(
                         tool_name,
                         tool_input,
                         self.adata,
                         world_state=self.world_state,
                         run_manager=self.run_manager,
                     )
+                if _caught:
+                    try:
+                        _rd = json.loads(_rj)
+                        _msgs = list({str(w.message) for w in _caught})
+                        existing = _rd.get("runtime_warnings") or []
+                        _rd["runtime_warnings"] = existing + _msgs
+                        _rj = json.dumps(_rd, indent=2)
+                    except Exception:
+                        pass
+                return _rj, _ad
+
+            if self.verbose and tool_name in self._STREAMING_TOOLS:
+                # Streaming tools produce their own tqdm/progress output. Using
+                # Rich's Live (console.status) fights with tqdm and blanks the
+                # terminal. Print a start line and let the tool's output flow.
+                console.print(f"[cyan]▶[/cyan] {label}...")
+                result_json, self.adata = _dispatch()
+                console.print(f"[green]✓[/green] {label} done")
+            elif self.verbose:
+                with console.status(f"{label}...", spinner="dots"):
+                    result_json, self.adata = _dispatch()
             else:
-                result_json, self.adata = process_tool_call(
-                    tool_name,
-                    tool_input,
-                    self.adata,
-                    world_state=self.world_state,
-                    run_manager=self.run_manager,
-                )
+                result_json, self.adata = _dispatch()
 
         # Check for image in result and store for vision
         try:
@@ -2711,10 +2737,10 @@ class SCAgent:
                 self.world_state.invalidate_inspect_cache()
                 self._sync_world_state()
 
-            # If there's an image, store it for the next message
+            # If there's an image directly embedded in the result, queue it
             if "image_base64" in result_data:
                 image_context = result_data.get("image_context", {})
-                self._pending_image = {
+                self._pending_images.append({
                     "base64": result_data["image_base64"],
                     "mime": result_data.get("image_mime", "image/png"),
                     "path": (
@@ -2723,13 +2749,34 @@ class SCAgent:
                         or image_context.get("output_path")
                         or "figure.png"
                     ),
-                }
+                    "role": "figure",
+                })
                 # Remove base64 from JSON to keep response small
                 del result_data["image_base64"]
                 if "image_mime" in result_data:
                     del result_data["image_mime"]
                 result_data["image_included"] = True
                 result_json = json.dumps(result_data, indent=2)
+
+            # Auto-load any figure artifacts (e.g. QC plots, UMAP) that weren't
+            # embedded directly — encode them so the LLM can see and interpret them.
+            already_loaded = {img["path"] for img in self._pending_images}
+            for artifact in result_data.get("artifacts_created", []) or []:
+                if artifact.get("kind") != "figure":
+                    continue
+                path = artifact.get("path", "")
+                if not path or path in already_loaded or not os.path.exists(path):
+                    continue
+                try:
+                    self._pending_images.append({
+                        "base64": encode_image_base64(path),
+                        "mime": get_image_mime_type(path),
+                        "path": path,
+                        "role": artifact.get("role", "figure"),
+                    })
+                    already_loaded.add(path)
+                except Exception as enc_err:
+                    logger.warning("Failed to encode figure %s for vision: %s", path, enc_err)
 
             status = result_data.get("status", "unknown")
 
@@ -3599,7 +3646,7 @@ class SCAgent:
         self.adata = None
         self.run_manager = None
         self.biological_context = None
-        self._pending_image = None
+        self._pending_images = []
         self._interaction_state = {
             "shown_figures": [],
             "reviewed_figures": [],

@@ -181,11 +181,16 @@ class AgentWorldState:
         ]
         annotation_keys = []
         if adata is not None:
+            semantic_roles = self.data_summary.get("semantic_obs_roles", {})
             annotation_keys = [
-                column
-                for column in adata.obs.columns
-                if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label"))
+                candidate.get("column")
+                for candidate in semantic_roles.get("cell_type", [])
+                if candidate.get("column")
             ]
+            for column in adata.obs.columns:
+                if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label")):
+                    if column not in annotation_keys:
+                        annotation_keys.append(column)
         deg_available = bool(adata is not None and "rank_genes_groups" in adata.uns)
         primary_cluster_key = self.data_summary.get("cluster_key")
         obs_columns = list(adata.obs.columns) if adata is not None else []
@@ -412,6 +417,7 @@ class AgentWorldState:
         from ..core.inspector import (
             clustering_record_to_dict,
             metadata_candidate_to_dict,
+            semantic_roles_to_dict,
         )
 
         # Re-use the cached DataState if adata's structure hasn't changed.
@@ -434,7 +440,7 @@ class AgentWorldState:
             "has_neighbors": state.has_neighbors,
             "has_umap": state.has_umap,
             "has_clusters": state.has_clusters,
-            "has_celltypes": state.has_celltypist or state.has_scimilarity,
+            "has_celltypes": state.has_celltype_annotations,
         }
         self.analysis_stage = _stage_from_processing(processing)
         self.data_summary = {
@@ -447,6 +453,8 @@ class AgentWorldState:
             "batch_correction_applied": state.batch_correction_applied,
             "cluster_key": state.cluster_key,
             "n_clusters": state.n_clusters,
+            "cell_type_key": state.cell_type_key,
+            "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
         }
         self.metadata_candidates = [
             metadata_candidate_to_dict(candidate)
@@ -461,6 +469,8 @@ class AgentWorldState:
             annotation_sources.append("celltypist")
         if state.has_scimilarity:
             annotation_sources.append("scimilarity")
+        if state.cell_type_candidates and not (state.has_celltypist or state.has_scimilarity):
+            annotation_sources.append("external_or_manual")
         self.annotation_sources = annotation_sources
 
         context_text = request_text or self.active_request

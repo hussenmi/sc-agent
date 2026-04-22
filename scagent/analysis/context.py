@@ -13,7 +13,7 @@ import re
 
 from anndata import AnnData
 
-from ..core.inspector import inspect_data
+from ..core.inspector import inspect_data, rank_obs_semantic_candidates
 
 
 @dataclass
@@ -122,16 +122,8 @@ def _infer_tissue_from_annotations(adata: AnnData) -> tuple[Optional[str], Dict[
     This stays intentionally conservative. The goal is to identify obvious
     PBMC-like mixtures, not to guess specific tissue identity from weak clues.
     """
-    annotation_key = None
-    for key in (
-        "celltypist_majority_voting",
-        "celltypist_predicted_labels",
-        "scimilarity_representative_prediction",
-        "scimilarity_cluster_majority",
-    ):
-        if key in adata.obs.columns:
-            annotation_key = key
-            break
+    ranked = rank_obs_semantic_candidates(adata, roles={"cell_type"}).get("cell_type", [])
+    annotation_key = ranked[0].column if ranked else None
 
     if annotation_key is None:
         return None, {}

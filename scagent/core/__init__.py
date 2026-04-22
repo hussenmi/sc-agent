@@ -15,9 +15,11 @@ from .inspector import (
     metadata_resolution_to_dict,
     promote_clustering_to_primary,
     rank_obs_metadata_candidates,
+    rank_obs_semantic_candidates,
     recommend_next_steps,
     register_clustering,
     resolve_batch_metadata,
+    semantic_roles_to_dict,
 )
 from .io import load_data, load_10x_h5, load_h5ad
 from .qc import (
@@ -42,9 +44,11 @@ __all__ = [
     "inspect_data",
     "recommend_next_steps",
     "rank_obs_metadata_candidates",
+    "rank_obs_semantic_candidates",
     "resolve_batch_metadata",
     "metadata_candidate_to_dict",
     "metadata_resolution_to_dict",
+    "semantic_roles_to_dict",
     "get_clustering_registry",
     "clustering_record_to_dict",
     "default_cluster_key_for_method",
