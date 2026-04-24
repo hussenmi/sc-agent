@@ -1075,12 +1075,12 @@ def _characterize_features(adata: AnnData) -> dict:
     if len(mt_genes_found) == 0:
         mt_warning = (
             f"No MT- genes found with standard prefix search. "
-            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — strip it before QC.' if genome_prefix else 'Inspect var_names format before running QC.'}"
+            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — standard detection patterns may not match.' if genome_prefix else 'Inspect var_names format before running QC.'}"
         )
     if len(ribo_genes_found) == 0:
         ribo_warning = (
             f"No RPS/RPL genes found with standard prefix search. "
-            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — strip it before QC.' if genome_prefix else 'Inspect var_names format before running QC.'}"
+            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — standard detection patterns may not match.' if genome_prefix else 'Inspect var_names format before running QC.'}"
         )
 
     # --- obs_names (barcode) characterization ---
@@ -1657,3 +1657,73 @@ def summarize_state(state: DataState) -> str:
         )
 
     return "\n".join(lines)
+
+
+def obs_columns_detail(obs_df, n_obs: int, max_values: int = 8) -> dict:
+    """
+    Compact per-column summary of adata.obs for LLM role inference.
+
+    For each column returns dtype, n_unique, and either:
+    - representative unique values (categorical / low-cardinality, n_unique <= 15)
+    - min/max/mean stats (continuous numeric, n_unique > 15)
+
+    Columns that are essentially unique per cell (barcodes, index-like) are
+    flagged as high_cardinality. All columns are included — no truncation.
+
+    Returns {"columns": {...}, "total_obs_cols": N}
+    """
+    import math
+    import pandas as pd
+
+    cols = list(obs_df.columns)
+    total = len(cols)
+    detail: dict = {}
+
+    for col in cols:
+        series = obs_df[col]
+        dtype_str = str(series.dtype)
+        non_null = series.dropna()
+        n_unique = int(series.nunique(dropna=True))
+
+        if n_unique == 0:
+            detail[col] = {"dtype": dtype_str, "n_unique": 0}
+            continue
+
+        if n_obs > 0 and n_unique >= n_obs * 0.9 and n_unique > 50:
+            detail[col] = {"dtype": dtype_str, "n_unique": n_unique, "note": "high_cardinality"}
+            continue
+
+        is_numeric = pd.api.types.is_numeric_dtype(series)
+        if is_numeric and n_unique > 15:
+            try:
+                vals = non_null.to_numpy(dtype=float)
+                detail[col] = {
+                    "dtype": dtype_str,
+                    "n_unique": n_unique,
+                    "min": round(float(vals.min()), 4),
+                    "max": round(float(vals.max()), 4),
+                    "mean": round(float(vals.mean()), 4),
+                }
+            except Exception:
+                detail[col] = {"dtype": dtype_str, "n_unique": n_unique}
+        else:
+            try:
+                unique_vals = non_null.unique().tolist()
+                samples = []
+                for v in unique_vals:
+                    if isinstance(v, float) and math.isnan(v):
+                        continue
+                    sv = str(v)
+                    if len(sv) > 50:
+                        sv = sv[:47] + "..."
+                    samples.append(sv)
+                    if len(samples) >= max_values:
+                        break
+                entry: dict = {"dtype": dtype_str, "n_unique": n_unique, "values": samples}
+                if n_unique > max_values:
+                    entry["values_truncated"] = True
+                detail[col] = entry
+            except Exception:
+                detail[col] = {"dtype": dtype_str, "n_unique": n_unique}
+
+    return {"columns": detail, "total_obs_cols": total}

@@ -260,7 +260,8 @@ def select_hvg(
     batch_key : str, optional
         obs column to stratify HVG selection by batch. Recommended for
         multi-sample data to avoid selecting batch-specific genes.
-        Not supported with flavor='seurat_v3' — use 'seurat' instead.
+        Supported by all flavors including 'seurat_v3' (ranks genes by
+        median rank across batches).
     exclude_patterns : str or sequence of str, optional
         Regex pattern(s) for source-defined features that must not drive HVG,
         PCA, or clustering. This is generic provenance-driven behavior; do
@@ -283,15 +284,6 @@ def select_hvg(
     """
     if not inplace:
         adata = adata.copy()
-
-    requested_flavor = flavor
-    if batch_key and flavor == 'seurat_v3':
-        logger.info(
-            "seurat_v3 does not support batch_key — switching to flavor='seurat' "
-            "for batch-aware HVG selection."
-        )
-        flavor = 'seurat'
-        layer = None
 
     # For seurat_v3, we need raw integer counts. Falling back to a
     # log-normalized adata.X silently produces wrong HVGs, so refuse
@@ -377,7 +369,6 @@ def select_hvg(
 
     hvg_meta = dict(adata.uns.get("hvg", {}))
     hvg_meta.update({
-        "requested_flavor": requested_flavor,
         "flavor": flavor,
         "n_top_genes": int(n_top_genes),
         "batch_key": batch_key,

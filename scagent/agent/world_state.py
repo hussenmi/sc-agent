@@ -152,7 +152,6 @@ class AgentWorldState:
     metadata_candidates: List[Dict[str, Any]] = field(default_factory=list)
     clustering_registry: List[Dict[str, Any]] = field(default_factory=list)
     annotation_sources: List[str] = field(default_factory=list)
-    biological_context: Dict[str, Any] = field(default_factory=dict)
     artifacts: List[ArtifactRecord] = field(default_factory=list)
     outstanding_decisions: List[DecisionRecord] = field(default_factory=list)
     resolved_decisions: List[DecisionRecord] = field(default_factory=list)
@@ -227,13 +226,13 @@ class AgentWorldState:
 
             # Dimensionality reduction
             if processing.get("is_normalized") or processing.get("has_hvg"):
-                available_actions.extend(["run_dimred", "run_pca"])
+                available_actions.extend(["run_pca"])
                 if processing.get("has_pca"):
                     available_actions.append("run_neighbors")
                 if processing.get("has_neighbors"):
                     available_actions.append("run_umap")
             else:
-                blocked_actions.append({"action": "run_dimred", "needs": "normalized data with HVGs"})
+                blocked_actions.append({"action": "run_pca", "needs": "normalized data with HVGs"})
 
             # Clustering
             if processing.get("has_neighbors"):
@@ -347,7 +346,6 @@ class AgentWorldState:
             "metadata_candidates": self.metadata_candidates,
             "clustering_registry": self.clustering_registry,
             "annotation_sources": self.annotation_sources,
-            "biological_context": self.biological_context,
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
             "outstanding_decisions": [decision.to_dict() for decision in self.outstanding_decisions],
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions],
@@ -359,10 +357,16 @@ class AgentWorldState:
         }
 
     def snapshot(self) -> Dict[str, Any]:
+        # Strip semantic_obs_roles from the LLM snapshot — the LLM uses
+        # obs_columns_detail (also in data_summary) for role inference instead.
+        # semantic_obs_roles stays in data_summary for _derive_capabilities().
+        data_summary_for_llm = {
+            k: v for k, v in self.data_summary.items() if k != "semantic_obs_roles"
+        }
         return {
             "analysis_stage": self.analysis_stage,
             "active_request": self.active_request,
-            "data_summary": self.data_summary,
+            "data_summary": data_summary_for_llm,
             "metadata_candidates": self.metadata_candidates[:3],
             "clustering_registry": self.clustering_registry[:6],
             "annotation_sources": self.annotation_sources,
@@ -412,13 +416,14 @@ class AgentWorldState:
             self.invalidate_inspect_cache()
             return
 
-        from ..analysis import infer_biological_context
         from ..core import inspect_data
         from ..core.inspector import (
             clustering_record_to_dict,
             metadata_candidate_to_dict,
+            obs_columns_detail,
             semantic_roles_to_dict,
         )
+
 
         # Re-use the cached DataState if adata's structure hasn't changed.
         # inspect_data touches adata.X (expensive on large datasets); caching it
@@ -455,6 +460,7 @@ class AgentWorldState:
             "n_clusters": state.n_clusters,
             "cell_type_key": state.cell_type_key,
             "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
+            "obs_columns_detail": obs_columns_detail(adata.obs, adata.n_obs),
         }
         self.metadata_candidates = [
             metadata_candidate_to_dict(candidate)
@@ -473,12 +479,6 @@ class AgentWorldState:
             annotation_sources.append("external_or_manual")
         self.annotation_sources = annotation_sources
 
-        context_text = request_text or self.active_request
-        self.biological_context = infer_biological_context(
-            adata,
-            text_context=context_text or "",
-            _precomputed_state=state,
-        ).to_dict()
         self.data_summary["capabilities"] = self._derive_capabilities(adata)
 
     def register_artifact(self, artifact_payload: Dict[str, Any]) -> None:
@@ -686,17 +686,6 @@ class AgentWorldState:
                 },
             }
 
-        if tool_name == "run_dimred":
-            return {
-                "tool": "run_dimred",
-                "timestamp": ts,
-                "n_pcs": result.get("n_pcs"),
-                "n_neighbors": result.get("n_neighbors"),
-                "svd_solver": result.get("svd_solver"),
-                "mask_var": result.get("mask_var"),
-                "umap_min_dist": result.get("umap_min_dist"),
-                "variance_explained": result.get("variance_explained"),
-            }
 
         if tool_name == "run_pca":
             return {
@@ -769,7 +758,6 @@ class AgentWorldState:
             if result.get("n_neighbors") is not None:
                 entry["n_neighbors"] = result.get("n_neighbors")
             entry["neighbors_recomputed"] = result.get("neighbors_recomputed")
-            entry["umap_recomputed"] = result.get("umap_recomputed")
             if result.get("method") == "scvi":
                 entry["n_latent"] = result.get("n_latent")
                 entry["max_epochs"] = result.get("max_epochs")

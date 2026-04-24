@@ -34,6 +34,19 @@ def get_tools() -> List[Dict[str, Any]]:
     # Action tools (mutate state)
     action_tools = [
         {
+            "name": "load_data",
+            "description": "Replace the primary in-memory dataset with a new file. Use this when the user explicitly wants to switch focus to a different dataset. Always save the current primary with save_data first if it has been processed. Returns full inspection info (shape, state, obs columns, batch metadata) — do NOT call inspect_data afterwards.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to the h5ad or 10X h5 file to load as the new primary dataset."},
+                    "goal": {"type": "string", "description": "Analysis goal hint (e.g., 'qc', 'cluster', 'annotate')"},
+                    "context": {"type": "string", "description": "Optional biological context hint (e.g., 'PBMC healthy human')"}
+                },
+                "required": ["data_path"]
+            }
+        },
+        {
             "name": "run_qc",
             "description": "Run or preview the quality control pipeline: QC metrics, doublet detection, cell/gene filtering. Use preview_only=true first in collaborative workflows so the user can review proposed removals before filters are applied. Do not assume intermediate h5ad saving is desired.",
             "input_schema": {
@@ -43,11 +56,11 @@ def get_tools() -> List[Dict[str, Any]]:
                     "output_path": {"type": "string", "description": "Optional path to save a processed h5ad. Prefer saving only final outputs unless the user explicitly asks for checkpoints."},
                     "preview_only": {"type": "boolean", "description": "If true, do not filter. Instead compute full QC metrics, estimate removals, and generate pre-filter QC figures."},
                     "confirm_filtering": {"type": "boolean", "description": "Required to apply cell/gene filtering. Set true only after the user has explicitly confirmed the previewed thresholds, parameters, and removal counts."},
-                    "data_type": {"type": "string", "enum": ["single_cell", "single_nucleus"], "description": "Must be confirmed with the user before applying filters. 'single_cell'=25% MT threshold; 'single_nucleus'=5%. When omitted from preview, both options are shown so you can present them to the user and ask."},
+                    "data_type": {"type": "string", "enum": ["single_cell", "single_nucleus"], "description": "Hint for MT threshold direction: 'single_nucleus' starts at 5%, 'single_cell' at 20%. The actual threshold must be chosen from the QC figure — always inspect the distribution before filtering."},
                     "mt_threshold": {"type": "number", "description": "Max MT% threshold. Overrides data_type if provided."},
                     "filter_mt": {"type": "boolean", "description": "If false, compute and report MT metrics but do not apply a hard MT% cell filter. Use this for source pipelines that inspect MT but do not remove cells by MT%."},
                     "min_genes": {"type": "integer", "description": "Minimum detected genes per cell before cell removal. This is cell-level filtering, distinct from min_cells per gene."},
-                    "min_cells": {"type": "integer", "description": "Minimum cells per gene before gene removal. Leave unset to auto-scale: ~55 (exp(4)) for single-sample data, ~148 (exp(5)) for multi-sample/batch data. Only set explicitly to override this behaviour."},
+                    "min_cells": {"type": "integer", "description": "Minimum cells a gene must be expressed in to be kept (default: 3). In preview, shows how many genes would be removed. Present this to the user alongside the projected removal count and confirm before applying."},
                     "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
                     "remove_mt": {"type": "boolean", "description": "Remove mitochondrial genes from the feature set (default: false)"},
                     "detect_doublets_flag": {"type": "boolean", "description": "Run Scrublet doublet detection (default: true)"},
@@ -80,30 +93,13 @@ def get_tools() -> List[Dict[str, Any]]:
                     "raw_layer_name": {"type": "string", "description": "Layer used to preserve/reset raw integer counts (default: raw_counts)."},
                     "force_reset_from_raw": {"type": "boolean", "description": "If true, reset adata.X from raw_layer_name before normalization when available. Use for retries to avoid double-normalization (default: true)."},
                     "set_raw_after_normalization": {"type": "boolean", "description": "If true, set adata.raw = adata.copy() after normalization/log1p and before later scaling/PCA (default: true)."},
-                    "hvg_flavor": {"type": "string", "enum": ["seurat", "seurat_v3", "cell_ranger"], "description": "Scanpy HVG flavor (default: seurat for batch-aware log-normalized workflows)."},
-                    "hvg_layer": {"type": "string", "description": "Optional layer for HVG calculation. seurat_v3 requires raw integer counts in a layer."},
-                    "batch_key": {"type": "string", "description": "obs column for batch-stratified HVG selection. Recommended for multi-sample data to avoid batch-specific HVGs."},
+                    "hvg_flavor": {"type": "string", "enum": ["seurat", "seurat_v3", "cell_ranger"], "description": "Scanpy HVG flavor (default: seurat_v3). seurat_v3 uses VST on raw counts and supports batch_key (ranks by median rank across batches). seurat works on log-normalized data."},
+                    "hvg_layer": {"type": "string", "description": "Layer for HVG calculation. seurat_v3 requires raw integer counts; if omitted, auto-detects from 'raw_counts', 'raw_data', 'counts' in that order. Only set explicitly if your raw counts are in a non-standard layer."},
+                    "batch_key": {"type": "string", "description": "obs column for batch-stratified HVG selection. Recommended for multi-sample data. Supported by all flavors including seurat_v3."},
                     "hvg_exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex pattern(s) for source-defined features that must not be marked highly_variable. Only pass evidence-backed source/workflow exclusions; do not invent dataset-specific patterns."},
                     "hvg_exclusion_mode": {"type": "string", "enum": ["post", "pre"], "description": "How to apply source-defined HVG exclusions. 'post' runs HVG then forces excluded features to false; 'pre' computes HVGs only on allowed features (default: post)."},
                     "hvg_exclude_match_mode": {"type": "string", "enum": ["match", "contains", "fullmatch"], "description": "Regex matching mode for hvg_exclude_patterns against var_names (default: match)."},
                     "hvg_exclusion_source": {"type": "string", "description": "Short provenance for the feature-exclusion rule, e.g. source repo file/function/line or paper method."}
-                },
-                "required": []
-            }
-        },
-        {
-            "name": "run_dimred",
-            "description": "Compound convenience tool for PCA -> neighbors -> UMAP. Use only when the user requests all three steps together; use run_pca, run_neighbors, or run_umap for modular requests.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
-                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "n_pcs": {"type": "integer", "description": "Number of PCs (default: 30)"},
-                    "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"},
-                    "svd_solver": {"type": "string", "description": "PCA SVD solver (default: arpack)"},
-                    "mask_var": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Boolean var column for PCA feature mask, or null for all genes (default: highly_variable)"},
-                    "umap_min_dist": {"type": "number", "description": "UMAP min_dist (default: scagent config, usually 0.1)"}
                 },
                 "required": []
             }
@@ -229,7 +225,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
                 "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
                 "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
-                "This tool is modular by default: it does not compute downstream UMAP unless compute_umap=true."
+                "This tool only performs batch correction. Run run_neighbors and run_umap as separate steps afterwards."
             ),
             "input_schema": {
                 "type": "object",
@@ -250,10 +246,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     "neighbors_within_batch": {"type": "integer", "description": "BBKNN only: neighbors contributed per batch per cell (default: 3; total = n_batches × this value)"},
                     "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
                     "max_epochs": {"type": "integer", "description": "scVI only: training epochs (default: 200; use fewer only for quick tests)"},
-                    "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"},
-                    "compute_neighbors": {"type": "boolean", "description": "Harmony/Scanorama/scVI only: compute a neighbor graph on the corrected embedding after correction (default: false; forced true if compute_umap=true)."},
-                    "compute_umap": {"type": "boolean", "description": "Compute UMAP after correction (default: false). For BBKNN, uses the BBKNN graph; for embedding methods, computes neighbors first if needed."},
-                    "n_neighbors": {"type": "integer", "description": "Neighbors for optional post-correction graph computation (default: 30)."}
+                    "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
                 },
                 "required": []
             }
@@ -1037,13 +1030,11 @@ def process_tool_call(
         load_data,
         metadata_candidate_to_dict,
         metadata_resolution_to_dict,
+        obs_columns_detail as _obs_columns_detail,
         promote_clustering_to_primary,
-        rank_obs_metadata_candidates,
-        rank_obs_semantic_candidates,
         recommend_next_steps,
         register_clustering,
         resolve_batch_metadata,
-        semantic_roles_to_dict,
         run_qc_pipeline,
         normalize_data,
         run_pca,
@@ -1058,7 +1049,7 @@ def process_tool_call(
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import run_celltypist, run_scimilarity
     from ..batch import run_scanorama, run_harmony, run_scvi, run_bbknn
-    from ..analysis import infer_biological_context
+
     from .decision_policy import (
         decision_for_batch_strategy,
         decision_for_clustering_selection,
@@ -1254,7 +1245,7 @@ def process_tool_call(
         elif not state.is_normalized:
             next_priority = "normalize_and_hvg"
         elif not (state.has_pca and state.has_neighbors and state.has_umap):
-            next_priority = "run_dimred"
+            next_priority = "run_pca"
         elif not state.has_clusters:
             next_priority = "run_clustering"
         else:
@@ -1280,13 +1271,13 @@ def process_tool_call(
         }
 
     def _available_annotation_keys(adata_obj) -> List[str]:
-        semantic = rank_obs_semantic_candidates(adata_obj, roles={"cell_type"})
-        keys = [candidate.column for candidate in semantic.get("cell_type", [])]
-        for column in adata_obj.obs.columns:
-            if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label")):
-                if column not in keys:
-                    keys.append(column)
-        return keys
+        ocd = _obs_columns_detail(adata_obj.obs, adata_obj.n_obs).get("columns", {})
+        return [
+            col for col, info in ocd.items()
+            if info.get("note") != "high_cardinality"
+            and 2 <= info.get("n_unique", 0) <= 300
+            and info.get("dtype") in ("object", "category")
+        ]
 
     def _available_plot_colors(adata_obj) -> List[str]:
         preferred = [
@@ -1391,7 +1382,12 @@ def process_tool_call(
         raise ValueError("No data available. Provide data_path or load data first.")
 
     def fix_output_path(output_path: str, tool_name: str) -> str:
-        """Normalize output_path values for h5ad-producing tools."""
+        """Normalize output_path values for h5ad-producing tools.
+
+        Relative paths with no directory component (e.g. 'result.h5ad') are
+        resolved inside the run directory when run_manager is available, so
+        saved files land alongside figures and reports rather than in cwd.
+        """
         import os as os_module
         if output_path is None:
             return None
@@ -1399,6 +1395,11 @@ def process_tool_call(
             if tool_name == "save_data":
                 return os_module.path.join(output_path, "final_result.h5ad")
             return None
+        # Bare filename with no directory component → put it in the run dir
+        if (run_manager is not None
+                and not os_module.path.isabs(output_path)
+                and os_module.path.dirname(output_path) == ""):
+            return os_module.path.join(run_manager.run_dir, output_path)
         return output_path
 
     def _resolve_integer_counts_layer(adata, requested_layer: str = "raw_counts"):
@@ -1566,7 +1567,7 @@ def process_tool_call(
         genes = genes or []
         if plot_type == "umap":
             if "X_umap" not in adata_obj.obsm:
-                raise ValueError("UMAP embedding not found. Run run_dimred first.")
+                raise ValueError("UMAP embedding not found. Run run_pca, run_neighbors, and run_umap first.")
             if color_by in ("", None):
                 color_by = None
             elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
@@ -2637,7 +2638,9 @@ def process_tool_call(
 
         # ===== INSPECTION TOOLS =====
         elif tool_name == "inspect_data":
-            # update_memory=True if loading from path (so data persists), False if just inspecting existing
+            # update_memory=True only when there is no primary loaded yet.
+            # When primary is already in memory, data_path loads a copy for
+            # inspection only — the primary is NOT replaced.
             should_update = tool_input.get("data_path") is not None and adata is None
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=should_update)
             state = inspect_data(working_adata)
@@ -2647,7 +2650,6 @@ def process_tool_call(
             guidance_context = context_hint
             if tool_input.get("data_path"):
                 context_hint = " ".join(part for part in [context_hint, str(tool_input.get("data_path"))] if part)
-            biological_context = infer_biological_context(working_adata, text_context=context_hint)
             confirmed_batch_key = _confirmed_decision_value("batch_key")
             guidance = _analysis_guidance(state, goal=goal, context=guidance_context)
 
@@ -2716,13 +2718,6 @@ def process_tool_call(
                         if present
                     ],
                 },
-                "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
-                "metadata_interpretation": {
-                    "note": (
-                        "semantic_obs_roles are ranked deterministic candidates for the LLM/user to "
-                        "choose from when column meaning is ambiguous."
-                    )
-                },
                 "batch": {
                     "confirmed_batch_key": confirmed_batch_key,
                     "inferred_batch_key": state.batch_key,
@@ -2745,10 +2740,12 @@ def process_tool_call(
                 "batch_key": confirmed_batch_key,
                 "recommended_batch_key": batch_resolution.recommended_column,
                 "available_clusterings": _clusterings_payload(working_adata),
-                "biological_context": biological_context.to_dict(),
                 "analysis_guidance": guidance,
+                "obs_names_sample": working_adata.obs_names[:10].tolist(),
+                "var_names_sample": working_adata.var_names[:10].tolist(),
                 "obs_preview": _dataframe_preview(working_adata.obs),
                 "var_preview": _dataframe_preview(working_adata.var),
+                "obs_columns_detail": _obs_columns_detail(working_adata.obs, working_adata.n_obs),
             }
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)
@@ -2921,67 +2918,65 @@ def process_tool_call(
         elif tool_name == "summarize_qc_metrics":
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
 
-            metrics = {}
-            semantic_qc = rank_obs_semantic_candidates(
-                working_adata,
-                roles={
-                    "qc_total_counts",
-                    "qc_n_genes",
-                    "qc_pct_mt",
-                    "qc_pct_ribo",
-                    "doublet_score",
-                    "doublet_label",
-                },
-            )
-            metric_columns = []
-            canonical_metric_columns = [
-                'total_counts',
-                'n_genes_by_counts',
-                'pct_counts_mt',
-                'pct_counts_ribo',
-                'doublet_score',
-            ]
-            for col in canonical_metric_columns:
-                if col in working_adata.obs:
-                    metric_columns.append((col, col, None))
-            semantic_metric_by_column = {}
-            for role, candidates in semantic_qc.items():
-                if role == "doublet_label" or not candidates:
-                    continue
-                for candidate in candidates:
-                    existing = semantic_metric_by_column.get(candidate.column)
-                    if existing is None or candidate.confidence > existing[1].confidence:
-                        semantic_metric_by_column[candidate.column] = (role, candidate)
-            existing_columns = {existing[0] for existing in metric_columns}
-            for column, (role, candidate) in semantic_metric_by_column.items():
-                if column not in existing_columns:
-                    metric_columns.append((column, role, candidate))
+            import pandas as _pd
 
-            for col, role, candidate in metric_columns:
-                values = working_adata.obs[col]
-                if not hasattr(values, "median"):
-                    continue
-                metrics[role] = {
-                    "column": col,
-                    "median": float(values.median()),
-                    "mean": float(values.mean()),
-                    "min": float(values.min()),
-                    "max": float(values.max())
-                }
-                if candidate is not None:
-                    metrics[role]["candidate"] = metadata_candidate_to_dict(candidate)
+            metrics = {}
+            obs = working_adata.obs
+
+            # Map canonical role names → columns. Check exact names first, then
+            # fall back to pattern matching on all numeric obs columns.
+            _role_patterns = {
+                "qc_total_counts":  ("total_counts", ["total_count", "n_counts", "sum_counts"]),
+                "qc_n_genes":       ("n_genes_by_counts", ["n_genes", "ngenes", "num_genes", "n_features"]),
+                "qc_pct_mt":        ("pct_counts_mt", ["pct_mt", "percent_mt", "mito_pct", "pct_mito", "mt_pct"]),
+                "qc_pct_ribo":      ("pct_counts_ribo", ["pct_ribo", "percent_ribo", "ribo_pct"]),
+                "doublet_score":    ("doublet_score", ["scrublet_score", "doublet_prob", "dbl_score"]),
+            }
+            seen = set()
+            for role, (canonical, aliases) in _role_patterns.items():
+                col = None
+                if canonical in obs:
+                    col = canonical
+                else:
+                    for alias in aliases:
+                        if alias in obs:
+                            col = alias
+                            break
+                    if col is None:
+                        lower_cols = {c.lower(): c for c in obs.columns}
+                        for alias in [canonical] + aliases:
+                            if alias.lower() in lower_cols:
+                                col = lower_cols[alias.lower()]
+                                break
+                if col and col not in seen:
+                    seen.add(col)
+                    values = obs[col]
+                    if _pd.api.types.is_numeric_dtype(values):
+                        metrics[role] = {
+                            "column": col,
+                            "median": float(values.median()),
+                            "mean": float(values.mean()),
+                            "min": float(values.min()),
+                            "max": float(values.max()),
+                        }
+
+            # Doublet label column
+            _doublet_label_names = [
+                "predicted_doublet", "is_doublet", "doublet_label",
+                "doublet", "scrublet_doublet", "dbl_label",
+            ]
+            doublet_label = next(
+                (c for c in _doublet_label_names if c in obs), None
+            )
+            if doublet_label is None:
+                lower_cols = {c.lower(): c for c in obs.columns}
+                for name in _doublet_label_names:
+                    if name.lower() in lower_cols:
+                        doublet_label = lower_cols[name.lower()]
+                        break
 
             doublet_info = {}
-            doublet_label = (
-                'predicted_doublet'
-                if 'predicted_doublet' in working_adata.obs
-                else (
-                    semantic_qc.get("doublet_label", [{}])[0].column
-                    if semantic_qc.get("doublet_label")
-                    else None
-                )
-            )
-            if doublet_label and doublet_label in working_adata.obs:
+            if doublet_label and doublet_label in obs:
                 labels = working_adata.obs[doublet_label]
                 if labels.dtype == bool:
                     positive = labels
@@ -3008,61 +3003,57 @@ def process_tool_call(
 
             # Find annotation column
             key = tool_input.get("annotation_key")
-            cell_type_candidates = rank_obs_semantic_candidates(
-                working_adata,
-                roles={"cell_type"},
-            ).get("cell_type", [])
             if not key:
-                if cell_type_candidates:
-                    top = cell_type_candidates[0]
-                    gap = (
-                        top.confidence - cell_type_candidates[1].confidence
-                        if len(cell_type_candidates) > 1
-                        else top.confidence
+                # Use obs_columns_detail from world state if available, otherwise compute
+                ocd = (
+                    (world_state.data_summary.get("obs_columns_detail") or {})
+                    if world_state is not None
+                    else {}
+                )
+                if not ocd:
+                    ocd = _obs_columns_detail(working_adata.obs, working_adata.n_obs).get("columns", {})
+                # Candidate columns: categorical, n_unique 2-300, not flagged high_cardinality
+                candidates = [
+                    col for col, info in ocd.items()
+                    if info.get("note") != "high_cardinality"
+                    and 2 <= info.get("n_unique", 0) <= 300
+                    and info.get("dtype") in ("object", "category")
+                ]
+                if len(candidates) == 1:
+                    key = candidates[0]
+                elif candidates:
+                    return _finalize_result(
+                        {
+                            "status": "needs_choice",
+                            "tool": "get_celltypes",
+                            "message": (
+                                "Multiple obs columns could be cell type annotations. "
+                                "Identify the right one from obs_columns_detail and call "
+                                "get_celltypes with annotation_key."
+                            ),
+                            "obs_columns_detail": {c: ocd[c] for c in candidates},
+                            "recovery_options": [
+                                "Call get_celltypes again with annotation_key set to the intended column.",
+                                "Ask the user which column contains the cell type labels.",
+                            ],
+                        },
+                        updated_adata,
+                        dataset_changed=False,
+                        summary="Cell type annotation column needs disambiguation.",
                     )
-                    if top.confidence >= 0.72 and gap >= 0.08:
-                        key = top.column
-                    elif len(cell_type_candidates) == 1 and top.confidence >= 0.55:
-                        key = top.column
-                    else:
-                        return _finalize_result(
-                            {
-                                "status": "needs_choice",
-                                "tool": "get_celltypes",
-                                "message": (
-                                    "Multiple obs columns look like possible cell type annotations. "
-                                    "Choose one and call get_celltypes with annotation_key."
-                                ),
-                                "cell_type_candidates": [
-                                    metadata_candidate_to_dict(candidate)
-                                    for candidate in cell_type_candidates
-                                ],
-                                "recovery_options": [
-                                    "Call get_celltypes again with annotation_key set to the intended column.",
-                                    "Ask the user whether they want broad, fine, automated, or manual labels.",
-                                ],
-                            },
-                            updated_adata,
-                            dataset_changed=False,
-                            summary="Cell type annotation column needs disambiguation.",
-                        )
 
             if not key or key not in working_adata.obs:
+                ocd = _obs_columns_detail(working_adata.obs, working_adata.n_obs).get("columns", {})
                 return _smart_unavailable_result(
                     tool="get_celltypes",
-                    message="No cell type annotations are available on the current in-memory dataset.",
+                    message="No cell type annotations found. Check obs_columns_detail for available columns.",
                     adata_obj=updated_adata,
                     missing_prerequisites=["annotation"],
                     recovery_options=[
                         "Run cell type annotation on the current clustering.",
-                        "Inspect semantic_obs_roles from inspect_data for possible annotation columns.",
+                        "Call get_celltypes with annotation_key set to the correct obs column.",
                     ],
-                    extra={
-                        "cell_type_candidates": [
-                            metadata_candidate_to_dict(candidate)
-                            for candidate in cell_type_candidates
-                        ],
-                    },
+                    extra={"obs_columns_detail": ocd},
                 )
 
             counts = working_adata.obs[key].value_counts()
@@ -3100,15 +3091,8 @@ def process_tool_call(
             return json.dumps({
                 "status": "ok",
                 "tool": "list_obs_columns",
-                "columns": list(working_adata.obs.columns),
                 "n_columns": len(working_adata.obs.columns),
-                "metadata_candidates": [
-                    metadata_candidate_to_dict(candidate)
-                    for candidate in rank_obs_metadata_candidates(working_adata)
-                ],
-                "semantic_obs_roles": semantic_roles_to_dict(
-                    rank_obs_semantic_candidates(working_adata)
-                ),
+                "obs_columns_detail": _obs_columns_detail(working_adata.obs, working_adata.n_obs),
             }, indent=2), updated_adata
 
         elif tool_name in {"review_figure", "review_artifact"}:
@@ -3313,6 +3297,42 @@ def process_tool_call(
             )
 
         # ===== ACTION TOOLS =====
+        elif tool_name == "load_data":
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=True)
+            if working_adata is None:
+                return _error_result(tool="load_data", message="data_path is required", suggestions=["Provide a valid path to an h5ad or 10X h5 file."])
+            state = inspect_data(working_adata)
+            batch_resolution = resolve_batch_metadata(working_adata)
+            from ..core.inspector import _characterize_features
+            feature_info = _characterize_features(working_adata)
+            ocd = _obs_columns_detail(working_adata.obs, working_adata.n_obs)
+            result = {
+                "status": "ok",
+                "tool": "load_data",
+                "loaded": tool_input.get("data_path"),
+                "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
+                "data_type": state.data_type,
+                "state": make_state(working_adata),
+                "embeddings": [k for k in working_adata.obsm.keys()],
+                "layers": list(working_adata.layers.keys()),
+                "genes": {
+                    "format": state.gene_id_format,
+                    "has_symbols": state.has_gene_symbols,
+                    "sample": feature_info["sample_gene_names"],
+                    "mt_genes_detected": feature_info["mt_genes_detected"],
+                },
+                "obs_columns_detail": ocd,
+                "batch_metadata": {
+                    "status": batch_resolution.status,
+                    "recommended_batch_key": batch_resolution.recommended_column,
+                    "recommended_role": batch_resolution.recommended_role,
+                    "needs_confirmation": batch_resolution.needs_user_confirmation,
+                    "reason": batch_resolution.reason,
+                    "candidates": [metadata_candidate_to_dict(c) for c in (batch_resolution.candidates or [])],
+                },
+            }
+            return json.dumps(result, indent=2), updated_adata
+
         elif tool_name == "run_qc":
             import pandas as pd
 
@@ -3331,7 +3351,7 @@ def process_tool_call(
             remove_doublets = bool(tool_input.get("remove_doublets", False))
             filter_mt = bool(tool_input.get("filter_mt", True))
             min_genes = tool_input.get("min_genes")
-            min_cells = tool_input.get("min_cells")
+            min_cells = tool_input.get("min_cells", 3)
             requested_mt_threshold = tool_input.get("mt_threshold")
             preview_only = bool(tool_input.get("preview_only", False))
             confirm_filtering = bool(tool_input.get("confirm_filtering", False))
@@ -3386,10 +3406,12 @@ def process_tool_call(
             # (not a throwaway copy) means apply mode can reuse them without recomputing.
             # Actual cell/gene filtering only happens later if not preview_only.
             _metrics_precomputed = 'pct_counts_mt' in adata.obs.columns
+            # Never recompute doublets during the filtering step — scores from preview are authoritative.
+            _effective_force_recompute = force_doublet_recompute and not confirm_filtering
             _doublets_precomputed = (
                 detect_doublets_flag
                 and 'predicted_doublet' in adata.obs.columns
-                and not force_doublet_recompute
+                and not _effective_force_recompute
             )
             doublet_predictions_source = (
                 "precomputed"
@@ -3486,55 +3508,42 @@ def process_tool_call(
             if requested_mt_threshold is not None:
                 mt_threshold = float(requested_mt_threshold)
                 data_type_confirmed = True
-            elif requested_data_type == "single_nucleus":
-                mt_threshold = 5.0
-                data_type_confirmed = True
-            elif requested_data_type == "single_cell":
-                mt_threshold = 25.0
-                data_type_confirmed = True
             else:
-                # data_type not confirmed — compute preview with a placeholder and flag for user
-                median_mt_preview = float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else 0.0
-                mt_threshold = 5.0 if median_mt_preview < 2.0 else 25.0
                 data_type_confirmed = False
+                # No explicit threshold — pick a sentinel based on data type hint only.
+                # The real threshold must come from inspecting the QC figures.
+                median_mt_preview = float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else 0.0
+                mt_threshold = 5.0 if (requested_data_type == "single_nucleus" or median_mt_preview < 2.0) else 20.0
                 warnings.append(
-                    f"data_type not confirmed. Median MT={median_mt_preview:.2f}% suggests "
-                    f"{'single-nucleus (5% threshold)' if median_mt_preview < 2.0 else 'single-cell (25% threshold)'}, "
-                    "but this must be confirmed with the user before applying filters. "
-                    "Pass data_type='single_cell' or data_type='single_nucleus' after confirmation."
+                    f"mt_threshold not set explicitly (median MT={median_mt_preview:.2f}%). "
+                    "Review the MT% distribution in the QC figure and choose a data-driven threshold "
+                    "based on where the high-MT tail separates from the main population. "
+                    "Then re-run with mt_threshold=<value> to get exact removal counts."
                 )
             if not filter_mt:
                 warnings.append(
-                    "Hard MT% cell filtering is disabled for this run; MT metrics and reference thresholds "
-                    "are reported for QC review only."
+                    "Hard MT% cell filtering is disabled for this run; MT metrics are "
+                    "reported for QC review only."
                 )
 
-            if min_cells is None:
-                from ..config.defaults import QC_DEFAULTS
-                import math
-                # Workshop uses exp(5)~148 for multi-sample data, exp(4)~55 for single-sample.
-                # Include recommended_column so needs_confirmation datasets (where applied_column
-                # is None) still get the multi-sample threshold when a candidate batch key exists.
-                effective_batch = (
-                    batch_key
-                    or requested_batch_key
-                    or (batch_resolution.recommended_column if batch_resolution else None)
-                )
-                if (effective_batch and effective_batch in qc_preview.obs.columns
-                        and qc_preview.obs[effective_batch].nunique() > 1):
-                    min_cells = int(math.exp(5))
-                else:
-                    min_cells = int(QC_DEFAULTS.min_cells_per_gene)
-
-            cells_over_mt = int((qc_preview.obs['pct_counts_mt'] >= mt_threshold).sum()) if 'pct_counts_mt' in qc_preview.obs else 0
-            # Precompute impact at both standard thresholds so the LLM can present both options to the user
             _mt_col = qc_preview.obs['pct_counts_mt'] if 'pct_counts_mt' in qc_preview.obs else None
+            cells_over_mt = int((_mt_col >= mt_threshold).sum()) if _mt_col is not None else 0
+            # Report exact removal counts at a range of thresholds so the model can present
+            # data-driven options without anchoring to any single "standard" value.
             mt_threshold_options = {
-                "single_cell":    {"threshold": 25.0, "cells_flagged": int((_mt_col >= 25.0).sum()) if _mt_col is not None else 0, "pct_flagged": round(float((_mt_col >= 25.0).mean()) * 100, 1) if _mt_col is not None else 0},
-                "single_nucleus": {"threshold":  5.0, "cells_flagged": int((_mt_col >=  5.0).sum()) if _mt_col is not None else 0, "pct_flagged": round(float((_mt_col >=  5.0).mean()) * 100, 1) if _mt_col is not None else 0},
+                str(t): {
+                    "threshold": t,
+                    "cells_flagged": int((_mt_col >= t).sum()) if _mt_col is not None else 0,
+                    "pct_flagged": round(float((_mt_col >= t).mean()) * 100, 1) if _mt_col is not None else 0,
+                }
+                for t in [5, 10, 15, 20, 25, 30]
             } if not data_type_confirmed else None
             predicted_doublets = int(qc_preview.obs['predicted_doublet'].sum()) if 'predicted_doublet' in qc_preview.obs else 0
-            genes_low_cells = int((qc_preview.var['n_cells_by_counts'] < min_cells).sum()) if 'n_cells_by_counts' in qc_preview.var.columns else 0
+            genes_low_cells = (
+                int((qc_preview.var['n_cells_by_counts'] < min_cells).sum())
+                if min_cells is not None and 'n_cells_by_counts' in qc_preview.var.columns
+                else 0
+            )
             cells_low_genes = (
                 int((qc_preview.obs['n_genes_by_counts'] < int(min_genes)).sum())
                 if min_genes is not None and 'n_genes_by_counts' in qc_preview.obs.columns
@@ -3556,7 +3565,7 @@ def process_tool_call(
             projected_cells_retained = int(n_before - projected_cells_removed)
 
             gene_removal_mask = pd.Series(False, index=qc_preview.var_names)
-            if 'n_cells_by_counts' in qc_preview.var.columns:
+            if min_cells is not None and 'n_cells_by_counts' in qc_preview.var.columns:
                 gene_removal_mask |= qc_preview.var['n_cells_by_counts'] < int(min_cells)
             if remove_ribo and 'ribo' in qc_preview.var.columns:
                 gene_removal_mask |= qc_preview.var['ribo'].astype(bool)
@@ -3638,16 +3647,17 @@ def process_tool_call(
                     plt.close(fig)
                     figure_outputs.append(hist_path)
 
-                    # --- Figure 4: MT% histogram with threshold line ---
+                    # --- Figure 4: MT% histogram (threshold line only when user confirmed a value) ---
                     if "pct_counts_mt" in qc_plot_adata.obs.columns:
                         fig, ax = plt.subplots(figsize=(8, 4))
                         ax.hist(qc_plot_adata.obs["pct_counts_mt"], bins=100, edgecolor='black', alpha=0.7)
-                        ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=2,
-                                   label=f'Threshold: {mt_threshold:.1f}%')
+                        if data_type_confirmed:
+                            ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=2,
+                                       label=f'Threshold: {mt_threshold:.1f}%')
+                            ax.legend()
                         ax.set_xlabel("Mitochondrial %")
                         ax.set_ylabel("Cell Count")
                         ax.set_title("Mitochondrial Content Distribution")
-                        ax.legend()
                         fig.tight_layout()
                         mt_hist_path = os.path.join(figure_dir, "qc_mt_histogram.png")
                         fig.savefig(mt_hist_path, dpi=150, bbox_inches='tight')
@@ -3664,10 +3674,11 @@ def process_tool_call(
                     if 'pct_counts_mt' in qc_plot_adata.obs.columns and 'total_counts' in qc_plot_adata.obs.columns:
                         sc.pl.scatter(qc_plot_adata, x='total_counts', y='pct_counts_mt', ax=axes[1], show=False)
                         axes[1].set_xscale('log')
-                        axes[1].axhline(mt_threshold, color='red', linestyle='--', linewidth=2,
-                                        label=f'MT threshold: {mt_threshold:.1f}%')
+                        if data_type_confirmed:
+                            axes[1].axhline(mt_threshold, color='red', linestyle='--', linewidth=2,
+                                            label=f'MT threshold: {mt_threshold:.1f}%')
+                            axes[1].legend()
                         axes[1].set_title("MT% vs Counts")
-                        axes[1].legend()
                     fig.tight_layout()
                     scatter_path = os.path.join(figure_dir, "qc_scatter.png")
                     fig.savefig(scatter_path, dpi=150, bbox_inches='tight')
@@ -3678,9 +3689,10 @@ def process_tool_call(
                     if 'pct_counts_mt' in qc_plot_adata.obs.columns and 'pct_counts_ribo' in qc_plot_adata.obs.columns:
                         fig, ax = plt.subplots(figsize=(6, 5))
                         sc.pl.scatter(qc_plot_adata, x='pct_counts_mt', y='pct_counts_ribo', ax=ax, show=False)
-                        ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=1, label=f'MT threshold')
+                        if data_type_confirmed:
+                            ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=1, label=f'MT threshold')
+                            ax.legend()
                         ax.set_title("Ribosomal vs Mitochondrial Content")
-                        ax.legend()
                         fig.tight_layout()
                         ribo_mt_path = os.path.join(figure_dir, "qc_ribo_vs_mt.png")
                         fig.savefig(ribo_mt_path, dpi=150, bbox_inches='tight')
@@ -3717,9 +3729,11 @@ def process_tool_call(
                     "cells_flagged": cells_low_genes,
                 },
                 "min_cells_per_gene": {
-                    "value": int(min_cells),
+                    "value": int(min_cells) if min_cells is not None else None,
                     "reason": (
                         f"Genes detected in fewer than {int(min_cells)} cells add noise and little clustering signal."
+                        if min_cells is not None
+                        else "No min-cells-per-gene filter requested."
                     ),
                     "genes_flagged": genes_low_cells,
                 },
@@ -3757,7 +3771,7 @@ def process_tool_call(
                     "data_type": requested_data_type,
                     "data_type_confirmed": data_type_confirmed,
                     "min_genes": int(min_genes) if min_genes is not None else None,
-                    "min_cells_per_gene": int(min_cells),
+                    "min_cells_per_gene": int(min_cells) if min_cells is not None else None,
                     "remove_ribo": bool(remove_ribo),
                     "remove_mt_genes": bool(remove_mt),
                     "detect_doublets": bool(detect_doublets_flag),
@@ -3786,10 +3800,10 @@ def process_tool_call(
                 },
                 "gene_filters": {
                     "low_cells": {
-                        "enabled": True,
-                        "threshold": int(min_cells),
+                        "enabled": min_cells is not None,
+                        "threshold": int(min_cells) if min_cells is not None else None,
                         "genes_flagged": genes_low_cells,
-                        "will_remove": True,
+                        "will_remove": min_cells is not None,
                     },
                     "ribosomal": {
                         "enabled": bool(remove_ribo),
@@ -4114,8 +4128,8 @@ def process_tool_call(
             raw_layer_name = tool_input.get("raw_layer_name", "raw_counts")
             force_reset_from_raw = bool(tool_input.get("force_reset_from_raw", True))
             set_raw_after_normalization = bool(tool_input.get("set_raw_after_normalization", True))
-            hvg_flavor = tool_input.get("hvg_flavor", "seurat")
-            hvg_layer = tool_input.get("hvg_layer")
+            hvg_flavor = tool_input.get("hvg_flavor", "seurat_v3")
+            hvg_layer = tool_input.get("hvg_layer") or None
             batch_key = tool_input.get("batch_key")
             hvg_exclude_patterns = tool_input.get("hvg_exclude_patterns") or []
             if isinstance(hvg_exclude_patterns, str):
@@ -4343,6 +4357,21 @@ def process_tool_call(
             metric = tool_input.get("metric", "euclidean")
             key_added = tool_input.get("key_added")
 
+            if use_rep not in adata.obsm:
+                available_reps = [k for k in adata.obsm.keys()]
+                return _smart_unavailable_result(
+                    tool="run_neighbors",
+                    message=f"Representation '{use_rep}' not found in adata.obsm.",
+                    adata_obj=adata,
+                    missing_prerequisites=["pca"] if use_rep == "X_pca" else [use_rep],
+                    recovery_options=[
+                        f"Run run_pca first to compute '{use_rep}'." if use_rep == "X_pca"
+                        else f"Compute '{use_rep}' before calling run_neighbors.",
+                        f"Set use_rep to one of the available representations: {available_reps}",
+                    ],
+                    extra={"available_representations": available_reps},
+                )
+
             compute_neighbors(
                 adata,
                 n_neighbors=n_neighbors,
@@ -4395,11 +4424,29 @@ def process_tool_call(
         elif tool_name == "run_umap":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            neighbors_key = tool_input.get("neighbors_key")
+            _neighbors_lookup = neighbors_key or "neighbors"
+            if _neighbors_lookup not in adata.uns:
+                available_graphs = [k for k in adata.uns if "neighbor" in k.lower() or k == "neighbors"]
+                return _smart_unavailable_result(
+                    tool="run_umap",
+                    message=f"Neighbor graph '{_neighbors_lookup}' not found in adata.uns.",
+                    adata_obj=adata,
+                    missing_prerequisites=["neighbors"],
+                    recovery_options=[
+                        "Run run_neighbors first to compute the neighbor graph.",
+                        *(
+                            [f"Or set neighbors_key to one of the existing graphs: {available_graphs}"]
+                            if available_graphs else []
+                        ),
+                    ],
+                    extra={"available_neighbor_graphs": available_graphs},
+                )
+
             neighbors_before = _neighbors_provenance(adata)
             min_dist = float(tool_input.get("min_dist", 0.5))
             spread = float(tool_input.get("spread", 1.0))
             n_components = int(tool_input.get("n_components", 2))
-            neighbors_key = tool_input.get("neighbors_key")
             random_state = int(tool_input.get("random_state", 0))
 
             compute_umap(
@@ -4453,44 +4500,6 @@ def process_tool_call(
                     ],
                 ),
             )
-
-        elif tool_name == "run_dimred":
-            warnings = _state_preservation_warning(tool_input, adata)
-            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            n_pcs = tool_input.get("n_pcs", 30)
-            n_neighbors = tool_input.get("n_neighbors", 30)
-            svd_solver = tool_input.get("svd_solver", "arpack")
-            mask_var = tool_input.get("mask_var", "highly_variable")
-            umap_min_dist = float(tool_input.get("umap_min_dist", 0.1))
-
-            run_pca(adata, n_comps=n_pcs, mask_var=mask_var, svd_solver=svd_solver)
-            compute_neighbors(adata, n_neighbors=n_neighbors)
-            compute_umap(adata, min_dist=umap_min_dist)
-
-            output_path = fix_output_path(tool_input.get("output_path"), "run_dimred")
-            if output_path:
-                write_h5ad_safe(adata, output_path)
-
-            return json.dumps({
-                "status": "ok",
-                "tool": "run_dimred",
-                "output_path": output_path,
-                "saved": output_path is not None,
-                "n_pcs": n_pcs,
-                "n_neighbors": n_neighbors,
-                "svd_solver": svd_solver,
-                "mask_var": mask_var,
-                "umap_min_dist": umap_min_dist,
-                "variance_explained": float(adata.uns['pca']['variance_ratio'].sum()),
-                "side_effects": {
-                    "pca_recomputed": True,
-                    "neighbors_recomputed": True,
-                    "umap_recomputed": True,
-                    "clustering_recomputed": False,
-                },
-                "warnings": warnings,
-                "state": make_state(adata)
-            }, indent=2), adata
 
         elif tool_name == "run_clustering":
             warnings = _state_preservation_warning(tool_input, adata)
@@ -5369,9 +5378,6 @@ def process_tool_call(
 
             # Get batch sizes for output
             batch_sizes = adata.obs[batch_key].value_counts().to_dict()
-            compute_umap_after = bool(tool_input.get("compute_umap", False))
-            compute_neighbors_after = bool(tool_input.get("compute_neighbors", False)) or compute_umap_after
-
             if method == "harmony":
                 run_harmony(adata, batch_key=batch_key)
                 corrected_rep = "X_pca_harmony"
@@ -5382,9 +5388,9 @@ def process_tool_call(
                 if "X_pca" not in adata.obsm:
                     return _error_result(
                         tool="run_batch_correction",
-                        message="BBKNN requires PCA in adata.obsm['X_pca']. Run run_dimred first.",
+                        message="BBKNN requires PCA in adata.obsm['X_pca']. Run run_pca first.",
                         adata_obj=adata,
-                        recovery_options=["Run run_dimred to compute PCA, then retry BBKNN."],
+                        recovery_options=["Run run_pca to compute PCA, then retry BBKNN."],
                         extra={"method": "bbknn"},
                     )
                 run_bbknn(
@@ -5396,10 +5402,6 @@ def process_tool_call(
                 # BBKNN correction lives in the neighbor graph, not an obsm key.
                 # corrected_rep=None signals downstream logic to use the BBKNN graph as-is.
                 corrected_rep = None
-                if tool_input.get("compute_neighbors"):
-                    warnings.append(
-                        "compute_neighbors was ignored for BBKNN because BBKNN itself creates the batch-balanced neighbor graph."
-                    )
             elif method == "scvi":
                 n_latent = int(tool_input.get("n_latent") or 30)
                 max_epochs = int(tool_input.get("max_epochs") or 200)
@@ -5431,25 +5433,8 @@ def process_tool_call(
                 run_scanorama(adata, batch_key=batch_key)
                 corrected_rep = "X_scanorama"
 
-            n_neighbors = None
             neighbors_recomputed = method == "bbknn"
             umap_recomputed = False
-
-            # Modular behavior: do not run downstream graph/UMAP steps unless
-            # explicitly requested. For embedding-based corrections, UMAP
-            # requires a graph on the corrected representation, so compute it
-            # when compute_umap=true.
-            if corrected_rep is not None and compute_neighbors_after:
-                n_neighbors = int(tool_input.get("n_neighbors") or 30)
-                compute_neighbors(adata, n_neighbors=n_neighbors, use_rep=corrected_rep)
-                neighbors_recomputed = True
-            if compute_umap_after:
-                compute_umap(adata)
-                umap_recomputed = True
-            elif "X_umap" in adata.obsm:
-                warnings.append(
-                    "Batch correction was run without compute_umap=true. Existing X_umap was left unchanged and may not reflect the newly corrected representation/graph."
-                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
             if output_path:
@@ -5478,8 +5463,6 @@ def process_tool_call(
             if batch_decision is not None:
                 decisions.append(batch_decision)
             extra = {}
-            if corrected_rep is not None and n_neighbors is not None:
-                extra["n_neighbors"] = n_neighbors
             if method == "scvi":
                 extra["n_latent"] = int(tool_input.get("n_latent") or 30)
                 extra["max_epochs"] = int(tool_input.get("max_epochs") or 200)
@@ -5495,14 +5478,6 @@ def process_tool_call(
                 if corrected_rep is None
                 else corrected_rep
             )
-            umap_note = (
-                "UMAP recomputed from batch-corrected BBKNN neighbor graph"
-                if corrected_rep is None and umap_recomputed
-                else f"UMAP recomputed using corrected {corrected_rep} embedding"
-                if umap_recomputed
-                else "UMAP was not recomputed; run run_umap explicitly when ready."
-            )
-
             batch_result = {
                 "status": "ok",
                 "tool": "run_batch_correction",
@@ -5513,11 +5488,9 @@ def process_tool_call(
                 "n_batches": len(batch_sizes),
                 "batch_sizes": {str(k): int(v) for k, v in batch_sizes.items()},
                 "corrected_embedding": corrected_embedding_label,
-                "compute_neighbors_requested": bool(tool_input.get("compute_neighbors", False)),
-                "compute_umap_requested": compute_umap_after,
                 "neighbors_recomputed": neighbors_recomputed,
-                "umap_recomputed": umap_recomputed,
-                "note": umap_note,
+                "umap_recomputed": False,
+                "note": "Batch correction complete. Run run_umap next (and run_neighbors first for Harmony/Scanorama/scVI).",
                 "warnings": warnings,
                 "state": make_state(adata),
                 **extra,
@@ -5547,11 +5520,8 @@ def process_tool_call(
                     [
                         _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists in adata.obs."),
                         _check("corrected_embedding_present", corrected_present, corrected_check_label),
-                    ] + (
-                        [_check("umap_present", "X_umap" in adata.obsm, "UMAP was recomputed after correction.")]
-                        if compute_umap_after else
-                        [_check("no_umap_side_effect", not umap_recomputed, "UMAP was not recomputed because compute_umap=false.")]
-                    ),
+                        _check("umap_not_recomputed", not umap_recomputed, "UMAP was not recomputed — run run_umap to refresh the layout."),
+                    ],
                 ),
             )
 

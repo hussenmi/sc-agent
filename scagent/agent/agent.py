@@ -81,9 +81,9 @@ SUCCESS_OVERRIDE_PATTERNS = [
 AUTO_RECOVERY_ATTEMPTS = 2
 
 ACTION_TOOL_NAMES = {
+    "load_data",
     "run_qc",
     "normalize_and_hvg",
-    "run_dimred",
     "run_pca",
     "run_neighbors",
     "run_umap",
@@ -635,11 +635,6 @@ class SCAgent:
             run_step("normalize_and_hvg", normalize_input)
             return {"selected_action": selected_action, "steps": steps}
 
-        if selected_action == "run_dimred":
-            dimred_input = dict(action_inputs.get("run_dimred", {}))
-            run_step("run_dimred", dimred_input)
-            return {"selected_action": selected_action, "steps": steps}
-
         if selected_action == "run_annotation":
             annotation_input = dict(action_inputs.get("run_annotation", {}))
             run_step("run_celltypist", annotation_input)
@@ -922,7 +917,7 @@ class SCAgent:
             if result_data.get("n_hvg") is not None:
                 summary = f"Normalization and HVG selection are complete ({result_data['n_hvg']} HVGs selected)."
             options, option_actions = self._checkpoint_options([
-                ("Compute PCA, neighbors, and UMAP", "run_dimred"),
+                ("Run PCA", "run_pca"),
                 ("Inspect the normalized dataset state before computing embeddings", "inspect_existing_state"),
                 ("Something else", "custom"),
             ])
@@ -936,29 +931,7 @@ class SCAgent:
                 "recommendation": options[0],
                 "option_actions": option_actions,
                 "action_inputs": {
-                    "run_dimred": {},
-                },
-                "artifacts": artifacts,
-            }
-
-        elif tool_name == "run_dimred":
-            summary = "PCA, neighbors, and UMAP are complete."
-            options, option_actions = self._checkpoint_options([
-                ("Run clustering on the current embedding", "run_clustering"),
-                ("Review the embedding outputs before clustering", "review_corrected_embedding"),
-                ("Something else", "custom"),
-            ])
-            checkpoint = {
-                "kind": "dimred",
-                "question": "Dimensionality reduction is complete. What should I do next?",
-                "options": options,
-                "default": options[0],
-                "decision_key": "dimred_next_step",
-                "summary": summary,
-                "recommendation": options[0],
-                "option_actions": option_actions,
-                "action_inputs": {
-                    "run_clustering": {},
+                    "run_pca": {},
                 },
                 "artifacts": artifacts,
             }
@@ -1062,11 +1035,10 @@ class SCAgent:
         elif tool_name == "run_batch_correction":
             method = result_data.get("method", "batch correction")
             batch_key = result_data.get("batch_key", "batch")
-            summary = f"Applied {method} batch correction using '{batch_key}' and recomputed the embedding."
+            summary = f"Applied {method} batch correction using '{batch_key}'. UMAP must be recomputed before plotting or clustering."
             options, option_actions = self._checkpoint_options([
-                ("Run clustering on the corrected representation", "run_clustering"),
-                ("Generate or review corrected UMAP figures before clustering", "review_corrected_embedding"),
-                ("Inspect batch mixing quality before continuing", "inspect_batch_mixing"),
+                ("Recompute UMAP from the corrected graph", "run_umap"),
+                ("Inspect batch mixing quality before computing UMAP", "inspect_batch_mixing"),
                 ("Something else", "custom"),
             ])
             checkpoint = {
@@ -1079,7 +1051,7 @@ class SCAgent:
                 "recommendation": options[0],
                 "option_actions": option_actions,
                 "action_inputs": {
-                    "run_clustering": {},
+                    "run_umap": {},
                 },
                 "artifacts": artifacts,
             }
@@ -1165,7 +1137,7 @@ class SCAgent:
 
         if tool_name == "generate_figure" and "embedding" in missing:
             options, option_actions = self._checkpoint_options([
-                ("Compute PCA, neighbors, and UMAP now", "run_dimred"),
+                ("Run PCA, then neighbors, then UMAP", "run_pca"),
                 ("Inspect the current dataset state before computing embeddings", "inspect_existing_state"),
                 ("Something else", "custom"),
             ])
@@ -1178,7 +1150,7 @@ class SCAgent:
                 "summary": message,
                 "recommendation": options[0],
                 "option_actions": option_actions,
-                "action_inputs": {"run_dimred": {}},
+                "action_inputs": {"run_pca": {}},
                 "artifacts": artifacts,
             }
         elif tool_name == "generate_figure" and "valid_color_key" in missing:
@@ -1541,7 +1513,6 @@ class SCAgent:
                 "dataset_changed": tool_name in {
                     "run_qc",
                     "normalize_and_hvg",
-                    "run_dimred",
                     "run_pca",
                     "run_neighbors",
                     "run_umap",
@@ -1750,10 +1721,9 @@ class SCAgent:
         # _sync_world_state (which calls inspect_data on the full adata) runs.
         if self.verbose:
             from rich.console import Console
-            from rich.panel import Panel
+            from rich.rule import Rule
             console = Console()
-            console.print()
-            console.print(Panel(request, title="🔬 Analyzing", border_style="cyan"))
+            console.print(Rule(style="cyan"))
 
         self._sync_world_state(extra_text=request)
 
@@ -2527,11 +2497,11 @@ class SCAgent:
         return final_result
 
     _TOOL_LABELS = {
+        "load_data":            "Loading dataset",
         "run_qc":               "Running QC",
         "score_integration":    "Scoring integration quality",
         "benchmark_integration": "Benchmarking integration (scib-metrics)",
         "normalize_and_hvg":    "Normalizing",
-        "run_dimred":           "Dimensionality reduction",
         "run_pca":              "Running PCA",
         "run_neighbors":        "Computing neighbors",
         "run_umap":             "Computing UMAP",
@@ -2562,7 +2532,6 @@ class SCAgent:
     # For these tools we print a start line and let the tool's own output flow through.
     _STREAMING_TOOLS = {
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
-        "run_dimred",             # UMAP can take minutes on large datasets
         "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets
         "benchmark_integration",  # scib-metrics runs many metrics
@@ -2602,7 +2571,6 @@ class SCAgent:
             checkpoint_tools = {
                 "run_qc",
                 "normalize_and_hvg",
-                "run_dimred",
                 "run_pca",
                 "run_neighbors",
                 "run_umap",

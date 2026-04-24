@@ -182,7 +182,7 @@ def filter_genes(
     adata : AnnData
         AnnData object.
     min_cells : float, optional
-        Minimum cells a gene must be expressed in. Default is exp(4) ~ 55.
+        Minimum cells a gene must be expressed in. If None, no min-cell filtering is applied.
     remove_ribo : bool, default True
         Remove ribosomal genes.
     remove_mt : bool, default False
@@ -198,14 +198,11 @@ def filter_genes(
     if not inplace:
         adata = adata.copy()
 
-    if min_cells is None:
-        min_cells = QC_DEFAULTS.min_cells_per_gene
-
     n_before = adata.n_vars
 
-    # Filter by minimum cells
-    sc.pp.filter_genes(adata, min_cells=min_cells)
-    logger.info(f"Filtered genes by min_cells={min_cells:.0f}: {n_before:,} -> {adata.n_vars:,}")
+    if min_cells is not None:
+        sc.pp.filter_genes(adata, min_cells=min_cells)
+        logger.info(f"Filtered genes by min_cells={min_cells:.0f}: {n_before:,} -> {adata.n_vars:,}")
 
     # Remove ribosomal genes
     if remove_ribo:
@@ -554,7 +551,7 @@ def run_qc_pipeline(
     min_genes : int, optional
         Minimum detected genes per cell. If None, no cell-level gene-count filtering is applied.
     min_cells : float, optional
-        Minimum cells per gene. Default is exp(4) ~ 55.
+        Minimum cells per gene. If None, no gene-level cell-count filtering is applied.
     remove_ribo : bool, default True
         Remove ribosomal genes.
     detect_doublets_flag : bool, default True
@@ -613,18 +610,7 @@ def run_qc_pipeline(
     if remove_doublets:
         filter_doublets(adata, inplace=True)
 
-    # Step 4: Filter genes
-    # Workshop uses np.exp(5) (~148) for multi-sample data and np.exp(4) (~55)
-    # for single-sample data. Scale automatically when batch_key is present.
-    if min_cells is None and batch_key and batch_key in adata.obs.columns:
-        n_batches = adata.obs[batch_key].nunique()
-        if n_batches > 1:
-            min_cells = float(np.exp(5))
-            logger.info(
-                "Multi-sample data (%d batches) — using min_cells=exp(5)~148 "
-                "instead of exp(4)~55 (workshop session 5 practice).",
-                n_batches,
-            )
+    # Step 4: Filter genes (min_cells=None means skip cell-count filtering)
     filter_genes(adata, min_cells=min_cells, remove_ribo=remove_ribo, inplace=True)
 
     logger.info(f"QC pipeline complete. Final shape: {adata.n_obs:,} x {adata.n_vars:,}")

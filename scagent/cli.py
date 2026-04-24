@@ -250,6 +250,30 @@ Examples:
     return 0
 
 
+def _maybe_save_on_exit(agent, console) -> None:
+    """Prompt to save adata if data is loaded and unsaved at session end."""
+    if agent.adata is None:
+        return
+    from pathlib import Path
+    from scagent.terminal import read_user_input
+    run_dir = agent.run_manager.run_dir if agent.run_manager else Path(agent.output_dir)
+    default_path = str(run_dir / "final_result.h5ad")
+    try:
+        console.print(f"\n[yellow]You have data in memory. Save before exiting?[/yellow] [dim](Enter path, or press Enter for default: {default_path}, or n to skip)[/dim]")
+        response = read_user_input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if response.lower() in ("n", "no", "skip"):
+        return
+    save_path = response if response and response.lower() not in ("y", "yes") else default_path
+    try:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        agent.adata.write_h5ad(save_path)
+        console.print(f"[green]Saved to {save_path}[/green]")
+    except Exception as e:
+        console.print(f"[red]Save failed: {e}[/red]")
+
+
 def run_start(args):
     """Start an interactive session."""
     from rich.console import Console
@@ -318,6 +342,7 @@ def run_start(args):
             agent._update_context_bar()
             user_input = read_user_input("\n> ")
         except (EOFError, KeyboardInterrupt):
+            _maybe_save_on_exit(agent, console)
             console.print("\n[dim]Session ended.[/dim]")
             break
 
@@ -325,6 +350,7 @@ def run_start(args):
             continue
 
         if user_input.lower() in ("exit", "quit", "q", "done"):
+            _maybe_save_on_exit(agent, console)
             console.print("[dim]Session ended.[/dim]")
             break
 
