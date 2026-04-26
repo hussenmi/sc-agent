@@ -14,12 +14,13 @@ from typing import Optional, List
 class QCDefaults:
     """Quality control default parameters."""
 
-    # Mitochondrial content thresholds
-    mt_threshold_cells: float = 25.0  # For dissociated cells
-    mt_threshold_nuclei: float = 5.0  # For single nuclei
+    # Mitochondrial content thresholds — used only when mt_threshold is not set explicitly.
+    # The actual threshold must always be chosen from the QC figure distribution.
+    mt_threshold_cells: float = 20.0  # Starting point for dissociated cells; override from QC figure
+    mt_threshold_nuclei: float = 5.0  # Starting point for single nuclei; override from QC figure
 
-    # Gene filtering
-    min_cells_per_gene: float = np.exp(4)  # ~55 cells
+    # Gene filtering (unused by agent — threshold is data-driven from QC figures)
+    min_cells_per_gene: float = np.exp(4)  # ~55 cells, kept for programmatic use only
 
     # Scrublet doublet detection
     scrublet_expected_doublet_rate: float = 0.06
@@ -109,6 +110,10 @@ class BatchDefaults:
     # Harmony
     harmony_basis: str = 'X_pca'
     harmony_adjusted_basis: str = 'X_pca_harmony'
+
+    # BBKNN
+    bbknn_n_pcs: int = 30
+    bbknn_neighbors_within_batch: int = 3
 
 
 @dataclass(frozen=True)

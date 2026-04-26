@@ -6,6 +6,7 @@ and recommends what analysis steps are needed to reach a user's goal.
 """
 
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -82,6 +83,158 @@ METADATA_ROLE_ALIASES = {
 
 PARTITION_ROLES = {"batch", "sample", "donor"}
 
+SEMANTIC_OBS_ROLE_ALIASES = {
+    **METADATA_ROLE_ALIASES,
+    "cell_type": {
+        "cell_type",
+        "celltype",
+        "celltypes",
+        "cell_type_label",
+        "cell_type_labels",
+        "cell_label",
+        "cell_labels",
+        "cell_identity",
+        "identity",
+        "annotation",
+        "annotations",
+        "manual_annotation",
+        "manual_annotations",
+        "manual_labels",
+        "author_cell_type",
+        "author_celltype",
+        "broad_cell_type",
+        "fine_cell_type",
+        "predicted_labels",
+        "majority_voting",
+        "celltypist_predicted_labels",
+        "celltypist_majority_voting",
+        "predictions_unconstrained",
+        "representative_prediction",
+        "scimilarity_predictions_unconstrained",
+        "scimilarity_representative_prediction",
+        "cell_ontology_class",
+        "cell_ontology_term",
+    },
+    "cluster": {
+        "cluster",
+        "clusters",
+        "cluster_id",
+        "clusterid",
+        "clustering",
+        "leiden",
+        "louvain",
+        "phenograph",
+        "pheno_leiden",
+        "seurat_clusters",
+        "seurat_cluster",
+        "snn_res",
+        "rna_snn_res",
+        "integrated_snn_res",
+        "res",
+        "resolution",
+    },
+    "disease": {
+        "disease",
+        "disease_status",
+        "diagnosis",
+        "pathology",
+        "phenotype",
+    },
+    "tissue": {
+        "tissue",
+        "tissue_type",
+        "organ",
+        "site",
+        "anatomical_site",
+        "compartment",
+    },
+    "qc_total_counts": {
+        "total_counts",
+        "n_counts",
+        "ncounts",
+        "n_count",
+        "ncount_rna",
+        "ncount",
+        "umi_counts",
+        "n_umi",
+    },
+    "qc_n_genes": {
+        "n_genes_by_counts",
+        "n_genes",
+        "num_genes",
+        "n_feature",
+        "n_features",
+        "nfeature_rna",
+        "nfeature",
+        "genes_detected",
+    },
+    "qc_pct_mt": {
+        "pct_counts_mt",
+        "percent_mt",
+        "percent.mt",
+        "pct_mt",
+        "mt_pct",
+        "mito_pct",
+        "percent_mito",
+        "percent_mitochondrial",
+    },
+    "qc_pct_ribo": {
+        "pct_counts_ribo",
+        "percent_ribo",
+        "percent.ribo",
+        "pct_ribo",
+        "ribo_pct",
+        "percent_ribosomal",
+    },
+    "doublet_score": {
+        "doublet_score",
+        "doubletscore",
+        "scrublet_score",
+        "scrublet_doublet_score",
+    },
+    "doublet_label": {
+        "predicted_doublet",
+        "doublet",
+        "is_doublet",
+        "doublet_call",
+        "doublet_label",
+        "doublet_class",
+    },
+}
+
+NUMERIC_SEMANTIC_ROLES = {
+    "qc_total_counts",
+    "qc_n_genes",
+    "qc_pct_mt",
+    "qc_pct_ribo",
+    "doublet_score",
+}
+
+CELL_TYPE_VALUE_PATTERNS = [
+    r"\bt\s*cell\b",
+    r"\bb\s*cell\b",
+    r"\bnk\b",
+    r"\bcd4\b",
+    r"\bcd8\b",
+    r"\bmonocyte\b",
+    r"\bmacrophage\b",
+    r"\bdendritic\b",
+    r"\bplasma\b",
+    r"\bmast\b",
+    r"\bneutrophil\b",
+    r"\bgranulocyte\b",
+    r"\bepithelial\b",
+    r"\bendothelial\b",
+    r"\bfibroblast\b",
+    r"\bastrocyte\b",
+    r"\bmicroglia\b",
+    r"\bneuron\b",
+    r"\bhepatocyte\b",
+    r"\bkeratinocyte\b",
+    r"\bmyeloid\b",
+    r"\blymphocyte\b",
+]
+
 
 @dataclass
 class MetadataCandidate:
@@ -139,7 +292,9 @@ class DataState:
     # Raw data
     has_raw_layer: bool = False
     raw_layer_name: str = ""
-    is_counts: bool = False  # True if X contains integer counts
+    has_raw: bool = False          # True if adata.raw is set
+    raw_n_vars: int = 0            # Number of genes in adata.raw (often > n_genes after HVG)
+    is_counts: bool = False        # True if X contains integer counts
 
     # QC state
     has_qc_metrics: bool = False
@@ -177,6 +332,10 @@ class DataState:
     has_celltypist: bool = False
     celltypist_model: str = ""
     has_scimilarity: bool = False
+    has_celltype_annotations: bool = False
+    cell_type_key: str = ""
+    cell_type_candidates: List[MetadataCandidate] = field(default_factory=list)
+    semantic_obs_roles: Dict[str, List[MetadataCandidate]] = field(default_factory=dict)
 
     # Batch info
     batch_key: Optional[str] = None
@@ -238,6 +397,17 @@ def metadata_candidate_to_dict(candidate: MetadataCandidate) -> Dict[str, Any]:
     }
 
 
+def semantic_roles_to_dict(
+    roles: Dict[str, List[MetadataCandidate]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Serialize semantic obs-role candidates for LLM-facing responses."""
+    return {
+        role: [metadata_candidate_to_dict(candidate) for candidate in candidates]
+        for role, candidates in roles.items()
+        if candidates
+    }
+
+
 def metadata_resolution_to_dict(resolution: MetadataResolution) -> Dict[str, Any]:
     """Serialize a metadata resolution decision for tool responses."""
     return {
@@ -256,18 +426,37 @@ def metadata_resolution_to_dict(resolution: MetadataResolution) -> Dict[str, Any
 
 
 def _is_integer_matrix(X) -> bool:
-    """Check if matrix contains integer values (counts)."""
+    """Check if matrix contains integer values (counts).
+
+    Uses the dtype as a fast shortcut — integer dtypes are definitely counts,
+    float dtypes with a log1p-range max are definitely not.  Only falls back
+    to sampling when the dtype is ambiguous (float that could still be counts).
+    Sampling uses a cheap head-slice instead of np.random.choice to avoid
+    allocating an index array the size of the full NNZ count.
+    """
+    # Fast dtype shortcut: integer dtypes are always counts
+    dtype = getattr(X, "dtype", None)
+    if dtype is not None and np.issubdtype(dtype, np.integer):
+        return True
+
     if sp.issparse(X):
         data = X.data
     else:
-        data = X.flatten()
+        data = X.ravel()
 
-    sample_size = min(10000, len(data))
-    if len(data) > sample_size:
-        indices = np.random.choice(len(data), sample_size, replace=False)
-        data = data[indices]
+    if len(data) == 0:
+        return True
 
-    return np.allclose(data, np.round(data))
+    # Cheap head-slice — avoids O(nnz) np.random.choice for large matrices
+    sample = data[:min(10000, len(data))]
+    return bool(np.allclose(sample, np.round(sample)))
+
+
+def _is_subdtype(dtype, kind) -> bool:
+    try:
+        return bool(np.issubdtype(dtype, kind))
+    except TypeError:
+        return False
 
 
 def _detect_data_type(adata: AnnData) -> str:
@@ -295,16 +484,27 @@ def _normalize_column_name(column: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
 
 
-def _column_name_role_scores(column: str) -> Dict[str, float]:
+def _column_name_role_scores(
+    column: str,
+    aliases_by_role: Optional[Dict[str, Iterable[str]]] = None,
+    *,
+    fuzzy: bool = False,
+) -> Dict[str, float]:
     """Score how strongly a column name suggests each metadata role."""
+    aliases_by_role = aliases_by_role or METADATA_ROLE_ALIASES
     normalized = _normalize_column_name(column)
+    compact = normalized.replace("_", "")
     tokens = set(filter(None, normalized.split("_")))
     scores: Dict[str, float] = {}
 
-    for role, aliases in METADATA_ROLE_ALIASES.items():
+    for role, aliases in aliases_by_role.items():
         normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
+        compact_aliases = {alias.replace("_", "") for alias in normalized_aliases}
         if normalized in normalized_aliases:
             scores[role] = 1.0
+            continue
+        if compact in compact_aliases:
+            scores[role] = max(scores.get(role, 0.0), 0.96)
             continue
 
         alias_tokens = {
@@ -316,6 +516,21 @@ def _column_name_role_scores(column: str) -> Dict[str, float]:
         overlap = len(tokens & alias_tokens)
         if overlap:
             scores[role] = min(0.85, 0.45 + 0.18 * overlap)
+
+        if compact and fuzzy:
+            best_ratio = max(
+                (SequenceMatcher(None, compact, alias).ratio() for alias in compact_aliases),
+                default=0.0,
+            )
+            if best_ratio >= 0.88:
+                scores[role] = max(scores.get(role, 0.0), min(0.92, best_ratio))
+            elif best_ratio >= 0.80 and len(compact) >= 5:
+                scores[role] = max(scores.get(role, 0.0), 0.72)
+
+        if len(compact) >= 5:
+            for alias in compact_aliases:
+                if len(alias) >= 5 and (compact in alias or alias in compact):
+                    scores[role] = max(scores.get(role, 0.0), 0.78)
 
     if normalized.endswith("_id"):
         if "sample" in normalized or "orig" in normalized:
@@ -370,6 +585,204 @@ def _is_discrete_obs_column(adata: AnnData, column: str) -> bool:
         return np.allclose(non_na.to_numpy(), np.round(non_na.to_numpy()))
 
     return False
+
+
+def _categorical_structure_score(series, n_obs: int, role: str) -> float:
+    n_unique = int(series.nunique(dropna=True))
+    if n_unique <= 1 or n_unique >= n_obs:
+        return 0.0
+
+    unique_fraction = n_unique / max(1, n_obs)
+    dtype_name = str(series.dtype)
+    score = 0.0
+    if dtype_name == "category" or dtype_name == "bool" or "string" in dtype_name or dtype_name == "object":
+        score += 0.3
+    elif _is_subdtype(series.dtype, np.integer):
+        score += 0.22
+    elif _is_subdtype(series.dtype, np.floating):
+        non_na = series.dropna()
+        if non_na.empty or not np.allclose(non_na.to_numpy(), np.round(non_na.to_numpy())):
+            return 0.0
+        score += 0.12
+
+    if role == "cell_type":
+        if 2 <= n_unique <= min(200, max(8, int(n_obs * 0.35))):
+            score += 0.32
+        elif unique_fraction < 0.65:
+            score += 0.16
+    elif role == "cluster":
+        if 2 <= n_unique <= min(80, max(3, int(n_obs * 0.25))):
+            score += 0.34
+        elif unique_fraction < 0.35:
+            score += 0.12
+    else:
+        if n_unique <= min(24, max(3, int(n_obs * 0.2))):
+            score += 0.3
+        elif unique_fraction <= 0.3:
+            score += 0.14
+
+    if unique_fraction <= 0.05:
+        score += 0.18
+    elif unique_fraction <= 0.2:
+        score += 0.1
+
+    return min(1.0, score)
+
+
+def _numeric_structure_score(series, role: str) -> float:
+    if not _is_subdtype(series.dtype, np.number):
+        return 0.0
+    non_na = series.dropna()
+    if non_na.empty:
+        return 0.0
+
+    score = 0.45
+    values = non_na.to_numpy()
+    if role in {"qc_pct_mt", "qc_pct_ribo", "doublet_score"}:
+        finite = values[np.isfinite(values)]
+        if len(finite) and float(np.nanmin(finite)) >= 0:
+            score += 0.15
+        if len(finite) and float(np.nanmax(finite)) <= 100:
+            score += 0.12
+    elif role in {"qc_total_counts", "qc_n_genes"}:
+        if float(np.nanmax(values)) > 10:
+            score += 0.12
+        if np.allclose(values[: min(1000, len(values))], np.round(values[: min(1000, len(values))])):
+            score += 0.08
+    return min(1.0, score)
+
+
+def _semantic_value_score(series, role: str) -> float:
+    values = [str(value).strip().lower() for value in series.dropna().unique().tolist()[:50]]
+    if not values:
+        return 0.0
+
+    if role == "cell_type":
+        text = " | ".join(values)
+        matches = sum(1 for pattern in CELL_TYPE_VALUE_PATTERNS if re.search(pattern, text))
+        if matches >= 3:
+            return 0.45
+        if matches == 2:
+            return 0.34
+        if matches == 1:
+            return 0.22
+        if any("cell" in value for value in values):
+            return 0.14
+
+    if role == "cluster":
+        numeric_like = 0
+        for value in values:
+            try:
+                float(value)
+                numeric_like += 1
+            except ValueError:
+                if value.startswith(("cluster", "clust", "c")):
+                    numeric_like += 1
+        if numeric_like and numeric_like / len(values) >= 0.75:
+            return 0.32
+
+    if role == "doublet_label":
+        normalized_values = {value.replace(" ", "_") for value in values}
+        known = {"true", "false", "0", "1", "doublet", "singlet", "multiplet", "negative", "positive"}
+        if normalized_values and normalized_values <= known:
+            return 0.35
+
+    return 0.0
+
+
+def _semantic_min_confidence(role: str) -> float:
+    if role in {"cell_type", "cluster"}:
+        return 0.38
+    if role in NUMERIC_SEMANTIC_ROLES:
+        return 0.48
+    return 0.34
+
+
+def _score_obs_semantic_candidate(
+    adata: AnnData,
+    column: str,
+    role: str,
+) -> Optional[MetadataCandidate]:
+    series = adata.obs[column]
+    n_obs = max(1, adata.n_obs)
+    n_unique = int(series.nunique(dropna=True))
+    if n_unique <= 1:
+        return None
+
+    name_score = _column_name_role_scores(
+        column,
+        SEMANTIC_OBS_ROLE_ALIASES,
+        fuzzy=True,
+    ).get(role, 0.0)
+    if role in NUMERIC_SEMANTIC_ROLES and name_score < 0.7:
+        return None
+
+    if role in NUMERIC_SEMANTIC_ROLES:
+        structure_score = _numeric_structure_score(series, role)
+        value_score = 0.0
+    else:
+        structure_score = _categorical_structure_score(series, n_obs, role)
+        value_score = _semantic_value_score(series, role)
+
+    if structure_score == 0.0 and name_score < 0.9:
+        return None
+
+    confidence = min(0.99, 0.56 * name_score + 0.27 * structure_score + 0.17 * value_score)
+    if name_score == 0.0:
+        confidence *= 0.72
+    if confidence < _semantic_min_confidence(role):
+        return None
+
+    examples = _series_examples(series.dropna().unique().tolist(), limit=4)
+    rationale_parts = [f"{n_unique} unique values"]
+    if name_score >= 0.9:
+        rationale_parts.append(f"name strongly suggests {role}")
+    elif name_score >= 0.65:
+        rationale_parts.append(f"name resembles {role}")
+    elif name_score > 0:
+        rationale_parts.append(f"name weakly suggests {role}")
+    if structure_score >= 0.55:
+        rationale_parts.append("values have the expected structure")
+    elif structure_score > 0:
+        rationale_parts.append("values are structurally plausible")
+    if value_score > 0:
+        rationale_parts.append("example values support the role")
+    if examples:
+        rationale_parts.append("examples: " + ", ".join(examples))
+
+    return MetadataCandidate(
+        column=str(column),
+        role=role,
+        n_unique=n_unique,
+        unique_fraction=n_unique / n_obs,
+        confidence=round(confidence, 3),
+        rationale="; ".join(rationale_parts),
+        dtype=str(series.dtype),
+        examples=examples,
+    )
+
+
+def rank_obs_semantic_candidates(
+    adata: AnnData,
+    *,
+    roles: Optional[Iterable[str]] = None,
+    limit_per_role: int = 6,
+) -> Dict[str, List[MetadataCandidate]]:
+    """Rank obs columns by semantic role using names, structure, and examples."""
+    roles_set = set(roles) if roles is not None else set(SEMANTIC_OBS_ROLE_ALIASES)
+    ranked: Dict[str, List[MetadataCandidate]] = {}
+
+    for column in adata.obs.columns:
+        for role in roles_set:
+            candidate = _score_obs_semantic_candidate(adata, column, role)
+            if candidate is not None:
+                ranked.setdefault(role, []).append(candidate)
+
+    for role, candidates in list(ranked.items()):
+        candidates.sort(key=lambda candidate: candidate.confidence, reverse=True)
+        ranked[role] = candidates[:limit_per_role]
+
+    return ranked
 
 
 def rank_obs_metadata_candidates(
@@ -551,12 +964,22 @@ def resolve_batch_metadata(
 
 
 def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
-    """Detect if a raw counts layer exists."""
+    """Detect if a raw counts layer exists in adata.layers.
+
+    Note: adata.raw is checked separately in inspect_data and reported via
+    has_raw / raw_n_vars fields.
+    """
     common_raw_names = ["raw_counts", "raw_data", "counts", "raw"]
 
     for name in common_raw_names:
         if name in adata.layers and _is_integer_matrix(adata.layers[name]):
             return True, name
+
+    # Check adata.raw — but only if it actually contains integer counts.
+    # adata.raw is often log-normalized data stored before HVG selection,
+    # not true raw counts. Verify before reporting it as a raw counts source.
+    if adata.raw is not None and _is_integer_matrix(adata.raw.X):
+        return True, "__raw__"
 
     return False, ""
 
@@ -567,58 +990,172 @@ def _detect_gene_id_format(adata: AnnData) -> Tuple[str, bool, bool, List[str]]:
 
     Returns: (format, has_symbols, has_ensembl, sample_names)
     """
-    gene_names = adata.var_names.tolist()
-    sample = gene_names[:20]
-
-    ensembl_pattern = re.compile(r"^ENS[A-Z]{0,3}G\d{11}")
-    entrez_pattern = re.compile(r"^\d{1,8}$")
-    symbol_pattern = re.compile(r"^[A-Z][A-Z0-9-]{1,15}$", re.IGNORECASE)
-
-    ensembl_count = sum(1 for gene in sample if ensembl_pattern.match(str(gene)))
-    entrez_count = sum(1 for gene in sample if entrez_pattern.match(str(gene)))
-    symbol_count = sum(
-        1
-        for gene in sample
-        if symbol_pattern.match(str(gene)) and not ensembl_pattern.match(str(gene))
+    info = _characterize_features(adata)
+    return (
+        info["gene_id_format"],
+        info["has_gene_symbols"],
+        info["has_ensembl_ids"],
+        info["sample_gene_names"],
     )
 
-    has_symbols = "gene_symbols" in adata.var.columns or "gene_name" in adata.var.columns
-    has_ensembl = "gene_ids" in adata.var.columns or "ensembl_id" in adata.var.columns
 
-    if ensembl_count > len(sample) * 0.5:
+def _characterize_features(adata: AnnData) -> dict:
+    """
+    Comprehensive characterization of var_names and obs_names for the LLM.
+
+    Returns a dict that is embedded directly into the inspect_data result so
+    the agent has everything it needs to decide whether gene names need
+    transformation before QC or annotation.
+    """
+    gene_names = adata.var_names.tolist()
+    sample_size = min(200, len(gene_names))
+    sample = gene_names[:sample_size]
+
+    ensembl_re = re.compile(r"^ENS[A-Z]{0,3}G\d{11}")
+    entrez_re = re.compile(r"^\d{1,8}$")
+    symbol_re = re.compile(r"^[A-Z][A-Z0-9\-\.]{1,20}$", re.IGNORECASE)
+    genome_prefix_re = re.compile(r"^([A-Za-z0-9]+_{2,})")
+
+    # --- genome prefix detection ---
+    prefix_counts: dict = {}
+    for g in sample:
+        m = genome_prefix_re.match(str(g))
+        if m:
+            prefix_counts[m.group(1)] = prefix_counts.get(m.group(1), 0) + 1
+    genome_prefix = None
+    if prefix_counts:
+        top_prefix, top_count = max(prefix_counts.items(), key=lambda x: x[1])
+        if top_count > sample_size * 0.3:
+            genome_prefix = top_prefix
+
+    # strip prefix for downstream pattern matching
+    def _strip(name: str) -> str:
+        return genome_prefix_re.sub("", name) if genome_prefix else name
+
+    stripped = [_strip(g) for g in sample]
+
+    ensembl_count = sum(1 for g in stripped if ensembl_re.match(g))
+    entrez_count = sum(1 for g in stripped if entrez_re.match(g))
+    symbol_count = sum(1 for g in stripped if symbol_re.match(g) and not ensembl_re.match(g))
+
+    has_symbols_col = "gene_symbols" in adata.var.columns or "gene_name" in adata.var.columns
+    has_ensembl_col = "gene_ids" in adata.var.columns or "ensembl_id" in adata.var.columns
+
+    if ensembl_count > sample_size * 0.5:
         fmt = "ensembl"
-    elif entrez_count > len(sample) * 0.5:
+    elif entrez_count > sample_size * 0.5:
         fmt = "entrez"
-    elif symbol_count > len(sample) * 0.3:
+    elif symbol_count > sample_size * 0.3:
         fmt = "symbol"
     else:
         fmt = "mixed" if (ensembl_count > 0 and symbol_count > 0) else "unknown"
 
-    return fmt, has_symbols or fmt == "symbol", has_ensembl or fmt == "ensembl", sample[:5]
+    # --- special / non-human gene populations ---
+    special_populations: List[dict] = []
+    all_genes_set = set(gene_names)
+
+    # viral / custom genomes — anything with a prefix different from the main one
+    alt_prefixes: dict = {}
+    for g in gene_names:
+        m = genome_prefix_re.match(str(g))
+        if m:
+            p = m.group(1)
+            if p != genome_prefix:
+                alt_prefixes[p] = alt_prefixes.get(p, 0) + 1
+    for p, cnt in alt_prefixes.items():
+        special_populations.append({"prefix": p, "n_genes": cnt,
+                                     "example": next(g for g in gene_names if g.startswith(p))})
+
+    # --- MT / ribo detectability ---
+    mt_genes_found = [g for g in gene_names if re.search(r'(?:^|_)MT-', g)]
+    ribo_genes_found = [g for g in gene_names if re.search(r'(?:^|_)(?:RPS|RPL)', g)]
+
+    mt_warning = None
+    ribo_warning = None
+    if len(mt_genes_found) == 0:
+        mt_warning = (
+            f"No MT- genes found with standard prefix search. "
+            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — standard detection patterns may not match.' if genome_prefix else 'Inspect var_names format before running QC.'}"
+        )
+    if len(ribo_genes_found) == 0:
+        ribo_warning = (
+            f"No RPS/RPL genes found with standard prefix search. "
+            f"{'Genome prefix detected: ' + repr(genome_prefix) + ' — standard detection patterns may not match.' if genome_prefix else 'Inspect var_names format before running QC.'}"
+        )
+
+    # --- obs_names (barcode) characterization ---
+    obs_sample = adata.obs_names.tolist()[:10]
+    tenx_re = re.compile(r'^[ACGT]{16}(-\d+)?$')
+    n_tenx = sum(1 for b in obs_sample if tenx_re.match(b))
+    obs_format = "10x_barcode" if n_tenx > 7 else "custom"
+    suffixes = set()
+    for b in obs_sample:
+        m = re.search(r'-(\d+)$', b)
+        if m:
+            suffixes.add(m.group(1))
+
+    return {
+        # gene id format (backwards-compat with existing callers)
+        "gene_id_format": fmt,
+        "has_gene_symbols": has_symbols_col or fmt == "symbol",
+        "has_ensembl_ids": has_ensembl_col or fmt == "ensembl",
+        "sample_gene_names": gene_names[:10],
+        # extended info for LLM — raw facts, no pre-interpreted flags
+        "genome_prefix": genome_prefix,
+        "special_gene_populations": special_populations,
+        "mt_genes_detected": len(mt_genes_found),
+        "mt_gene_examples": mt_genes_found[:3],
+        "ribo_genes_detected": len(ribo_genes_found),
+        "ribo_gene_examples": ribo_genes_found[:3],
+        "obs_names_format": obs_format,
+        "obs_names_sample": obs_sample,
+        "obs_names_suffixes_detected": sorted(suffixes),
+    }
 
 
 def _detect_normalization(adata: AnnData) -> Tuple[bool, bool, str]:
     """
     Detect if data is normalized and log-transformed.
 
+    Uses metadata shortcuts to avoid touching adata.X when possible — X.max()
+    on a large sparse matrix can scan hundreds of millions of values.
+
     Returns: (is_normalized, is_log_transformed, method)
     """
-    method = ""
+    # --- Metadata shortcuts (no X access) ---
+    # log1p in uns is written by sc.pp.log1p and is definitive.
     if "log1p" in adata.uns:
-        method = "log1p"
+        return True, True, "log1p"
 
+    # HVG + PCA presence strongly implies prior normalization even without log1p.
+    if "highly_variable" in adata.var.columns and "X_pca" in adata.obsm:
+        method = "log1p" if "log1p" in adata.uns else "unknown"
+        return True, False, method
+
+    # Integer dtype means raw counts — no normalization has occurred.
+    dtype = getattr(adata.X, "dtype", None)
+    if dtype is not None and np.issubdtype(dtype, np.integer):
+        return False, False, ""
+
+    # --- Fallback: sample a small prefix of X.data (cheap head-slice) ---
     if sp.issparse(adata.X):
-        max_val = adata.X.max()
-        sample_data = adata.X.data[:min(10000, len(adata.X.data))]
+        data = adata.X.data
+        if len(data) == 0:
+            return False, False, ""
+        sample_data = data[:min(10000, len(data))]
+        max_val = float(sample_data.max())
     else:
-        max_val = np.max(adata.X)
-        sample_data = adata.X.flatten()[:10000]
+        flat = adata.X.ravel()
+        if len(flat) == 0:
+            return False, False, ""
+        sample_data = flat[:10000]
+        max_val = float(sample_data.max())
 
     has_floats = not np.allclose(sample_data, np.round(sample_data))
     is_log = max_val < 15 and has_floats
     is_normalized = has_floats
 
-    return is_normalized, is_log, method
+    return is_normalized, is_log, ""
 
 
 def normalize_clustering_method(method: str) -> str:
@@ -690,6 +1227,25 @@ def _infer_obs_clustering_entries(adata: AnnData) -> List[ClusteringRecord]:
             )
         )
         seen.add(text)
+
+    semantic_clusters = rank_obs_semantic_candidates(adata, roles={"cluster"}).get("cluster", [])
+    for candidate in semantic_clusters:
+        if candidate.column in seen:
+            continue
+        n_clusters = int(adata.obs[candidate.column].nunique(dropna=True))
+        if n_clusters <= 1:
+            continue
+        entries.append(
+            ClusteringRecord(
+                key=candidate.column,
+                method="inferred",
+                n_clusters=n_clusters,
+                resolution=None,
+                is_primary=False,
+                created_by="inferred",
+            )
+        )
+        seen.add(candidate.column)
 
     return entries
 
@@ -835,8 +1391,12 @@ def inspect_data(adata: AnnData) -> DataState:
     state.layers = list(adata.layers.keys())
     state.obsm_keys = list(adata.obsm.keys())
     state.obsp_keys = list(adata.obsp.keys())
+    state.semantic_obs_roles = rank_obs_semantic_candidates(adata)
 
     state.has_raw_layer, state.raw_layer_name = _detect_raw_layer(adata)
+    if adata.raw is not None:
+        state.has_raw = True
+        state.raw_n_vars = adata.raw.n_vars
     state.is_counts = _is_integer_matrix(adata.X)
 
     gene_fmt, has_sym, has_ens, sample_genes = _detect_gene_id_format(adata)
@@ -845,12 +1405,20 @@ def inspect_data(adata: AnnData) -> DataState:
     state.has_ensembl_ids = has_ens
     state.sample_gene_names = sample_genes
 
+    qc_roles = state.semantic_obs_roles
     qc_obs_cols = ["n_genes_by_counts", "total_counts", "n_genes"]
-    state.has_qc_metrics = any(column in adata.obs.columns for column in qc_obs_cols)
-    state.has_mt_metrics = "pct_counts_mt" in adata.obs.columns
-    state.has_ribo_metrics = "pct_counts_ribo" in adata.obs.columns
+    state.has_qc_metrics = any(column in adata.obs.columns for column in qc_obs_cols) or bool(
+        qc_roles.get("qc_total_counts") or qc_roles.get("qc_n_genes") or qc_roles.get("qc_pct_mt")
+    )
+    state.has_mt_metrics = "pct_counts_mt" in adata.obs.columns or bool(qc_roles.get("qc_pct_mt"))
+    state.has_ribo_metrics = "pct_counts_ribo" in adata.obs.columns or bool(qc_roles.get("qc_pct_ribo"))
 
-    if "doublet_score" in adata.obs.columns or "predicted_doublet" in adata.obs.columns:
+    if (
+        "doublet_score" in adata.obs.columns
+        or "predicted_doublet" in adata.obs.columns
+        or qc_roles.get("doublet_score")
+        or qc_roles.get("doublet_label")
+    ):
         state.has_doublet_scores = True
         state.doublet_detection_method = "scrublet" if "scrublet" in adata.uns else "unknown"
 
@@ -905,6 +1473,12 @@ def inspect_data(adata: AnnData) -> DataState:
     ]
     if any(column in adata.obs.columns for column in scimilarity_cols):
         state.has_scimilarity = True
+    state.cell_type_candidates = state.semantic_obs_roles.get("cell_type", [])
+    if state.cell_type_candidates:
+        state.cell_type_key = state.cell_type_candidates[0].column
+    state.has_celltype_annotations = bool(
+        state.cell_type_candidates or state.has_celltypist or state.has_scimilarity
+    )
 
     batch_resolution = resolve_batch_metadata(adata)
     state.metadata_candidates = batch_resolution.candidates
@@ -958,7 +1532,7 @@ def recommend_next_steps(state: DataState, goal: str) -> List[str]:
         steps.append("filter_genes")
         return steps
 
-    if not state.has_raw_layer and state.is_counts:
+    if not state.has_raw_layer and not state.has_raw and state.is_counts:
         steps.append("preserve_raw_counts")
 
     if not state.has_qc_metrics:
@@ -1021,8 +1595,11 @@ def summarize_state(state: DataState) -> str:
     lines.append(f"Data type: {state.data_type}")
 
     processing = []
+    if state.has_raw:
+        extra = f", {state.raw_n_vars:,} genes" if state.raw_n_vars != state.n_genes else ""
+        processing.append(f"raw counts in adata.raw{extra}")
     if state.has_raw_layer:
-        processing.append(f"raw counts in '{state.raw_layer_name}'")
+        processing.append(f"raw counts in layer '{state.raw_layer_name}'")
     if state.has_qc_metrics:
         processing.append("QC metrics computed")
     if state.has_doublet_scores:
@@ -1080,3 +1657,73 @@ def summarize_state(state: DataState) -> str:
         )
 
     return "\n".join(lines)
+
+
+def obs_columns_detail(obs_df, n_obs: int, max_values: int = 8) -> dict:
+    """
+    Compact per-column summary of adata.obs for LLM role inference.
+
+    For each column returns dtype, n_unique, and either:
+    - representative unique values (categorical / low-cardinality, n_unique <= 15)
+    - min/max/mean stats (continuous numeric, n_unique > 15)
+
+    Columns that are essentially unique per cell (barcodes, index-like) are
+    flagged as high_cardinality. All columns are included — no truncation.
+
+    Returns {"columns": {...}, "total_obs_cols": N}
+    """
+    import math
+    import pandas as pd
+
+    cols = list(obs_df.columns)
+    total = len(cols)
+    detail: dict = {}
+
+    for col in cols:
+        series = obs_df[col]
+        dtype_str = str(series.dtype)
+        non_null = series.dropna()
+        n_unique = int(series.nunique(dropna=True))
+
+        if n_unique == 0:
+            detail[col] = {"dtype": dtype_str, "n_unique": 0}
+            continue
+
+        if n_obs > 0 and n_unique >= n_obs * 0.9 and n_unique > 50:
+            detail[col] = {"dtype": dtype_str, "n_unique": n_unique, "note": "high_cardinality"}
+            continue
+
+        is_numeric = pd.api.types.is_numeric_dtype(series)
+        if is_numeric and n_unique > 15:
+            try:
+                vals = non_null.to_numpy(dtype=float)
+                detail[col] = {
+                    "dtype": dtype_str,
+                    "n_unique": n_unique,
+                    "min": round(float(vals.min()), 4),
+                    "max": round(float(vals.max()), 4),
+                    "mean": round(float(vals.mean()), 4),
+                }
+            except Exception:
+                detail[col] = {"dtype": dtype_str, "n_unique": n_unique}
+        else:
+            try:
+                unique_vals = non_null.unique().tolist()
+                samples = []
+                for v in unique_vals:
+                    if isinstance(v, float) and math.isnan(v):
+                        continue
+                    sv = str(v)
+                    if len(sv) > 50:
+                        sv = sv[:47] + "..."
+                    samples.append(sv)
+                    if len(samples) >= max_values:
+                        break
+                entry: dict = {"dtype": dtype_str, "n_unique": n_unique, "values": samples}
+                if n_unique > max_values:
+                    entry["values_truncated"] = True
+                detail[col] = entry
+            except Exception:
+                detail[col] = {"dtype": dtype_str, "n_unique": n_unique}
+
+    return {"columns": detail, "total_obs_cols": total}

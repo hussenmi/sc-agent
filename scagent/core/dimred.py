@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 def run_pca(
     adata: AnnData,
     n_comps: int = DIMRED_DEFAULTS.n_pcs,
-    use_highly_variable: bool = True,
+    mask_var: Optional[str] = "highly_variable",
+    svd_solver: str = "arpack",
     random_state: int = 0,
     inplace: bool = True,
 ) -> Optional[AnnData]:
@@ -34,8 +35,12 @@ def run_pca(
         AnnData object (should be normalized and log-transformed).
     n_comps : int, default 30
         Number of principal components to compute.
-    use_highly_variable : bool, default True
-        Use only highly variable genes for PCA.
+    mask_var : str or None, default 'highly_variable'
+        Boolean column in adata.var selecting genes for PCA. The default
+        restricts to HVGs; pass None to use all genes. (Replaces the old
+        deprecated `use_highly_variable` flag.)
+    svd_solver : str, default 'arpack'
+        SVD solver passed to scanpy.tl.pca.
     random_state : int, default 0
         Random seed for reproducibility.
     inplace : bool, default True
@@ -49,17 +54,22 @@ def run_pca(
     if not inplace:
         adata = adata.copy()
 
-    # Check for HVGs if requested
-    if use_highly_variable and 'highly_variable' not in adata.var.columns:
-        logger.warning("No HVGs found, running PCA on all genes")
-        use_highly_variable = False
+    # Resolve mask: if the caller requested HVGs but the column is missing,
+    # fall back to all genes with a warning rather than failing.
+    if mask_var is not None and mask_var not in adata.var.columns:
+        logger.warning(
+            "mask_var=%r not found in adata.var; running PCA on all genes",
+            mask_var,
+        )
+        mask_var = None
 
     logger.info(f"Running PCA with {n_comps} components")
 
     sc.tl.pca(
         adata,
         n_comps=n_comps,
-        use_highly_variable=use_highly_variable,
+        mask_var=mask_var,
+        svd_solver=svd_solver,
         random_state=random_state,
     )
 
@@ -227,6 +237,7 @@ def run_dimensionality_reduction(
     n_pcs: int = DIMRED_DEFAULTS.n_pcs,
     n_neighbors: int = DIMRED_DEFAULTS.n_neighbors,
     umap_min_dist: float = DIMRED_DEFAULTS.umap_min_dist,
+    svd_solver: str = "arpack",
     compute_fdl: bool = False,
     random_state: int = 0,
     inplace: bool = True,
@@ -262,7 +273,7 @@ def run_dimensionality_reduction(
     logger.info("Running dimensionality reduction pipeline...")
 
     # PCA
-    run_pca(adata, n_comps=n_pcs, random_state=random_state, inplace=True)
+    run_pca(adata, n_comps=n_pcs, svd_solver=svd_solver, random_state=random_state, inplace=True)
 
     # Neighbors
     compute_neighbors(adata, n_neighbors=n_neighbors, inplace=True)

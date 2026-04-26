@@ -64,6 +64,9 @@ def run_leiden(
         random_state=random_state,
         key_added=key_added,
         neighbors_key=neighbors_key,
+        flavor="igraph",
+        n_iterations=2,
+        directed=False,
     )
 
     n_clusters = adata.obs[key_added].nunique()
@@ -133,12 +136,15 @@ def run_phenograph(
         resolution_parameter=resolution,
     )
 
-    # CRITICAL: Convert Jaccard graph from COO to CSR format
-    # PhenoGraph stores the graph in COO format, but Scanpy expects CSR
-    if 'pheno_jaccard_ig' in adata.obsp:
-        if not sp.isspmatrix_csr(adata.obsp['pheno_jaccard_ig']):
-            adata.obsp['pheno_jaccard_ig'] = sp.csr_matrix(adata.obsp['pheno_jaccard_ig'])
-            logger.info("Converted pheno_jaccard_ig to CSR format")
+    # CRITICAL: Convert any PhenoGraph Jaccard graph to CSR format.
+    # PhenoGraph stores the graph in COO format (key name varies by version,
+    # e.g. 'pheno_jaccard_ig', 'jaccard_ig', 'pheno_jaccard'), but Scanpy
+    # expects CSR. Scan obsp rather than hardcoding one key.
+    for obsp_key in list(adata.obsp.keys()):
+        if 'jaccard' in obsp_key.lower() or 'pheno' in obsp_key.lower():
+            if not sp.isspmatrix_csr(adata.obsp[obsp_key]):
+                adata.obsp[obsp_key] = sp.csr_matrix(adata.obsp[obsp_key])
+                logger.info(f"Converted {obsp_key} to CSR format")
 
     n_clusters = adata.obs[key_added].nunique()
     logger.info(f"PhenoGraph clustering complete: {n_clusters} clusters")
@@ -302,4 +308,4 @@ def get_top_markers(
     if key not in adata.uns:
         raise ValueError(f"DE results not found at key '{key}'. Run differential expression first.")
 
-    return sc.get.rank_genes_groups_df(adata, group=group).head(n_genes)
+    return sc.get.rank_genes_groups_df(adata, group=group, key=key).head(n_genes)

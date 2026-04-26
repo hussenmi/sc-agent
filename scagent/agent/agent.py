@@ -9,13 +9,15 @@ Creates run directories with manifests for reproducibility.
 import os
 import sys
 import json
+import random
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Literal
 import logging
 from datetime import datetime
 import re
 
-from .tools import get_tools, get_openai_tools, process_tool_call
+from .codex_bridge import CODEX_DECISION_SCHEMA, CodexCLIClient, CodexCLIError
+from .tools import get_tools, get_openai_tools, process_tool_call, encode_image_base64, get_image_mime_type
 from .prompts import SYSTEM_PROMPT
 from .run_manager import RunManager, create_run
 from .decision_policy import (
@@ -25,21 +27,82 @@ from .world_state import AgentWorldState, artifact_id_from_path
 
 logger = logging.getLogger(__name__)
 
-Provider = Literal["anthropic", "openai"]
+Provider = Literal["anthropic", "openai", "groq", "codex"]
+
+FAILURE_PATTERNS = [
+    r"\berror:",
+    r"\bfailed to\b",
+    r"\bfailed\b",
+    r"\bfailure\b",
+    r"\bexception\b",
+    r"\btraceback\b",
+    r"\bi couldn't\b",
+    r"\bi could not\b",
+    r"\bi can't\b",
+    r"\bi cannot\b",
+    r"\bunable to\b",
+    r"\bnot installed\b",
+    r"\bno module named\b",
+    r"\bmodule not found\b",
+    r"\bmissing dependency\b",
+    r"\bmissing package\b",
+    r"\bmissing module\b",
+    r"\btry again\b",
+]
+NON_FAILURE_PATTERNS = [
+    r"\bno errors?\b",
+    r"\bwithout errors?\b",
+    r"\b0 errors?\b",
+]
+# If any of these are present the response is considered complete, even if failure
+# keywords appear (e.g. the agent correctly explains a fallback and offers next steps).
+SUCCESS_OVERRIDE_PATTERNS = [
+    r"\bwhat would you like\b",
+    r"\bwhat would you like to do next\b",
+    r"\bhow would you like\b",
+    r"\bwhat do you think\b",
+    r"\bwould you like me to\b",
+    r"\bif you want.*i can\b",
+    r"\bi can proceed\b",
+    r"\bone of these ways\b",
+    r"\bone of the following\b",
+    r"\breadyfor\b",  # "ready for downstream"
+    r"\bready for\b",
+    r"\bsuccessfully applied\b",
+    r"\bsuccessfully completed\b",
+    r"\bsuccessfully run\b",
+    r"\bsuccessfully computed\b",
+    r"\bconverged after\b",
+    r"\bbatch.corrected and ready\b",
+    r"\bnow batch.corrected\b",
+    # Any numbered next-step list ("1 Run", "1 Bypass", "1 Inspect", etc.)
+    r"\b1[\.\)]\s+\w+\b.*\b2[\.\)]\s+\w+\b",
+]
+AUTO_RECOVERY_ATTEMPTS = 2
 
 ACTION_TOOL_NAMES = {
+    "load_data",
     "run_qc",
     "normalize_and_hvg",
-    "run_dimred",
+    "run_pca",
+    "run_neighbors",
+    "run_umap",
     "run_clustering",
     "compare_clusterings",
     "run_celltypist",
     "run_scimilarity",
     "run_batch_correction",
+    "score_integration",
+    "benchmark_integration",
     "run_deg",
+    "run_pseudobulk_deg",
     "run_gsea",
+    "run_spectra",
+    "score_gene_signature",
+    "query_cells",
     "save_data",
     "run_code",
+    "run_shell",
     "install_package",
 }
 
@@ -56,7 +119,7 @@ INSPECTION_TOOL_NAMES = {
     "review_artifact",
     "inspect_run_state",
     "inspect_workspace",
-    "web_search_docs",
+    "read_file",
     "search_papers",
     "fetch_url",
     "web_search",
@@ -90,18 +153,19 @@ class SCAgent:
     """
     Autonomous single-cell RNA-seq analysis agent.
 
-    Uses Claude or OpenAI API to analyze single-cell data following lab best practices.
+    Uses Claude, OpenAI-compatible APIs, or Codex CLI to analyze single-cell data
+    following lab best practices.
     All tool calls return structured JSON for reliable LLM reasoning.
     Optionally creates run directories with manifests for reproducibility.
 
     Parameters
     ----------
     provider : str, default "anthropic"
-        API provider: "anthropic" or "openai".
+        LLM provider: "anthropic", "openai", "groq", or "codex".
     api_key : str, optional
         API key. If not provided, reads from ANTHROPIC_API_KEY or OPENAI_API_KEY.
     model : str, optional
-        Model to use. Defaults: "claude-sonnet-4-20250514" (Anthropic) or "gpt-4o" (OpenAI).
+        Model to use. Defaults depend on provider.
     verbose : bool, default True
         Print agent outputs.
     collaborative : bool, default True
@@ -135,12 +199,18 @@ class SCAgent:
         create_run_dir: bool = True,
         output_dir: str = ".",
         save_checkpoints: bool = False,
+        show_context_usage: bool = False,
     ):
         # Use environment defaults if not specified
         if provider is None:
             provider = os.environ.get("SCAGENT_PROVIDER", "anthropic")
         if model is None:
-            model = os.environ.get("SCAGENT_MODEL")  # None = use provider default
+            if provider == "codex":
+                # Prefer a Codex-specific override, but let SCAGENT_MODEL keep
+                # working for users who already configure one model in .env.
+                model = os.environ.get("SCAGENT_CODEX_MODEL") or os.environ.get("SCAGENT_MODEL")
+            else:
+                model = os.environ.get("SCAGENT_MODEL")  # None = use provider default
         if base_url is None:
             base_url = os.environ.get("SCAGENT_BASE_URL")  # For OpenAI-compatible APIs
 
@@ -154,7 +224,8 @@ class SCAgent:
         self.run_manager: Optional[RunManager] = None
         self.world_state = AgentWorldState()
         self.biological_context: Optional[Dict[str, Any]] = None
-        self._pending_image: Optional[Dict[str, str]] = None  # For vision support
+        self._pending_images: List[Dict[str, str]] = []  # For vision support (list of figure dicts)
+        self._next_llm_status_message: Optional[str] = None
         self._conversation_history: List[Dict[str, Any]] = []  # For interactive mode
         self._active_request: str = ""
         self._active_request_is_followup: bool = False
@@ -164,11 +235,19 @@ class SCAgent:
             "asked_questions": [],
         }
         self._pending_checkpoint: Optional[Dict[str, Any]] = None
+        self._context_limit: int = 128_000  # overwritten by _init_* below
+        self._last_estimated_tokens: int = 0
+        self._last_actual_tokens: int = 0   # exact count from API response usage field
+        self.show_context_usage: bool = show_context_usage
+
+        self._silence_noisy_loggers()
 
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
         elif provider == "openai":
             self._init_openai(api_key, model, base_url)
+        elif provider == "codex":
+            self._init_codex(model)
         elif provider == "groq":
             # Groq uses OpenAI-compatible API
             self._init_openai(
@@ -178,7 +257,35 @@ class SCAgent:
             )
             self.provider = "groq"  # Keep track of actual provider
         else:
-            raise ValueError(f"Unknown provider: {provider}. Use 'anthropic', 'openai', or 'groq'.")
+            raise ValueError(
+                f"Unknown provider: {provider}. Use 'anthropic', 'openai', 'groq', or 'codex'."
+            )
+
+    @staticmethod
+    def _silence_noisy_loggers() -> None:
+        """Suppress INFO-level chatter from third-party libraries.
+
+        Libraries like httpx, lightning, and openai log routine HTTP requests
+        and training progress at INFO level, which clutters the terminal when
+        the root logger is set to INFO (e.g. after scVI/lightning initialise).
+        We push them to WARNING so only genuine problems surface.
+        """
+        import logging as _logging
+        for name in (
+            "httpx",
+            "httpcore",
+            "httpcore.http11",
+            "httpcore.connection",
+            "openai",
+            "openai._base_client",
+            "anthropic",
+            "anthropic._base_client",
+            "lightning",
+            "lightning.pytorch",
+            "pytorch_lightning",
+            "harmonypy",
+        ):
+            _logging.getLogger(name).setLevel(_logging.WARNING)
 
     def _init_anthropic(self, api_key: Optional[str], model: Optional[str]):
         """Initialize Anthropic client."""
@@ -198,6 +305,7 @@ class SCAgent:
         self.client = Anthropic(api_key=api_key)
         self.model = model or "claude-sonnet-4-20250514"
         self.tools = get_tools()
+        self._context_limit = 200_000  # all Claude models support 200K
 
     def _init_openai(self, api_key: Optional[str], model: Optional[str], base_url: Optional[str] = None):
         """Initialize OpenAI-compatible client (works with OpenAI, Groq, Together, etc.)."""
@@ -221,6 +329,108 @@ class SCAgent:
             self.client = OpenAI(api_key=api_key)
         self.model = model or "gpt-4o"
         self.tools = get_openai_tools()
+        self._context_limit = self._resolve_context_limit()
+
+    def _init_codex(self, model: Optional[str]):
+        """Initialize Codex CLI bridge for ChatGPT-login-backed runs."""
+        codex_model = model or os.environ.get("SCAGENT_CODEX_MODEL")
+        self.client = CodexCLIClient(model=codex_model, cwd=os.getcwd())
+        self.model = codex_model or "codex-default"
+        self.tools = get_openai_tools()
+
+
+    # Map of LaTeX commands to Unicode/text used inside inline math blocks
+    _LATEX_COMMANDS = {
+        r"\rightarrow": "→",
+        r"\leftarrow": "←",
+        r"\Rightarrow": "⇒",
+        r"\Leftarrow": "⇐",
+        r"\leftrightarrow": "↔",
+        r"\uparrow": "↑",
+        r"\downarrow": "↓",
+        r"\approx": "≈",
+        r"\geq": "≥",
+        r"\leq": "≤",
+        r"\neq": "≠",
+        r"\times": "×",
+        r"\pm": "±",
+        r"\cdot": "·",
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\gamma": "γ",
+        r"\delta": "δ",
+        r"\lambda": "λ",
+        r"\mu": "μ",
+        r"\sigma": "σ",
+        r"\infty": "∞",
+        r"\sum": "Σ",
+        r"\prod": "Π",
+        r"\in": "∈",
+        r"\notin": "∉",
+        r"\subset": "⊂",
+        r"\cup": "∪",
+        r"\cap": "∩",
+        r"\sqrt": "√",
+        r"\log": "log",
+        r"\exp": "exp",
+    }
+
+    @classmethod
+    def _resolve_inline_math(cls, math_content: str) -> str:
+        """Convert the interior of a $...$ block to readable plain text."""
+        result = math_content
+        # Replace known LaTeX commands (longest first to avoid partial matches)
+        for cmd, uni in sorted(cls._LATEX_COMMANDS.items(), key=lambda x: -len(x[0])):
+            result = result.replace(cmd, uni)
+        # Strip any remaining backslash commands we don't know (e.g. \text{...} → content)
+        result = re.sub(r"\\text\{([^}]*)\}", r"\1", result)
+        result = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", result)
+        result = re.sub(r"\{([^}]*)\}", r"\1", result)  # bare braces → content
+        result = re.sub(r"\\[a-zA-Z]+", "", result)     # drop unknown commands
+        return result.strip()
+
+    @classmethod
+    def _delatex(cls, text: str) -> str:
+        """Replace LaTeX math expressions with readable Unicode equivalents.
+
+        Handles both single-symbol blocks ($\\times$) and compound inline
+        math expressions ($151,370 \\times 0.00035 \\approx 53$).
+        """
+        if not text or "$" not in text:
+            return text
+        # Replace compound inline math $...$ blocks (non-greedy, no newlines inside)
+        def _replace_math(m):
+            return cls._resolve_inline_math(m.group(1))
+        text = re.sub(r"\$([^$\n]+?)\$", _replace_math, text)
+        return text
+
+    # Patterns produced by local models' internal thinking/channel tokens that leak
+    # into assistant text content and should be stripped before display.
+    _ARTIFACT_PATTERNS = [
+        # Gemma 4 / Gemma-style channel tokens:  <|channel>thought\n...\n<channel|>
+        re.compile(r"<\|channel\>[^\|]*\n.*?<channel\|>\n?", re.DOTALL),
+        # Qwen / DeepSeek thinking blocks: <think>...</think>
+        re.compile(r"<think>.*?</think>\n?", re.DOTALL),
+        # Generic angle-bracket model tokens: <|...|> on their own line
+        re.compile(r"^<\|[^|]+\|>\s*$", re.MULTILINE),
+    ]
+
+    # Capturing versions of the above — used to extract thinking content for display.
+    _THINKING_EXTRACT_PATTERNS = [
+        # Gemma 4: <|channel>thought\n{content}\n<channel|>
+        re.compile(r"<\|channel\>[^\|]*\n(.*?)<channel\|>\n?", re.DOTALL),
+        # Qwen / DeepSeek: <think>{content}</think>
+        re.compile(r"<think>(.*?)</think>\n?", re.DOTALL),
+    ]
+
+    @classmethod
+    def _strip_model_artifacts(cls, text: str) -> str:
+        """Remove internal thinking/channel tokens that local models sometimes leak."""
+        if not text:
+            return text
+        for pat in cls._ARTIFACT_PATTERNS:
+            text = pat.sub("", text)
+        return text.strip()
 
     def _print(self, message: str, style: str = None, markdown: bool = False):
         """Print message if verbose using rich formatting.
@@ -231,6 +441,8 @@ class SCAgent:
             from rich.console import Console
             from rich.markdown import Markdown
             console = Console()
+            message = self._strip_model_artifacts(message)
+            message = self._delatex(message)
 
             # Auto-detect markdown if not explicitly set
             if not markdown and message:
@@ -247,12 +459,23 @@ class SCAgent:
                 console.print(message)
 
     def _print_thinking(self, message: str):
-        """Print agent thinking/reasoning."""
-        if self.verbose:
-            from rich.console import Console
-            from rich.panel import Panel
-            console = Console()
-            console.print(f"[dim]💭[/dim] [italic]{message}[/italic]")
+        """Print agent narration before a tool call."""
+        if not message or not message.strip():
+            return
+        from rich.console import Console
+        from rich.markdown import Markdown
+        console = Console()
+        message = self._strip_model_artifacts(message)
+        message = self._delatex(message)
+        if not message.strip():
+            return
+        # Render as markdown if it contains markdown patterns, otherwise inline
+        md_patterns = ["**", "##", "```", "- ", "1. "]
+        if any(p in message for p in md_patterns):
+            console.print("[cyan]…[/cyan]")
+            console.print(Markdown(message))
+        else:
+            console.print(f"[cyan]…[/cyan] {message}")
 
     def _print_error(self, message: str):
         """Print error message."""
@@ -278,11 +501,50 @@ class SCAgent:
         payload["pending_checkpoint"] = self._pending_checkpoint
         return json.dumps(payload, indent=2)
 
+    def _is_gemma_model(self) -> bool:
+        return "gemma" in (self.model or "").lower()
+
     def _is_action_tool(self, tool_name: str) -> bool:
         return tool_name in ACTION_TOOL_NAMES
 
     def _is_inspection_tool(self, tool_name: str) -> bool:
         return tool_name in INSPECTION_TOOL_NAMES
+
+    def _build_image_message(self, images: List[Dict[str, str]], provider: str) -> Dict[str, Any]:
+        """Build a user message containing one or more figures with a role-aware prompt."""
+        roles = {img.get("role", "figure") for img in images}
+        paths_str = ", ".join(img["path"] for img in images)
+        if "qc_figure" in roles:
+            prompt_text = (
+                f"Here {'is the QC figure' if len(images) == 1 else 'are the QC figures'} ({paths_str}). "
+                "Look at the distributions carefully and suggest specific filtering thresholds based on what you see — "
+                "e.g. an MT% cutoff that captures the low-quality tail, a min_genes value that separates "
+                "empty droplets from real cells, whether doublet removal looks warranted. "
+                "Cite the specific values visible in the plots. "
+                "Present these as your suggestions with projected removal counts, and ask the user to confirm before applying."
+            )
+        else:
+            n = len(images)
+            prompt_text = (
+                f"Here {'is the' if n == 1 else 'are the'} generated "
+                f"figure{'s' if n > 1 else ''} ({paths_str}). "
+                "Interpret it in the context of the current analysis — what does it show, "
+                "what are the key observations, and is there anything the user should act on?"
+            )
+
+        content: List[Any] = [{"type": "text", "text": prompt_text}]
+        for img in images:
+            if provider == "anthropic":
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": img["mime"], "data": img["base64"]},
+                })
+            else:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img['mime']};base64,{img['base64']}"},
+                })
+        return {"role": "user", "content": content}
 
     def _checkpoint_artifact_paths(self, result_data: Dict[str, Any]) -> List[str]:
         paths: List[str] = []
@@ -364,17 +626,13 @@ class SCAgent:
         if selected_action == "run_qc_apply":
             qc_input = dict(action_inputs.get("run_qc_apply", {}))
             qc_input["preview_only"] = False
+            qc_input["confirm_filtering"] = True
             run_step("run_qc", qc_input)
             return {"selected_action": selected_action, "steps": steps}
 
         if selected_action == "run_normalize_and_hvg":
             normalize_input = dict(action_inputs.get("run_normalize_and_hvg", {}))
             run_step("normalize_and_hvg", normalize_input)
-            return {"selected_action": selected_action, "steps": steps}
-
-        if selected_action == "run_dimred":
-            dimred_input = dict(action_inputs.get("run_dimred", {}))
-            run_step("run_dimred", dimred_input)
             return {"selected_action": selected_action, "steps": steps}
 
         if selected_action == "run_annotation":
@@ -501,7 +759,7 @@ class SCAgent:
         "review_artifact",
         "generate_figure",  # Visualization doesn't change state
         "save_data",  # Saving is always ok
-        "web_search_docs",
+        "read_file",
         "search_papers",
         "fetch_url",
         "web_search",
@@ -548,21 +806,35 @@ class SCAgent:
 
         if tool_name == "run_qc":
             if tool_input.get("preview_only", False):
-                mt_threshold = tool_input.get("mt_threshold", "auto")
                 # Get doublet count from the correct location
                 qc_decisions = result_data.get("qc_decisions", {})
+                filtering_plan = result_data.get("filtering_plan", {})
+                plan_params = filtering_plan.get("parameters", {})
+                projected = filtering_plan.get("projected_after_filtering", {})
+                mt_threshold = plan_params.get("mt_threshold", tool_input.get("mt_threshold", "auto"))
+                min_cells = plan_params.get("min_cells_per_gene")
+                min_genes = plan_params.get("min_genes")
                 doublet_count = int(qc_decisions.get("doublet_detection", {}).get("cells_flagged", 0))
-                high_mt_cells = int(qc_decisions.get("mt_threshold", {}).get("cells_flagged", 0))
+                mt_decision = qc_decisions.get("mt_threshold", {})
+                filter_mt = bool(mt_decision.get("filter_enabled", True))
+                high_mt_cells = int(mt_decision.get("cells_flagged", 0))
+                min_genes_cells = int(qc_decisions.get("min_genes", {}).get("cells_flagged", 0))
                 before_cells = result_data.get("before", {}).get("n_cells", 0)
-                # Projected = before - high_mt (doublets are flagged but not auto-removed)
-                projected_cells = before_cells - high_mt_cells if before_cells else "?"
+                projected_removals = projected.get("cells_removed")
+                projected_cells = projected.get("cells_retained")
+                if projected_cells is None:
+                    projected_cells = before_cells - projected_removals if before_cells and projected_removals else "?"
+                projected_genes_removed = projected.get("genes_removed_before_cell_filtering")
                 question = (
-                    "QC preview is complete. I summarized the proposed removals and saved the QC figures. "
+                    "QC preview is complete. I summarized the thresholds, parameters, and proposed removals. "
                     "What should I do next?"
                 )
                 options, option_actions = self._checkpoint_options([
                     (
-                        f"Apply the proposed QC filters ({projected_cells} projected cells retained)",
+                        (
+                            "Apply the proposed QC filters "
+                            f"({projected_removals} cells and ~{projected_genes_removed} genes projected for removal)"
+                        ),
                         "run_qc_apply",
                     ),
                     (
@@ -576,8 +848,12 @@ class SCAgent:
                     ("Something else", "custom"),
                 ])
                 summary = (
-                    f"QC preview: {high_mt_cells} high-MT cells to remove, {doublet_count} doublets flagged. "
-                    f"Estimated {projected_cells} cells retained after MT filtering."
+                    f"QC preview: parameters mt_threshold={mt_threshold}, "
+                    f"min_genes={min_genes}, min_cells_per_gene={min_cells}; "
+                    f"{min_genes_cells} low-gene cells flagged, "
+                    f"{high_mt_cells} high-MT cells {'to remove' if filter_mt else 'reported only'}, "
+                    f"{doublet_count} doublets flagged. Estimated {projected_cells} cells retained "
+                    f"and ~{projected_genes_removed} genes removed before cell filtering."
                 )
                 checkpoint = {
                     "kind": "qc_preview",
@@ -591,11 +867,23 @@ class SCAgent:
                     "action_inputs": {
                         "run_qc_apply": {
                             "mt_threshold": tool_input.get("mt_threshold"),
+                            "filter_mt": tool_input.get("filter_mt", True),
+                            "min_genes": tool_input.get("min_genes"),
                             "min_cells": tool_input.get("min_cells"),
                             "remove_ribo": tool_input.get("remove_ribo", True),
                             "remove_mt": tool_input.get("remove_mt", False),
                             "detect_doublets_flag": tool_input.get("detect_doublets_flag", True),
+                            "remove_doublets": tool_input.get("remove_doublets", False),
+                            "scrublet_expected_doublet_rate": tool_input.get("scrublet_expected_doublet_rate"),
+                            "scrublet_sim_doublet_ratio": tool_input.get("scrublet_sim_doublet_ratio"),
+                            "scrublet_n_prin_comps": tool_input.get("scrublet_n_prin_comps"),
+                            "scrublet_min_counts": tool_input.get("scrublet_min_counts"),
+                            "scrublet_min_cells": tool_input.get("scrublet_min_cells"),
+                            "scrublet_min_gene_variability_pctl": tool_input.get("scrublet_min_gene_variability_pctl"),
+                            "scrublet_random_state": tool_input.get("scrublet_random_state"),
+                            "force_doublet_recompute": tool_input.get("force_doublet_recompute", False),
                             "batch_key": tool_input.get("batch_key"),
+                            "confirm_filtering": True,
                         }
                     },
                     "artifacts": artifacts,
@@ -629,7 +917,7 @@ class SCAgent:
             if result_data.get("n_hvg") is not None:
                 summary = f"Normalization and HVG selection are complete ({result_data['n_hvg']} HVGs selected)."
             options, option_actions = self._checkpoint_options([
-                ("Compute PCA, neighbors, and UMAP", "run_dimred"),
+                ("Run PCA", "run_pca"),
                 ("Inspect the normalized dataset state before computing embeddings", "inspect_existing_state"),
                 ("Something else", "custom"),
             ])
@@ -643,29 +931,7 @@ class SCAgent:
                 "recommendation": options[0],
                 "option_actions": option_actions,
                 "action_inputs": {
-                    "run_dimred": {},
-                },
-                "artifacts": artifacts,
-            }
-
-        elif tool_name == "run_dimred":
-            summary = "PCA, neighbors, and UMAP are complete."
-            options, option_actions = self._checkpoint_options([
-                ("Run clustering on the current embedding", "run_clustering"),
-                ("Review the embedding outputs before clustering", "review_corrected_embedding"),
-                ("Something else", "custom"),
-            ])
-            checkpoint = {
-                "kind": "dimred",
-                "question": "Dimensionality reduction is complete. What should I do next?",
-                "options": options,
-                "default": options[0],
-                "decision_key": "dimred_next_step",
-                "summary": summary,
-                "recommendation": options[0],
-                "option_actions": option_actions,
-                "action_inputs": {
-                    "run_clustering": {},
+                    "run_pca": {},
                 },
                 "artifacts": artifacts,
             }
@@ -769,11 +1035,10 @@ class SCAgent:
         elif tool_name == "run_batch_correction":
             method = result_data.get("method", "batch correction")
             batch_key = result_data.get("batch_key", "batch")
-            summary = f"Applied {method} batch correction using '{batch_key}' and recomputed the embedding."
+            summary = f"Applied {method} batch correction using '{batch_key}'. UMAP must be recomputed before plotting or clustering."
             options, option_actions = self._checkpoint_options([
-                ("Run clustering on the corrected representation", "run_clustering"),
-                ("Generate or review corrected UMAP figures before clustering", "review_corrected_embedding"),
-                ("Inspect batch mixing quality before continuing", "inspect_batch_mixing"),
+                ("Recompute UMAP from the corrected graph", "run_umap"),
+                ("Inspect batch mixing quality before computing UMAP", "inspect_batch_mixing"),
                 ("Something else", "custom"),
             ])
             checkpoint = {
@@ -786,7 +1051,7 @@ class SCAgent:
                 "recommendation": options[0],
                 "option_actions": option_actions,
                 "action_inputs": {
-                    "run_clustering": {},
+                    "run_umap": {},
                 },
                 "artifacts": artifacts,
             }
@@ -872,7 +1137,7 @@ class SCAgent:
 
         if tool_name == "generate_figure" and "embedding" in missing:
             options, option_actions = self._checkpoint_options([
-                ("Compute PCA, neighbors, and UMAP now", "run_dimred"),
+                ("Run PCA, then neighbors, then UMAP", "run_pca"),
                 ("Inspect the current dataset state before computing embeddings", "inspect_existing_state"),
                 ("Something else", "custom"),
             ])
@@ -885,7 +1150,7 @@ class SCAgent:
                 "summary": message,
                 "recommendation": options[0],
                 "option_actions": option_actions,
-                "action_inputs": {"run_dimred": {}},
+                "action_inputs": {"run_pca": {}},
                 "artifacts": artifacts,
             }
         elif tool_name == "generate_figure" and "valid_color_key" in missing:
@@ -989,7 +1254,19 @@ class SCAgent:
 
     def _build_system_prompt(self) -> str:
         """Attach runtime state to the static system prompt."""
-        return f"{SYSTEM_PROMPT}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
+        prompt = SYSTEM_PROMPT
+        if self._is_gemma_model():
+            # Gemma 4 puts all output inside thinking blocks and produces no narration
+            # text outside them. This instruction mirrors how Claude/GPT behave: brief
+            # narration sentence after thinking, before the tool call.
+            prompt += (
+                "\n\n## Narration Requirement\n"
+                "After your thinking block, always write one brief sentence describing "
+                "what you are about to do (e.g. 'I'll inspect the data to check QC metrics.'), "
+                "then call the appropriate tool. Do not include this sentence inside the "
+                "thinking block — write it as plain response text after the closing tag."
+            )
+        return f"{prompt}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
 
     def _current_capabilities(self) -> Dict[str, Any]:
         return (self.world_state.data_summary or {}).get("capabilities", {})
@@ -1236,7 +1513,9 @@ class SCAgent:
                 "dataset_changed": tool_name in {
                     "run_qc",
                     "normalize_and_hvg",
-                    "run_dimred",
+                    "run_pca",
+                    "run_neighbors",
+                    "run_umap",
                     "run_clustering",
                     "compare_clusterings",
                     "run_celltypist",
@@ -1283,15 +1562,94 @@ class SCAgent:
         result_data["verification"] = self._generic_verification(tool_name, tool_input, result_data)
         return result_data
 
+    def _looks_like_failure(self, message: str) -> bool:
+        """Heuristic for assistant responses that likely need recovery.
+
+        Returns False immediately when the response contains clear completion
+        indicators (next-step options, success confirmations) even if it also
+        mentions past failures that were handled gracefully.
+        """
+        normalized = " ".join((message or "").lower().split())
+        if not normalized:
+            return False
+        # If the response ends with next-step options or confirms success, the
+        # agent has already resolved any issues — no recovery needed.
+        if any(re.search(p, normalized) for p in SUCCESS_OVERRIDE_PATTERNS):
+            return False
+        scrubbed = normalized
+        for pattern in NON_FAILURE_PATTERNS:
+            scrubbed = re.sub(pattern, "", scrubbed)
+        return any(re.search(pattern, scrubbed) for pattern in FAILURE_PATTERNS)
+
+    def _build_auto_recovery_instruction(self, error_msg: str, attempt: int) -> str:
+        """Prompt the model to self-correct before asking the user for help."""
+        return (
+            f"Your previous response indicates an unresolved issue.\n\n"
+            f"Issue:\n{error_msg}\n\n"
+            f"This is automatic recovery attempt {attempt} of {AUTO_RECOVERY_ATTEMPTS}. "
+            "Try to resolve the problem yourself before asking the user for help. "
+            "Use the available tools to inspect state, fix missing prerequisites, adjust parameters, "
+            "or try a better approach. If you can recover, do so and then give a normal user-facing "
+            "summary. Only if you still cannot proceed after genuinely trying should you ask the user "
+            "a concise follow-up question."
+        )
+
+    def _print_auto_recovery_notice(self, attempt: int, error_snippet: str = "") -> None:
+        """Tell the user the agent is trying to recover automatically."""
+        from rich.console import Console
+        console = Console()
+        if error_snippet:
+            # Trim to one line for display
+            first_line = error_snippet.strip().splitlines()[0][:120]
+            console.print(f"[yellow]↺ Error:[/yellow] {first_line}")
+        console.print(
+            f"[yellow]  Trying to recover automatically ({attempt}/{AUTO_RECOVERY_ATTEMPTS})...[/yellow]"
+        )
+
+    def _maybe_continue_after_failure(
+        self,
+        final_result: str,
+        messages: List[Dict[str, Any]],
+        auto_recovery_attempts: int,
+        suggestions: Optional[List[str]] = None,
+    ):
+        """Try bounded automatic recovery before interrupting the user."""
+        if not self._looks_like_failure(final_result):
+            return False, auto_recovery_attempts
+
+        if auto_recovery_attempts < AUTO_RECOVERY_ATTEMPTS:
+            next_attempt = auto_recovery_attempts + 1
+            logger.warning(
+                "Assistant final response looked like a failure; starting automatic recovery attempt %s/%s",
+                next_attempt,
+                AUTO_RECOVERY_ATTEMPTS,
+            )
+            self._print_auto_recovery_notice(next_attempt, error_snippet=final_result)
+            messages.append({
+                "role": "user",
+                "content": self._build_auto_recovery_instruction(final_result, next_attempt),
+            })
+            self._conversation_history = messages
+            return True, next_attempt
+
+        if self.verbose:
+            user_input = self._ask_continue(final_result, suggestions=suggestions)
+            if user_input.lower() not in ["quit", "exit", "q"]:
+                messages.append({"role": "user", "content": user_input})
+                self._conversation_history = messages
+                return True, 0
+
+        return False, auto_recovery_attempts
+
     def _ask_continue(self, error_msg: str, suggestions: list = None) -> str:
-        """Ask user how to proceed after an error."""
+        """Ask user how to proceed after automatic recovery was not enough."""
         from rich.console import Console
         from rich.panel import Panel
         console = Console()
 
         console.print()
         console.print(Panel(
-            f"{error_msg}",
+            "The agent ran into an issue and could not fully recover automatically.",
             title="⚠️  Issue Detected",
             border_style="yellow"
         ))
@@ -1307,7 +1665,9 @@ class SCAgent:
         console.print("  • Type 'quit' to stop")
 
         try:
-            response = input("\n> ").strip()
+            from ..terminal import read_user_input
+
+            response = read_user_input("\n> ")
             return response if response else "try to recover from the error"
         except (EOFError, KeyboardInterrupt):
             return "quit"
@@ -1356,6 +1716,15 @@ class SCAgent:
         self._active_request_is_followup = is_followup
         self.world_state.set_active_request(request)
         self._remember_user_preferences(request)
+
+        # Print the panel immediately so the terminal never looks stuck while
+        # _sync_world_state (which calls inspect_data on the full adata) runs.
+        if self.verbose:
+            from rich.console import Console
+            from rich.rule import Rule
+            console = Console()
+            console.print(Rule(style="cyan"))
+
         self._sync_world_state(extra_text=request)
 
         # Create run directory only for first analysis
@@ -1404,13 +1773,6 @@ class SCAgent:
         if self.run_manager:
             user_message += f"\nOutput directory: {self.run_manager.run_dir}"
 
-        if self.verbose:
-            from rich.console import Console
-            from rich.panel import Panel
-            console = Console()
-            console.print()
-            console.print(Panel(request, title="🔬 Analyzing", border_style="cyan"))
-
         if self.collaborative and not sys.stdin.isatty():
             message = (
                 "Collaborative agent mode requires an interactive terminal because the agent must "
@@ -1423,8 +1785,240 @@ class SCAgent:
         # Route to provider-specific implementation
         if self.provider == "anthropic":
             return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
-        else:
+        elif self.provider in {"openai", "groq"}:
             return self._analyze_openai(user_message, max_iterations, continue_conversation)
+        elif self.provider == "codex":
+            return self._analyze_codex(user_message, max_iterations, continue_conversation)
+        raise RuntimeError(f"Unsupported provider: {self.provider}")
+
+    def _codex_tool_specs(self) -> List[Dict[str, Any]]:
+        """Return compact tool specs for the Codex decision prompt."""
+        specs: List[Dict[str, Any]] = []
+        for tool in self.tools:
+            function = tool.get("function", {})
+            if function.get("name") == "ask_user":
+                # In CLI mode, user questions should be normal final responses.
+                # The next interactive turn will capture the user's choice.
+                continue
+            specs.append({
+                "name": function.get("name"),
+                "description": function.get("description", ""),
+                "input_schema": function.get("parameters", {}),
+            })
+        return specs
+
+    def _build_codex_decision_prompt(self, messages: List[Dict[str, Any]]) -> str:
+        """Build a one-step planner prompt for the Codex CLI bridge."""
+        tool_result_limit = int(os.environ.get("SCAGENT_CODEX_TOOL_RESULT_LIMIT", "50000"))
+
+        def compact_message(message: Dict[str, Any]) -> Dict[str, Any]:
+            compact = dict(message)
+            content = compact.get("content")
+            if isinstance(content, str) and len(content) > tool_result_limit:
+                compact["content"] = (
+                    content[:tool_result_limit]
+                    + f"\n\n[truncated to {tool_result_limit} characters]"
+                )
+            return compact
+
+        payload = {
+            "runtime_state": json.loads(self._runtime_guidance()),
+            "conversation": [compact_message(message) for message in messages],
+            "available_tools": self._codex_tool_specs(),
+        }
+        return (
+            f"{self._build_system_prompt()}\n\n"
+            "## Codex CLI Bridge Instructions\n"
+            "You are selecting the next SCAgent action. Do not run shell commands or edit files. "
+            "SCAgent will execute exactly one returned tool call, then send you the JSON result "
+            "on the next iteration.\n\n"
+            "Return JSON matching the required schema only:\n"
+            "- Use kind='tool_call' when another SCAgent tool should run. Set tool_name to one "
+            "available tool and tool_input_json to a string containing a JSON object.\n"
+            "- Use kind='final' when the analysis response is complete. Set content to the final "
+            "user-facing answer.\n"
+            "- For final responses, set tool_name and tool_input_json to null. For tool calls, set "
+            "content to null.\n\n"
+            "When a tool result or runtime state says checkpoint_required or pending_checkpoint, "
+            "do not call an ask-user tool. Return kind='final' with a clear, conversational summary "
+            "of what just happened and 2-4 numbered next-step options. Do not mention internal "
+            "checkpoint fields such as default, recommendation, option_actions, or decision_key. "
+            "Do not say 'You selected option N' unless that is the actual scientific result; just "
+            "carry out the selected action or ask what to do next.\n\n"
+            "## Current Request, History, Runtime State, and Tools\n"
+            f"{json.dumps(payload, indent=2, default=str)}"
+        )
+
+    def _context_bar_str(self) -> str:
+        """Compact context usage indicator: '▓▓▓░░░░░░░ 28% · 21K/77K'"""
+        # Prefer exact count from the last API response; fall back to estimate
+        used = self._last_actual_tokens or self._last_estimated_tokens
+        limit = self._context_limit
+        if limit <= 0 or used <= 0:
+            return ""
+        pct = min(used / limit, 1.0)
+        filled = int(pct * 10)
+        bar = "▓" * filled + "░" * (10 - filled)
+        used_k = f"{used // 1000}K" if used >= 1000 else str(used)
+        limit_k = f"{limit // 1000}K" if limit >= 1000 else str(limit)
+        return f"{bar} {pct:.0%} · {used_k}/{limit_k}"
+
+    def _update_context_bar(self) -> None:
+        """
+        Write the context usage bar to the bottom-right corner of the terminal.
+
+        Writes directly to /dev/tty (the controlling terminal) to bypass any
+        stdout wrapping by Rich. Uses ANSI cursor-save/restore so nothing else
+        on screen is disturbed. Called both before and after each model call so
+        the bar persists after the spinner clears.
+        """
+        if not self.show_context_usage or self._last_estimated_tokens <= 0:
+            return
+        try:
+            import shutil
+            size = shutil.get_terminal_size(fallback=(0, 0))
+            cols, rows = size.columns, size.lines
+            if cols <= 0 or rows <= 0:
+                return
+
+            # Full bar: " ▓▓▓░░░░░░░ 28% · 21K/77K " (~26 chars)
+            bar = f" {self._context_bar_str()} "
+            if len(bar) > cols:
+                # Compact: just percentage and counts, no block bar
+                used = self._last_actual_tokens or self._last_estimated_tokens
+                pct = min(used / self._context_limit, 1.0)
+                used_k = f"{used // 1000}K" if used >= 1000 else str(used)
+                limit_k = f"{self._context_limit // 1000}K" if self._context_limit >= 1000 else str(self._context_limit)
+                bar = f" {pct:.0%} {used_k}/{limit_k} "
+            if len(bar) > cols:
+                return  # terminal too narrow even for compact form
+
+            col = cols - len(bar) + 1
+            with open("/dev/tty", "w") as tty:
+                tty.write(f"\0337\033[{rows};{col}H\033[2m{bar}\033[0m\0338")
+                tty.flush()
+        except Exception:
+            return
+
+    def _with_llm_status(self, action):
+        """Run a blocking model call with provider-neutral terminal feedback."""
+        status_messages = [
+            "Analyzing...",
+            "Working...",
+            "Thinking...",
+            'Doing...',
+            'Thinkering...',
+            'Processing...',
+        ]
+        if self.verbose:
+            from rich.console import Console
+
+            console = Console()
+            message = self._next_llm_status_message or random.choice(status_messages)
+            self._next_llm_status_message = None
+            with console.status(message, spinner="dots"):
+                return action()
+        self._next_llm_status_message = None
+        return action()
+
+    def _request_codex_decision(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Ask Codex for the next step while keeping terminal feedback provider-neutral."""
+        prompt = self._build_codex_decision_prompt(messages)
+        return self._with_llm_status(
+            lambda: self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
+        )
+
+    def _analyze_codex(
+        self,
+        user_message: str,
+        max_iterations: int,
+        continue_conversation: bool = False,
+    ) -> str:
+        """Run analysis loop using Codex CLI ChatGPT login."""
+        if continue_conversation and self._conversation_history:
+            messages = self._conversation_history.copy()
+            messages.append({"role": "user", "content": user_message})
+        else:
+            messages = [{"role": "user", "content": user_message}]
+        final_result = ""
+        tool_names = {tool.get("name") for tool in self._codex_tool_specs()}
+        auto_recovery_attempts = 0
+
+        try:
+            for _iteration in range(max_iterations):
+                decision = self._request_codex_decision(messages)
+
+                kind = decision.get("kind")
+                if kind == "tool_call":
+                    tool_name = decision.get("tool_name")
+                    tool_input_text = decision.get("tool_input_json") or "{}"
+                    if tool_name not in tool_names:
+                        raise CodexCLIError(f"Codex requested unknown SCAgent tool: {tool_name}")
+                    try:
+                        tool_input = json.loads(tool_input_text)
+                    except json.JSONDecodeError as exc:
+                        raise CodexCLIError(
+                            f"Codex returned invalid JSON tool_input_json for {tool_name}."
+                        ) from exc
+                    if not isinstance(tool_input, dict):
+                        raise CodexCLIError(f"Codex returned non-object tool_input_json for {tool_name}.")
+
+                    result_json = self._execute_tool(str(tool_name), tool_input)
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_call": {
+                            "name": tool_name,
+                            "arguments": tool_input,
+                        },
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_name": tool_name,
+                        "content": result_json,
+                    })
+
+                    if self._pending_images:
+                        paths = ", ".join(img["path"] for img in self._pending_images)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"Figure(s) generated at {paths}. The Codex CLI bridge does not "
+                                "support inline image bytes; call review_figure if visual review is needed."
+                            ),
+                        })
+                        self._pending_images = []
+                    continue
+
+                if kind == "final":
+                    final_result = decision.get("content") or ""
+                    messages.append({"role": "assistant", "content": final_result})
+                    self._print("\n" + "-" * 50)
+                    self._print(final_result)
+                    should_continue, auto_recovery_attempts = self._maybe_continue_after_failure(
+                        final_result,
+                        messages,
+                        auto_recovery_attempts,
+                        suggestions=["Provide additional instructions", "Try a different approach"],
+                    )
+                    if should_continue:
+                        continue
+                    self._conversation_history = messages
+                    if self.run_manager:
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
+                    return final_result
+
+                raise CodexCLIError(f"Codex returned unknown decision kind: {kind}")
+
+            final_result = "Analysis stopped: max iterations reached"
+            self._conversation_history = messages
+        except Exception as e:
+            if self.run_manager:
+                self.run_manager.fail(str(e))
+            raise
+
+        return final_result
 
     def _analyze_anthropic(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using Anthropic API."""
@@ -1436,16 +2030,23 @@ class SCAgent:
             # Start fresh
             messages = [{"role": "user", "content": user_message}]
         final_result = ""
+        auto_recovery_attempts = 0
 
         try:
             for iteration in range(max_iterations):
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    system=self._build_system_prompt(),
-                    tools=self.tools,
-                    messages=messages,
+                messages = self._trim_messages_if_needed(messages, anthropic=True)
+                response = self._with_llm_status(
+                    lambda: self.client.messages.create(
+                        model=self.model,
+                        max_tokens=4096,
+                        system=self._build_system_prompt(),
+                        tools=self.tools,
+                        messages=messages,
+                    )
                 )
+
+                if response.usage and hasattr(response.usage, 'input_tokens') and response.usage.input_tokens:
+                    self._last_actual_tokens = response.usage.input_tokens
 
                 if response.stop_reason == "tool_use":
                     tool_results = []
@@ -1454,8 +2055,7 @@ class SCAgent:
                     for content in response.content:
                         if content.type == "text":
                             assistant_content.append(content)
-                            if self.verbose:
-                                self._print_thinking(content.text)
+                            self._print_thinking(content.text)
 
                         elif content.type == "tool_use":
                             assistant_content.append(content)
@@ -1470,58 +2070,36 @@ class SCAgent:
                     messages.append({"role": "assistant", "content": assistant_content})
                     messages.append({"role": "user", "content": tool_results})
 
-                    # If there's a pending image, add it as a user message with vision
-                    if self._pending_image:
-                        image_msg = {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": f"Here is the generated figure ({self._pending_image['path']}). Please analyze it:"},
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": self._pending_image['mime'],
-                                        "data": self._pending_image['base64']
-                                    }
-                                }
-                            ]
-                        }
-                        messages.append(image_msg)
-                        self._print(f"    [Sending image to LLM for analysis]")
-                        self._pending_image = None
+                    # If there are pending figures, inject them as a vision user message
+                    if self._pending_images:
+                        messages.append(self._build_image_message(self._pending_images, "anthropic"))
+                        self._next_llm_status_message = "Analyzing figure..."
+                        self._pending_images = []
 
                 elif response.stop_reason == "end_turn":
                     # Add final assistant message to history
                     messages.append({"role": "assistant", "content": response.content})
 
-                    for content in response.content:
-                        if hasattr(content, "text"):
-                            final_result = content.text
-                            self._print("\n" + "-" * 50)
-                            self._print(final_result)
+                    text_parts = [content.text for content in response.content if hasattr(content, "text")]
+                    final_result = "\n".join(part for part in text_parts if part)
+                    if final_result:
+                        self._print("\n" + "-" * 50)
+                        self._print(final_result)
 
-                    # Check if the response indicates failure/incomplete
-                    failure_indicators = ["error", "failed", "couldn't", "unable to", "not installed",
-                                         "missing", "cannot", "exception", "try again"]
-                    seems_like_failure = any(ind in final_result.lower() for ind in failure_indicators)
-
-                    # If it looks like a failure, offer interactive recovery
-                    if seems_like_failure and self.verbose:
-                        user_input = self._ask_continue(
-                            final_result,  # Pass the actual response - it contains the specific issue
-                            suggestions=["Provide additional instructions", "Try a different approach"]
-                        )
-                        if user_input.lower() not in ["quit", "exit", "q"]:
-                            # Continue the conversation with user input
-                            messages.append({"role": "user", "content": user_input})
-                            self._conversation_history = messages
-                            continue  # Go to next iteration
+                    should_continue, auto_recovery_attempts = self._maybe_continue_after_failure(
+                        final_result,
+                        messages,
+                        auto_recovery_attempts,
+                        suggestions=["Provide additional instructions", "Try a different approach"],
+                    )
+                    if should_continue:
+                        continue
 
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result)
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -1539,6 +2117,235 @@ class SCAgent:
 
         return final_result
 
+    def _parse_xml_tool_calls(self, text: str) -> list:
+        """Parse tool calls from local model text output.
+
+        Handles three formats emitted by local models (e.g. Qwen2.5-Coder via vLLM):
+          1. <tool_call>{"name": ..., "arguments": ...}</tool_call>
+          2. <tools>{"name": ..., "arguments": ...}</tools>
+          3. Bare JSON: {"name": ..., "arguments": ...}  (no wrapper)
+        Returns list of dicts with 'id', 'name', 'arguments' keys, or empty list.
+        """
+        import re, uuid
+
+        def _extract(raw):
+            try:
+                parsed = json.loads(raw.strip())
+                if isinstance(parsed, dict) and "name" in parsed:
+                    return {
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "name": parsed["name"],
+                        "arguments": parsed.get("arguments", parsed.get("parameters", {})),
+                    }
+            except (json.JSONDecodeError, KeyError):
+                pass
+            return None
+
+        results = []
+
+        # 1 & 2: XML-wrapped
+        for tag in ("tool_call", "tools"):
+            for match in re.finditer(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, re.DOTALL):
+                tc = _extract(match.group(1))
+                if tc:
+                    results.append(tc)
+
+        if results:
+            return results
+
+        # 3: Bare JSON object(s) — try whole text, then scan for {...} blocks
+        tc = _extract(text)
+        if tc:
+            return [tc]
+
+        for match in re.finditer(r'\{[^{}]*"name"\s*:\s*"[^"]+"\s*,[^{}]*\}', text, re.DOTALL):
+            tc = _extract(match.group(0))
+            if tc:
+                results.append(tc)
+
+        return results
+
+    def _resolve_context_limit(self) -> int:
+        """
+        Determine the context window size for the current model.
+
+        For local/custom vLLM servers, queries the /v1/models endpoint which
+        reports max_model_len — the actual GPU-memory-constrained limit.
+        For cloud providers, returns known limits by model name.
+        """
+        # Any custom base_url (local or remote vLLM) — try to fetch the real limit
+        try:
+            base_url = str(getattr(self.client, 'base_url', ''))
+            cloud_hosts = ("api.openai.com", "api.anthropic.com", "api.groq.com")
+            is_cloud = any(h in base_url for h in cloud_hosts)
+            if not is_cloud and base_url:
+                for m in self.client.models.list().data:
+                    if m.id == self.model:
+                        limit = getattr(m, 'max_model_len', None)
+                        if limit and int(limit) > 0:
+                            logger.info(f"Context limit from vLLM: {int(limit):,} tokens")
+                            return int(limit)
+        except Exception:
+            pass
+
+        # Known cloud limits by model name
+        model = (self.model or "").lower()
+        if "claude" in model:
+            return 200_000
+        if "gpt-5" in model:
+            return 500_000
+        if "gpt-4o" in model:
+            return 128_000
+        if "gpt-4-turbo" in model:
+            return 128_000
+        if "llama" in model or "mixtral" in model or "gemma" in model:
+            return 128_000
+
+        return 128_000  # safe default
+
+    @staticmethod
+    def _estimate_tokens(messages: list) -> int:
+        """Rough token count: 1 token ≈ 4 chars of JSON-serialized content."""
+        try:
+            text = json.dumps(messages, default=str)
+            # Base64 image blobs (data:image/...;base64,<data>) can be 200KB+ of
+            # characters but vision models process them as ~256-2048 image tokens,
+            # not text tokens. Strip them and substitute a flat 4000-char estimate
+            # (~1000 tokens) per image so the text-token budget stays accurate.
+            text = re.sub(
+                r'data:[^;"\s]+;base64,[A-Za-z0-9+/=]+',
+                'data:image/placeholder_1000_tokens_estimated',
+                text,
+            )
+            return len(text) // 4
+        except Exception:
+            return 0
+
+    def _trim_messages_if_needed(self, messages: list, *, anthropic: bool = False) -> list:
+        """
+        Trim old tool results when approaching the context limit.
+
+        Why this is safe: the system prompt is rebuilt every iteration and
+        includes world_state.snapshot() — a structured summary of every
+        analysis step taken, the current data shape, clusters, annotations,
+        decisions made, and recent events.  A trimmed tool result from 10
+        turns ago is genuinely redundant: the model already acted on it and
+        its effects are captured in world_state.
+
+        Strategy (in order of aggressiveness):
+          1. Replace content of old tool-result messages with a short note
+          2. Truncate long assistant narrations in old messages
+
+        Always preserved:
+          - System message (index 0, OpenAI format)
+          - The most recent KEEP_TAIL messages verbatim
+          - All user messages (they're small and contain the user's intent)
+        """
+        threshold = int(self._context_limit * 0.75)
+        self._last_estimated_tokens = self._estimate_tokens(messages)
+        # Use whichever is higher: our estimate OR the last actual count from the
+        # API response. Since we only add messages between API calls, the current
+        # count is always >= last_actual, so this is a reliable lower bound that
+        # prevents under-trimming when the char-based estimate is too low.
+        token_basis = max(self._last_estimated_tokens, self._last_actual_tokens or 0)
+        if token_basis <= threshold:
+            return messages
+
+        messages = list(messages)  # shallow copy — entries are replaced, not mutated
+
+        KEEP_TAIL = 6
+        TRIM_MIN_CHARS = 300     # don't bother trimming small results
+        MAX_ASSISTANT_CHARS = 600
+
+        # System message lives at index 0 in OpenAI format; Anthropic passes it separately
+        first_trimmable = 0
+        if not anthropic and messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            first_trimmable = 1
+
+        protected_from = max(first_trimmable, len(messages) - KEEP_TAIL)
+
+        PLACEHOLDER = (
+            "[trimmed — result was processed; "
+            "current analysis state is reflected in the system prompt above]"
+        )
+
+        trimmed_before = token_basis
+
+        # Pass 1: replace large tool results
+        for i in range(first_trimmable, protected_from):
+            msg = messages[i]
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+
+            if role == "tool":
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > TRIM_MIN_CHARS:
+                    messages[i] = {**msg, "content": PLACEHOLDER}
+
+            elif role == "user" and isinstance(msg.get("content"), list):
+                # Anthropic format: tool results are blocks inside user messages
+                new_blocks, changed = [], False
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        inner = block.get("content", "")
+                        if isinstance(inner, str) and len(inner) > TRIM_MIN_CHARS:
+                            new_blocks.append({**block, "content": PLACEHOLDER})
+                            changed = True
+                            continue
+                    new_blocks.append(block)
+                if changed:
+                    messages[i] = {**msg, "content": new_blocks}
+
+        if self._estimate_tokens(messages) <= threshold:
+            return messages
+
+        # Pass 2: truncate long assistant narrations
+        for i in range(first_trimmable, protected_from):
+            msg = messages[i]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > MAX_ASSISTANT_CHARS:
+                messages[i] = {**msg, "content": content[:MAX_ASSISTANT_CHARS] + " [truncated]"}
+            elif isinstance(content, list):
+                new_blocks, changed = [], False
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if len(text) > MAX_ASSISTANT_CHARS:
+                            new_blocks.append({**block, "text": text[:MAX_ASSISTANT_CHARS] + " [truncated]"})
+                            changed = True
+                            continue
+                    new_blocks.append(block)
+                if changed:
+                    messages[i] = {**msg, "content": new_blocks}
+
+        remaining = self._estimate_tokens(messages)
+        freed = trimmed_before - remaining
+        if freed > 0:
+            limit_k = f"{self._context_limit // 1000}K" if self._context_limit >= 1000 else str(self._context_limit)
+            self._print(
+                f"[dim]⚡ Context compacted — freed ~{freed:,} tokens "
+                f"(was {trimmed_before:,}, now ~{remaining:,} / {limit_k}). "
+                f"Analysis state preserved in world state.[/dim]"
+            )
+            if self.run_manager:
+                self.run_manager.append_log(
+                    f"CONTEXT_COMPACT freed={freed} before={trimmed_before} after={remaining}"
+                )
+        if remaining > threshold:
+            logger.warning(
+                f"Context still large after trimming ({remaining:,} tokens estimated). "
+                f"Limit: {self._context_limit:,}. Session may be approaching its limit."
+            )
+            self._print(
+                f"[yellow]⚠ Context still large after compaction (~{remaining:,} tokens). "
+                f"Consider starting a new session if responses degrade.[/yellow]"
+            )
+
+        return messages
+
     def _analyze_openai(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using OpenAI API."""
         if continue_conversation and self._conversation_history:
@@ -1552,20 +2359,36 @@ class SCAgent:
                 {"role": "user", "content": user_message},
             ]
         final_result = ""
+        auto_recovery_attempts = 0
+        # Gemma 4 requires enable_thinking=True in the chat template to generate
+        # thinking blocks — without it the model skips the reasoning step entirely.
+        gemma_extra = (
+            {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
+            if self._is_gemma_model() else {}
+        )
 
         try:
             for iteration in range(max_iterations):
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = self._build_system_prompt()
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    max_completion_tokens=4096,
-                    tools=self.tools,
-                    messages=messages,
+                messages = self._trim_messages_if_needed(messages)
+                response = self._with_llm_status(
+                    lambda: self.client.chat.completions.create(
+                        model=self.model,
+                        max_completion_tokens=4096,
+                        tools=self.tools,
+                        messages=messages,
+                        **gemma_extra,
+                    )
                 )
 
                 choice = response.choices[0]
                 message = choice.message
+
+                # Capture exact token count from the API response (zero overhead —
+                # already returned). Used for the context bar display.
+                if response.usage and response.usage.prompt_tokens:
+                    self._last_actual_tokens = response.usage.prompt_tokens
 
                 if choice.finish_reason == "tool_calls" and message.tool_calls:
                     # Add assistant message with tool calls
@@ -1586,55 +2409,66 @@ class SCAgent:
                             "content": result_json,
                         })
 
-                    # If there's a pending image, add it as a user message with vision
-                    if self._pending_image:
-                        image_msg = {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": f"Here is the generated figure ({self._pending_image['path']}). Please analyze it:"},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{self._pending_image['mime']};base64,{self._pending_image['base64']}"
-                                    }
-                                }
-                            ]
-                        }
-                        messages.append(image_msg)
-                        self._print(f"    [Sending image to LLM for analysis]")
-                        self._pending_image = None
+                    # If there are pending figures, inject them as a vision user message
+                    if self._pending_images:
+                        messages.append(self._build_image_message(self._pending_images, "openai"))
+                        self._next_llm_status_message = "Analyzing figure..."
+                        self._pending_images = []
 
                 elif choice.finish_reason == "stop":
+                    # Check for XML tool calls in text (local models like Qwen2.5-Coder
+                    # emit <tool_call> or <tools> tags instead of structured tool_calls)
+                    xml_calls = self._parse_xml_tool_calls(message.content or "")
+                    if xml_calls:
+                        # Treat as tool calls — build a synthetic assistant message
+                        synthetic_tool_calls = [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": json.dumps(tc["arguments"]),
+                                },
+                            }
+                            for tc in xml_calls
+                        ]
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": synthetic_tool_calls,
+                        })
+                        for tc in xml_calls:
+                            tool_input = tc["arguments"] if isinstance(tc["arguments"], dict) else json.loads(tc["arguments"])
+                            result_json = self._execute_tool(tc["name"], tool_input)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result_json,
+                            })
+                        continue
+
                     # Add final assistant message to history
                     messages.append({"role": "assistant", "content": message.content})
 
                     final_result = message.content or ""
 
-                    # Check if the response indicates failure/incomplete
-                    failure_indicators = ["error", "failed", "couldn't", "unable to", "not installed",
-                                         "missing", "cannot", "exception", "try again"]
-                    seems_like_failure = any(ind in final_result.lower() for ind in failure_indicators)
-
                     self._print("\n" + "-" * 50)
                     self._print(final_result)
 
-                    # If it looks like a failure, offer interactive recovery
-                    if seems_like_failure and self.verbose:
-                        user_input = self._ask_continue(
-                            final_result,  # Pass the actual response - it contains the specific issue
-                            suggestions=["Provide additional instructions", "Try a different approach"]
-                        )
-                        if user_input.lower() not in ["quit", "exit", "q"]:
-                            # Continue the conversation with user input
-                            messages.append({"role": "user", "content": user_input})
-                            self._conversation_history = messages
-                            continue  # Go to next iteration
+                    should_continue, auto_recovery_attempts = self._maybe_continue_after_failure(
+                        final_result,
+                        messages,
+                        auto_recovery_attempts,
+                        suggestions=["Provide additional instructions", "Try a different approach"],
+                    )
+                    if should_continue:
+                        continue
 
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result)
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -1645,7 +2479,7 @@ class SCAgent:
                     final_result = message.content or ""
                     self._print(final_result)
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result)
+                        self.run_manager.complete(summary=final_result, request=self._active_request)
                     return final_result
 
                 else:
@@ -1662,6 +2496,51 @@ class SCAgent:
 
         return final_result
 
+    _TOOL_LABELS = {
+        "load_data":            "Loading dataset",
+        "run_qc":               "Running QC",
+        "score_integration":    "Scoring integration quality",
+        "benchmark_integration": "Benchmarking integration (scib-metrics)",
+        "normalize_and_hvg":    "Normalizing",
+        "run_pca":              "Running PCA",
+        "run_neighbors":        "Computing neighbors",
+        "run_umap":             "Computing UMAP",
+        "run_clustering":       "Clustering",
+        "compare_clusterings":  "Comparing clusterings",
+        "run_celltypist":       "Cell type annotation",
+        "run_scimilarity":      "Scimilarity annotation",
+        "run_batch_correction": "Batch correction",
+        "run_deg":              "Differential expression",
+        "run_pseudobulk_deg":  "Pseudobulk DEG (DESeq2)",
+        "run_gsea":             "GSEA",
+        "run_spectra":          "Spectra factor analysis",
+        "score_gene_signature": "Scoring gene signature",
+        "query_cells":          "Querying Scimilarity reference database",
+        "run_code":             "Running code",
+        "run_shell":            "Running shell command",
+        "generate_figure":      "Generating figure",
+        "inspect_data":         "Inspecting data",
+        "search_papers":        "Searching papers",
+        "research_findings":    "Searching literature",
+        "web_search":           "Searching web",
+        "review_artifact":      "Reviewing artifact",
+        "read_file":            "Reading file",
+    }
+
+    # Tools that produce their own tqdm/progress output. Using Rich's console.status()
+    # (Live display) on these conflicts with tqdm and makes the terminal appear blank.
+    # For these tools we print a start line and let the tool's own output flow through.
+    _STREAMING_TOOLS = {
+        "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
+        "run_umap",               # UMAP can take minutes on large datasets
+        "run_qc",                 # Scrublet progress on large datasets
+        "benchmark_integration",  # scib-metrics runs many metrics
+        "run_deg",                # rank_genes_groups can be slow
+        "run_pseudobulk_deg",     # DESeq2 fitting
+        "run_gsea",               # GSEA permutations
+        "run_code",               # unknown — user code may print progress
+    }
+
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Execute a tool and return JSON result."""
         from rich.console import Console
@@ -1669,7 +2548,7 @@ class SCAgent:
         from pathlib import Path
 
         console = Console()
-        logger.info(f"Tool call: {tool_name} with {tool_input}")
+        logger.debug("Tool call: %s with %s", tool_name, tool_input)
 
         # Only block truly pipeline-progressing tools when checkpoint pending
         # Allow flexible tools (run_code, inspection, visualization) to proceed
@@ -1692,7 +2571,9 @@ class SCAgent:
             checkpoint_tools = {
                 "run_qc",
                 "normalize_and_hvg",
-                "run_dimred",
+                "run_pca",
+                "run_neighbors",
+                "run_umap",
                 "run_clustering",
                 "run_celltypist",
                 "run_scimilarity",
@@ -1710,29 +2591,28 @@ class SCAgent:
                 else:
                     requested_path = Path(requested)
                     if not requested_path.is_absolute():
-                        if requested_path.parent == Path(".") or (
-                            requested_path.parts and requested_path.parts[0] == run_root.name
-                        ):
-                            tool_input["output_path"] = self.run_manager.get_figure_path(
-                                _sanitize_name(requested_path.stem),
-                                ext=requested_path.suffix.lstrip(".") or "png",
-                            )
+                        # Any relative path (e.g. "figures/umap.png", "umap.png") gets
+                        # routed through the run manager so the directory always exists.
+                        tool_input["output_path"] = self.run_manager.get_figure_path(
+                            _sanitize_name(requested_path.stem),
+                            ext=requested_path.suffix.lstrip(".") or "png",
+                        )
 
             if tool_name == "run_qc" and not tool_input.get("figure_dir"):
-                tool_input["figure_dir"] = str(self.run_manager.dirs["figures"])
+                tool_input["figure_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
 
             if tool_name == "compare_clusterings" and tool_input.get("generate_figures") and not tool_input.get("figure_dir"):
-                tool_input["figure_dir"] = str(self.run_manager.dirs["figures"])
+                tool_input["figure_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
 
             if tool_name == "run_gsea":
                 requested_dir = tool_input.get("output_dir")
                 if not requested_dir:
-                    tool_input["output_dir"] = str(self.run_manager.dirs["gsea"])
+                    tool_input["output_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["gsea"]))
                 else:
                     requested_path = Path(requested_dir)
                     if not requested_path.is_absolute():
                         if requested_path == Path(".") or requested_path.name == run_root.name:
-                            tool_input["output_dir"] = str(self.run_manager.dirs["gsea"])
+                            tool_input["output_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["gsea"]))
 
             # When save_checkpoints is False, NEVER save intermediate h5ad files
             # Only save when save_checkpoints is True OR when it's save_data tool
@@ -1745,73 +2625,90 @@ class SCAgent:
 
         _prepare_tool_paths()
         self._apply_world_state_overrides(tool_name, tool_input)
-        self._sync_world_state()
+        # Don't re-sync here — we already synced at the start of analyze() and after
+        # the previous tool call. Re-syncing before execution hits adata.X on every
+        # tool call without any adata change having occurred.
         before_snapshot = self.world_state.snapshot()
         if self.run_manager:
             self.run_manager.append_log(f"START {tool_name} {json.dumps(tool_input, default=str)}")
 
-        # Special handling for ask_user - get input from user but still track it like other tools
+        # ask_user is no longer in the tool list — the agent uses a turn-based
+        # model and presents options in its final text response instead.
+        # This branch is a safety net in case an older serialized conversation
+        # replays the tool; treat it as a no-op so the turn continues cleanly.
         if tool_name == "ask_user":
-            if self._pending_checkpoint:
-                tool_input.setdefault("question", self._pending_checkpoint.get("question", "What would you like to do next?"))
-                tool_input.setdefault("options", self._pending_checkpoint.get("options", []))
-                tool_input.setdefault("option_actions", self._pending_checkpoint.get("option_actions", []))
-                tool_input.setdefault("default", self._pending_checkpoint.get("default", ""))
-                tool_input.setdefault("decision_key", self._pending_checkpoint.get("decision_key", ""))
-            result_json = self._handle_ask_user(tool_input)
+            result_json = json.dumps({
+                "status": "ok",
+                "tool": "ask_user",
+                "message": "ask_user is no longer used — present options in your final response text.",
+                "user_response": "proceed",
+            }, indent=2)
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
             result_json = self._handle_install_package(tool_input)
-        # Special handling for run_code - show what's being executed
-        elif tool_name == "run_code":
-            self._print(f"\n[Tool] {tool_name}")
-            self._print(f"    Description: {tool_input.get('description', 'custom code')}")
-            if self.verbose:
-                code_preview = tool_input.get('code', '')[:100]
-                if len(tool_input.get('code', '')) > 100:
-                    code_preview += "..."
-                self._print(f"    Code: {code_preview}")
-            # Pass output directory for code file saving
-            if self.run_manager:
-                tool_input["output_dir"] = str(self.run_manager.run_dir)
-            # Run without spinner for code (it may have its own output)
-            result_json, self.adata = process_tool_call(
-                tool_name,
-                tool_input,
-                self.adata,
-                world_state=self.world_state,
-                run_manager=self.run_manager,
-            )
         else:
-            # Run with spinner for other tools
-            if self.verbose:
-                with console.status(f"[bold cyan]Running {tool_name}...", spinner="dots") as status:
-                    result_json, self.adata = process_tool_call(
+            # For run_code, inject the output_dir before dispatch
+            if tool_name == "run_code" and self.run_manager:
+                tool_input["output_dir"] = str(self.run_manager.run_dir)
+
+            # Build the display label
+            if tool_name == "run_code":
+                label = self._TOOL_LABELS.get(tool_name, tool_input.get('description', 'Running code'))
+            else:
+                label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
+
+            def _dispatch():
+                """Call process_tool_call with warning capture."""
+                import warnings as _warnings
+                with _warnings.catch_warnings(record=True) as _caught:
+                    _warnings.simplefilter("always")
+                    _rj, _ad = process_tool_call(
                         tool_name,
                         tool_input,
                         self.adata,
                         world_state=self.world_state,
                         run_manager=self.run_manager,
                     )
-                console.print(f"[green]✓[/green] {tool_name} complete")
+                if _caught:
+                    try:
+                        _rd = json.loads(_rj)
+                        _msgs = list({str(w.message) for w in _caught})
+                        existing = _rd.get("runtime_warnings") or []
+                        _rd["runtime_warnings"] = existing + _msgs
+                        _rj = json.dumps(_rd, indent=2)
+                    except Exception:
+                        pass
+                return _rj, _ad
+
+            if self.verbose and tool_name in self._STREAMING_TOOLS:
+                # Streaming tools produce their own tqdm/progress output. Using
+                # Rich's Live (console.status) fights with tqdm and blanks the
+                # terminal. Print a start line and let the tool's output flow.
+                console.print(f"[cyan]▶[/cyan] {label}...")
+                result_json, self.adata = _dispatch()
+                console.print(f"[green]✓[/green] {label} done")
+            elif self.verbose:
+                with console.status(f"{label}...", spinner="dots"):
+                    result_json, self.adata = _dispatch()
             else:
-                result_json, self.adata = process_tool_call(
-                    tool_name,
-                    tool_input,
-                    self.adata,
-                    world_state=self.world_state,
-                    run_manager=self.run_manager,
-                )
+                result_json, self.adata = _dispatch()
 
         # Check for image in result and store for vision
         try:
             result_data = json.loads(result_json)
-            self._sync_world_state()
+            # Only re-sync when the tool actually modifies adata (action tools).
+            # Inspection, figure, and search tools don't change the matrix, so
+            # syncing them would hit adata.X for no benefit.
+            # Invalidate the inspect cache first so the sync re-runs inspect_data
+            # with the fresh adata state (e.g. after QC filtering, normalization).
+            if self._is_action_tool(tool_name):
+                self.world_state.invalidate_inspect_cache()
+                self._sync_world_state()
 
-            # If there's an image, store it for the next message
+            # If there's an image directly embedded in the result, queue it
             if "image_base64" in result_data:
                 image_context = result_data.get("image_context", {})
-                self._pending_image = {
+                self._pending_images.append({
                     "base64": result_data["image_base64"],
                     "mime": result_data.get("image_mime", "image/png"),
                     "path": (
@@ -1820,13 +2717,34 @@ class SCAgent:
                         or image_context.get("output_path")
                         or "figure.png"
                     ),
-                }
+                    "role": "figure",
+                })
                 # Remove base64 from JSON to keep response small
                 del result_data["image_base64"]
                 if "image_mime" in result_data:
                     del result_data["image_mime"]
                 result_data["image_included"] = True
                 result_json = json.dumps(result_data, indent=2)
+
+            # Auto-load any figure artifacts (e.g. QC plots, UMAP) that weren't
+            # embedded directly — encode them so the LLM can see and interpret them.
+            already_loaded = {img["path"] for img in self._pending_images}
+            for artifact in result_data.get("artifacts_created", []) or []:
+                if artifact.get("kind") != "figure":
+                    continue
+                path = artifact.get("path", "")
+                if not path or path in already_loaded or not os.path.exists(path):
+                    continue
+                try:
+                    self._pending_images.append({
+                        "base64": encode_image_base64(path),
+                        "mime": get_image_mime_type(path),
+                        "path": path,
+                        "role": artifact.get("role", "figure"),
+                    })
+                    already_loaded.add(path)
+                except Exception as enc_err:
+                    logger.warning("Failed to encode figure %s for vision: %s", path, enc_err)
 
             status = result_data.get("status", "unknown")
 
@@ -1918,13 +2836,22 @@ class SCAgent:
             elif status == "needs_input":
                 pass  # Handled by ask_user
             elif status == "error":
-                self._print(f"    [red]✗ Error:[/red] {result_data.get('message', '')}")
-            verification_status = (result_data.get("verification") or {}).get("status")
-            if verification_status in {"warning", "failed"}:
-                self._print(
-                    f"    [yellow]Verification {verification_status}:[/yellow] "
-                    f"{result_data['verification'].get('summary', '')}"
-                )
+                err_msg = result_data.get('message') or result_data.get('error', '')
+                err_short = err_msg[:120] + ("…" if len(err_msg) > 120 else "")
+                self._print(f"    [red]✗ Error:[/red] {err_short}")
+                # Show captured output before the crash if available
+                pre_crash = result_data.get('output', '')
+                if pre_crash and pre_crash.strip():
+                    self._print(f"    [dim]Output before error:[/dim] {pre_crash.strip()[:200]}")
+            # Only show verification failures when the tool didn't already report
+            # an error — otherwise we'd print two lines saying the same thing.
+            if status != "error":
+                verification_status = (result_data.get("verification") or {}).get("status")
+                if verification_status in {"warning", "failed"}:
+                    self._print(
+                        f"    [yellow]Verification {verification_status}:[/yellow] "
+                        f"{result_data['verification'].get('summary', '')}"
+                    )
 
         except json.JSONDecodeError:
             pass
@@ -2403,11 +3330,25 @@ class SCAgent:
 
     def _handle_ask_user(self, tool_input: Dict[str, Any]) -> str:
         """Handle ask_user tool - prompt user for input."""
+        if self._pending_checkpoint:
+            checkpoint = self._pending_checkpoint
+            # Prefer the canonical checkpoint text over model-invented wording.
+            tool_input = {
+                **tool_input,
+                "question": checkpoint.get("question", tool_input.get("question", "")),
+                "options": checkpoint.get("options", tool_input.get("options", [])),
+                "option_actions": checkpoint.get("option_actions", tool_input.get("option_actions", [])),
+                "default": checkpoint.get("default", tool_input.get("default", "")),
+                "decision_key": checkpoint.get("decision_key", tool_input.get("decision_key", "")),
+                "summary": checkpoint.get("summary", tool_input.get("summary", "")),
+            }
+
         question = tool_input["question"]
         options = tool_input.get("options", [])
         option_actions = tool_input.get("option_actions", [])
         default = tool_input.get("default", "")
         decision_key = tool_input.get("decision_key", "")
+        summary = tool_input.get("summary", "")
 
         if self.collaborative and not sys.stdin.isatty():
             return json.dumps({
@@ -2435,16 +3376,21 @@ class SCAgent:
             }, indent=2)
 
         print()
+        if summary:
+            print(summary)
+            print()
         print(question)
         if options and not re.search(r"(^|\n)\s*1\.\s", question):
             for idx, option in enumerate(options, 1):
                 print(f"{idx}. {option}")
         if default:
-            print(f"[Default: {default}]")
+            print("Press Enter to use the suggested option.")
 
         # Get user input
         try:
-            response = input("> ").strip()
+            from ..terminal import read_user_input
+
+            response = read_user_input("> ")
             if not response and default:
                 response = default
         except (EOFError, KeyboardInterrupt):
@@ -2498,7 +3444,9 @@ class SCAgent:
         print('='*50)
 
         try:
-            response = input("Approve? [y/N]: ").strip().lower()
+            from ..terminal import read_user_input
+
+            response = read_user_input("Approve? [y/N]: ").lower()
         except (EOFError, KeyboardInterrupt):
             response = "n"
 
@@ -2566,27 +3514,50 @@ class SCAgent:
             Agent's response.
         """
         if self.provider == "anthropic":
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=self._build_system_prompt(),
-                messages=[{"role": "user", "content": message}],
+            response = self._with_llm_status(
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=self._build_system_prompt(),
+                    messages=[{"role": "user", "content": message}],
+                )
             )
             for content in response.content:
                 if hasattr(content, "text"):
                     return content.text
             return ""
-        else:
+        elif self.provider in {"openai", "groq"}:
             # OpenAI
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_completion_tokens=4096,
-                messages=[
-                    {"role": "system", "content": self._build_system_prompt()},
-                    {"role": "user", "content": message},
-                ],
+            response = self._with_llm_status(
+                lambda: self.client.chat.completions.create(
+                    model=self.model,
+                    max_completion_tokens=4096,
+                    messages=[
+                        {"role": "system", "content": self._build_system_prompt()},
+                        {"role": "user", "content": message},
+                    ],
+                    **({"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
+                       if self._is_gemma_model() else {}),
+                )
             )
-            return response.choices[0].message.content or ""
+            return self._strip_model_artifacts(response.choices[0].message.content or "")
+        elif self.provider == "codex":
+            messages = [{
+                "role": "user",
+                "content": (
+                    "Answer the following user question directly. Return kind='final' in the "
+                    "required JSON schema; do not call tools for this lightweight chat method.\n\n"
+                    f"User question: {message}"
+                ),
+            }]
+            decision = self._request_codex_decision(messages)
+            if decision.get("kind") == "final":
+                return decision.get("content") or ""
+            return (
+                "Codex requested an analysis tool for this question. "
+                "Use `scagent analyze --provider codex` for tool-using runs."
+            )
+        raise RuntimeError(f"Unsupported provider: {self.provider}")
 
     def inspect(self, data_path: str) -> Dict[str, Any]:
         """
@@ -2643,7 +3614,7 @@ class SCAgent:
         self.adata = None
         self.run_manager = None
         self.biological_context = None
-        self._pending_image = None
+        self._pending_images = []
         self._interaction_state = {
             "shown_figures": [],
             "reviewed_figures": [],

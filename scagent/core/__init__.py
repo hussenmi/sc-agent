@@ -13,14 +13,25 @@ from .inspector import (
     inspect_data,
     metadata_candidate_to_dict,
     metadata_resolution_to_dict,
+    obs_columns_detail,
     promote_clustering_to_primary,
     rank_obs_metadata_candidates,
+    rank_obs_semantic_candidates,
     recommend_next_steps,
     register_clustering,
     resolve_batch_metadata,
+    semantic_roles_to_dict,
 )
 from .io import load_data, load_10x_h5, load_h5ad
-from .qc import run_qc_pipeline, calculate_qc_metrics, filter_cells_by_mt, filter_genes, detect_doublets
+from .qc import (
+    run_qc_pipeline,
+    calculate_qc_metrics,
+    filter_cells_by_genes,
+    filter_cells_by_mt,
+    filter_doublets,
+    filter_genes,
+    detect_doublets,
+)
 from .normalization import normalize_data, preserve_raw_counts
 from .dimred import run_pca, compute_neighbors, compute_umap
 from .clustering import run_leiden, run_phenograph
@@ -32,11 +43,14 @@ __all__ = [
     "MetadataResolution",
     "ClusteringRecord",
     "inspect_data",
+    "obs_columns_detail",
     "recommend_next_steps",
     "rank_obs_metadata_candidates",
+    "rank_obs_semantic_candidates",
     "resolve_batch_metadata",
     "metadata_candidate_to_dict",
     "metadata_resolution_to_dict",
+    "semantic_roles_to_dict",
     "get_clustering_registry",
     "clustering_record_to_dict",
     "default_cluster_key_for_method",
@@ -51,7 +65,9 @@ __all__ = [
     # QC
     "run_qc_pipeline",
     "calculate_qc_metrics",
+    "filter_cells_by_genes",
     "filter_cells_by_mt",
+    "filter_doublets",
     "filter_genes",
     "detect_doublets",
     # Normalization

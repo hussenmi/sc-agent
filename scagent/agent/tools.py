@@ -15,8 +15,11 @@ os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
 from typing import List, Dict, Any
 import json
+import logging
 from pathlib import Path
 import re
+
+logger = logging.getLogger(__name__)
 
 
 def get_tools() -> List[Dict[str, Any]]:
@@ -31,6 +34,19 @@ def get_tools() -> List[Dict[str, Any]]:
     # Action tools (mutate state)
     action_tools = [
         {
+            "name": "load_data",
+            "description": "Replace the primary in-memory dataset with a new file. Use this when the user explicitly wants to switch focus to a different dataset. Always save the current primary with save_data first if it has been processed. Returns full inspection info (shape, state, obs columns, batch metadata) — do NOT call inspect_data afterwards.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to the h5ad or 10X h5 file to load as the new primary dataset."},
+                    "goal": {"type": "string", "description": "Analysis goal hint (e.g., 'qc', 'cluster', 'annotate')"},
+                    "context": {"type": "string", "description": "Optional biological context hint (e.g., 'PBMC healthy human')"}
+                },
+                "required": ["data_path"]
+            }
+        },
+        {
             "name": "run_qc",
             "description": "Run or preview the quality control pipeline: QC metrics, doublet detection, cell/gene filtering. Use preview_only=true first in collaborative workflows so the user can review proposed removals before filters are applied. Do not assume intermediate h5ad saving is desired.",
             "input_schema": {
@@ -39,11 +55,24 @@ def get_tools() -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
                     "output_path": {"type": "string", "description": "Optional path to save a processed h5ad. Prefer saving only final outputs unless the user explicitly asks for checkpoints."},
                     "preview_only": {"type": "boolean", "description": "If true, do not filter. Instead compute full QC metrics, estimate removals, and generate pre-filter QC figures."},
-                    "mt_threshold": {"type": "number", "description": "Max MT% (default: auto-detect)"},
-                    "min_cells": {"type": "integer", "description": "Minimum cells per gene before gene removal (default: ~55)"},
+                    "confirm_filtering": {"type": "boolean", "description": "Required to apply cell/gene filtering. Set true only after the user has explicitly confirmed the previewed thresholds, parameters, and removal counts."},
+                    "data_type": {"type": "string", "enum": ["single_cell", "single_nucleus"], "description": "Hint for MT threshold direction: 'single_nucleus' starts at 5%, 'single_cell' at 20%. The actual threshold must be chosen from the QC figure — always inspect the distribution before filtering."},
+                    "mt_threshold": {"type": "number", "description": "Max MT% threshold. Overrides data_type if provided."},
+                    "filter_mt": {"type": "boolean", "description": "If false, compute and report MT metrics but do not apply a hard MT% cell filter. Use this for source pipelines that inspect MT but do not remove cells by MT%."},
+                    "min_genes": {"type": "integer", "description": "Minimum detected genes per cell before cell removal. This is cell-level filtering, distinct from min_cells per gene."},
+                    "min_cells": {"type": "integer", "description": "Minimum cells a gene must be expressed in to be kept (default: 3). In preview, shows how many genes would be removed. Present this to the user alongside the projected removal count and confirm before applying."},
                     "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
                     "remove_mt": {"type": "boolean", "description": "Remove mitochondrial genes from the feature set (default: false)"},
                     "detect_doublets_flag": {"type": "boolean", "description": "Run Scrublet doublet detection (default: true)"},
+                    "remove_doublets": {"type": "boolean", "description": "If true, remove cells flagged as predicted doublets in apply mode. Preview mode reports the count only."},
+                    "scrublet_expected_doublet_rate": {"type": "number", "description": "Scrublet expected_doublet_rate (default: 0.06)."},
+                    "scrublet_sim_doublet_ratio": {"type": "number", "description": "Scrublet sim_doublet_ratio (default: 2.0)."},
+                    "scrublet_n_prin_comps": {"type": "integer", "description": "Scrublet n_prin_comps / PCA components (default: 30). Set to 40 to match some published pipelines."},
+                    "scrublet_min_counts": {"type": "integer", "description": "Scrublet scrub_doublets min_counts preprocessing parameter (default: 2)."},
+                    "scrublet_min_cells": {"type": "integer", "description": "Scrublet scrub_doublets min_cells preprocessing parameter (default: 3)."},
+                    "scrublet_min_gene_variability_pctl": {"type": "number", "description": "Scrublet scrub_doublets min_gene_variability_pctl preprocessing parameter (default: 85)."},
+                    "scrublet_random_state": {"type": "integer", "description": "Random seed for Scrublet (default: 0)."},
+                    "force_doublet_recompute": {"type": "boolean", "description": "If true, recompute Scrublet scores even if doublet columns already exist."},
                     "figure_dir": {"type": "string", "description": "Directory for QC figures. Plots are generated from the full pre-filter data."},
                     "batch_key": {"type": "string", "description": "Batch column for per-batch doublet detection"}
                 },
@@ -58,21 +87,68 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"}
+                    "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"},
+                    "target_sum": {"type": "number", "description": "Target counts per cell for normalize_total (default: 10000). Use source/paper value when reproducing a workflow."},
+                    "log_transform": {"type": "boolean", "description": "Apply log1p after normalize_total (default: true)."},
+                    "raw_layer_name": {"type": "string", "description": "Layer used to preserve/reset raw integer counts (default: raw_counts)."},
+                    "force_reset_from_raw": {"type": "boolean", "description": "If true, reset adata.X from raw_layer_name before normalization when available. Use for retries to avoid double-normalization (default: true)."},
+                    "set_raw_after_normalization": {"type": "boolean", "description": "If true, set adata.raw = adata.copy() after normalization/log1p and before later scaling/PCA (default: true)."},
+                    "hvg_flavor": {"type": "string", "enum": ["seurat", "seurat_v3", "cell_ranger"], "description": "Scanpy HVG flavor (default: seurat_v3). seurat_v3 uses VST on raw counts and supports batch_key (ranks by median rank across batches). seurat works on log-normalized data."},
+                    "hvg_layer": {"type": "string", "description": "Layer for HVG calculation. seurat_v3 requires raw integer counts; if omitted, auto-detects from 'raw_counts', 'raw_data', 'counts' in that order. Only set explicitly if your raw counts are in a non-standard layer."},
+                    "batch_key": {"type": "string", "description": "obs column for batch-stratified HVG selection. Recommended for multi-sample data. Supported by all flavors including seurat_v3."},
+                    "hvg_exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex pattern(s) for source-defined features that must not be marked highly_variable. Only pass evidence-backed source/workflow exclusions; do not invent dataset-specific patterns."},
+                    "hvg_exclusion_mode": {"type": "string", "enum": ["post", "pre"], "description": "How to apply source-defined HVG exclusions. 'post' runs HVG then forces excluded features to false; 'pre' computes HVGs only on allowed features (default: post)."},
+                    "hvg_exclude_match_mode": {"type": "string", "enum": ["match", "contains", "fullmatch"], "description": "Regex matching mode for hvg_exclude_patterns against var_names (default: match)."},
+                    "hvg_exclusion_source": {"type": "string", "description": "Short provenance for the feature-exclusion rule, e.g. source repo file/function/line or paper method."}
                 },
                 "required": []
             }
         },
         {
-            "name": "run_dimred",
-            "description": "Run PCA, compute neighbor graph, and UMAP embedding.",
+            "name": "run_pca",
+            "description": "Run PCA only. Does not compute neighbors, UMAP, clustering, or batch correction.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "n_pcs": {"type": "integer", "description": "Number of PCs (default: 30)"},
-                    "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"}
+                    "n_comps": {"type": "integer", "description": "Number of PCA components (default: 30)"},
+                    "svd_solver": {"type": "string", "description": "SVD solver passed to scanpy.tl.pca (default: arpack)"},
+                    "mask_var": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Boolean var column for PCA feature mask, or null for all genes (default: highly_variable)"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "run_neighbors",
+            "description": "Compute a neighbor graph only. Does not run PCA, UMAP, clustering, or batch correction.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
+                    "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"},
+                    "n_pcs": {"type": "integer", "description": "Number of PCs to use from the representation (optional)"},
+                    "use_rep": {"type": "string", "description": "Representation in adata.obsm to use (default: X_pca)"},
+                    "metric": {"type": "string", "description": "Distance metric (default: euclidean)"},
+                    "key_added": {"type": "string", "description": "Optional alternate neighbors key. Omit to write the default graph."}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "run_umap",
+            "description": "Compute UMAP only from an existing neighbor graph. Does not recompute PCA, neighbors, batch correction, or clustering.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
+                    "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
+                    "min_dist": {"type": "number", "description": "UMAP min_dist (default: 0.5, Scanpy's default)"},
+                    "spread": {"type": "number", "description": "UMAP spread (default: 1.0)"},
+                    "n_components": {"type": "integer", "description": "Number of UMAP dimensions (default: 2)"},
+                    "neighbors_key": {"type": "string", "description": "Optional neighbors key to use. Omit to use adata.uns['neighbors']."},
+                    "random_state": {"type": "integer", "description": "Random seed (default: 0)"}
                 },
                 "required": []
             }
@@ -85,7 +161,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
+                    "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"},
                     "cluster_key": {"type": "string", "description": "Optional explicit obs column to store this clustering result. If omitted, scagent will keep primary aliases like 'leiden' stable and store comparisons under deterministic keys like 'leiden_res_0_5'."},
                     "make_primary": {"type": "boolean", "description": "If true, promote this clustering to the default alias for the method (for example 'leiden') while preserving the explicit result key."}
@@ -100,7 +176,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
-                    "method": {"type": "string", "enum": ["leiden", "phenograph"], "description": "Method (default: leiden)"},
+                    "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolutions": {"type": "array", "items": {"type": "number"}, "description": "List of resolutions to compare"},
                     "generate_figures": {"type": "boolean", "description": "If true and UMAP is present, save one figure per clustering"},
                     "figure_dir": {"type": "string", "description": "Optional directory for generated comparison figures"},
@@ -140,16 +216,109 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_batch_correction",
-            "description": "Correct batch effects using Harmony or Scanorama.",
+            "description": (
+                "Correct batch effects using Harmony, BBKNN, Scanorama, or scVI. "
+                "Harmony: fast, corrects PCA embeddings, good for mild-to-moderate batch effects. "
+                "BBKNN: fast, builds a batch-balanced k-NN graph in PCA space; correction lives in "
+                "the neighbor graph (not a separate embedding). Run UMAP/clustering separately unless explicitly requested. "
+                "Good default when you have many samples (e.g. >10 batches). "
+                "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
+                "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
+                "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
+                "This tool only performs batch correction. Run run_neighbors and run_umap as separate steps afterwards."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional)"},
-                    "batch_key": {"type": "string", "description": "Batch column name"},
-                    "method": {"type": "string", "enum": ["harmony", "scanorama"], "description": "Method (default: harmony)"}
+                    "batch_key": {"type": "string", "description": "Column in adata.obs containing batch labels"},
+                    "method": {
+                        "type": "string",
+                        "enum": ["harmony", "bbknn", "scanorama", "scvi"],
+                        "description": (
+                            "Correction method (default: harmony). "
+                            "bbknn: batch-balanced graph, good for many batches (>10 samples). "
+                            "scvi: best for complex effects but needs raw_counts layer."
+                        )
+                    },
+                    "n_pcs": {"type": "integer", "description": "BBKNN only: number of PCA components to use (default: 30)"},
+                    "neighbors_within_batch": {"type": "integer", "description": "BBKNN only: neighbors contributed per batch per cell (default: 3; total = n_batches × this value)"},
+                    "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
+                    "max_epochs": {"type": "integer", "description": "scVI only: training epochs (default: 200; use fewer only for quick tests)"},
+                    "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "score_integration",
+            "description": (
+                "Score batch integration quality using neighborhood batch mixing entropy. "
+                "For each cell, examines its k nearest neighbors in the chosen embedding and "
+                "computes the Shannon entropy of batch labels — high entropy means batches are "
+                "well-mixed. The score is normalized to [0, 1] where 1 = perfect mixing. "
+                "Call this after run_batch_correction to quantify whether integration worked. "
+                "Can also be called on uncorrected embeddings (use_rep='X_pca') as a baseline "
+                "to compare before/after. Stores per-cell scores in obs['integration_entropy']."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "batch_key": {
+                        "type": "string",
+                        "description": "obs column with batch labels (same key used for batch correction)."
+                    },
+                    "use_rep": {
+                        "type": "string",
+                        "description": "Embedding to evaluate (default: 'X_umap'). Use the corrected embedding for post-integration score, or 'X_pca' for pre-integration baseline."
+                    },
+                    "n_neighbors": {
+                        "type": "integer",
+                        "description": "Neighborhood size for entropy calculation (default: 50). Larger = stabler but slower."
+                    }
+                },
+                "required": ["batch_key"]
+            }
+        },
+        {
+            "name": "benchmark_integration",
+            "description": (
+                "Benchmark batch integration quality using scib-metrics — the same evaluation "
+                "used in workshop session 5 to decide which correction method to keep. "
+                "Computes bio-conservation metrics (NMI, ARI, silhouette label, cLISI) and "
+                "batch-correction metrics (silhouette batch, iLISI, kBET, graph connectivity, PCR) "
+                "across all corrected embeddings present in adata.obsm, always including X_pca as "
+                "the uncorrected baseline. Returns a ranked table and the best-performing method. "
+                "Requires: scib-metrics (pip install scib-metrics), a label_key with cell type or "
+                "cluster annotations, and at least one corrected embedding from run_batch_correction."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "batch_key": {
+                        "type": "string",
+                        "description": "obs column with batch labels (same as used for batch correction)."
+                    },
+                    "label_key": {
+                        "type": "string",
+                        "description": "obs column with cell type or cluster labels for bio-conservation metrics (e.g. 'leiden', 'cell_type', 'celltypist_cell_type')."
+                    },
+                    "embedding_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "obsm keys to benchmark. Auto-detected if omitted (includes X_pca baseline + any corrected embeddings present)."
+                    },
+                    "fast": {
+                        "type": "boolean",
+                        "description": "Skip slow metrics (kBET) for a quicker result (default: false)."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory to save results CSV and results-table figure (optional but recommended)."
+                    }
+                },
+                "required": ["batch_key", "label_key"]
             }
         },
         {
@@ -163,9 +332,70 @@ def get_tools() -> List[Dict[str, Any]]:
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
                     "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"},
                     "layer": {"type": "string", "description": "Optional expression layer to use for DEG (for example scran_norm)"},
+                    "use_raw": {"type": "boolean", "description": "Whether to use adata.raw for DEG when layer is not set. If omitted, follows Scanpy default (uses adata.raw when present)."},
+                    "key_added": {"type": "string", "description": "Key in adata.uns for DEG results (default: rank_genes_groups)"},
+                    "n_genes": {"type": "integer", "description": "Number of ranked genes to store per group (default: 100)"},
                     "target_geneset": {"type": "string", "description": "Target gene set database for compatibility check (default: MSigDB_Hallmark_2020)"}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "run_pseudobulk_deg",
+            "description": (
+                "Run pseudobulk differential expression analysis using DESeq2. "
+                "Aggregates raw counts to the sample level (one observation per biological replicate "
+                "per cell type) before running statistics — this respects replicate independence and "
+                "is strongly preferred over single-cell Wilcoxon when biological replicates are available. "
+                "Requires: raw integer counts in a layer (default 'raw_counts'), a sample column with "
+                "≥ 2 replicates per condition, and a condition column. "
+                "Use run_deg (Wilcoxon) when no replicates are available."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sample_col": {
+                        "type": "string",
+                        "description": "Column in adata.obs identifying biological replicates (e.g. 'sample_id', 'donor'). Each unique value must be an independent sample."
+                    },
+                    "condition_col": {
+                        "type": "string",
+                        "description": "Column in adata.obs defining the condition to compare (e.g. 'disease', 'treatment', 'timepoint')."
+                    },
+                    "condition_a": {
+                        "type": "string",
+                        "description": "Reference condition (denominator in log fold change, e.g. 'healthy', 'control')."
+                    },
+                    "condition_b": {
+                        "type": "string",
+                        "description": "Test condition (numerator in log fold change, e.g. 'disease', 'treated'). Positive LFC means upregulated here."
+                    },
+                    "groups_col": {
+                        "type": "string",
+                        "description": "Column in adata.obs containing cell type or cluster labels (e.g. 'leiden', 'cell_type'). Used to subset to a specific cell type."
+                    },
+                    "cell_type": {
+                        "type": "string",
+                        "description": "Specific cell type label from groups_col to analyze. If omitted, runs on all cells together (use when adata is already subset)."
+                    },
+                    "layer": {
+                        "type": "string",
+                        "description": "Layer containing raw integer counts (default: 'raw_counts'). DESeq2 requires non-normalized counts."
+                    },
+                    "min_cells": {
+                        "type": "integer",
+                        "description": "Minimum cells a sample must contribute to pseudobulk to be retained (default: 10). Samples below this threshold are dropped."
+                    },
+                    "alpha": {
+                        "type": "number",
+                        "description": "Adjusted p-value threshold for significance reporting (default: 0.05)."
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Path to save full results as CSV (optional)."
+                    }
+                },
+                "required": ["sample_col", "condition_col", "condition_a", "condition_b", "groups_col"]
             }
         },
         {
@@ -202,6 +432,171 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "run_spectra",
+            "description": (
+                "Run Spectra semi-supervised factor analysis to discover gene programs. "
+                "Spectra fits a factor model guided by cell-type-specific gene set priors — "
+                "it produces both gene-set-guided factors (e.g. a T cell exhaustion program) "
+                "and de novo factors that explain residual variation not covered by the priors. "
+                "Outputs per-cell factor scores in obsm['SPECTRA_cell_scores'] (visualizable on UMAP), "
+                "top marker genes per factor in uns['SPECTRA_markers'], and gene loadings in uns['SPECTRA_factors']. "
+                "Requires: log-normalized counts in adata.X, a cell_type_key, and the Spectra-sc package. "
+                "Gene set dictionary format: JSON with cell type keys (one entry per cell type, even if empty {}) "
+                "plus a 'global' key. If none provided, runs in de novo mode (unsupervised). "
+                "Workshop note: num_epochs=100 for demos, 10000 for serious analysis."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cell_type_key": {
+                        "type": "string",
+                        "description": "obs column with cell type labels (e.g. 'celltypist_cell_type', 'leiden'). Every unique value must have an entry in the gene set dictionary."
+                    },
+                    "gene_set_dict_path": {
+                        "type": "string",
+                        "description": "Path to a JSON file containing the gene set dictionary. Format: {cell_type: {gene_set_name: [gene, ...]}, 'global': {gene_set_name: [gene, ...]}}. Missing cell types are auto-filled with empty entries."
+                    },
+                    "use_default_gene_sets": {
+                        "type": "boolean",
+                        "description": "Use Spectra's built-in default gene sets instead of a custom dictionary (default: false)."
+                    },
+                    "lam": {
+                        "type": "number",
+                        "description": "Regularization toward input gene sets (default: 0.1). Lower = stronger adherence to provided gene sets. Range: 0.001–0.5."
+                    },
+                    "num_epochs": {
+                        "type": "integer",
+                        "description": "Training iterations (default: 1000). Use 100 for a quick test, 10000 for publication-quality results."
+                    },
+                    "n_top_vals": {
+                        "type": "integer",
+                        "description": "Top genes per factor stored in SPECTRA_markers (default: 50)."
+                    },
+                    "use_highly_variable": {
+                        "type": "boolean",
+                        "description": "Restrict to highly variable genes plus gene set genes (default: true)."
+                    },
+                    "use_cell_types": {
+                        "type": "boolean",
+                        "description": "Fit cell-type-specific factors in addition to global factors (default: true)."
+                    },
+                    "overlap_threshold": {
+                        "type": "number",
+                        "description": "Minimum overlap coefficient to label a factor with a gene set name (default: 0.2)."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory to save the Spectra model and UMAP factor score figures (recommended)."
+                    }
+                },
+                "required": ["cell_type_key"]
+            }
+        },
+        {
+            "name": "query_cells",
+            "description": (
+                "Search the Scimilarity reference database (~24M cells) for cells most similar to a query. "
+                "Two modes:\n"
+                "- 'cells': query using specific cells (by obs_names list or a boolean obs column). "
+                "Uses the mean Scimilarity embedding of the selected cells.\n"
+                "- 'centroid': query using the centroid of a cluster or cell type group "
+                "(provide group_key + group_value). More robust for heterogeneous populations.\n"
+                "Returns the top-k matching reference cells with their metadata: cell type, tissue, disease, study, distance. "
+                "Useful for: validating ambiguous annotations, finding analogous cell states in other datasets, "
+                "characterising novel populations. "
+                "Requires Scimilarity to be installed and run_scimilarity to have been run (or X_scimilarity in obsm). "
+                "For centroid mode, raw counts must be available."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query_type": {
+                        "type": "string",
+                        "enum": ["cells", "centroid"],
+                        "description": "'cells' (default): query by specific cells. 'centroid': query by cluster/celltype centroid."
+                    },
+                    "cell_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of obs_names to use as query (cells mode). Use this for querying a specific set of cells."
+                    },
+                    "obs_column": {
+                        "type": "string",
+                        "description": "obs column where True/1 marks query cells (cells mode). Alternative to cell_ids."
+                    },
+                    "group_key": {
+                        "type": "string",
+                        "description": "obs column containing group labels (centroid mode), e.g. 'leiden' or 'celltypist_majority_voting'."
+                    },
+                    "group_value": {
+                        "type": "string",
+                        "description": "Which group to use as the centroid query (centroid mode), e.g. '3' or 'Macrophage'."
+                    },
+                    "k": {
+                        "type": "integer",
+                        "description": "Number of nearest reference cells to retrieve (default: 50). Increase to 500+ for broader characterisation."
+                    },
+                    "raw_layer": {
+                        "type": "string",
+                        "description": "Layer with raw integer counts (used in centroid mode). Leave unset to auto-detect."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "score_gene_signature",
+            "description": (
+                "Score each cell for a gene signature using Scanpy's implementation of the Seurat method "
+                "(average expression of the gene list minus the average of a random control set of similar "
+                "expression level). Scores are stored in adata.obs under 'score_name'. "
+                "Optionally run cell cycle scoring (S/G2M/G1 phases) as a special case. "
+                "Works on normalized data; no raw counts required. "
+                "Use for: cell cycle regression, pathway activity, viral signature, stress response, etc."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "gene_list": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of gene names to score. Genes not found in the dataset are silently dropped; the tool reports how many were matched."
+                    },
+                    "score_name": {
+                        "type": "string",
+                        "description": "Column name to store the score in adata.obs (default: 'gene_signature_score'). Use a descriptive name, e.g. 'IFN_response_score'."
+                    },
+                    "cell_cycle": {
+                        "type": "boolean",
+                        "description": "If true, run cell cycle scoring instead. Requires s_genes and g2m_genes. Adds 'S_score', 'G2M_score', and 'phase' to adata.obs."
+                    },
+                    "s_genes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "S-phase gene list for cell cycle scoring (only used when cell_cycle=true)."
+                    },
+                    "g2m_genes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "G2M-phase gene list for cell cycle scoring (only used when cell_cycle=true)."
+                    },
+                    "layer": {
+                        "type": "string",
+                        "description": "Layer to use for scoring. Defaults to adata.X (normalized counts). Do not use raw counts — the score uses expression levels, not counts."
+                    },
+                    "n_bins": {
+                        "type": "integer",
+                        "description": "Number of expression bins for control gene sampling (default: 25). Increase if you have very few genes."
+                    },
+                    "ctrl_size": {
+                        "type": "integer",
+                        "description": "Number of control genes sampled per bin (default: 50). Set to len(gene_list) for a tighter control."
+                    }
+                },
+                "required": []
+            }
+        },
+        {
             "name": "save_data",
             "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete.",
             "input_schema": {
@@ -215,33 +610,19 @@ def get_tools() -> List[Dict[str, Any]]:
     ]
 
     # Meta tools (agent control)
+    # Note: ask_user is intentionally absent. The agent follows a turn-based
+    # model (like Claude Code / Codex): run all tools to completion, produce a
+    # final response with numbered options, then wait for the user's next message.
+    # The user's reply comes back through the CLI loop as a normal analyze() call
+    # so state, data, and conversation history are always fully maintained.
     meta_tools = [
-        {
-            "name": "ask_user",
-            "description": "Ask the user a question and wait for their response. Collaboration is the default style, but do not use this for trivial bookkeeping. Use it when a preprocessing or interpretation choice should stay under user control, including QC thresholds, filtering decisions, clustering resolution changes, annotation ambiguity, batch correction, DEG comparisons, or any other material fork in the analysis. Keep the question concise and put the actionable choices in the options field.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "The question to ask the user"},
-                    "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices"},
-                    "option_actions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional machine-readable action hints aligned by index with options (for example run_qc_apply, run_celltypist, review_artifact)."
-                    },
-                    "default": {"type": "string", "description": "Default answer if user just presses enter"},
-                    "decision_key": {"type": "string", "description": "Optional state key to persist if the user answers explicitly (for example batch_key or primary_clustering)."}
-                },
-                "required": ["question"]
-            }
-        },
         {
             "name": "run_code",
             "description": "FLEXIBLE FALLBACK: Execute custom Python code on the AnnData object. This is your most versatile tool - use it for ANY valid request not covered by specialized tools. Examples: custom plots (variance explained, gene correlations, histograms), data filtering (remove clusters, subset cells), calculations (cluster sizes, gene stats), or any scanpy/pandas operation. Access: adata, sc (scanpy), plt (matplotlib), np, pd, output_dir, Path, ensure_dir(path). Use ensure_dir() to create directories before saving. ALWAYS prefer this over saying 'I can't do that'.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Python code to execute. Has access to adata, sc, plt, np, pd, output_dir, Path, ensure_dir(). Do NOT import os - use Path and ensure_dir instead."},
+                    "code": {"type": "string", "description": "Python code to execute. Has access to: adata, sc, plt, np, pd, output_dir, Path, ensure_dir(), write_report(). Key helpers: ensure_dir(path) creates the dir and returns a Path — use it for figures: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'. write_report(name, content) saves a markdown report to reports/name.md and returns the path — always use this instead of open() when saving text results, never write .txt files. Do NOT import os. When loading 10x h5 files with sc.read_10x_h5(), always call .var_names_make_unique() on each AnnData before concatenating. Use series.iloc[pos] not series[pos] for positional pandas access."},
                     "description": {"type": "string", "description": "Brief description of what the code does"},
                     "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
                 },
@@ -249,71 +630,93 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
-            "name": "web_search_docs",
-            "description": "Search general web and documentation sources. Use for package docs, API references, troubleshooting, method pages, and implementation details. Prefer this for software/documentation questions, not for scientific evidence claims.",
+            "name": "run_shell",
+            "description": (
+                "Run a shell command and return stdout/stderr. Use for system checks, "
+                "CLI tools, and anything that isn't Python. "
+                "Examples: 'nvidia-smi' (GPU availability and memory), 'free -h' (RAM), "
+                "'df -h .' (disk space), 'which cellbender' (tool installed?), "
+                "'cellbender remove-background --input raw.h5 --output clean.h5' (run CellBender), "
+                "'pip show scib-metrics' (package version), 'ls -lh /path/to/data'. "
+                "stdout and stderr are both captured and returned. "
+                "Commands that modify or delete files outside the output directory, "
+                "write to device files, or escalate privileges are blocked."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "site": {"type": "string", "description": "Optional site filter (e.g., 'scanpy.readthedocs.io', 'gseapy.readthedocs.io')"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 5)"}
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run. Executed via bash -c. Use absolute paths for reliability."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default: 60). Use a longer value for slow CLI tools like CellBender."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Working directory for the command (default: current session output directory)."
+                    }
+                },
+                "required": ["command"]
+            }
+        },
+        {
+            "name": "web_search",
+            "description": (
+                "Search the web for documentation, API references, package guides, troubleshooting, and tutorials. "
+                "Use the `site` parameter to target specific documentation sources. "
+                "Common bioinformatics doc sites: scanpy.readthedocs.io, anndata.readthedocs.io, "
+                "celltypist.readthedocs.io, gseapy.readthedocs.io, harmonypy.readthedocs.io, "
+                "scvi-tools.readthedocs.io, muon.readthedocs.io, squidpy.readthedocs.io. "
+                "For troubleshooting use scverse.discourse.org or github.com. "
+                "Use search_papers instead for peer-reviewed scientific evidence."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query — be specific (e.g., 'scanpy normalize_total target_sum parameter' rather than 'scanpy normalize')"},
+                    "site": {"type": "string", "description": "Optional domain to restrict results (e.g., 'scanpy.readthedocs.io')"},
+                    "max_results": {"type": "integer", "description": "Maximum results (default: 5)"}
                 },
                 "required": ["query"]
             }
         },
         {
             "name": "search_papers",
-            "description": "Search scientific literature using PubMed. Use for papers, reviews, recent pathway/cell-type findings, and scientific evidence. Returns PMID, title, year, journal, abstract excerpt, and PubMed URL.",
+            "description": (
+                "Search PubMed for peer-reviewed scientific literature. Use for: cell type markers, "
+                "pathway biology, disease mechanisms, method papers, and any claim that needs a citation. "
+                "Automatically normalises GSEA/gene set names (strips HALLMARK_, REACTOME_, GO_ prefixes). "
+                "Returns PMID, first author, year, journal, abstract, and PubMed URL. "
+                "Use web_search for package documentation instead."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "PubMed-style search query or plain text topic"},
-                    "max_results": {"type": "integer", "description": "Maximum papers to return (default: 5)"},
-                    "recent_years": {"type": "integer", "description": "Limit to the last N publication years (default: 5)"},
-                    "reviews_only": {"type": "boolean", "description": "Restrict to review articles"}
+                    "query": {"type": "string", "description": "Free-text query or PubMed search string. GSEA set names are normalised automatically (e.g. 'HALLMARK_TNFA_SIGNALING_VIA_NFKB' → 'TNF alpha signaling NF-kB'). Be specific: include cell type, disease, or gene names for better results."},
+                    "max_results": {"type": "integer", "description": "Maximum papers (default: 5)"},
+                    "recent_years": {"type": "integer", "description": "Restrict to last N years (default: 5). Use 10-15 for foundational method papers."},
+                    "reviews_only": {"type": "boolean", "description": "Return review articles only — good for overviews of a topic"}
                 },
                 "required": ["query"]
             }
         },
         {
             "name": "fetch_url",
-            "description": "Fetch and summarize a web page or article landing page. Use after a search step when you need the page contents rather than just search snippets.",
+            "description": (
+                "Fetch the full text of a web page. Use after web_search when snippets are not enough — "
+                "e.g. to read a function's full parameter list, a method's README, or a paper abstract. "
+                "Works well for readthedocs, GitHub READMEs, and static HTML pages. "
+                "JavaScript-heavy sites (Notion, some dashboards) may return little content."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "URL to fetch"},
-                    "max_chars": {"type": "integer", "description": "Maximum text characters to return (default: 4000)"}
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return (default: 4000; increase to 8000 for long API pages)"}
                 },
                 "required": ["url"]
-            }
-        },
-        {
-            "name": "web_search",
-            "description": "Backward-compatible alias for documentation/web search. Prefer web_search_docs for docs and search_papers for literature.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "site": {"type": "string", "description": "Optional site filter"},
-                    "max_results": {"type": "integer", "description": "Maximum results to return (default: 5)"}
-                },
-                "required": ["query"]
-            }
-        },
-        {
-            "name": "research_findings",
-            "description": "Conduct focused literature research on GSEA/pathway findings. Uses PubMed queries tailored to pathway, cell type, and leading-edge genes, and returns structured citations plus interpretation guidance. Use AFTER run_gsea to understand what enriched pathways mean biologically.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "pathway": {"type": "string", "description": "Pathway name to research (e.g., 'Oxidative phosphorylation', 'TNF signaling')"},
-                    "cell_type": {"type": "string", "description": "Cell type context (e.g., 'classical monocytes', 'CD8 T cells', 'B cells')"},
-                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Leading edge genes from GSEA to include in search"},
-                    "context": {"type": "string", "description": "Additional context (e.g., 'PBMC', 'tumor microenvironment', 'inflammation')"},
-                    "cluster_confidence": {"type": "number", "description": "Optional cluster confidence score (0-1) from annotation sanity checks"},
-                    "recent_years": {"type": "integer", "description": "Limit to papers from last N years (default: 3)"}
-                },
-                "required": ["pathway", "cell_type"]
             }
         },
         {
@@ -338,7 +741,7 @@ def get_tools() -> List[Dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "data_path": {"type": "string", "description": "Path to h5ad file (optional - uses in-memory data)"},
+                    "data_path": {"type": "string", "description": "Path to a single h5ad or 10x h5 file (optional - uses in-memory data). Do NOT pass a directory; for multi-sample loading use run_code."},
                     "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"},
                     "context": {"type": "string", "description": "Optional biological context hint from the user or file path (e.g., 'PBMC healthy human cells')"}
                 },
@@ -389,7 +792,8 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to h5ad with DEG results (optional - uses in-memory data)"},
                     "cluster": {"type": "string", "description": "Cluster ID"},
-                    "n_genes": {"type": "integer", "description": "Number of genes (default: 10)"}
+                    "n_genes": {"type": "integer", "description": "Number of genes (default: 10)"},
+                    "key": {"type": "string", "description": "DEG result key in adata.uns (default: rank_genes_groups)"}
                 },
                 "required": ["cluster"]
             }
@@ -481,6 +885,48 @@ def get_tools() -> List[Dict[str, Any]]:
                 "required": []
             }
         },
+        {
+            "name": "read_file",
+            "description": (
+                "Read and return the content of a file. Supports PDF (text extraction and optional page rendering), "
+                "plain text, Markdown, CSV, TSV, and JSON. Use this to read a paper, protocol, metadata table, "
+                "marker gene list, or any other reference document the user provides. "
+                "For large PDFs, use pages to read specific sections (e.g. methods). "
+                "Set render_pages=true to render PDF pages as images — the first page is sent directly to the vision "
+                "model so figures and plots embedded in the document are visible. Additional rendered pages are saved "
+                "to figures/pdf_pages/ and can be reviewed with review_figure. "
+                "Rendered pages are the right approach for scanned PDFs or pages where the content is primarily visual."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative path to the file."},
+                    "pages": {"type": "string", "description": "For PDFs: page range to extract, e.g. '1-5' or '3' or '2,4,6'. Default: all pages."},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return (default: 20000). Increase for longer documents."},
+                    "render_pages": {"type": "boolean", "description": "PDF only. Render pages as images (108 DPI PNG) in addition to text extraction. The first rendered page is sent to the vision model inline; others are saved to figures/pdf_pages/ for review_figure. Use when the document has figures, plots, or is scanned. Default: false."},
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "research_findings",
+            "description": (
+                "Search PubMed for literature about a specific pathway or gene set in the context of a cell type. "
+                "Returns recent papers and review articles. Used internally after GSEA to ground pathway "
+                "interpretations in published evidence."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pathway": {"type": "string", "description": "Pathway or gene set name (e.g. 'HALLMARK_TNFA_SIGNALING_VIA_NFKB')."},
+                    "cell_type": {"type": "string", "description": "Cell type context for the search (e.g. 'CD8 T cells')."},
+                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Top leading-edge genes to include in the query."},
+                    "context": {"type": "string", "description": "Additional biological context (tissue, disease, species)."},
+                    "recent_years": {"type": "integer", "description": "Limit search to this many recent years (default: 3)."},
+                },
+                "required": ["pathway"]
+            }
+        },
     ]
 
     return action_tools + meta_tools + inspection_tools
@@ -528,6 +974,36 @@ def get_image_mime_type(image_path: str) -> str:
     return mime_types.get(ext, "image/png")
 
 
+def _dataframe_preview(df, n: int = 5, max_cols: int = 20) -> dict:
+    """Return a JSON-serialisable head() preview of a DataFrame for LLM display."""
+    import math
+    subset = df.iloc[:n, :max_cols]
+    truncated_cols = df.shape[1] > max_cols
+
+    def _clean(v):
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        try:
+            # Categorical → string so json.dumps doesn't choke
+            return v.item() if hasattr(v, "item") else str(v) if not isinstance(v, (int, float, bool, type(None))) else v
+        except Exception:
+            return str(v)
+
+    rows = []
+    for idx, row in subset.iterrows():
+        entry = {"_index": str(idx)}
+        entry.update({col: _clean(val) for col, val in row.items()})
+        rows.append(entry)
+
+    return {
+        "columns": ["_index"] + list(subset.columns),
+        "rows": rows,
+        "total_rows": df.shape[0],
+        "total_cols": df.shape[1],
+        "truncated_cols": truncated_cols,
+    }
+
+
 def process_tool_call(
     tool_name: str,
     tool_input: Dict[str, Any],
@@ -554,8 +1030,8 @@ def process_tool_call(
         load_data,
         metadata_candidate_to_dict,
         metadata_resolution_to_dict,
+        obs_columns_detail as _obs_columns_detail,
         promote_clustering_to_primary,
-        rank_obs_metadata_candidates,
         recommend_next_steps,
         register_clustering,
         resolve_batch_metadata,
@@ -572,8 +1048,8 @@ def process_tool_call(
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import run_celltypist, run_scimilarity
-    from ..batch import run_scanorama, run_harmony
-    from ..analysis import infer_biological_context, build_literature_context, score_paper_relevance
+    from ..batch import run_scanorama, run_harmony, run_scvi, run_bbknn
+
     from .decision_policy import (
         decision_for_batch_strategy,
         decision_for_clustering_selection,
@@ -584,7 +1060,10 @@ def process_tool_call(
         """Create compact state dict."""
         state = inspect_data(adata)
         return {
-            "has_raw_counts": state.has_raw_layer,
+            "has_raw_counts": state.has_raw_layer or state.has_raw,
+            "raw_in_adata_raw": state.has_raw,
+            "raw_in_layer": state.has_raw_layer,
+            "raw_layer_name": state.raw_layer_name if state.has_raw_layer else None,
             "has_qc_metrics": state.has_qc_metrics,
             "has_doublets": state.has_doublet_scores,
             "is_normalized": state.is_normalized,
@@ -593,7 +1072,7 @@ def process_tool_call(
             "has_neighbors": state.has_neighbors,
             "has_umap": state.has_umap,
             "has_clusters": state.has_clusters,
-            "has_celltypes": state.has_celltypist or state.has_scimilarity,
+            "has_celltypes": state.has_celltype_annotations,
         }
 
     starting_state = make_state(adata) if adata is not None else {}
@@ -684,6 +1163,23 @@ def process_tool_call(
     def _check(name: str, passed: bool, details: str) -> Dict[str, Any]:
         return {"name": name, "status": "passed" if passed else "failed", "details": details}
 
+    def _neighbors_provenance(adata_obj) -> Dict[str, Any]:
+        neighbors = adata_obj.uns.get("neighbors", {}) if adata_obj is not None else {}
+        params = neighbors.get("params", {}) if isinstance(neighbors, dict) else {}
+        connectivities = adata_obj.obsp.get("connectivities") if adata_obj is not None and "connectivities" in adata_obj.obsp else None
+        distances = adata_obj.obsp.get("distances") if adata_obj is not None and "distances" in adata_obj.obsp else None
+        return {
+            "has_neighbors": bool(adata_obj is not None and "neighbors" in adata_obj.uns),
+            "params": _sanitize_uns_value(dict(params)) if isinstance(params, dict) else _sanitize_uns_value(params),
+            "connectivities_nnz": int(connectivities.nnz) if connectivities is not None and hasattr(connectivities, "nnz") else None,
+            "distances_nnz": int(distances.nnz) if distances is not None and hasattr(distances, "nnz") else None,
+            "connectivities_key": neighbors.get("connectivities_key") if isinstance(neighbors, dict) else None,
+            "distances_key": neighbors.get("distances_key") if isinstance(neighbors, dict) else None,
+        }
+
+    def _provenance_same(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+        return before == after
+
     def _finalize_result(
         result: Dict[str, Any],
         updated_adata,
@@ -749,7 +1245,7 @@ def process_tool_call(
         elif not state.is_normalized:
             next_priority = "normalize_and_hvg"
         elif not (state.has_pca and state.has_neighbors and state.has_umap):
-            next_priority = "run_dimred"
+            next_priority = "run_pca"
         elif not state.has_clusters:
             next_priority = "run_clustering"
         else:
@@ -775,10 +1271,12 @@ def process_tool_call(
         }
 
     def _available_annotation_keys(adata_obj) -> List[str]:
+        ocd = _obs_columns_detail(adata_obj.obs, adata_obj.n_obs).get("columns", {})
         return [
-            column
-            for column in adata_obj.obs.columns
-            if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label"))
+            col for col, info in ocd.items()
+            if info.get("note") != "high_cardinality"
+            and 2 <= info.get("n_unique", 0) <= 300
+            and info.get("dtype") in ("object", "category")
         ]
 
     def _available_plot_colors(adata_obj) -> List[str]:
@@ -832,6 +1330,37 @@ def process_tool_call(
             ),
         )
 
+    def _error_result(
+        *,
+        tool: str,
+        message: str,
+        adata_obj=None,
+        recovery_options: List[str] | None = None,
+        install_hint: str | None = None,
+        extra: Dict[str, Any] | None = None,
+    ):
+        """Return a standardized error tuple ``(json_str, adata)``.
+
+        Every tool error should go through this helper so the LLM always
+        sees the same shape: ``{status, tool, message, recovery_options,
+        available_columns}``.  ``install_hint`` is a shortcut that appends
+        a "pip install …" option automatically.
+        """
+        opts = list(recovery_options or [])
+        if install_hint:
+            opts.append(f"Install the missing package: {install_hint}")
+        payload: Dict[str, Any] = {
+            "status": "error",
+            "tool": tool,
+            "message": message,
+            "recovery_options": opts,
+        }
+        if adata_obj is not None:
+            payload["available_columns"] = list(adata_obj.obs.columns[:30])
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, indent=2), adata_obj
+
     def get_adata(tool_input, existing_adata, update_memory: bool = True, prefer_memory: bool = False):
         """Get adata from memory or load from disk.
 
@@ -853,7 +1382,12 @@ def process_tool_call(
         raise ValueError("No data available. Provide data_path or load data first.")
 
     def fix_output_path(output_path: str, tool_name: str) -> str:
-        """Normalize output_path values for h5ad-producing tools."""
+        """Normalize output_path values for h5ad-producing tools.
+
+        Relative paths with no directory component (e.g. 'result.h5ad') are
+        resolved inside the run directory when run_manager is available, so
+        saved files land alongside figures and reports rather than in cwd.
+        """
         import os as os_module
         if output_path is None:
             return None
@@ -861,7 +1395,65 @@ def process_tool_call(
             if tool_name == "save_data":
                 return os_module.path.join(output_path, "final_result.h5ad")
             return None
+        # Bare filename with no directory component → put it in the run dir
+        if (run_manager is not None
+                and not os_module.path.isabs(output_path)
+                and os_module.path.dirname(output_path) == ""):
+            return os_module.path.join(run_manager.run_dir, output_path)
         return output_path
+
+    def _resolve_integer_counts_layer(adata, requested_layer: str = "raw_counts"):
+        """
+        Find a layer with true integer counts, or raise a clear ValueError.
+
+        Checks (in order):
+        1. The explicitly requested layer name
+        2. Common raw layer names (raw_counts, raw_data, counts)
+        3. adata.raw — but ONLY if it contains integer values
+
+        Returns (layer_name_or_sentinel, X_matrix) where layer_name_or_sentinel
+        is either a key in adata.layers or '__raw__' if adata.raw is the source.
+        Raises ValueError with a user-facing message if no integer counts found.
+        """
+        from ..core.inspector import _is_integer_matrix
+
+        # 1. Explicitly requested layer
+        if requested_layer and requested_layer in adata.layers:
+            if _is_integer_matrix(adata.layers[requested_layer]):
+                return requested_layer, adata.layers[requested_layer]
+            else:
+                raise ValueError(
+                    f"Layer '{requested_layer}' exists but does not contain integer counts "
+                    f"(found float values — likely already normalized). "
+                    f"This tool requires raw UMI/read counts. "
+                    f"Available layers: {list(adata.layers.keys())}"
+                )
+
+        # 2. Common raw layer names
+        for name in ["raw_counts", "raw_data", "counts"]:
+            if name in adata.layers and _is_integer_matrix(adata.layers[name]):
+                return name, adata.layers[name]
+
+        # 3. adata.raw — only if truly integer
+        if adata.raw is not None:
+            if _is_integer_matrix(adata.raw.X):
+                return "__raw__", adata.raw.X
+            else:
+                raise ValueError(
+                    "adata.raw exists but contains non-integer values (likely log-normalized). "
+                    "This tool requires raw UMI/read counts. "
+                    "The original integer counts are not present in this object — "
+                    "reload from the source file or use a checkpoint saved before normalization."
+                )
+
+        # 4. Nothing found
+        raise ValueError(
+            "No integer count layer found. "
+            f"Checked: layer '{requested_layer}', 'raw_counts', 'raw_data', 'counts', and adata.raw. "
+            f"Available layers: {list(adata.layers.keys())}. "
+            "This tool requires raw UMI/read counts. Save them with normalize_and_hvg "
+            "which preserves raw counts in layers['raw_counts'] before normalizing."
+        )
 
     def _state_preservation_warning(tool_input, existing_adata):
         if existing_adata is not None and tool_input.get("data_path") not in (None, "memory"):
@@ -927,19 +1519,30 @@ def process_tool_call(
             created_by="tool",
         )
         primary_alias = default_cluster_key_for_method(normalized_method)
+        primary_cluster_key = primary_alias if primary_alias in adata_obj.obs.columns else ""
+        primary_alias_created = False
         if make_primary:
-            primary_alias = promote_clustering_to_primary(
+            primary_cluster_key = promote_clustering_to_primary(
                 adata_obj,
                 cluster_key=cluster_key,
                 method=normalized_method,
                 resolution=resolution,
                 created_by="tool",
             )
+            primary_alias_created = primary_cluster_key in adata_obj.obs.columns
+        primary_alias_available = bool(primary_cluster_key and primary_cluster_key in adata_obj.obs.columns)
+        created_obs_columns = [cluster_key]
+        if primary_alias_created and primary_cluster_key != cluster_key:
+            created_obs_columns.append(primary_cluster_key)
 
         sizes = adata_obj.obs[cluster_key].value_counts().to_dict()
         return {
             "cluster_key": cluster_key,
-            "primary_cluster_key": primary_alias,
+            "primary_alias": primary_alias,
+            "primary_cluster_key": primary_cluster_key,
+            "primary_alias_available": primary_alias_available,
+            "primary_alias_created": primary_alias_created,
+            "created_obs_columns": created_obs_columns,
             "method": normalized_method,
             "resolution": float(resolution),
             "n_clusters": len(sizes),
@@ -964,19 +1567,33 @@ def process_tool_call(
         genes = genes or []
         if plot_type == "umap":
             if "X_umap" not in adata_obj.obsm:
-                raise ValueError("UMAP embedding not found. Run run_dimred first.")
+                raise ValueError("UMAP embedding not found. Run run_pca, run_neighbors, and run_umap first.")
             if color_by in ("", None):
                 color_by = None
             elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
                 raise ValueError(f"'{color_by}' is not available for UMAP coloring.")
 
+        # For large datasets, rasterized scatter is orders of magnitude faster than
+        # vector rendering (the matplotlib default).  vector_friendly=False tells
+        # scanpy to rasterize scatter points — identical PNG output, seconds not minutes.
+        n_cells = adata_obj.n_obs
+        large_dataset = n_cells > 50_000
+        if large_dataset:
+            sc.settings.set_figure_params(vector_friendly=False)
+            dot_size = max(1, min(5, 120_000 // n_cells))
+        else:
+            dot_size = None
+
         fig, ax = plt.subplots(figsize=(10, 8))
 
         if plot_type == "umap":
+            kwargs = dict(ax=ax, show=False)
+            if dot_size is not None:
+                kwargs["size"] = dot_size
             if color_by is None:
-                sc.pl.umap(adata_obj, ax=ax, show=False)
+                sc.pl.umap(adata_obj, **kwargs)
             else:
-                sc.pl.umap(adata_obj, color=color_by, ax=ax, show=False)
+                sc.pl.umap(adata_obj, color=color_by, **kwargs)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -990,6 +1607,11 @@ def process_tool_call(
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close()
 
+        # Restore default figure params so subsequent plots in the same session
+        # are not affected.
+        if large_dataset:
+            sc.settings.set_figure_params(vector_friendly=True)
+
         result = {
             "status": "ok",
             "tool": "generate_figure",
@@ -998,8 +1620,18 @@ def process_tool_call(
             "color_by": color_by,
         }
         if include_image:
-            result["image_base64"] = encode_image_base64(output_path)
-            result["image_mime"] = get_image_mime_type(output_path)
+            try:
+                result["image_base64"] = encode_image_base64(output_path)
+                result["image_mime"] = get_image_mime_type(output_path)
+            except Exception as enc_err:
+                # Don't let an encoding failure blow up the whole tool call —
+                # the figure is already written to disk and the path is in
+                # the result. Log and continue without the inline blob.
+                logger.warning(
+                    "Failed to encode figure %s as base64 (%s); returning path only.",
+                    output_path, enc_err,
+                )
+                result["image_encode_error"] = str(enc_err)
         return result
 
     def _stringify_dataframe_columns(df):
@@ -1401,29 +2033,55 @@ def process_tool_call(
             resp.raise_for_status()
             xml = resp.text
 
+            def strip_tags(s: str) -> str:
+                return re.sub(r"<[^>]+>", "", s).strip()
+
             results = []
             articles = re.findall(r"<PubmedArticle>(.*?)</PubmedArticle>", xml, re.DOTALL)
             for article in articles:
                 title_match = re.search(r"<ArticleTitle>(.*?)</ArticleTitle>", article, re.DOTALL)
-                abstract_match = re.search(r"<AbstractText[^>]*>(.*?)</AbstractText>", article, re.DOTALL)
                 pmid_match = re.search(r"<PMID[^>]*>(\d+)</PMID>", article)
-                year_match = re.search(r"<PubDate>.*?<Year>(\d+)</Year>", article, re.DOTALL)
-                journal_match = re.search(r"<Title>(.*?)</Title>", article)
+                if not (title_match and pmid_match):
+                    continue
 
-                if title_match and pmid_match:
-                    title = re.sub(r"<[^>]+>", "", title_match.group(1))
-                    abstract = re.sub(r"<[^>]+>", "", abstract_match.group(1))[:700] if abstract_match else ""
-                    pmid = pmid_match.group(1)
-                    year = year_match.group(1) if year_match else "N/A"
-                    journal = journal_match.group(1) if journal_match else "N/A"
-                    results.append({
-                        "pmid": pmid,
-                        "title": title,
-                        "year": year,
-                        "journal": journal,
-                        "abstract": abstract,
-                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                    })
+                # Abstract: join all AbstractText sections (handles structured abstracts)
+                abstract_parts = re.findall(r"<AbstractText[^>]*>(.*?)</AbstractText>", article, re.DOTALL)
+                abstract = " ".join(strip_tags(p) for p in abstract_parts)[:1000]
+
+                pmid = pmid_match.group(1)
+                title = strip_tags(title_match.group(1))
+
+                year_match = re.search(r"<PubDate>.*?<Year>(\d+)</Year>", article, re.DOTALL)
+                year = year_match.group(1) if year_match else "N/A"
+
+                journal_match = re.search(r"<ISOAbbreviation>(.*?)</ISOAbbreviation>", article)
+                if not journal_match:
+                    journal_match = re.search(r"<Title>(.*?)</Title>", article)
+                journal = strip_tags(journal_match.group(1)) if journal_match else "N/A"
+
+                # First author
+                last_name = re.search(r"<LastName>(.*?)</LastName>", article)
+                first_name = re.search(r"<Initials>(.*?)</Initials>", article)
+                first_author = ""
+                if last_name:
+                    first_author = strip_tags(last_name.group(1))
+                    if first_name:
+                        first_author += f" {strip_tags(first_name.group(1))}"
+
+                # DOI
+                doi_match = re.search(r'<ArticleId IdType="doi">(.*?)</ArticleId>', article)
+                doi = strip_tags(doi_match.group(1)) if doi_match else None
+
+                results.append({
+                    "pmid": pmid,
+                    "title": title,
+                    "first_author": first_author,
+                    "year": year,
+                    "journal": journal,
+                    "abstract": abstract,
+                    "doi": doi,
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                })
 
             return results
         except Exception:
@@ -1462,18 +2120,36 @@ def process_tool_call(
 
             if BeautifulSoup is not None:
                 soup = BeautifulSoup(html_text, "html.parser")
-                for tag in soup(["script", "style", "noscript", "svg"]):
+
+                # Strip boilerplate before extraction
+                for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header", "aside"]):
+                    tag.decompose()
+                for tag in soup.find_all(attrs={"role": ["navigation", "banner", "complementary"]}):
+                    tag.decompose()
+                for tag in soup.find_all(class_=lambda c: c and any(
+                    kw in (" ".join(c) if isinstance(c, list) else c)
+                    for kw in ("sidebar", "toctree", "nav", "menu", "breadcrumb", "footer", "header")
+                )):
                     tag.decompose()
 
                 page_title = clean_whitespace(soup.title.get_text(" ", strip=True)) if soup.title else ""
                 meta = soup.find("meta", attrs={"name": "description"})
                 meta_desc = clean_whitespace(meta.get("content", "")) if meta else ""
 
-                main = soup.find("main") or soup.find("article") or soup.body or soup
+                # Prefer semantic containers (readthedocs uses .rst-content, sphinx uses .document)
+                main = (
+                    soup.find("main") or
+                    soup.find("article") or
+                    soup.find(class_=lambda c: c and any(
+                        kw in (" ".join(c) if isinstance(c, list) else c)
+                        for kw in ("rst-content", "document", "content", "body-content")
+                    )) or
+                    soup.body or soup
+                )
                 parts = []
-                for tag in main.find_all(["h1", "h2", "h3", "p", "li"]):
+                for tag in main.find_all(["h1", "h2", "h3", "h4", "p", "li", "dt", "dd", "pre", "code"]):
                     text_part = clean_whitespace(tag.get_text(" ", strip=True))
-                    if text_part:
+                    if text_part and len(text_part) > 3:
                         parts.append(text_part)
 
                 if not parts:
@@ -1561,7 +2237,7 @@ def process_tool_call(
             "title": title,
             "meta_description": meta_description,
             "extracted_with": extracted_with,
-            "text_excerpt": cleaned[:max_chars],
+            "text": cleaned[:max_chars],
             "text_length": len(cleaned),
             "truncated": len(cleaned) > max_chars,
         }
@@ -1606,11 +2282,15 @@ def process_tool_call(
                         "os.system", "os.popen", "os.exec"]
             for f in forbidden:
                 if f in code:
-                    return json.dumps({
-                        "status": "error",
-                        "tool": "run_code",
-                        "message": f"Forbidden operation: {f}. Use Path from namespace for file operations."
-                    }, indent=2), adata
+                    return _error_result(
+                        tool="run_code",
+                        message=f"Forbidden operation: {f}. Use Path from namespace for file operations.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Rewrite the code using the provided namespace (Path, ensure_dir, write_report).",
+                            "For shell commands, use the run_shell tool instead.",
+                        ],
+                    )
 
             # Load data if needed
             if adata is None and "data_path" in tool_input:
@@ -1619,8 +2299,26 @@ def process_tool_call(
             # Helper function for safe directory creation
             from pathlib import Path as _Path
             def ensure_dir(path):
-                """Safely create directory if it doesn't exist."""
-                _Path(path).mkdir(parents=True, exist_ok=True)
+                """Create directory if it doesn't exist and return it as a Path."""
+                p = _Path(path)
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+
+            _run_dir = _Path(tool_input.get("output_dir", "."))
+
+            def write_report(name: str, content: str) -> str:
+                """Write a markdown report to reports/name.md and return the path.
+
+                Always use this instead of open() when saving analysis results —
+                it ensures reports land in the right directory as readable .md files.
+
+                Example:
+                    write_report('cluster_summary', '## Cluster Summary\\n\\n...')
+                """
+                reports_dir = ensure_dir(_run_dir / "reports")
+                safe_name = name.replace(" ", "_").rstrip(".md")
+                path = reports_dir / f"{safe_name}.md"
+                path.write_text(content)
                 return str(path)
 
             # Execute in controlled namespace
@@ -1634,8 +2332,9 @@ def process_tool_call(
                 "scanpy": sc,
                 "matplotlib": matplotlib,
                 "output_dir": tool_input.get("output_dir", "."),
-                "Path": _Path,  # Safe path operations
-                "ensure_dir": ensure_dir,  # Helper for creating directories
+                "Path": _Path,
+                "ensure_dir": ensure_dir,
+                "write_report": write_report,
             }
 
             # Capture stdout so LLM can see print outputs
@@ -1647,13 +2346,74 @@ def process_tool_call(
             # Capture any figures created
             plt.close('all')
 
+            import warnings as _warnings
+            exec_error = None
+            _caught = []
             try:
                 sys.stdout = stdout_capture
-                exec(code, namespace)
+                with _warnings.catch_warnings(record=True) as _caught:
+                    _warnings.simplefilter("always")
+                    exec(code, namespace)
+            except Exception as _exec_err:
+                exec_error = _exec_err
             finally:
                 sys.stdout = old_stdout
 
             captured_output = stdout_capture.getvalue()
+
+            # Append actionable warnings to captured output so the agent sees and acts on them.
+            # Suppress purely cosmetic pandas FutureWarnings that require no action.
+            _cosmetic = {
+                "Series.__getitem__ treating keys as positions",
+                "The default of observed=False",
+            }
+            for w in _caught:
+                msg = str(w.message)
+                if not any(c in msg for c in _cosmetic):
+                    captured_output += f"\nWarning ({w.category.__name__}): {msg}"
+
+            # After execution, ensure var_names and obs_names are unique on the live adata.
+            # 10x h5 files can contain duplicate gene symbols; anndata.concat() propagates
+            # them. Leaving duplicates causes silent wrong-gene indexing downstream.
+            # obs_names duplicates arise when concat is called without keys/suffixes.
+            var_names_fixed = False
+            obs_names_fixed = False
+            adata = namespace.get("adata", adata)
+            if adata is not None and not adata.var_names.is_unique:
+                adata.var_names_make_unique()
+                var_names_fixed = True
+            if adata is not None and adata.obs_names.duplicated().any():
+                adata.obs_names_make_unique()
+                obs_names_fixed = True
+
+            if exec_error is not None:
+                err_type = type(exec_error).__name__
+                err_msg = str(exec_error)
+
+                # Give the LLM targeted guidance based on the error type
+                if err_type in ("TypeError", "AttributeError") or "unexpected keyword" in err_msg or "got an unexpected" in err_msg:
+                    hint = "This looks like an API mismatch. Look up the function's documentation with web_search + fetch_url before retrying — do not guess."
+                elif err_type in ("KeyError", "IndexError") or "not in" in err_msg:
+                    hint = "This looks like a missing column or key. Check adata.obs.columns, adata.var.columns, or adata.obsm with inspect_data or a quick run_code before retrying."
+                elif err_type in ("ModuleNotFoundError", "ImportError"):
+                    hint = f"Package not installed. Use the install_package tool to request installation of the missing package."
+                elif err_type == "SyntaxError":
+                    hint = "Syntax error in the generated code — fix it directly."
+                elif err_type == "NameError":
+                    hint = "NameError — check that all variables used are defined in the namespace (adata, sc, np, pd, plt, Path, ensure_dir, write_report, output_dir)."
+                else:
+                    hint = "Diagnose the error before retrying: if it's an API issue look up docs; if it's a data issue inspect adata state."
+
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_code",
+                    "description": description,
+                    "error_type": err_type,
+                    "message": f"{err_type}: {err_msg}",
+                    "output": captured_output[:500] if captured_output else None,
+                    "recovery_options": [hint],
+                }, indent=2), adata
+
             adata = namespace.get("adata", adata)
             custom_output_path = namespace.get("output_path")
 
@@ -1695,6 +2455,10 @@ def process_tool_call(
             }
             if adata is not None:
                 result["shape"] = {"n_cells": adata.n_obs, "n_genes": adata.n_vars}
+            if var_names_fixed:
+                result.setdefault("auto_fixes", []).append("var_names had duplicates — called .var_names_make_unique()")
+            if obs_names_fixed:
+                result.setdefault("auto_fixes", []).append("obs_names had duplicates — called .obs_names_make_unique()")
             if save_to:
                 result["ignored_save_to"] = save_to
             if save_warning:
@@ -1716,24 +2480,19 @@ def process_tool_call(
             site = tool_input.get("site", "")
             max_results = tool_input.get("max_results", 5)
             search_result = search_web(query, site=site, max_results=max_results)
-            search_result["tool"] = tool_name
-            search_result["search_kind"] = "docs"
-            if tool_name == "web_search":
-                search_result["deprecated_alias"] = True
-                search_result["warning"] = (
-                    "web_search is retained for backward compatibility. Prefer web_search_docs for documentation lookup."
-                )
-            search_result["note"] = (
-                "Use this for documentation, troubleshooting, and implementation details. "
-                "For scientific literature, prefer search_papers or research_findings."
-            )
+            search_result["tool"] = "web_search"
             return json.dumps(search_result, indent=2), adata
 
         elif tool_name == "search_papers":
-            query = tool_input["query"]
+            raw_query = tool_input["query"]
             max_results = tool_input.get("max_results", 5)
             recent_years = tool_input.get("recent_years", 5)
             reviews_only = tool_input.get("reviews_only", False)
+
+            # Normalise GSEA gene set names: HALLMARK_TNFA_SIGNALING_VIA_NFKB → TNF alpha signaling NF-kB
+            import re as _re
+            query = _re.sub(r"^(HALLMARK|REACTOME|KEGG|GO|WP|BIOCARTA|PID|NABA)_", "", raw_query, flags=_re.IGNORECASE)
+            query = query.replace("_", " ").strip()
 
             results = search_pubmed(
                 query=query,
@@ -1745,12 +2504,44 @@ def process_tool_call(
             return json.dumps({
                 "status": "ok",
                 "tool": "search_papers",
-                "backend": "pubmed",
                 "query": query,
+                "original_query": raw_query if raw_query != query else None,
                 "reviews_only": reviews_only,
                 "years_searched": f"last {recent_years} years",
+                "count": len(results),
                 "results": results,
-                "note": "Use fetch_url on a selected PubMed URL if you want the landing page text. Prefer PMID-backed evidence for scientific claims.",
+            }, indent=2), adata
+
+        elif tool_name == "research_findings":
+            pathway = tool_input["pathway"]
+            cell_type = tool_input.get("cell_type", "")
+            genes = tool_input.get("genes", [])
+            context = tool_input.get("context", "")
+            recent_years = tool_input.get("recent_years", 3)
+
+            # Build a focused query: pathway + cell type + top genes
+            gene_str = " ".join(genes[:5]) if genes else ""
+            query_parts = [p for p in [pathway, cell_type, gene_str, context] if p]
+            query = " ".join(query_parts)
+
+            # Normalise GSEA-style pathway names before searching
+            import re as _re
+            query = _re.sub(r"^(HALLMARK|REACTOME|KEGG|GO|WP|BIOCARTA|PID|NABA)_", "", query, flags=_re.IGNORECASE)
+            query = query.replace("_", " ").strip()
+
+            recent_papers = search_pubmed(query=query, max_results=5, recent_years=recent_years, reviews_only=False)
+            reviews = search_pubmed(query=query, max_results=3, recent_years=recent_years, reviews_only=True)
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "research_findings",
+                "pathway": pathway,
+                "cell_type": cell_type,
+                "query": query,
+                "findings": {
+                    "selected_papers": recent_papers,
+                    "review_articles": reviews,
+                },
             }, indent=2), adata
 
         elif tool_name == "fetch_url":
@@ -1760,320 +2551,76 @@ def process_tool_call(
             fetched["tool"] = "fetch_url"
             return json.dumps(fetched, indent=2), adata
 
-        elif tool_name == "research_findings":
-            pathway = tool_input["pathway"]
-            cell_type = tool_input["cell_type"]
-            genes = tool_input.get("genes", [])
-            context = tool_input.get("context", "")
-            cluster_confidence = tool_input.get("cluster_confidence")
-            recent_years = tool_input.get("recent_years", 3)
+        elif tool_name == "run_shell":
+            import subprocess
+            import shlex
 
-            def normalize_pathway_term(term: str) -> str:
-                cleaned = term.replace("HALLMARK_", "").replace("GO_", "").replace("REACTOME_", "")
-                cleaned = cleaned.replace("_", " ")
-                cleaned = re.sub(r"\s+", " ", cleaned).strip()
-                replacements = {
-                    "nf kb": "NF-kB",
-                    "il 2": "IL-2",
-                    "stat 5": "STAT5",
-                    "tgf beta": "TGF-beta",
-                }
-                lowered = cleaned.lower()
-                for old, new in replacements.items():
-                    lowered = lowered.replace(old, new.lower())
-                return lowered.title().replace("Nf-Kb", "NF-kB").replace("Il-2", "IL-2").replace("Stat5", "STAT5")
+            command = tool_input.get("command", "").strip()
+            timeout = int(tool_input.get("timeout", 60))
+            workdir = tool_input.get("workdir") or tool_input.get("output_dir") or "."
 
-            def pathway_tokens(term: str) -> List[str]:
-                tokens = [tok.lower() for tok in re.split(r"[^A-Za-z0-9]+", term) if tok]
-                stop = {"pathway", "signaling", "response", "process", "hallmark", "up", "down", "v1", "cell", "cells", "immune"}
-                return [tok for tok in tokens if tok not in stop and len(tok) > 2]
-
-            def infer_cell_lineage(cell_type_term: str) -> str:
-                lowered = re.sub(r"\s+", " ", cell_type_term.lower()).strip()
-                if any(tok in lowered for tok in ["cytotoxic t", "helper t", "regulatory t", "treg", "mait", "trm", "tem", "tcm", "t cell"]):
-                    return "t_cell"
-                if "nk" in lowered or "natural killer" in lowered:
-                    return "nk"
-                if "pdc" in lowered or "plasmacytoid" in lowered:
-                    return "pdc"
-                if "dc" in lowered or "dendritic" in lowered:
-                    return "dendritic"
-                if "monocyte" in lowered or "myelo" in lowered or "myelocyte" in lowered:
-                    return "monocyte"
-                if "b cell" in lowered:
-                    return "b_cell"
-                if "plasma" in lowered or "plasmablast" in lowered:
-                    return "plasma"
-                return "unknown"
-
-            def pathway_query_profile(term: str, cell_type_term: str) -> Dict[str, Any]:
-                normalized = normalize_pathway_term(term)
-                lineage = infer_cell_lineage(cell_type_term)
-                profiles = {
-                    "allograft rejection": {
-                        "query_terms": [normalized, "immune activation", "cytotoxic lymphocyte", "antigen presentation"],
-                        "scoring_terms": ["immune activation", "cytotoxic lymphocyte", "antigen presentation", "t cell activation", "nk cell activation"],
-                        "penalty_terms": ["transplant", "allogeneic", "recipient", "donor"],
-                    },
-                    "interferon gamma response": {
-                        "query_terms": [normalized, "interferon gamma signaling", "ifng response", "antigen presentation"],
-                        "scoring_terms": ["interferon gamma", "interferon signaling", "antigen presentation"],
-                    },
-                    "il-2/stat5 signaling": {
-                        "query_terms": [normalized, "IL-2 signaling", "STAT5 signaling", "cytokine signaling"],
-                        "scoring_terms": ["il-2", "stat5", "cytokine signaling"],
-                    },
-                    "apical junction": {
-                        "query_terms": [normalized, "cell adhesion", "junctional remodeling", "cytoskeletal remodeling"],
-                        "scoring_terms": ["cell adhesion", "junction", "cytoskeletal remodeling"],
-                    },
-                    "kras signaling up": {
-                        "query_terms": [normalized, "RAS signaling", "MAPK signaling"],
-                        "scoring_terms": ["ras signaling", "mapk signaling", "kras"],
-                    },
-                    "coagulation": {
-                        "query_terms": [normalized, "coagulation", "immunothrombosis", "thromboinflammation"],
-                        "scoring_terms": ["coagulation", "immunothrombosis", "thromboinflammation"],
-                    },
-                    "myc targets v1": {
-                        "query_terms": [normalized, "MYC signaling", "MYC target genes", "proliferation"],
-                        "scoring_terms": ["myc", "proliferation"],
-                    },
-                    "p53 pathway": {
-                        "query_terms": [normalized, "p53 signaling", "DNA damage response", "apoptosis"],
-                        "scoring_terms": ["p53", "dna damage", "apoptosis"],
-                    },
-                }
-                profile = dict(profiles.get(normalized.lower(), {"query_terms": [normalized], "scoring_terms": [normalized]}))
-
-                if normalized.lower() == "allograft rejection":
-                    if lineage in {"t_cell", "nk"}:
-                        profile["query_terms"] = [normalized, "cytotoxic lymphocyte activation", "t cell activation", "natural killer cell activation"]
-                        profile["scoring_terms"] = ["cytotoxic lymphocyte", "t cell activation", "natural killer cell activation", "immune activation"]
-                    elif lineage in {"dendritic", "monocyte", "pdc"}:
-                        profile["query_terms"] = [normalized, "antigen presentation", "myeloid activation", "interferon response"]
-                        profile["scoring_terms"] = ["antigen presentation", "myeloid activation", "interferon response", "inflammatory activation"]
-                    elif lineage in {"b_cell", "plasma"}:
-                        profile["query_terms"] = [normalized, "antigen presentation", "lymphocyte activation", "b cell activation"]
-                        profile["scoring_terms"] = ["antigen presentation", "lymphocyte activation", "b cell activation"]
-
-                if normalized.lower() == "apical junction" and lineage in {"t_cell", "nk", "monocyte", "dendritic", "pdc"}:
-                    profile["query_terms"] = [normalized, "cell adhesion", "immune cell migration", "cytoskeletal remodeling", "immune synapse"]
-                    profile["scoring_terms"] = ["cell adhesion", "immune cell migration", "cytoskeletal remodeling", "immune synapse"]
-
-                if normalized.lower() == "kras signaling up" and lineage in {"monocyte", "dendritic", "pdc"}:
-                    profile["query_terms"] = [normalized, "MAPK signaling", "myeloid activation", "inflammatory signaling"]
-                    profile["scoring_terms"] = ["mapk signaling", "myeloid activation", "inflammatory signaling"]
-
-                if normalized.lower() == "myc targets v1" and lineage in {"t_cell", "b_cell", "plasma"}:
-                    profile["query_terms"] = [normalized, "lymphocyte proliferation", "MYC signaling", "activation-induced proliferation"]
-                    profile["scoring_terms"] = ["lymphocyte proliferation", "myc signaling", "proliferation"]
-
-                profile["display_term"] = normalized
-                profile["lineage"] = lineage
-                return profile
-
-            def build_cell_type_terms(cell_type_term: str) -> List[str]:
-                lowered = re.sub(r"\s+", " ", cell_type_term.lower()).strip().rstrip("s")
-                terms = [lowered]
-                if any(tok in lowered for tok in ["cytotoxic t", "trm", "tem", "tcm", "helper t", "regulatory t", "treg", "mait", "t cell"]):
-                    if "cytotoxic" in lowered or "trm" in lowered or "tem" in lowered:
-                        terms.extend(["cytotoxic t cell", "t cell"])
-                    elif "regulatory" in lowered or "treg" in lowered:
-                        terms.extend(["regulatory t cell", "t cell"])
-                    else:
-                        terms.append("t cell")
-                elif "nk" in lowered or "natural killer" in lowered:
-                    terms.extend(["natural killer cell", "nk cell"])
-                elif "pdc" in lowered or "plasmacytoid" in lowered:
-                    terms.extend(["plasmacytoid dendritic cell", "dendritic cell"])
-                elif "dc" in lowered or "dendritic" in lowered:
-                    terms.extend(["dendritic cell", "conventional dendritic cell"])
-                elif "monocyte" in lowered or "myelo" in lowered:
-                    terms.append("monocyte")
-                elif "b cell" in lowered:
-                    terms.append("b cell")
-                elif "plasma" in lowered:
-                    terms.extend(["plasma cell", "antibody secreting cell"])
-
-                seen = set()
-                ordered = []
-                for term in terms:
-                    if term and term not in seen:
-                        ordered.append(term)
-                        seen.add(term)
-                return ordered[:3]
-
-            all_findings = {
-                "pathway": pathway,
-                "cell_type": cell_type,
-                "normalized_pathway": normalize_pathway_term(pathway),
-                "pubmed_results": [],
-                "review_articles": [],
-                "gene_specific": [],
-                "selected_papers": [],
-                "search_strategy": [],
-            }
-
-            cell_type_terms = build_cell_type_terms(cell_type)
-            pathway_profile = pathway_query_profile(pathway, cell_type)
-            context_profile = build_literature_context(
-                context,
-                cell_type=cell_type,
-                cluster_confidence=cluster_confidence,
-            )
-            normalized_pathway = pathway_profile["display_term"]
-            all_findings["normalized_pathway"] = normalized_pathway
-            all_findings["pathway_query_terms"] = pathway_profile["query_terms"]
-            all_findings["cell_type_query_terms"] = cell_type_terms
-            all_findings["context_profile"] = context_profile.to_dict()
-
-            primary_queries = [
-                ("pathway_and_cell_type_strict", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])'),
-                ("pathway_only", f'("{normalized_pathway}"[Title/Abstract])'),
+            # Block destructive patterns — focused on things that can't be undone
+            _blocked = [
+                ("rm -rf /", "recursive deletion of root"),
+                ("rm -rf ~", "recursive deletion of home directory"),
+                ("rm -rf $HOME", "recursive deletion of home directory"),
+                ("> /dev/", "writing to device file"),
+                ("dd if=/dev/zero of=/dev/", "disk overwrite"),
+                ("mkfs", "filesystem formatting"),
+                (":(){ :|:& };:", "fork bomb"),
+                ("sudo rm", "privileged deletion"),
+                ("chmod -R 777 /", "global permission change"),
             ]
-
-            for idx, alias_term in enumerate(pathway_profile.get("query_terms", [])[1:3], start=1):
-                primary_queries.append(
-                    (f"pathway_alias_{idx}_and_cell_type", f'("{alias_term}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])')
-                )
-
-            if len(cell_type_terms) > 1:
-                primary_queries.append(
-                    ("pathway_and_broad_cell_type", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[1]}"[Title/Abstract])')
-                )
-
-            if genes and len(genes) >= 2:
-                gene_str = " OR ".join([f'"{g}"[Title/Abstract]' for g in genes[:3]])
-                primary_queries.append(
-                    ("leading_edge_and_cell_type", f'({gene_str}) AND ("{cell_type_terms[0]}"[Title/Abstract])')
-                )
-                alias_for_genes = pathway_profile.get("query_terms", [normalized_pathway])[1] if len(pathway_profile.get("query_terms", [])) > 1 else normalized_pathway
-                primary_queries.append(
-                    ("pathway_alias_and_leading_edge", f'("{alias_for_genes}"[Title/Abstract]) AND ({gene_str})')
-                )
-
-            seen_pmids = set()
-            aggregated_primary = []
-            for label, query_str in primary_queries:
-                results = search_pubmed(query_str, max_results=4, recent_years=recent_years)
-                all_findings["search_strategy"].append({
-                    "label": label,
-                    "query": query_str,
-                    "results_found": len(results),
-                })
-                for paper in results:
-                    if paper["pmid"] not in seen_pmids:
-                        seen_pmids.add(paper["pmid"])
-                        aggregated_primary.append(paper)
-
-            all_findings["pubmed_results"] = aggregated_primary
-
-            # Review searches
-            review_queries = [
-                ("review_pathway_and_cell_type", f'("{normalized_pathway}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])'),
-                ("review_pathway_only", f'("{normalized_pathway}"[Title/Abstract])'),
-            ]
-            for idx, alias_term in enumerate(pathway_profile.get("query_terms", [])[1:3], start=1):
-                review_queries.append(
-                    (f"review_alias_{idx}", f'("{alias_term}"[Title/Abstract]) AND ("{cell_type_terms[0]}"[Title/Abstract])')
-                )
-            review_results = []
-            seen_review_pmids = set()
-            for label, query_str in review_queries:
-                results = search_pubmed(
-                    query_str,
-                    max_results=3,
-                    recent_years=recent_years,
-                    reviews_only=True,
-                )
-                all_findings["search_strategy"].append({
-                    "label": label,
-                    "query": f"{query_str} AND review[pt]",
-                    "results_found": len(results),
-                })
-                for paper in results:
-                    if paper["pmid"] not in seen_review_pmids:
-                        seen_review_pmids.add(paper["pmid"])
-                        review_results.append(paper)
-            scored_reviews = [
-                score_paper_relevance(
-                    paper,
-                    pathway_profile=pathway_profile,
-                    cell_type_terms=cell_type_terms,
-                    genes_list=genes,
-                    context_profile=context_profile,
-                    pathway_tokens_fn=pathway_tokens,
-                    prefer_reviews=True,
-                )
-                for paper in review_results
-            ]
-            scored_reviews.sort(
-                key=lambda paper: (paper.get("relevance_score", 0), paper.get("year", "0")),
-                reverse=True,
-            )
-            all_findings["review_articles"] = [paper for paper in scored_reviews if paper.get("relevance_score", 0) >= 2.0][:3]
-
-            # Gene-specific subset for compatibility / inspection
-            gene_specific = []
-            if genes and len(genes) >= 2:
-                for paper in aggregated_primary:
-                    scored = score_paper_relevance(
-                        paper,
-                        pathway_profile=pathway_profile,
-                        cell_type_terms=cell_type_terms,
-                        genes_list=genes,
-                        context_profile=context_profile,
-                        pathway_tokens_fn=pathway_tokens,
+            for pattern, reason in _blocked:
+                if pattern in command:
+                    return _error_result(
+                        tool="run_shell",
+                        message=f"Blocked: {reason}.",
+                        adata_obj=adata,
+                        recovery_options=["Rewrite the command to avoid destructive operations."],
+                        extra={"command": command},
                     )
-                    if any("leading-edge genes" in reason for reason in scored["match_reasons"]):
-                        gene_specific.append(scored)
-            all_findings["gene_specific"] = gene_specific[:4]
 
-            scored_primary = [
-                score_paper_relevance(
-                    paper,
-                    pathway_profile=pathway_profile,
-                    cell_type_terms=cell_type_terms,
-                    genes_list=genes,
-                    context_profile=context_profile,
-                    pathway_tokens_fn=pathway_tokens,
+            try:
+                proc = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=workdir,
                 )
-                for paper in aggregated_primary
-            ]
-            scored_primary.sort(
-                key=lambda paper: (paper.get("relevance_score", 0), paper.get("year", "0")),
-                reverse=True,
-            )
-            selected_primary = [paper for paper in scored_primary if paper.get("relevance_score", 0) >= 2.5]
-            all_findings["selected_papers"] = selected_primary[:5]
-
-            # Count findings
-            total_results = (
-                len(all_findings["pubmed_results"]) +
-                len(all_findings["review_articles"]) +
-                len(all_findings["gene_specific"])
-            )
+                stdout = proc.stdout.strip()
+                stderr = proc.stderr.strip()
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                return _error_result(
+                    tool="run_shell",
+                    message=f"Command timed out after {timeout}s.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        f"Increase the timeout (currently {timeout}s).",
+                        "Break the command into smaller steps.",
+                    ],
+                    extra={"command": command},
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="run_shell",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=["Check command syntax and that required tools are installed."],
+                    extra={"command": command},
+                )
 
             return json.dumps({
-                "status": "ok",
-                "tool": "research_findings",
-                "pathway": pathway,
-                "normalized_pathway": normalized_pathway,
-                "cell_type": cell_type,
-                "genes_researched": genes[:5] if genes else [],
-                "context": context,
-                "cluster_confidence": cluster_confidence,
-                "context_profile": context_profile.to_dict(),
-                "years_searched": f"last {recent_years} years",
-                "total_papers_found": total_results,
-                "findings": all_findings,
-                "recommended_next_steps": [
-                    "Prioritize review articles to understand the pathway in this cell context.",
-                    "Use primary studies to support concrete biological claims.",
-                    "Cite PMIDs when summarizing pathway relevance."
-                ],
-                "note": "Papers are from PubMed. Review abstracts for biological function, disease context, and therapeutic implications."
+                "status": "ok" if returncode == 0 else "error",
+                "tool": "run_shell",
+                "command": command,
+                "returncode": returncode,
+                "stdout": stdout[:8000] if stdout else "",
+                "stderr": stderr[:2000] if stderr else "",
+                "truncated": len(stdout) > 8000,
             }, indent=2), adata
 
         elif tool_name == "install_package":
@@ -2091,7 +2638,9 @@ def process_tool_call(
 
         # ===== INSPECTION TOOLS =====
         elif tool_name == "inspect_data":
-            # update_memory=True if loading from path (so data persists), False if just inspecting existing
+            # update_memory=True only when there is no primary loaded yet.
+            # When primary is already in memory, data_path loads a copy for
+            # inspection only — the primary is NOT replaced.
             should_update = tool_input.get("data_path") is not None and adata is None
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=should_update)
             state = inspect_data(working_adata)
@@ -2101,15 +2650,26 @@ def process_tool_call(
             guidance_context = context_hint
             if tool_input.get("data_path"):
                 context_hint = " ".join(part for part in [context_hint, str(tool_input.get("data_path"))] if part)
-            biological_context = infer_biological_context(working_adata, text_context=context_hint)
             confirmed_batch_key = _confirmed_decision_value("batch_key")
             guidance = _analysis_guidance(state, goal=goal, context=guidance_context)
 
+            raw_info = {"adata_raw": None, "layers": []}
+            if state.has_raw:
+                raw_info["adata_raw"] = {
+                    "n_vars": state.raw_n_vars,
+                    "note": "full gene set before HVG subsetting" if state.raw_n_vars > state.n_genes else "same gene set as X",
+                }
+            if state.has_raw_layer:
+                raw_info["layers"].append(state.raw_layer_name)
+
+            from ..core.inspector import _characterize_features
+            feature_info = _characterize_features(working_adata)
             result = {
                 "status": "ok",
                 "tool": "inspect_data",
                 "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
                 "data_type": state.data_type,
+                "raw": raw_info,
                 "state": make_state(working_adata),
                 "embeddings": [k for k in working_adata.obsm.keys()],
                 "layers": list(working_adata.layers.keys()),
@@ -2117,14 +2677,46 @@ def process_tool_call(
                     "format": state.gene_id_format,
                     "has_symbols": state.has_gene_symbols,
                     "has_ensembl": state.has_ensembl_ids,
-                    "sample": state.sample_gene_names,
+                    "sample": feature_info["sample_gene_names"],
                     "var_columns": list(working_adata.var.columns)[:10],
+                    "genome_prefix": feature_info["genome_prefix"],
+                    "special_gene_populations": feature_info["special_gene_populations"],
+                    "mt_genes_detected": feature_info["mt_genes_detected"],
+                    "mt_gene_examples": feature_info["mt_gene_examples"],
+                    "ribo_genes_detected": feature_info["ribo_genes_detected"],
+                    "ribo_gene_examples": feature_info["ribo_gene_examples"],
+                },
+                "obs_names": {
+                    "format": feature_info["obs_names_format"],
+                    "sample": feature_info["obs_names_sample"],
+                    "suffixes_detected": feature_info["obs_names_suffixes_detected"],
                 },
                 "clustering": {
                     "has_clusters": state.has_clusters,
                     "cluster_key": state.cluster_key,
                     "n_clusters": state.n_clusters,
                     "available_clusterings": _clusterings_payload(working_adata),
+                },
+                "annotations": {
+                    "has_celltypes": state.has_celltype_annotations,
+                    "cell_type_key": state.cell_type_key,
+                    "cell_type_candidates": [
+                        metadata_candidate_to_dict(candidate)
+                        for candidate in state.cell_type_candidates
+                    ],
+                    "sources": [
+                        source
+                        for source, present in (
+                            ("celltypist", state.has_celltypist),
+                            ("scimilarity", state.has_scimilarity),
+                            (
+                                "external_or_manual",
+                                bool(state.cell_type_candidates)
+                                and not (state.has_celltypist or state.has_scimilarity),
+                            ),
+                        )
+                        if present
+                    ],
                 },
                 "batch": {
                     "confirmed_batch_key": confirmed_batch_key,
@@ -2148,8 +2740,12 @@ def process_tool_call(
                 "batch_key": confirmed_batch_key,
                 "recommended_batch_key": batch_resolution.recommended_column,
                 "available_clusterings": _clusterings_payload(working_adata),
-                "biological_context": biological_context.to_dict(),
                 "analysis_guidance": guidance,
+                "obs_names_sample": working_adata.obs_names[:10].tolist(),
+                "var_names_sample": working_adata.var_names[:10].tolist(),
+                "obs_preview": _dataframe_preview(working_adata.obs),
+                "var_preview": _dataframe_preview(working_adata.var),
+                "obs_columns_detail": _obs_columns_detail(working_adata.obs, working_adata.n_obs),
             }
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)
@@ -2270,7 +2866,15 @@ def process_tool_call(
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             key = tool_input.get("cluster_key", "leiden")
             if key not in working_adata.obs:
-                return json.dumps({"status": "error", "message": f"No cluster column '{key}'"}), updated_adata
+                return _error_result(
+                    tool="get_cluster_sizes",
+                    message=f"No cluster column '{key}'.",
+                    adata_obj=working_adata,
+                    recovery_options=[
+                        "Run clustering first, then request cluster sizes.",
+                        "Use list_obs_columns to find the correct cluster key.",
+                    ],
+                )
 
             sizes = working_adata.obs[key].value_counts().to_dict()
             return json.dumps({
@@ -2285,8 +2889,9 @@ def process_tool_call(
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
             cluster = tool_input["cluster"]
             n_genes = tool_input.get("n_genes", 10)
+            key = tool_input.get("key", "rank_genes_groups")
 
-            if "rank_genes_groups" not in working_adata.uns:
+            if key not in working_adata.uns:
                 return _smart_unavailable_result(
                     tool="get_top_markers",
                     message="Top markers are not available because differential expression has not been run yet.",
@@ -2296,37 +2901,93 @@ def process_tool_call(
                         "Run differential expression on the current clustering first.",
                         "Inspect available clusterings before choosing a DEG grouping.",
                     ],
-                    extra={"cluster": cluster},
+                    extra={"cluster": cluster, "key": key},
                 )
 
-            markers_df = get_top_markers(working_adata, group=cluster, n_genes=n_genes)
+            markers_df = get_top_markers(working_adata, group=cluster, n_genes=n_genes, key=key)
             markers = markers_df[['names', 'scores', 'logfoldchanges', 'pvals_adj']].to_dict('records')
 
             return json.dumps({
                 "status": "ok",
                 "tool": "get_top_markers",
                 "cluster": cluster,
+                "key": key,
                 "markers": markers
             }, indent=2), updated_adata
 
         elif tool_name == "summarize_qc_metrics":
             working_adata, updated_adata = get_adata(tool_input, adata, update_memory=False)
 
+            import pandas as _pd
+
             metrics = {}
-            for col in ['total_counts', 'n_genes_by_counts', 'pct_counts_mt', 'doublet_score']:
-                if col in working_adata.obs:
-                    metrics[col] = {
-                        "median": float(working_adata.obs[col].median()),
-                        "mean": float(working_adata.obs[col].mean()),
-                        "min": float(working_adata.obs[col].min()),
-                        "max": float(working_adata.obs[col].max())
-                    }
+            obs = working_adata.obs
+
+            # Map canonical role names → columns. Check exact names first, then
+            # fall back to pattern matching on all numeric obs columns.
+            _role_patterns = {
+                "qc_total_counts":  ("total_counts", ["total_count", "n_counts", "sum_counts"]),
+                "qc_n_genes":       ("n_genes_by_counts", ["n_genes", "ngenes", "num_genes", "n_features"]),
+                "qc_pct_mt":        ("pct_counts_mt", ["pct_mt", "percent_mt", "mito_pct", "pct_mito", "mt_pct"]),
+                "qc_pct_ribo":      ("pct_counts_ribo", ["pct_ribo", "percent_ribo", "ribo_pct"]),
+                "doublet_score":    ("doublet_score", ["scrublet_score", "doublet_prob", "dbl_score"]),
+            }
+            seen = set()
+            for role, (canonical, aliases) in _role_patterns.items():
+                col = None
+                if canonical in obs:
+                    col = canonical
+                else:
+                    for alias in aliases:
+                        if alias in obs:
+                            col = alias
+                            break
+                    if col is None:
+                        lower_cols = {c.lower(): c for c in obs.columns}
+                        for alias in [canonical] + aliases:
+                            if alias.lower() in lower_cols:
+                                col = lower_cols[alias.lower()]
+                                break
+                if col and col not in seen:
+                    seen.add(col)
+                    values = obs[col]
+                    if _pd.api.types.is_numeric_dtype(values):
+                        metrics[role] = {
+                            "column": col,
+                            "median": float(values.median()),
+                            "mean": float(values.mean()),
+                            "min": float(values.min()),
+                            "max": float(values.max()),
+                        }
+
+            # Doublet label column
+            _doublet_label_names = [
+                "predicted_doublet", "is_doublet", "doublet_label",
+                "doublet", "scrublet_doublet", "dbl_label",
+            ]
+            doublet_label = next(
+                (c for c in _doublet_label_names if c in obs), None
+            )
+            if doublet_label is None:
+                lower_cols = {c.lower(): c for c in obs.columns}
+                for name in _doublet_label_names:
+                    if name.lower() in lower_cols:
+                        doublet_label = lower_cols[name.lower()]
+                        break
 
             doublet_info = {}
-            if 'predicted_doublet' in working_adata.obs:
+            if doublet_label and doublet_label in obs:
+                labels = working_adata.obs[doublet_label]
+                if labels.dtype == bool:
+                    positive = labels
+                else:
+                    positive = labels.astype(str).str.lower().isin(
+                        {"true", "1", "doublet", "multiplet", "positive"}
+                    )
                 doublet_info = {
-                    "n_doublets": int(working_adata.obs['predicted_doublet'].sum()),
-                    "doublet_rate": float(working_adata.obs['predicted_doublet'].mean())
+                    "column": doublet_label,
+                    "n_doublets": int(positive.sum()),
+                    "doublet_rate": float(positive.mean())
                 }
 
             return json.dumps({
@@ -2343,22 +3004,56 @@ def process_tool_call(
             # Find annotation column
             key = tool_input.get("annotation_key")
             if not key:
-                for candidate in ['celltypist_majority_voting', 'celltypist_predicted_labels',
-                                  'scimilarity_representative_prediction', 'cell_type', 'celltype']:
-                    if candidate in working_adata.obs:
-                        key = candidate
-                        break
+                # Use obs_columns_detail from world state if available, otherwise compute
+                ocd = (
+                    (world_state.data_summary.get("obs_columns_detail") or {})
+                    if world_state is not None
+                    else {}
+                )
+                if not ocd:
+                    ocd = _obs_columns_detail(working_adata.obs, working_adata.n_obs).get("columns", {})
+                # Candidate columns: categorical, n_unique 2-300, not flagged high_cardinality
+                candidates = [
+                    col for col, info in ocd.items()
+                    if info.get("note") != "high_cardinality"
+                    and 2 <= info.get("n_unique", 0) <= 300
+                    and info.get("dtype") in ("object", "category")
+                ]
+                if len(candidates) == 1:
+                    key = candidates[0]
+                elif candidates:
+                    return _finalize_result(
+                        {
+                            "status": "needs_choice",
+                            "tool": "get_celltypes",
+                            "message": (
+                                "Multiple obs columns could be cell type annotations. "
+                                "Identify the right one from obs_columns_detail and call "
+                                "get_celltypes with annotation_key."
+                            ),
+                            "obs_columns_detail": {c: ocd[c] for c in candidates},
+                            "recovery_options": [
+                                "Call get_celltypes again with annotation_key set to the intended column.",
+                                "Ask the user which column contains the cell type labels.",
+                            ],
+                        },
+                        updated_adata,
+                        dataset_changed=False,
+                        summary="Cell type annotation column needs disambiguation.",
+                    )
 
             if not key or key not in working_adata.obs:
+                ocd = _obs_columns_detail(working_adata.obs, working_adata.n_obs).get("columns", {})
                 return _smart_unavailable_result(
                     tool="get_celltypes",
-                    message="No cell type annotations are available on the current in-memory dataset.",
+                    message="No cell type annotations found. Check obs_columns_detail for available columns.",
                     adata_obj=updated_adata,
                     missing_prerequisites=["annotation"],
                     recovery_options=[
                         "Run cell type annotation on the current clustering.",
-                        "Inspect available clustering keys before annotating.",
+                        "Call get_celltypes with annotation_key set to the correct obs column.",
                     ],
+                    extra={"obs_columns_detail": ocd},
                 )
 
             counts = working_adata.obs[key].value_counts()
@@ -2396,12 +3091,8 @@ def process_tool_call(
             return json.dumps({
                 "status": "ok",
                 "tool": "list_obs_columns",
-                "columns": list(working_adata.obs.columns),
                 "n_columns": len(working_adata.obs.columns),
-                "metadata_candidates": [
-                    metadata_candidate_to_dict(candidate)
-                    for candidate in rank_obs_metadata_candidates(working_adata)
-                ],
+                "obs_columns_detail": _obs_columns_detail(working_adata.obs, working_adata.n_obs),
             }, indent=2), updated_adata
 
         elif tool_name in {"review_figure", "review_artifact"}:
@@ -2440,8 +3131,15 @@ def process_tool_call(
 
             if artifact_kind == "figure":
                 if include_image:
-                    result["image_base64"] = encode_image_base64(artifact_path)
-                    result["image_mime"] = get_image_mime_type(artifact_path)
+                    try:
+                        result["image_base64"] = encode_image_base64(artifact_path)
+                        result["image_mime"] = get_image_mime_type(artifact_path)
+                    except Exception as enc_err:
+                        logger.warning(
+                            "Failed to encode artifact %s as base64 (%s); returning path only.",
+                            artifact_path, enc_err,
+                        )
+                        result["image_encode_error"] = str(enc_err)
             elif artifact_kind == "json":
                 with open(artifact_path) as handle:
                     payload = json.load(handle)
@@ -2599,7 +3297,45 @@ def process_tool_call(
             )
 
         # ===== ACTION TOOLS =====
+        elif tool_name == "load_data":
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=True)
+            if working_adata is None:
+                return _error_result(tool="load_data", message="data_path is required", suggestions=["Provide a valid path to an h5ad or 10X h5 file."])
+            state = inspect_data(working_adata)
+            batch_resolution = resolve_batch_metadata(working_adata)
+            from ..core.inspector import _characterize_features
+            feature_info = _characterize_features(working_adata)
+            ocd = _obs_columns_detail(working_adata.obs, working_adata.n_obs)
+            result = {
+                "status": "ok",
+                "tool": "load_data",
+                "loaded": tool_input.get("data_path"),
+                "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
+                "data_type": state.data_type,
+                "state": make_state(working_adata),
+                "embeddings": [k for k in working_adata.obsm.keys()],
+                "layers": list(working_adata.layers.keys()),
+                "genes": {
+                    "format": state.gene_id_format,
+                    "has_symbols": state.has_gene_symbols,
+                    "sample": feature_info["sample_gene_names"],
+                    "mt_genes_detected": feature_info["mt_genes_detected"],
+                },
+                "obs_columns_detail": ocd,
+                "batch_metadata": {
+                    "status": batch_resolution.status,
+                    "recommended_batch_key": batch_resolution.recommended_column,
+                    "recommended_role": batch_resolution.recommended_role,
+                    "needs_confirmation": batch_resolution.needs_user_confirmation,
+                    "reason": batch_resolution.reason,
+                    "candidates": [metadata_candidate_to_dict(c) for c in (batch_resolution.candidates or [])],
+                },
+            }
+            return json.dumps(result, indent=2), updated_adata
+
         elif tool_name == "run_qc":
+            import pandas as pd
+
             warnings = []
             if adata is not None and tool_input.get("data_path") not in (None, "memory"):
                 warnings.append(
@@ -2612,9 +3348,31 @@ def process_tool_call(
             detect_doublets_flag = tool_input.get("detect_doublets_flag", True)
             remove_ribo = tool_input.get("remove_ribo", True)
             remove_mt = tool_input.get("remove_mt", False)
-            min_cells = tool_input.get("min_cells")
+            remove_doublets = bool(tool_input.get("remove_doublets", False))
+            filter_mt = bool(tool_input.get("filter_mt", True))
+            min_genes = tool_input.get("min_genes")
+            min_cells = tool_input.get("min_cells", 3)
             requested_mt_threshold = tool_input.get("mt_threshold")
             preview_only = bool(tool_input.get("preview_only", False))
+            confirm_filtering = bool(tool_input.get("confirm_filtering", False))
+            scrublet_expected_doublet_rate = float(tool_input.get("scrublet_expected_doublet_rate") or 0.06)
+            scrublet_sim_doublet_ratio = float(tool_input.get("scrublet_sim_doublet_ratio") or 2.0)
+            scrublet_n_prin_comps = int(tool_input.get("scrublet_n_prin_comps") or 30)
+            scrublet_min_counts = int(tool_input.get("scrublet_min_counts") or 2)
+            scrublet_min_cells = int(tool_input.get("scrublet_min_cells") or 3)
+            scrublet_min_gene_variability_pctl = float(tool_input.get("scrublet_min_gene_variability_pctl") or 85.0)
+            scrublet_random_state = int(tool_input.get("scrublet_random_state") or 0)
+            force_doublet_recompute = bool(tool_input.get("force_doublet_recompute", False))
+            requested_scrublet_params = {
+                "expected_doublet_rate": scrublet_expected_doublet_rate,
+                "sim_doublet_ratio": scrublet_sim_doublet_ratio,
+                "n_prin_comps": scrublet_n_prin_comps,
+                "min_counts": scrublet_min_counts,
+                "min_cells": scrublet_min_cells,
+                "min_gene_variability_pctl": scrublet_min_gene_variability_pctl,
+                "random_state": scrublet_random_state,
+                "force_recompute": force_doublet_recompute,
+            }
             requested_batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
             if requested_batch_key and "batch_key" not in tool_input and _confirmed_decision_value("batch_key"):
                 warnings.append(
@@ -2643,38 +3401,178 @@ def process_tool_call(
                 elif batch_resolution.status == "no_candidate":
                     warnings.append(batch_resolution.reason)
 
-            qc_preview = adata.copy()
+            # Compute QC metrics directly on adata — these are non-destructive obs/var
+            # annotations (pct_counts_mt, doublet_score, etc.). Writing to adata here
+            # (not a throwaway copy) means apply mode can reuse them without recomputing.
+            # Actual cell/gene filtering only happens later if not preview_only.
+            _metrics_precomputed = 'pct_counts_mt' in adata.obs.columns
+            # Never recompute doublets during the filtering step — scores from preview are authoritative.
+            _effective_force_recompute = force_doublet_recompute and not confirm_filtering
+            _doublets_precomputed = (
+                detect_doublets_flag
+                and 'predicted_doublet' in adata.obs.columns
+                and not _effective_force_recompute
+            )
+            doublet_predictions_source = (
+                "precomputed"
+                if _doublets_precomputed
+                else ("computed" if detect_doublets_flag else "not_run")
+            )
+            stored_scrublet_params = (
+                adata.uns.get("scrublet_params", {})
+                if _doublets_precomputed and isinstance(adata.uns.get("scrublet_params", {}), dict)
+                else {}
+            )
+            scrublet_params_for_report = requested_scrublet_params.copy()
+            if stored_scrublet_params:
+                scrublet_params_for_report = {
+                    "expected_doublet_rate": float(stored_scrublet_params.get("expected_doublet_rate", scrublet_expected_doublet_rate)),
+                    "sim_doublet_ratio": float(stored_scrublet_params.get("sim_doublet_ratio", scrublet_sim_doublet_ratio)),
+                    "n_prin_comps": int(stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps)),
+                    "n_prin_comps_used": int(stored_scrublet_params.get("n_prin_comps_used", stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps))),
+                    "min_counts": int(stored_scrublet_params.get("min_counts", scrublet_min_counts)),
+                    "min_cells": int(stored_scrublet_params.get("min_cells", scrublet_min_cells)),
+                    "min_gene_variability_pctl": float(stored_scrublet_params.get("min_gene_variability_pctl", scrublet_min_gene_variability_pctl)),
+                    "random_state": int(stored_scrublet_params.get("random_state", scrublet_random_state)),
+                    "force_recompute": force_doublet_recompute,
+                    "batch_key": stored_scrublet_params.get("batch_key", batch_key),
+                }
+                changed_requested_params = [
+                    key for key in (
+                        "scrublet_expected_doublet_rate",
+                        "scrublet_sim_doublet_ratio",
+                        "scrublet_n_prin_comps",
+                        "scrublet_min_counts",
+                        "scrublet_min_cells",
+                        "scrublet_min_gene_variability_pctl",
+                        "scrublet_random_state",
+                    )
+                    if key in tool_input
+                ]
+                if changed_requested_params:
+                    warnings.append(
+                        "Existing Scrublet predictions were reused. Requested Scrublet parameters "
+                        "were not recomputed; pass force_doublet_recompute=true to regenerate doublet calls."
+                    )
+
             try:
-                calculate_qc_metrics(qc_preview, inplace=True)
-                if detect_doublets_flag:
-                    detect_doublets(qc_preview, batch_key=batch_key, inplace=True)
+                if not _metrics_precomputed:
+                    calculate_qc_metrics(adata, inplace=True)
+                if detect_doublets_flag and not _doublets_precomputed:
+                    if force_doublet_recompute:
+                        for col in ("doublet_score", "predicted_doublet"):
+                            if col in adata.obs.columns:
+                                del adata.obs[col]
+                    detect_doublets(
+                        adata,
+                        batch_key=batch_key,
+                        expected_doublet_rate=scrublet_expected_doublet_rate,
+                        sim_doublet_ratio=scrublet_sim_doublet_ratio,
+                        n_prin_comps=scrublet_n_prin_comps,
+                        scrublet_min_counts=scrublet_min_counts,
+                        scrublet_min_cells=scrublet_min_cells,
+                        scrublet_min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
+                        random_state=scrublet_random_state,
+                        inplace=True,
+                    )
+                    doublet_predictions_source = "computed"
+                    stored_scrublet_params = adata.uns.get("scrublet_params", {}) if isinstance(adata.uns.get("scrublet_params", {}), dict) else {}
+                    if stored_scrublet_params:
+                        scrublet_params_for_report = {
+                            "expected_doublet_rate": float(stored_scrublet_params.get("expected_doublet_rate", scrublet_expected_doublet_rate)),
+                            "sim_doublet_ratio": float(stored_scrublet_params.get("sim_doublet_ratio", scrublet_sim_doublet_ratio)),
+                            "n_prin_comps": int(stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps)),
+                            "n_prin_comps_used": int(stored_scrublet_params.get("n_prin_comps_used", stored_scrublet_params.get("n_prin_comps", scrublet_n_prin_comps))),
+                            "min_counts": int(stored_scrublet_params.get("min_counts", scrublet_min_counts)),
+                            "min_cells": int(stored_scrublet_params.get("min_cells", scrublet_min_cells)),
+                            "min_gene_variability_pctl": float(stored_scrublet_params.get("min_gene_variability_pctl", scrublet_min_gene_variability_pctl)),
+                            "random_state": int(stored_scrublet_params.get("random_state", scrublet_random_state)),
+                            "force_recompute": force_doublet_recompute,
+                            "batch_key": stored_scrublet_params.get("batch_key", batch_key),
+                        }
             except ValueError as e:
                 if detect_doublets_flag and "skimage is not installed" in str(e):
-                    warnings.append("Scrublet auto-threshold requires skimage; preview reran without doublet detection.")
+                    warnings.append("Scrublet auto-threshold requires skimage; reran without doublet detection.")
                     detect_doublets_flag = False
+                    doublet_predictions_source = "not_run"
+                    scrublet_params_for_report = requested_scrublet_params.copy()
+                    if not _metrics_precomputed:
+                        calculate_qc_metrics(adata, inplace=True)
                 else:
                     raise
 
-            if requested_mt_threshold is None:
-                median_mt_preview = float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else 0.0
-                auto_data_type = "nuclei" if median_mt_preview < 2.0 else "cells"
-                mt_threshold = 5.0 if auto_data_type == "nuclei" else 25.0
-                warnings.append(
-                    f"mt_threshold auto-selected as {mt_threshold:.1f}% based on median pct_counts_mt={median_mt_preview:.2f} ({auto_data_type}-like)."
-                )
-            else:
+            # Use adata directly — no copy needed, metrics are already there
+            qc_preview = adata
+
+            requested_data_type = tool_input.get("data_type")  # "single_cell" | "single_nucleus" | None
+            if requested_mt_threshold is not None:
                 mt_threshold = float(requested_mt_threshold)
-                auto_data_type = "user-specified"
+                data_type_confirmed = True
+            else:
+                data_type_confirmed = False
+                # No explicit threshold — pick a sentinel based on data type hint only.
+                # The real threshold must come from inspecting the QC figures.
+                median_mt_preview = float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else 0.0
+                mt_threshold = 5.0 if (requested_data_type == "single_nucleus" or median_mt_preview < 2.0) else 20.0
+                warnings.append(
+                    f"mt_threshold not set explicitly (median MT={median_mt_preview:.2f}%). "
+                    "Review the MT% distribution in the QC figure and choose a data-driven threshold "
+                    "based on where the high-MT tail separates from the main population. "
+                    "Then re-run with mt_threshold=<value> to get exact removal counts."
+                )
+            if not filter_mt:
+                warnings.append(
+                    "Hard MT% cell filtering is disabled for this run; MT metrics are "
+                    "reported for QC review only."
+                )
 
-            if min_cells is None:
-                from ..config.defaults import QC_DEFAULTS
-                min_cells = int(QC_DEFAULTS.min_cells_per_gene)
-
-            cells_over_mt = int((qc_preview.obs['pct_counts_mt'] >= mt_threshold).sum()) if 'pct_counts_mt' in qc_preview.obs else 0
+            _mt_col = qc_preview.obs['pct_counts_mt'] if 'pct_counts_mt' in qc_preview.obs else None
+            cells_over_mt = int((_mt_col >= mt_threshold).sum()) if _mt_col is not None else 0
+            # Report exact removal counts at a range of thresholds so the model can present
+            # data-driven options without anchoring to any single "standard" value.
+            mt_threshold_options = {
+                str(t): {
+                    "threshold": t,
+                    "cells_flagged": int((_mt_col >= t).sum()) if _mt_col is not None else 0,
+                    "pct_flagged": round(float((_mt_col >= t).mean()) * 100, 1) if _mt_col is not None else 0,
+                }
+                for t in [5, 10, 15, 20, 25, 30]
+            } if not data_type_confirmed else None
             predicted_doublets = int(qc_preview.obs['predicted_doublet'].sum()) if 'predicted_doublet' in qc_preview.obs else 0
-            genes_low_cells = int((qc_preview.var['n_cells_by_counts'] < min_cells).sum()) if 'n_cells_by_counts' in qc_preview.var.columns else 0
+            genes_low_cells = (
+                int((qc_preview.var['n_cells_by_counts'] < min_cells).sum())
+                if min_cells is not None and 'n_cells_by_counts' in qc_preview.var.columns
+                else 0
+            )
+            cells_low_genes = (
+                int((qc_preview.obs['n_genes_by_counts'] < int(min_genes)).sum())
+                if min_genes is not None and 'n_genes_by_counts' in qc_preview.obs.columns
+                else 0
+            )
             ribo_genes = int(qc_preview.var['ribo'].sum()) if 'ribo' in qc_preview.var.columns and remove_ribo else 0
             mt_genes = int(qc_preview.var['mt'].sum()) if 'mt' in qc_preview.var.columns and remove_mt else 0
+            n_mt_genes_detected = int(qc_preview.var['mt'].sum()) if 'mt' in qc_preview.var.columns else 0
+            n_ribo_genes_detected = int(qc_preview.var['ribo'].sum()) if 'ribo' in qc_preview.var.columns else 0
+
+            cell_removal_mask = pd.Series(False, index=qc_preview.obs_names)
+            if min_genes is not None and 'n_genes_by_counts' in qc_preview.obs.columns:
+                cell_removal_mask |= qc_preview.obs['n_genes_by_counts'] < int(min_genes)
+            if filter_mt and 'pct_counts_mt' in qc_preview.obs.columns:
+                cell_removal_mask |= qc_preview.obs['pct_counts_mt'] >= mt_threshold
+            if remove_doublets and 'predicted_doublet' in qc_preview.obs.columns:
+                cell_removal_mask |= qc_preview.obs['predicted_doublet'].astype(bool)
+            projected_cells_removed = int(cell_removal_mask.sum())
+            projected_cells_retained = int(n_before - projected_cells_removed)
+
+            gene_removal_mask = pd.Series(False, index=qc_preview.var_names)
+            if min_cells is not None and 'n_cells_by_counts' in qc_preview.var.columns:
+                gene_removal_mask |= qc_preview.var['n_cells_by_counts'] < int(min_cells)
+            if remove_ribo and 'ribo' in qc_preview.var.columns:
+                gene_removal_mask |= qc_preview.var['ribo'].astype(bool)
+            if remove_mt and 'mt' in qc_preview.var.columns:
+                gene_removal_mask |= qc_preview.var['mt'].astype(bool)
+            projected_genes_removed = int(gene_removal_mask.sum())
+            projected_genes_retained = int(g_before - projected_genes_removed)
 
             figure_outputs = []
             figure_dir = tool_input.get("figure_dir")
@@ -2683,7 +3581,7 @@ def process_tool_call(
                 import matplotlib.pyplot as plt
                 os.makedirs(figure_dir, exist_ok=True)
                 try:
-                    qc_plot_adata = qc_preview.copy()
+                    qc_plot_adata = adata.copy()
 
                     # Add log-transformed columns for visualization
                     if "total_counts" in qc_plot_adata.obs.columns:
@@ -2749,16 +3647,17 @@ def process_tool_call(
                     plt.close(fig)
                     figure_outputs.append(hist_path)
 
-                    # --- Figure 4: MT% histogram with threshold line ---
+                    # --- Figure 4: MT% histogram (threshold line only when user confirmed a value) ---
                     if "pct_counts_mt" in qc_plot_adata.obs.columns:
                         fig, ax = plt.subplots(figsize=(8, 4))
                         ax.hist(qc_plot_adata.obs["pct_counts_mt"], bins=100, edgecolor='black', alpha=0.7)
-                        ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=2,
-                                   label=f'Threshold: {mt_threshold:.1f}%')
+                        if data_type_confirmed:
+                            ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=2,
+                                       label=f'Threshold: {mt_threshold:.1f}%')
+                            ax.legend()
                         ax.set_xlabel("Mitochondrial %")
                         ax.set_ylabel("Cell Count")
                         ax.set_title("Mitochondrial Content Distribution")
-                        ax.legend()
                         fig.tight_layout()
                         mt_hist_path = os.path.join(figure_dir, "qc_mt_histogram.png")
                         fig.savefig(mt_hist_path, dpi=150, bbox_inches='tight')
@@ -2775,10 +3674,11 @@ def process_tool_call(
                     if 'pct_counts_mt' in qc_plot_adata.obs.columns and 'total_counts' in qc_plot_adata.obs.columns:
                         sc.pl.scatter(qc_plot_adata, x='total_counts', y='pct_counts_mt', ax=axes[1], show=False)
                         axes[1].set_xscale('log')
-                        axes[1].axhline(mt_threshold, color='red', linestyle='--', linewidth=2,
-                                        label=f'MT threshold: {mt_threshold:.1f}%')
+                        if data_type_confirmed:
+                            axes[1].axhline(mt_threshold, color='red', linestyle='--', linewidth=2,
+                                            label=f'MT threshold: {mt_threshold:.1f}%')
+                            axes[1].legend()
                         axes[1].set_title("MT% vs Counts")
-                        axes[1].legend()
                     fig.tight_layout()
                     scatter_path = os.path.join(figure_dir, "qc_scatter.png")
                     fig.savefig(scatter_path, dpi=150, bbox_inches='tight')
@@ -2789,9 +3689,10 @@ def process_tool_call(
                     if 'pct_counts_mt' in qc_plot_adata.obs.columns and 'pct_counts_ribo' in qc_plot_adata.obs.columns:
                         fig, ax = plt.subplots(figsize=(6, 5))
                         sc.pl.scatter(qc_plot_adata, x='pct_counts_mt', y='pct_counts_ribo', ax=ax, show=False)
-                        ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=1, label=f'MT threshold')
+                        if data_type_confirmed:
+                            ax.axvline(mt_threshold, color='red', linestyle='--', linewidth=1, label=f'MT threshold')
+                            ax.legend()
                         ax.set_title("Ribosomal vs Mitochondrial Content")
-                        ax.legend()
                         fig.tight_layout()
                         ribo_mt_path = os.path.join(figure_dir, "qc_ribo_vs_mt.png")
                         fig.savefig(ribo_mt_path, dpi=150, bbox_inches='tight')
@@ -2804,16 +3705,35 @@ def process_tool_call(
             qc_decisions = {
                 "mt_threshold": {
                     "value": mt_threshold,
+                    "filter_enabled": filter_mt,
+                    "data_type_confirmed": data_type_confirmed,
+                    **({"threshold_options": mt_threshold_options} if mt_threshold_options else {}),
                     "reason": (
-                        f"Cells with pct_counts_mt >= {mt_threshold:.1f}% are usually stressed, damaged, or dying; "
-                        "high mitochondrial RNA often indicates low-quality cells."
+                        f"Cells with pct_counts_mt >= {mt_threshold:.1f}% are flagged for review; "
+                        + (
+                            "this threshold will be applied in filtering."
+                            if filter_mt
+                            else "hard MT% filtering is disabled for this run."
+                        )
                     ),
                     "cells_flagged": cells_over_mt,
                 },
+                "min_genes": {
+                    "value": int(min_genes) if min_genes is not None else None,
+                    "enabled": min_genes is not None,
+                    "reason": (
+                        f"Cells with fewer than {int(min_genes)} detected genes are usually low-quality."
+                        if min_genes is not None
+                        else "No cell-level gene-count filter was requested."
+                    ),
+                    "cells_flagged": cells_low_genes,
+                },
                 "min_cells_per_gene": {
-                    "value": int(min_cells),
+                    "value": int(min_cells) if min_cells is not None else None,
                     "reason": (
                         f"Genes detected in fewer than {int(min_cells)} cells add noise and little clustering signal."
+                        if min_cells is not None
+                        else "No min-cells-per-gene filter requested."
                     ),
                     "genes_flagged": genes_low_cells,
                 },
@@ -2823,7 +3743,9 @@ def process_tool_call(
                         "Scrublet flags likely multiplets; these are reported so the user can decide whether to exclude them."
                     ),
                     "cells_flagged": predicted_doublets,
-                    "removal_default": False,
+                    "remove_on_apply": remove_doublets,
+                    "predictions_source": doublet_predictions_source,
+                    "parameters": scrublet_params_for_report,
                 },
                 "remove_ribo": {
                     "enabled": bool(remove_ribo),
@@ -2835,12 +3757,100 @@ def process_tool_call(
                     "reason": "Mitochondrial genes are often excluded from downstream feature selection to reduce QC-driven signal.",
                     "genes_flagged": mt_genes,
                 },
+                "gene_detection_counts": {
+                    "n_mt_genes_detected": n_mt_genes_detected,
+                    "n_ribo_genes_detected": n_ribo_genes_detected,
+                },
+            }
+            filtering_plan = {
+                "confirmation_required": not preview_only and not confirm_filtering,
+                "confirmed": bool(confirm_filtering and not preview_only),
+                "parameters": {
+                    "mt_threshold": mt_threshold,
+                    "filter_mt": filter_mt,
+                    "data_type": requested_data_type,
+                    "data_type_confirmed": data_type_confirmed,
+                    "min_genes": int(min_genes) if min_genes is not None else None,
+                    "min_cells_per_gene": int(min_cells) if min_cells is not None else None,
+                    "remove_ribo": bool(remove_ribo),
+                    "remove_mt_genes": bool(remove_mt),
+                    "detect_doublets": bool(detect_doublets_flag),
+                    "remove_doublets": bool(remove_doublets),
+                    "batch_key_for_doublets": batch_key,
+                    "scrublet": scrublet_params_for_report,
+                },
+                "cell_filters": {
+                    "low_genes": {
+                        "enabled": min_genes is not None,
+                        "threshold": int(min_genes) if min_genes is not None else None,
+                        "cells_flagged": cells_low_genes,
+                        "will_remove": min_genes is not None,
+                    },
+                    "high_mt": {
+                        "enabled": bool(filter_mt),
+                        "threshold_pct": mt_threshold,
+                        "cells_flagged": cells_over_mt,
+                        "will_remove": bool(filter_mt),
+                    },
+                    "doublets": {
+                        "enabled": bool(detect_doublets_flag),
+                        "cells_flagged": predicted_doublets,
+                        "will_remove": bool(remove_doublets),
+                    },
+                },
+                "gene_filters": {
+                    "low_cells": {
+                        "enabled": min_cells is not None,
+                        "threshold": int(min_cells) if min_cells is not None else None,
+                        "genes_flagged": genes_low_cells,
+                        "will_remove": min_cells is not None,
+                    },
+                    "ribosomal": {
+                        "enabled": bool(remove_ribo),
+                        "genes_flagged": ribo_genes,
+                        "will_remove": bool(remove_ribo),
+                    },
+                    "mitochondrial": {
+                        "enabled": bool(remove_mt),
+                        "genes_flagged": mt_genes,
+                        "will_remove": bool(remove_mt),
+                    },
+                },
+                "projected_after_filtering": {
+                    "cells_removed": projected_cells_removed,
+                    "cells_retained": projected_cells_retained,
+                    "genes_removed_before_cell_filtering": projected_genes_removed,
+                    "genes_retained_before_cell_filtering": projected_genes_retained,
+                    "note": (
+                        "Gene removals are estimated before cell filtering; final gene removals can change "
+                        "after cells are removed."
+                    ),
+                },
             }
 
+            cell_filter_bits = []
+            if min_genes is not None:
+                cell_filter_bits.append(
+                    f"removing {cells_low_genes} cells with fewer than {int(min_genes)} genes"
+                )
+            if filter_mt:
+                cell_filter_bits.append(
+                    f"filtering {cells_over_mt} cells with pct_counts_mt >= {mt_threshold:.1f}%"
+                )
+            else:
+                cell_filter_bits.append(
+                    f"reporting {cells_over_mt} cells with pct_counts_mt >= {mt_threshold:.1f}% without applying an MT filter"
+                )
+            doublet_action = "removing" if remove_doublets else "flagging"
             recommendation = (
-                f"I recommend filtering {cells_over_mt} high-MT cells with pct_counts_mt >= {mt_threshold:.1f}%, "
-                f"removing {genes_low_cells} low-detection genes, and "
-                f"{'flagging' if detect_doublets_flag else 'skipping'} doublets ({predicted_doublets} cells)."
+                "I recommend "
+                + ", ".join(cell_filter_bits)
+                + f", removing {genes_low_cells} low-detection genes, and "
+                + (
+                    f"{doublet_action} doublets ({predicted_doublets} cells)."
+                    if detect_doublets_flag
+                    else "skipping doublet detection."
+                )
             )
             if batch_resolution and batch_resolution.needs_user_confirmation and tool_input.get("batch_key"):
                 recommendation += (
@@ -2888,12 +3898,17 @@ def process_tool_call(
                     "mode": "preview",
                     "before": {"n_cells": n_before, "n_genes": g_before},
                     "after": {"n_cells": n_before, "n_genes": g_before},
-                    "recommended_data_type": auto_data_type,
+                    "data_type_confirmed": data_type_confirmed,
                     "recommendation": recommendation,
+                    "filtering_plan": filtering_plan,
                     "qc_decisions": qc_decisions,
                     "metrics": {
                         "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
                         "doublet_rate": float(qc_preview.obs['predicted_doublet'].mean()) if 'predicted_doublet' in qc_preview.obs else None,
+                        "cells_below_min_genes": cells_low_genes,
+                        "genes_below_min_cells": genes_low_cells,
+                        "predicted_doublets": predicted_doublets,
+                        "cells_over_mt_threshold": cells_over_mt,
                     },
                     "warnings": warnings,
                     "figures": figure_outputs,
@@ -2930,14 +3945,73 @@ def process_tool_call(
                     ),
                 )
 
+            if not confirm_filtering:
+                confirmation_result = {
+                    "status": "needs_confirmation",
+                    "tool": "run_qc",
+                    "mode": "confirmation_required",
+                    "message": (
+                        "QC filtering was not applied. Review the thresholds, parameters, and removal "
+                        "counts, then confirm before I remove cells or genes."
+                    ),
+                    "required_next_action": "ask_user",
+                    "before": {"n_cells": n_before, "n_genes": g_before},
+                    "after": {"n_cells": n_before, "n_genes": g_before},
+                    "recommendation": recommendation,
+                    "filtering_plan": filtering_plan,
+                    "qc_decisions": qc_decisions,
+                    "metrics": {
+                        "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
+                        "doublet_rate": float(qc_preview.obs['predicted_doublet'].mean()) if 'predicted_doublet' in qc_preview.obs else None,
+                        "cells_below_min_genes": cells_low_genes,
+                        "genes_below_min_cells": genes_low_cells,
+                        "predicted_doublets": predicted_doublets,
+                        "cells_over_mt_threshold": cells_over_mt,
+                    },
+                    "warnings": warnings,
+                    "figures": figure_outputs,
+                    "batch_strategy": batch_strategy,
+                    "state": make_state(adata),
+                }
+                return _finalize_result(
+                    confirmation_result,
+                    adata,
+                    dataset_changed=False,
+                    summary="Prepared a QC filtering plan and paused for explicit confirmation.",
+                    artifacts_created=artifact_payloads,
+                    decisions_raised=decisions,
+                    verification=_build_verification(
+                        "passed",
+                        "QC filtering did not modify the dataset because confirmation is required.",
+                        [
+                            _check(
+                                "dataset_unchanged",
+                                adata.n_obs == n_before and adata.n_vars == g_before,
+                                "No cells or genes were removed before confirmation.",
+                            )
+                        ],
+                    ),
+                )
+
             try:
                 run_qc_pipeline(
                     adata,
                     mt_threshold=mt_threshold,
+                    filter_mt=filter_mt,
+                    min_genes=int(min_genes) if min_genes is not None else None,
                     min_cells=min_cells,
                     remove_ribo=remove_ribo,
                     detect_doublets_flag=detect_doublets_flag,
+                    remove_doublets=remove_doublets,
                     batch_key=batch_key,
+                    scrublet_expected_doublet_rate=scrublet_expected_doublet_rate,
+                    scrublet_sim_doublet_ratio=scrublet_sim_doublet_ratio,
+                    scrublet_n_prin_comps=scrublet_n_prin_comps,
+                    scrublet_min_counts=scrublet_min_counts,
+                    scrublet_min_cells=scrublet_min_cells,
+                    scrublet_min_gene_variability_pctl=scrublet_min_gene_variability_pctl,
+                    scrublet_random_state=scrublet_random_state,
+                    force_doublet_recompute=force_doublet_recompute,
                 )
             except ValueError as e:
                 if detect_doublets_flag and "skimage is not installed" in str(e):
@@ -2946,13 +4020,34 @@ def process_tool_call(
                     run_qc_pipeline(
                         adata,
                         mt_threshold=mt_threshold,
+                        filter_mt=filter_mt,
+                        min_genes=int(min_genes) if min_genes is not None else None,
                         min_cells=min_cells,
                         remove_ribo=remove_ribo,
                         detect_doublets_flag=False,
+                        remove_doublets=False,
                         batch_key=batch_key,
                     )
                 else:
                     raise
+
+            actual_cells_removed = n_before - adata.n_obs
+            actual_genes_removed = g_before - adata.n_vars
+            post_filter_doublets = int(adata.obs['predicted_doublet'].sum()) if 'predicted_doublet' in adata.obs else None
+            post_filter_doublet_rate = (
+                float(adata.obs['predicted_doublet'].mean())
+                if 'predicted_doublet' in adata.obs
+                else None
+            )
+            pre_filter_doublet_rate = (
+                float(predicted_doublets / n_before)
+                if detect_doublets_flag and n_before
+                else None
+            )
+            qc_decisions["min_cells_per_gene"]["genes_flagged_before_cell_filtering"] = genes_low_cells
+            qc_decisions["min_cells_per_gene"]["genes_removed_after_cell_filtering"] = actual_genes_removed
+            qc_decisions["doublet_detection"]["cells_flagged_before_filtering"] = predicted_doublets
+            qc_decisions["doublet_detection"]["cells_remaining_after_filtering"] = post_filter_doublets
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_qc")
             if output_path:
@@ -2971,12 +4066,22 @@ def process_tool_call(
                 "before": {"n_cells": n_before, "n_genes": g_before},
                 "after": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "recommendation": recommendation,
+                "filtering_plan": filtering_plan,
                 "qc_decisions": qc_decisions,
                 "metrics": {
-                    "cells_removed": n_before - adata.n_obs,
-                    "genes_removed": g_before - adata.n_vars,
-                    "doublet_rate": float(adata.obs['predicted_doublet'].mean()) if 'predicted_doublet' in adata.obs else None,
+                    "cells_removed": actual_cells_removed,
+                    "genes_removed": actual_genes_removed,
+                    "doublet_rate": pre_filter_doublet_rate,
+                    "post_filter_doublet_rate": post_filter_doublet_rate,
                     "median_pct_mt": float(adata.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in adata.obs else None,
+                    "cells_below_min_genes": cells_low_genes,
+                    "genes_below_min_cells": genes_low_cells,
+                    "genes_below_min_cells_before_cell_filtering": genes_low_cells,
+                    "genes_removed_after_cell_filtering": actual_genes_removed,
+                    "predicted_doublets": predicted_doublets,
+                    "predicted_doublets_before_filtering": predicted_doublets,
+                    "predicted_doublets_remaining": post_filter_doublets,
+                    "cells_over_mt_threshold": cells_over_mt,
                 },
                 "warnings": warnings,
                 "figures": figure_outputs,
@@ -3016,49 +4121,385 @@ def process_tool_call(
         elif tool_name == "normalize_and_hvg":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            normalize_data(adata)
-            n_hvg = tool_input.get("n_hvg", 4000)
-            select_hvg(adata, n_top_genes=n_hvg)
+            n_hvg = int(tool_input.get("n_hvg", 4000))
+            target_sum = tool_input.get("target_sum", 10000)
+            target_sum = float(target_sum) if target_sum is not None else None
+            log_transform = bool(tool_input.get("log_transform", True))
+            raw_layer_name = tool_input.get("raw_layer_name", "raw_counts")
+            force_reset_from_raw = bool(tool_input.get("force_reset_from_raw", True))
+            set_raw_after_normalization = bool(tool_input.get("set_raw_after_normalization", True))
+            hvg_flavor = tool_input.get("hvg_flavor", "seurat_v3")
+            hvg_layer = tool_input.get("hvg_layer") or None
+            batch_key = tool_input.get("batch_key")
+            hvg_exclude_patterns = tool_input.get("hvg_exclude_patterns") or []
+            if isinstance(hvg_exclude_patterns, str):
+                hvg_exclude_patterns = [hvg_exclude_patterns]
+            hvg_exclusion_mode = tool_input.get("hvg_exclusion_mode", "post")
+            hvg_exclude_match_mode = tool_input.get("hvg_exclude_match_mode", "match")
+            hvg_exclusion_source = tool_input.get("hvg_exclusion_source")
+
+            before_shape = (adata.n_obs, adata.n_vars)
+
+            def _integer_like_matrix(matrix, n_rows: int = 100, n_cols: int = 100) -> bool:
+                if matrix is None:
+                    return False
+                sample = matrix[:min(n_rows, matrix.shape[0]), :min(n_cols, matrix.shape[1])]
+                if hasattr(sample, "toarray"):
+                    sample = sample.toarray()
+                sample = np.asarray(sample)
+                return bool(np.allclose(sample, np.round(sample)))
+
+            try:
+                normalize_data(
+                    adata,
+                    target_sum=target_sum,
+                    log_transform=log_transform,
+                    preserve_raw=True,
+                    raw_layer_name=raw_layer_name,
+                    force_reset_from_raw=force_reset_from_raw,
+                )
+                if set_raw_after_normalization:
+                    adata.raw = adata.copy()
+                select_hvg(
+                    adata,
+                    n_top_genes=n_hvg,
+                    flavor=hvg_flavor,
+                    layer=hvg_layer,
+                    batch_key=batch_key,
+                    exclude_patterns=hvg_exclude_patterns,
+                    exclusion_mode=hvg_exclusion_mode,
+                    exclude_match_mode=hvg_exclude_match_mode,
+                    exclusion_source=hvg_exclusion_source,
+                )
+            except ValueError as e:
+                return _error_result(
+                    tool="normalize_and_hvg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Retry normalize_and_hvg with force_reset_from_raw=true "
+                        f"so adata.X is restored from layers['{raw_layer_name}'] before normalization.",
+                        "If the dataset was already normalized in this session, "
+                        "do not call scanpy normalize/log1p manually on the current X; "
+                        "reset from raw counts first.",
+                        "If the dataset was loaded already-normalized from disk, "
+                        "load the raw-counts version instead, or place raw "
+                        f"counts into adata.layers['{raw_layer_name}'] before retrying.",
+                    ],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "normalize_and_hvg")
             if output_path:
                 write_h5ad_safe(adata, output_path)
 
-            return json.dumps({
+            artifact_payloads = []
+            if output_path:
+                artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
+                if artifact is not None:
+                    artifact_payloads.append(artifact)
+
+            hvg_meta = adata.uns.get("hvg", {})
+            exclusion_meta = hvg_meta.get("feature_exclusions", {})
+            raw_counts_present = raw_layer_name in adata.layers
+            raw_counts_integer_like = (
+                _integer_like_matrix(adata.layers[raw_layer_name])
+                if raw_counts_present
+                else False
+            )
+            raw_shape = list(adata.raw.shape) if adata.raw is not None else None
+            normalized_counts_target = None
+            if log_transform:
+                import scipy.sparse as sp
+                if sp.issparse(adata.X):
+                    X_counts = adata.X.copy()
+                    X_counts.data = np.expm1(X_counts.data)
+                    normalized_counts_target = float(np.median(np.asarray(X_counts.sum(axis=1)).ravel()))
+                else:
+                    X_counts = np.expm1(np.asarray(adata.X))
+                    normalized_counts_target = float(np.median(X_counts.sum(axis=1)))
+
+            result_payload = {
                 "status": "ok",
                 "tool": "normalize_and_hvg",
                 "output_path": output_path,
                 "saved": output_path is not None,
+                "before": {"n_cells": before_shape[0], "n_genes": before_shape[1]},
+                "after": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
+                "target_sum": target_sum,
+                "log_transform": log_transform,
+                "normalization": adata.uns.get("normalization", {}),
+                "raw_layer_name": raw_layer_name,
+                "raw_counts_present": raw_counts_present,
+                "raw_counts_integer_like": raw_counts_integer_like,
+                "adata_raw_set": adata.raw is not None,
+                "adata_raw_shape": raw_shape,
+                "set_raw_after_normalization": set_raw_after_normalization,
                 "n_hvg": int(adata.var['highly_variable'].sum()),
+                "hvg": {
+                    "requested_flavor": hvg_meta.get("requested_flavor", hvg_flavor),
+                    "flavor": hvg_meta.get("flavor", hvg_flavor),
+                    "method": "scanpy.pp.highly_variable_genes",
+                    "n_top_genes": int(hvg_meta.get("n_top_genes", n_hvg)),
+                    "batch_key": hvg_meta.get("batch_key", batch_key),
+                    "layer": hvg_meta.get("layer", hvg_layer),
+                    "n_hvg_selected": int(adata.var['highly_variable'].sum()),
+                },
+                "feature_exclusions": exclusion_meta,
+                "metrics": {
+                    "n_hvg_selected": int(adata.var['highly_variable'].sum()),
+                    "normalized_counts_target_median": normalized_counts_target,
+                    "n_excluded_features": int(exclusion_meta.get("n_excluded", 0) or 0),
+                    "excluded_features_marked_hvg": int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0),
+                },
                 "warnings": warnings,
                 "state": make_state(adata)
-            }, indent=2), adata
+            }
+            verification_checks = [
+                _check(
+                    "raw_counts_present",
+                    raw_counts_present,
+                    f"Raw counts layer '{raw_layer_name}' is present.",
+                ),
+                _check(
+                    "raw_counts_integer_like",
+                    raw_counts_integer_like,
+                    f"Raw counts layer '{raw_layer_name}' appears integer-like in a matrix sample.",
+                ),
+                _check(
+                    "hvg_count",
+                    int(adata.var['highly_variable'].sum()) > 0,
+                    f"{int(adata.var['highly_variable'].sum())} HVGs are marked.",
+                ),
+                _check(
+                    "excluded_features_not_hvg",
+                    int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0) == 0,
+                    "No excluded features remain marked highly_variable.",
+                ),
+            ]
+            if set_raw_after_normalization:
+                verification_checks.append(
+                    _check(
+                        "adata_raw_set",
+                        adata.raw is not None,
+                        "adata.raw was set after normalization/log1p.",
+                    )
+                )
+            return _finalize_result(
+                result_payload,
+                adata,
+                dataset_changed=True,
+                summary=(
+                    f"Normalized data to target_sum={target_sum}, "
+                    f"selected {int(adata.var['highly_variable'].sum())} HVGs, "
+                    f"and applied {int(exclusion_meta.get('n_excluded', 0) or 0)} source-defined feature exclusions."
+                ),
+                artifacts_created=artifact_payloads,
+                verification=_build_verification(
+                    "passed",
+                    "Normalization and HVG selection completed with provenance checks.",
+                    verification_checks,
+                ),
+            )
 
-        elif tool_name == "run_dimred":
+        elif tool_name == "run_pca":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            n_pcs = tool_input.get("n_pcs", 30)
-            n_neighbors = tool_input.get("n_neighbors", 30)
+            n_comps = int(tool_input.get("n_comps") or tool_input.get("n_pcs") or 30)
+            svd_solver = tool_input.get("svd_solver", "arpack")
+            mask_var = tool_input.get("mask_var", "highly_variable")
 
-            run_pca(adata, n_comps=n_pcs)
-            compute_neighbors(adata, n_neighbors=n_neighbors)
-            compute_umap(adata)
+            run_pca(adata, n_comps=n_comps, mask_var=mask_var, svd_solver=svd_solver)
 
-            output_path = fix_output_path(tool_input.get("output_path"), "run_dimred")
+            output_path = fix_output_path(tool_input.get("output_path"), "run_pca")
             if output_path:
                 write_h5ad_safe(adata, output_path)
 
-            return json.dumps({
+            result = {
                 "status": "ok",
-                "tool": "run_dimred",
+                "tool": "run_pca",
                 "output_path": output_path,
                 "saved": output_path is not None,
-                "n_pcs": n_pcs,
-                "n_neighbors": n_neighbors,
-                "variance_explained": float(adata.uns['pca']['variance_ratio'].sum()),
+                "n_comps": n_comps,
+                "svd_solver": svd_solver,
+                "mask_var": mask_var,
+                "variance_explained": float(adata.uns["pca"]["variance_ratio"].sum()),
+                "side_effects": {
+                    "pca_computed": True,
+                    "neighbors_recomputed": False,
+                    "umap_recomputed": False,
+                    "clustering_recomputed": False,
+                },
                 "warnings": warnings,
-                "state": make_state(adata)
-            }, indent=2), adata
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=True,
+                summary=f"Ran PCA only with n_comps={n_comps} and svd_solver={svd_solver}.",
+                verification=_build_verification(
+                    "passed",
+                    "PCA was computed without downstream graph or embedding side effects.",
+                    [
+                        _check("pca_present", "X_pca" in adata.obsm, "PCA embedding exists in adata.obsm['X_pca']."),
+                        _check("no_umap_side_effect", "X_umap" not in adata.obsm or starting_state.get("has_umap"), "run_pca did not create a new UMAP embedding."),
+                    ],
+                ),
+            )
+
+        elif tool_name == "run_neighbors":
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            n_neighbors = int(tool_input.get("n_neighbors") or 30)
+            n_pcs = tool_input.get("n_pcs")
+            n_pcs = int(n_pcs) if n_pcs is not None else None
+            use_rep = tool_input.get("use_rep", "X_pca")
+            metric = tool_input.get("metric", "euclidean")
+            key_added = tool_input.get("key_added")
+
+            if use_rep not in adata.obsm:
+                available_reps = [k for k in adata.obsm.keys()]
+                return _smart_unavailable_result(
+                    tool="run_neighbors",
+                    message=f"Representation '{use_rep}' not found in adata.obsm.",
+                    adata_obj=adata,
+                    missing_prerequisites=["pca"] if use_rep == "X_pca" else [use_rep],
+                    recovery_options=[
+                        f"Run run_pca first to compute '{use_rep}'." if use_rep == "X_pca"
+                        else f"Compute '{use_rep}' before calling run_neighbors.",
+                        f"Set use_rep to one of the available representations: {available_reps}",
+                    ],
+                    extra={"available_representations": available_reps},
+                )
+
+            compute_neighbors(
+                adata,
+                n_neighbors=n_neighbors,
+                n_pcs=n_pcs,
+                use_rep=use_rep,
+                metric=metric,
+                key_added=key_added,
+            )
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_neighbors")
+            if output_path:
+                write_h5ad_safe(adata, output_path)
+
+            graph_key = key_added or "neighbors"
+            result = {
+                "status": "ok",
+                "tool": "run_neighbors",
+                "output_path": output_path,
+                "saved": output_path is not None,
+                "n_neighbors": n_neighbors,
+                "n_pcs": n_pcs,
+                "use_rep": use_rep,
+                "metric": metric,
+                "neighbors_key": graph_key,
+                "neighbors_provenance": _neighbors_provenance(adata) if key_added is None else _sanitize_uns_value(adata.uns.get(key_added, {})),
+                "side_effects": {
+                    "pca_recomputed": False,
+                    "neighbors_recomputed": True,
+                    "umap_recomputed": False,
+                    "clustering_recomputed": False,
+                },
+                "warnings": warnings,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=True,
+                summary=f"Computed neighbors only using {use_rep} with n_neighbors={n_neighbors}.",
+                verification=_build_verification(
+                    "passed",
+                    "Neighbor graph was computed without UMAP or clustering side effects.",
+                    [
+                        _check("neighbors_present", graph_key in adata.uns, f"Neighbors key '{graph_key}' exists in adata.uns."),
+                        _check("no_umap_side_effect", "X_umap" not in adata.obsm or starting_state.get("has_umap"), "run_neighbors did not create a new UMAP embedding."),
+                    ],
+                ),
+            )
+
+        elif tool_name == "run_umap":
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            neighbors_key = tool_input.get("neighbors_key")
+            _neighbors_lookup = neighbors_key or "neighbors"
+            if _neighbors_lookup not in adata.uns:
+                available_graphs = [k for k in adata.uns if "neighbor" in k.lower() or k == "neighbors"]
+                return _smart_unavailable_result(
+                    tool="run_umap",
+                    message=f"Neighbor graph '{_neighbors_lookup}' not found in adata.uns.",
+                    adata_obj=adata,
+                    missing_prerequisites=["neighbors"],
+                    recovery_options=[
+                        "Run run_neighbors first to compute the neighbor graph.",
+                        *(
+                            [f"Or set neighbors_key to one of the existing graphs: {available_graphs}"]
+                            if available_graphs else []
+                        ),
+                    ],
+                    extra={"available_neighbor_graphs": available_graphs},
+                )
+
+            neighbors_before = _neighbors_provenance(adata)
+            min_dist = float(tool_input.get("min_dist", 0.5))
+            spread = float(tool_input.get("spread", 1.0))
+            n_components = int(tool_input.get("n_components", 2))
+            random_state = int(tool_input.get("random_state", 0))
+
+            compute_umap(
+                adata,
+                min_dist=min_dist,
+                spread=spread,
+                n_components=n_components,
+                neighbors_key=neighbors_key,
+                random_state=random_state,
+            )
+            neighbors_after = _neighbors_provenance(adata)
+            graph_preserved = _provenance_same(neighbors_before, neighbors_after)
+
+            output_path = fix_output_path(tool_input.get("output_path"), "run_umap")
+            if output_path:
+                write_h5ad_safe(adata, output_path)
+
+            result = {
+                "status": "ok",
+                "tool": "run_umap",
+                "output_path": output_path,
+                "saved": output_path is not None,
+                "min_dist": min_dist,
+                "spread": spread,
+                "n_components": n_components,
+                "neighbors_key": neighbors_key or "neighbors",
+                "random_state": random_state,
+                "neighbors_before": neighbors_before,
+                "neighbors_after": neighbors_after,
+                "neighbor_graph_preserved": graph_preserved,
+                "side_effects": {
+                    "pca_recomputed": False,
+                    "neighbors_recomputed": False,
+                    "umap_recomputed": True,
+                    "clustering_recomputed": False,
+                },
+                "warnings": warnings,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=True,
+                summary=f"Computed UMAP only from the existing neighbor graph with min_dist={min_dist}.",
+                verification=_build_verification(
+                    "passed" if graph_preserved else "warning",
+                    "UMAP was computed from the existing neighbor graph.",
+                    [
+                        _check("umap_present", "X_umap" in adata.obsm, "UMAP embedding exists in adata.obsm['X_umap']."),
+                        _check("neighbor_graph_preserved", graph_preserved, "Neighbor graph provenance and sparsity were unchanged by run_umap."),
+                    ],
+                ),
+            )
 
         elif tool_name == "run_clustering":
             warnings = _state_preservation_warning(tool_input, adata)
@@ -3106,7 +4547,11 @@ def process_tool_call(
                 "method": result_payload["method"],
                 "resolution": result_payload["resolution"],
                 "cluster_key": result_payload["cluster_key"],
+                "created_obs_columns": result_payload["created_obs_columns"],
+                "primary_alias": result_payload["primary_alias"],
                 "primary_cluster_key": result_payload["primary_cluster_key"],
+                "primary_alias_available": result_payload["primary_alias_available"],
+                "primary_alias_created": result_payload["primary_alias_created"],
                 "make_primary": bool(make_primary),
                 "n_clusters": result_payload["n_clusters"],
                 "cluster_sizes": result_payload["cluster_sizes"],
@@ -3115,6 +4560,19 @@ def process_tool_call(
                 "state": make_state(adata)
             }
             primary_key = result_payload["primary_cluster_key"]
+            primary_check = (
+                _check(
+                    "primary_alias_available",
+                    result_payload["primary_alias_available"],
+                    f"Primary clustering alias '{primary_key}' is available.",
+                )
+                if bool(make_primary)
+                else _check(
+                    "primary_alias_not_requested",
+                    True,
+                    "Primary alias was not requested; no alias availability is implied.",
+                )
+            )
             verification_checks = [
                 _check(
                     "cluster_key_created",
@@ -3126,11 +4584,7 @@ def process_tool_call(
                     adata.obs[result_payload["cluster_key"]].nunique() == result_payload["n_clusters"],
                     "Reported cluster count matches the stored clustering column.",
                 ),
-                _check(
-                    "primary_alias_available",
-                    primary_key in adata.obs.columns,
-                    f"Primary clustering alias '{primary_key}' is available.",
-                ),
+                primary_check,
             ]
             return _finalize_result(
                 clustering_result,
@@ -3316,12 +4770,29 @@ def process_tool_call(
                     context="cluster_key",
                 )
 
-            run_celltypist(
-                adata,
-                model=model,
-                majority_voting=majority,
-                over_clustering=cluster_key if majority else None,
-            )
+            try:
+                run_celltypist(
+                    adata,
+                    model=model,
+                    majority_voting=majority,
+                    over_clustering=cluster_key if majority else None,
+                )
+            except ValueError as e:
+                # Most often: missing raw-counts layer when adata.X is already
+                # log-normalized. Surface a recoverable error rather than
+                # crashing the tool loop.
+                return _error_result(
+                    tool="run_celltypist",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ensure raw integer counts are in adata.layers['raw_counts'] "
+                        "before running CellTypist (normalize_and_hvg preserves them "
+                        "automatically; data loaded externally may not).",
+                        "If you have raw counts under a different layer name, "
+                        "pass it as raw_layer when invoking via run_code.",
+                    ],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_celltypist")
             if output_path:
@@ -3456,21 +4927,415 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "query_cells":
+            from ..annotation.scimilarity import query_cells as _query_cells, DEFAULT_MODEL_PATH
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return _error_result(
+                    tool="query_cells",
+                    message="No data loaded. Load a dataset first.",
+                    recovery_options=["Load data with inspect_data or provide a data_path."],
+                )
+
+            query_type = tool_input.get("query_type", "cells")
+            k = tool_input.get("k", 50)
+            raw_layer = tool_input.get("raw_layer")
+
+            # Validate mode-specific inputs early for a clear error
+            if query_type == "centroid":
+                if not tool_input.get("group_key") or not tool_input.get("group_value"):
+                    return _error_result(
+                        tool="query_cells",
+                        message="centroid mode requires group_key and group_value.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide both group_key (obs column) and group_value (category within it).",
+                            "Use list_obs_columns to find available grouping columns.",
+                        ],
+                    )
+            else:
+                if not tool_input.get("cell_ids") and not tool_input.get("obs_column"):
+                    return _error_result(
+                        tool="query_cells",
+                        message="cells mode requires either cell_ids (list of obs_names) or obs_column.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide a list of cell_ids (obs_names) or an obs_column to select cells from.",
+                        ],
+                    )
+
+            try:
+                result = _query_cells(
+                    adata,
+                    query_type=query_type,
+                    cell_ids=tool_input.get("cell_ids"),
+                    obs_column=tool_input.get("obs_column"),
+                    group_key=tool_input.get("group_key"),
+                    group_value=tool_input.get("group_value"),
+                    k=k,
+                    model_path=DEFAULT_MODEL_PATH,
+                    raw_layer=raw_layer,
+                )
+            except (FileNotFoundError, ImportError) as e:
+                return _error_result(
+                    tool="query_cells",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify the SCimilarity model path exists (see download_model.sh).",
+                    ],
+                    install_hint="pip install scimilarity" if "Import" in type(e).__name__ else None,
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="query_cells",
+                    message=f"Cell query failed: {e}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify adata has raw counts (raw_layer) and correct obs structure.",
+                    ],
+                )
+
+            # Build a human-readable summary
+            top_ct = result.get("top_celltypes", {})
+            top_tissue = result.get("top_tissues", {})
+            top_disease = result.get("top_diseases", {})
+            coherence = result.get("coherence")
+            mean_dist = result.get("mean_dist")
+
+            summary_parts = [
+                f"Retrieved {result['n_results']} reference cells (k={k}).",
+                f"Mean distance: {mean_dist:.4f}." if mean_dist is not None else "",
+                f"Query coherence: {coherence}%." if coherence is not None else "",
+                "Top cell types: " + ", ".join(f"{ct} ({n})" for ct, n in list(top_ct.items())[:5]) + "." if top_ct else "",
+                "Top tissues: " + ", ".join(f"{t} ({n})" for t, n in list(top_tissue.items())[:5]) + "." if top_tissue else "",
+            ]
+            summary = " ".join(p for p in summary_parts if p)
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "query_cells",
+                **result,
+                "message": summary,
+            }, indent=2), adata
+
+        elif tool_name == "score_gene_signature":
+            import numpy as np
+            import scanpy as sc
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return _error_result(
+                    tool="score_gene_signature",
+                    message="No data loaded. Load a dataset first.",
+                    recovery_options=["Load data with inspect_data or provide a data_path."],
+                )
+
+            from ..core.inspector import inspect_data as _inspect_for_norm
+            _norm_state = _inspect_for_norm(adata)
+            if not _norm_state.is_normalized:
+                return _error_result(
+                    tool="score_gene_signature",
+                    message=(
+                        "Data does not appear to be normalized. score_gene_signature works on "
+                        "log-normalized expression values (adata.X), not raw counts. "
+                        "Run normalize_and_hvg first."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=["Run normalize_and_hvg before scoring gene signatures."],
+                )
+
+            cell_cycle = tool_input.get("cell_cycle", False)
+
+            if cell_cycle:
+                # ---- Cell cycle scoring ----
+                s_genes = tool_input.get("s_genes") or []
+                g2m_genes = tool_input.get("g2m_genes") or []
+                if not s_genes or not g2m_genes:
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
+                            "cell_cycle=true requires both s_genes and g2m_genes. "
+                            "Provide lists of S-phase and G2M-phase marker genes."
+                        ),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide both s_genes and g2m_genes lists.",
+                            "Use standard Tirosh et al. 2016 cell cycle gene sets (search_papers can find them).",
+                        ],
+                    )
+
+                # Filter to genes present in the dataset
+                var_names = set(adata.var_names)
+                s_found = [g for g in s_genes if g in var_names]
+                g2m_found = [g for g in g2m_genes if g in var_names]
+
+                if not s_found or not g2m_found:
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
+                            f"Cell cycle scoring failed: found {len(s_found)}/{len(s_genes)} S-phase genes "
+                            f"and {len(g2m_found)}/{len(g2m_genes)} G2M-phase genes in the dataset. "
+                            "Need at least one gene per phase. Check gene name format (human HGNC symbols)."
+                        ),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Verify gene names match the dataset format (inspect sample var_names with inspect_data).",
+                            "Genes may be in mouse format (e.g., Ccnb1) vs. human (CCNB1) — convert if needed.",
+                        ],
+                    )
+
+                try:
+                    sc.tl.score_genes_cell_cycle(
+                        adata,
+                        s_genes=s_found,
+                        g2m_genes=g2m_found,
+                    )
+                except Exception as e:
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=f"Cell cycle scoring failed: {e}",
+                        adata_obj=adata,
+                        recovery_options=["Check gene name formats and ensure data is log-normalized."],
+                    )
+
+                phase_counts = adata.obs["phase"].value_counts().to_dict()
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "score_gene_signature",
+                    "mode": "cell_cycle",
+                    "s_genes_matched": len(s_found),
+                    "s_genes_total": len(s_genes),
+                    "g2m_genes_matched": len(g2m_found),
+                    "g2m_genes_total": len(g2m_genes),
+                    "scores_added": ["S_score", "G2M_score", "phase"],
+                    "phase_distribution": phase_counts,
+                    "message": (
+                        f"Cell cycle scoring complete. Phase distribution: "
+                        + ", ".join(f"{k}: {v}" for k, v in sorted(phase_counts.items()))
+                        + ". Scores stored in adata.obs['S_score'], ['G2M_score'], ['phase']."
+                    ),
+                }, indent=2), adata
+
+            else:
+                # ---- Generic gene signature scoring ----
+                gene_list = tool_input.get("gene_list") or []
+                if not gene_list:
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message="Provide gene_list (list of gene names) or set cell_cycle=true.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Provide a gene_list of marker genes to score.",
+                            "Set cell_cycle=true with s_genes and g2m_genes for cell cycle scoring.",
+                        ],
+                    )
+
+                score_name = tool_input.get("score_name", "gene_signature_score")
+                layer = tool_input.get("layer")
+                n_bins = tool_input.get("n_bins", 25)
+                ctrl_size = tool_input.get("ctrl_size", 50)
+
+                # Validate layer if provided
+                if layer and layer not in adata.layers:
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
+                            f"Layer '{layer}' not found. Available layers: {list(adata.layers.keys())}. "
+                            "Leave layer unset to use adata.X (recommended)."
+                        ),
+                        adata_obj=adata,
+                        recovery_options=["Use one of the available layers or omit layer to use adata.X."],
+                    )
+
+                # Filter gene_list to genes present in the dataset and report coverage
+                var_names = set(adata.var_names)
+                matched = [g for g in gene_list if g in var_names]
+                missing = [g for g in gene_list if g not in var_names]
+
+                if not matched:
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=(
+                            f"None of the {len(gene_list)} provided genes were found in the dataset. "
+                            f"Check gene name format — dataset uses: {list(adata.var_names[:5])}..."
+                        ),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Verify gene name format matches the dataset (human HGNC vs. mouse, Ensembl IDs vs. symbols).",
+                            "Use inspect_data to see example var_names.",
+                        ],
+                        extra={"genes_not_found": gene_list[:20]},
+                    )
+
+                # Warn if coverage is low but still proceed
+                coverage_pct = len(matched) / len(gene_list) * 100
+
+                try:
+                    sc.tl.score_genes(
+                        adata,
+                        gene_list=matched,
+                        score_name=score_name,
+                        n_bins=n_bins,
+                        ctrl_size=ctrl_size,
+                        layer=layer,
+                    )
+                except Exception as e:
+                    return _error_result(
+                        tool="score_gene_signature",
+                        message=f"Gene scoring failed: {e}",
+                        adata_obj=adata,
+                        recovery_options=["Verify gene list and layer contain valid expression data."],
+                    )
+
+                scores = adata.obs[score_name]
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "score_gene_signature",
+                    "mode": "signature",
+                    "score_name": score_name,
+                    "genes_requested": len(gene_list),
+                    "genes_matched": len(matched),
+                    "genes_missing": len(missing),
+                    "coverage_pct": round(coverage_pct, 1),
+                    "missing_genes": missing[:20] if missing else [],
+                    "score_stats": {
+                        "mean": round(float(scores.mean()), 4),
+                        "std": round(float(scores.std()), 4),
+                        "min": round(float(scores.min()), 4),
+                        "max": round(float(scores.max()), 4),
+                        "pct_positive": round(float((scores > 0).mean() * 100), 1),
+                    },
+                    "message": (
+                        f"Scored {len(matched)}/{len(gene_list)} genes ({coverage_pct:.0f}% coverage). "
+                        f"Score stored in adata.obs['{score_name}']. "
+                        f"Mean score: {scores.mean():.4f}, "
+                        f"{(scores > 0).mean() * 100:.1f}% of cells are positive."
+                        + (f" Warning: {len(missing)} genes not found in dataset." if missing else "")
+                    ),
+                }, indent=2), adata
+
+        elif tool_name == "run_spectra":
+            from ..analysis.spectra import run_spectra
+
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+
+            cell_type_key = tool_input.get("cell_type_key")
+            if not cell_type_key or cell_type_key not in adata.obs.columns:
+                return _error_result(
+                    tool="run_spectra",
+                    message=f"cell_type_key '{cell_type_key}' not found in adata.obs.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Run cell type annotation (run_celltypist or run_scimilarity) first.",
+                        "Use list_obs_columns to find the correct annotation column.",
+                    ],
+                )
+
+            output_dir = fix_output_path(tool_input.get("output_dir"), "run_spectra")
+
+            try:
+                result = run_spectra(
+                    adata,
+                    cell_type_key=cell_type_key,
+                    gene_set_dict_path=tool_input.get("gene_set_dict_path"),
+                    use_default_gene_sets=bool(tool_input.get("use_default_gene_sets", False)),
+                    lam=float(tool_input.get("lam", 0.1)),
+                    rho=0.001,
+                    num_epochs=int(tool_input.get("num_epochs", 1000)),
+                    n_top_vals=int(tool_input.get("n_top_vals", 50)),
+                    use_highly_variable=bool(tool_input.get("use_highly_variable", True)),
+                    use_weights=True,
+                    use_cell_types=bool(tool_input.get("use_cell_types", True)),
+                    label_factors=True,
+                    overlap_threshold=float(tool_input.get("overlap_threshold", 0.2)),
+                    output_dir=output_dir,
+                )
+            except ImportError as e:
+                return _error_result(
+                    tool="run_spectra",
+                    message=str(e),
+                    adata_obj=adata,
+                    install_hint="pip install Spectra-sc",
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="run_spectra",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify cell_type_key is valid and gene set paths are correct.",
+                    ],
+                )
+
+            artifacts_created = []
+            if result.get("figure_path"):
+                artifact = _artifact_payload(
+                    result["figure_path"],
+                    role="figure",
+                    metadata={"kind": "spectra_factor_umaps"},
+                )
+                if artifact:
+                    artifacts_created.append(artifact)
+
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "run_spectra",
+                    "cell_type_key": cell_type_key,
+                    "n_factors": result["n_factors"],
+                    "factor_labels": result["factor_labels"],
+                    "top_markers_per_factor": result["top_markers_per_factor"],
+                    "model_path": result.get("model_path"),
+                    "figure_path": result.get("figure_path"),
+                    "obsm_key": "SPECTRA_cell_scores",
+                    "note": (
+                        "Factor scores in adata.obsm['SPECTRA_cell_scores'] — "
+                        "color UMAP by individual columns to visualize each gene program. "
+                        "Top marker genes per factor are in adata.uns['SPECTRA_markers']."
+                    ),
+                    "warnings": warnings,
+                    "state": make_state(adata),
+                },
+                adata,
+                dataset_changed=True,
+                summary=f"Spectra discovered {result['n_factors']} gene program factors using '{cell_type_key}' as cell type key.",
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "Spectra completed successfully.",
+                    [
+                        _check(
+                            "cell_scores_present",
+                            "SPECTRA_cell_scores" in adata.obsm,
+                            f"Factor scores written to adata.obsm['SPECTRA_cell_scores'] ({result['n_factors']} factors).",
+                        ),
+                        _check(
+                            "markers_present",
+                            "SPECTRA_markers" in adata.uns,
+                            "Top marker genes stored in adata.uns['SPECTRA_markers'].",
+                        ),
+                    ],
+                ),
+            )
+
         elif tool_name == "save_data":
             if adata is None:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "save_data",
-                    "message": "No in-memory data available to save. Run an analysis tool first."
-                }, indent=2), adata
+                return _error_result(
+                    tool="save_data",
+                    message="No in-memory data available to save. Run an analysis tool first.",
+                    recovery_options=["Load and process data before saving."],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "save_data")
             if not output_path:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "save_data",
-                    "message": "Provide an .h5ad output_path or a directory where the final_result.h5ad can be written."
-                }, indent=2), adata
+                return _error_result(
+                    tool="save_data",
+                    message="Provide an .h5ad output_path or a directory where the final_result.h5ad can be written.",
+                    adata_obj=adata,
+                    recovery_options=["Provide output_path as a .h5ad file path or directory."],
+                )
 
             save_details = write_h5ad_safe(adata, output_path)
             artifact = _artifact_payload(output_path, role="saved_dataset", metadata={"save_mode": save_details.get("save_mode", "direct")})
@@ -3513,17 +5378,63 @@ def process_tool_call(
 
             # Get batch sizes for output
             batch_sizes = adata.obs[batch_key].value_counts().to_dict()
-
             if method == "harmony":
                 run_harmony(adata, batch_key=batch_key)
-                corrected_rep = 'X_pca_harmony'
+                corrected_rep = "X_pca_harmony"
+            elif method == "bbknn":
+                n_pcs = int(tool_input.get("n_pcs") or 30)
+                neighbors_within_batch = int(tool_input.get("neighbors_within_batch") or 3)
+                # BBKNN requires PCA — validate before running
+                if "X_pca" not in adata.obsm:
+                    return _error_result(
+                        tool="run_batch_correction",
+                        message="BBKNN requires PCA in adata.obsm['X_pca']. Run run_pca first.",
+                        adata_obj=adata,
+                        recovery_options=["Run run_pca to compute PCA, then retry BBKNN."],
+                        extra={"method": "bbknn"},
+                    )
+                run_bbknn(
+                    adata,
+                    batch_key=batch_key,
+                    n_pcs=n_pcs,
+                    neighbors_within_batch=neighbors_within_batch,
+                )
+                # BBKNN correction lives in the neighbor graph, not an obsm key.
+                # corrected_rep=None signals downstream logic to use the BBKNN graph as-is.
+                corrected_rep = None
+            elif method == "scvi":
+                n_latent = int(tool_input.get("n_latent") or 30)
+                max_epochs = int(tool_input.get("max_epochs") or 200)
+                store_normalized = bool(tool_input.get("store_normalized", False))
+                # scVI requires raw integer counts — validate before training
+                try:
+                    _resolve_integer_counts_layer(adata, "raw_counts")
+                except ValueError as e:
+                    return _error_result(
+                        tool="run_batch_correction",
+                        message=str(e),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Ensure raw integer counts are in adata.layers['raw_counts'] "
+                            "(normalize_and_hvg preserves them automatically).",
+                            "Try method='harmony' or 'bbknn' instead — they work on PCA embeddings and do not need raw counts.",
+                        ],
+                        extra={"method": "scvi"},
+                    )
+                run_scvi(
+                    adata,
+                    batch_key=batch_key,
+                    n_latent=n_latent,
+                    max_epochs=max_epochs,
+                    store_normalized=store_normalized,
+                )
+                corrected_rep = "X_scVI"
             else:
                 run_scanorama(adata, batch_key=batch_key)
-                corrected_rep = 'X_scanorama'
+                corrected_rep = "X_scanorama"
 
-            # Recompute neighbors and UMAP on corrected embedding
-            compute_neighbors(adata, n_neighbors=30, use_rep=corrected_rep)
-            compute_umap(adata)
+            neighbors_recomputed = method == "bbknn"
+            umap_recomputed = False
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_batch_correction")
             if output_path:
@@ -3551,6 +5462,22 @@ def process_tool_call(
             )
             if batch_decision is not None:
                 decisions.append(batch_decision)
+            extra = {}
+            if method == "scvi":
+                extra["n_latent"] = int(tool_input.get("n_latent") or 30)
+                extra["max_epochs"] = int(tool_input.get("max_epochs") or 200)
+                extra["scvi_normalized_stored"] = bool(tool_input.get("store_normalized", False))
+            elif method == "bbknn":
+                extra["n_pcs"] = int(tool_input.get("n_pcs") or 30)
+                extra["neighbors_within_batch"] = int(tool_input.get("neighbors_within_batch") or 3)
+                extra["total_neighbors_per_cell"] = len(batch_sizes) * extra["neighbors_within_batch"]
+
+            # BBKNN correction lives in the neighbor graph (adata.obsp), not an obsm key
+            corrected_embedding_label = (
+                "BBKNN graph (adata.obsp['connectivities'])"
+                if corrected_rep is None
+                else corrected_rep
+            )
             batch_result = {
                 "status": "ok",
                 "tool": "run_batch_correction",
@@ -3560,26 +5487,213 @@ def process_tool_call(
                 "batch_key": batch_key,
                 "n_batches": len(batch_sizes),
                 "batch_sizes": {str(k): int(v) for k, v in batch_sizes.items()},
-                "corrected_embedding": corrected_rep,
-                "umap_recomputed": True,
-                "note": f"UMAP recomputed using corrected {corrected_rep} embedding",
+                "corrected_embedding": corrected_embedding_label,
+                "neighbors_recomputed": neighbors_recomputed,
+                "umap_recomputed": False,
+                "note": "Batch correction complete. Run run_umap next (and run_neighbors first for Harmony/Scanorama/scVI).",
                 "warnings": warnings,
-                "state": make_state(adata)
+                "state": make_state(adata),
+                **extra,
             }
+
+            # For BBKNN the correction is in the neighbor graph, not an obsm key
+            if corrected_rep is None:
+                corrected_present = adata.uns.get("bbknn_batch_key") == batch_key
+                corrected_check_label = "BBKNN neighbor graph stored in adata.obsp['connectivities']."
+            else:
+                corrected_present = corrected_rep in adata.obsm
+                corrected_check_label = f"Corrected embedding '{corrected_rep}' exists in adata.obsm."
+
             return _finalize_result(
                 batch_result,
                 adata,
                 dataset_changed=True,
-                summary=f"Applied {method} batch correction using '{batch_key}' and recomputed the neighborhood graph.",
+                summary=(
+                    f"Applied {method} batch correction using '{batch_key}'. "
+                    f"Downstream UMAP recomputed: {umap_recomputed}."
+                ),
                 artifacts_created=artifacts_created,
                 decisions_raised=decisions,
                 verification=_build_verification(
                     "passed",
-                    "Batch correction completed and the corrected embedding is available.",
+                    "Batch correction completed and the corrected representation is available.",
                     [
                         _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists in adata.obs."),
-                        _check("corrected_embedding_present", corrected_rep in adata.obsm, f"Corrected embedding '{corrected_rep}' exists in adata.obsm."),
-                        _check("umap_present", "X_umap" in adata.obsm, "UMAP was recomputed after correction."),
+                        _check("corrected_embedding_present", corrected_present, corrected_check_label),
+                        _check("umap_not_recomputed", not umap_recomputed, "UMAP was not recomputed — run run_umap to refresh the layout."),
+                    ],
+                ),
+            )
+
+        elif tool_name == "score_integration":
+            from ..batch.entropy import compute_batch_entropy
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            batch_key = tool_input.get("batch_key")
+            use_rep = tool_input.get("use_rep", "X_umap")
+            n_neighbors = int(tool_input.get("n_neighbors", 50))
+
+            if not batch_key or batch_key not in adata.obs.columns:
+                return _error_result(
+                    tool="score_integration",
+                    message=f"batch_key '{batch_key}' not found in adata.obs.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Use list_obs_columns to find the correct batch column name.",
+                        "Confirm the batch column with the user before scoring.",
+                    ],
+                )
+
+            try:
+                result = compute_batch_entropy(
+                    adata,
+                    batch_key=batch_key,
+                    use_rep=use_rep,
+                    n_neighbors=n_neighbors,
+                )
+            except (ValueError, ImportError) as e:
+                return _error_result(
+                    tool="score_integration",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify batch_key has ≥2 unique values and use_rep embedding exists in adata.obsm.",
+                    ],
+                )
+
+            # Store per-cell entropy in obs for downstream visualization
+            adata.obs["integration_entropy"] = result["per_cell_entropy"]
+
+            entropy_mean = result["entropy_mean"]
+            if entropy_mean >= 0.8:
+                interpretation = "Excellent mixing — batches are well-integrated."
+            elif entropy_mean >= 0.6:
+                interpretation = "Good mixing — minor batch structure may remain."
+            elif entropy_mean >= 0.4:
+                interpretation = "Moderate mixing — consider a stronger correction method (e.g. scVI)."
+            else:
+                interpretation = "Poor mixing — strong batch structure persists. Try scVI or check batch_key."
+
+            return json.dumps({
+                "status": "ok",
+                "tool": "score_integration",
+                "use_rep": use_rep,
+                "batch_key": batch_key,
+                "n_neighbors": result["n_neighbors"],
+                "n_batches": result["n_batches"],
+                "entropy_mean": round(entropy_mean, 4),
+                "entropy_median": round(result["entropy_median"], 4),
+                "entropy_per_batch": {k: round(v, 4) for k, v in result["entropy_per_batch"].items()},
+                "interpretation": interpretation,
+                "note": (
+                    "Per-cell scores stored in adata.obs['integration_entropy']. "
+                    "Color UMAP by 'integration_entropy' to see spatial mixing patterns."
+                ),
+                "state": make_state(adata),
+            }, indent=2), adata
+
+        elif tool_name == "benchmark_integration":
+            from ..batch.scib import run_scib_benchmark
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            batch_key = tool_input.get("batch_key")
+            label_key = tool_input.get("label_key")
+            embedding_keys = tool_input.get("embedding_keys") or None
+            fast = bool(tool_input.get("fast", False))
+            output_dir = fix_output_path(tool_input.get("output_dir"), "benchmark_integration")
+
+            for col, name in [(batch_key, "batch_key"), (label_key, "label_key")]:
+                if not col or col not in adata.obs.columns:
+                    return _error_result(
+                        tool="benchmark_integration",
+                        message=f"{name} '{col}' not found in adata.obs.",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Use list_obs_columns to find valid batch and label columns.",
+                            "Run cell type annotation first if label_key is missing.",
+                        ],
+                    )
+
+            try:
+                bench = run_scib_benchmark(
+                    adata,
+                    batch_key=batch_key,
+                    label_key=label_key,
+                    embedding_keys=embedding_keys,
+                    fast=fast,
+                    output_dir=output_dir,
+                )
+            except ImportError as e:
+                return _error_result(
+                    tool="benchmark_integration",
+                    message=str(e),
+                    adata_obj=adata,
+                    install_hint="pip install scib-metrics",
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="benchmark_integration",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify batch/label keys and that embeddings are properly formatted.",
+                    ],
+                )
+
+            artifacts_created = []
+            if bench.get("output_figure"):
+                artifact = _artifact_payload(
+                    bench["output_figure"],
+                    role="figure",
+                    metadata={"kind": "scib_benchmark_table"},
+                )
+                if artifact:
+                    artifacts_created.append(artifact)
+            if bench.get("output_csv"):
+                artifact = _artifact_payload(
+                    bench["output_csv"],
+                    role="artifact",
+                    metadata={"kind": "scib_results_csv"},
+                )
+                if artifact:
+                    artifacts_created.append(artifact)
+
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "benchmark_integration",
+                    "batch_key": batch_key,
+                    "label_key": label_key,
+                    "embeddings_benchmarked": bench["embeddings_benchmarked"],
+                    "scores_by_embedding": bench["scores_by_embedding"],
+                    "best_method": bench["best_method"],
+                    "results_table": bench["results_table"],
+                    "output_csv": bench.get("output_csv"),
+                    "output_figure": bench.get("output_figure"),
+                    "note": (
+                        f"Best embedding by total scib score: {bench['best_method']}. "
+                        "Use run_batch_correction with the corresponding method if not already applied."
+                    ) if bench["best_method"] else "",
+                    "state": make_state(adata),
+                },
+                adata,
+                dataset_changed=False,
+                summary=f"scib-metrics benchmark complete across {len(bench['embeddings_benchmarked'])} embeddings. Best: {bench['best_method']}.",
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "scib-metrics benchmark completed successfully.",
+                    [
+                        _check(
+                            "embeddings_benchmarked",
+                            len(bench["embeddings_benchmarked"]) > 0,
+                            f"Benchmarked {len(bench['embeddings_benchmarked'])} embeddings.",
+                        ),
+                        _check(
+                            "best_method_identified",
+                            bench["best_method"] is not None,
+                            f"Best method: {bench['best_method']}.",
+                        ),
                     ],
                 ),
             )
@@ -3615,6 +5729,9 @@ def process_tool_call(
             )
             method = tool_input.get("method", "wilcoxon")
             layer = tool_input.get("layer")
+            use_raw = tool_input.get("use_raw")
+            key_added = tool_input.get("key_added", "rank_genes_groups")
+            n_genes = int(tool_input.get("n_genes", 100))
             target_geneset = tool_input.get("target_geneset", DEG_DEFAULTS.default_geneset)
 
             # Run validated DEG - this validates inputs, runs rank_genes_groups,
@@ -3624,22 +5741,29 @@ def process_tool_call(
                     adata,
                     groupby=groupby,
                     method=method,
+                    n_genes=n_genes,
                     layer=layer,
+                    use_raw=use_raw,
+                    key_added=key_added,
                     target_geneset=target_geneset,
                     min_cluster_size=DEG_DEFAULTS.min_cluster_size,
                     warn_cluster_size=DEG_DEFAULTS.warn_cluster_size,
                     imbalance_ratio=DEG_DEFAULTS.max_imbalance_ratio,
-                    block_on_errors=False,  # Don't block, let agent see issues
+                    block_on_errors=True,
                     batch_confound_threshold=DEG_DEFAULTS.batch_confound_threshold,
                     max_logfc=DEG_DEFAULTS.max_logfc_sanity,
                     inplace=True,
                 )
             except Exception as e:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_deg",
-                    "message": str(e),
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_deg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify groupby column is valid and has ≥2 groups.",
+                        "If a layer was specified, ensure it exists and contains valid expression data.",
+                    ],
+                )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_deg")
             if output_path:
@@ -3650,7 +5774,7 @@ def process_tool_call(
             top_markers_summary = {}
             for group in groups[:15]:  # Limit to first 15 clusters for response size
                 try:
-                    markers_df = get_top_markers(adata, group=str(group), n_genes=5)
+                    markers_df = get_top_markers(adata, group=str(group), n_genes=5, key=key_added)
                     top_markers_summary[str(group)] = [
                         {
                             "gene": row['names'],
@@ -3669,6 +5793,9 @@ def process_tool_call(
                 "n_errors": len(validity_report.errors),
                 "n_warnings": len(validity_report.warnings),
                 "matrix_type": validity_report.matrix_type,
+                "matrix_source": validity_report.matrix_source,
+                "use_raw": validity_report.use_raw,
+                "layer_used": validity_report.layer_used,
                 "data_species": validity_report.data_species,
                 "gene_id_format": validity_report.gene_id_format,
             }
@@ -3689,9 +5816,15 @@ def process_tool_call(
                 "saved": output_path is not None,
                 "groupby": groupby,
                 "method": method,
+                "key_added": key_added,
+                "n_genes": n_genes,
                 "n_groups": len(groups),
                 "requested_layer": layer,
+                "requested_use_raw": use_raw,
                 "layer_used": validity_report.layer_used,
+                "use_raw": validity_report.use_raw,
+                "matrix_source": validity_report.matrix_source,
+                "matrix_type": validity_report.matrix_type,
                 "cluster_sizes": validity_report.cluster_sizes,
                 "validity": validity_summary,
                 "caveats_for_gsea": deg_caveats,
@@ -3700,6 +5833,66 @@ def process_tool_call(
                 "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
+
+        elif tool_name == "run_pseudobulk_deg":
+            from ..analysis.pseudobulk import run_pseudobulk_deg
+
+            warnings = _state_preservation_warning(tool_input, adata)
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+
+            sample_col = tool_input["sample_col"]
+            condition_col = tool_input["condition_col"]
+            condition_a = tool_input["condition_a"]
+            condition_b = tool_input["condition_b"]
+            groups_col = tool_input["groups_col"]
+            cell_type = tool_input.get("cell_type")
+            layer = tool_input.get("layer", "raw_counts")
+            min_cells = int(tool_input.get("min_cells") or 10)
+            alpha = float(tool_input.get("alpha") or 0.05)
+            output_path = tool_input.get("output_path")
+
+            # Validate integer counts before aggregating
+            try:
+                _resolve_integer_counts_layer(adata, layer)
+            except ValueError as e:
+                return _error_result(
+                    tool="run_pseudobulk_deg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ensure raw integer counts are in the specified layer (normalize_and_hvg preserves them).",
+                    ],
+                )
+
+            try:
+                result = run_pseudobulk_deg(
+                    adata,
+                    sample_col=sample_col,
+                    condition_col=condition_col,
+                    condition_a=condition_a,
+                    condition_b=condition_b,
+                    groups_col=groups_col,
+                    cell_type=cell_type,
+                    layer=layer,
+                    min_cells=min_cells,
+                    alpha=alpha,
+                    output_path=output_path,
+                )
+            except (ImportError, ValueError) as e:
+                return _error_result(
+                    tool="run_pseudobulk_deg",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify sample_col, condition_col, and groups_col exist and are valid.",
+                        "Ensure ≥2 samples per condition for DESeq2 replication.",
+                    ],
+                    install_hint="pip install decoupler pydeseq2" if "Import" in type(e).__name__ else None,
+                )
+
+            result["warnings"] = warnings
+            result["state"] = make_state(adata)
+            return json.dumps(result, indent=2), adata
 
         elif tool_name == "run_gsea":
             import scanpy as sc
@@ -3716,12 +5909,12 @@ def process_tool_call(
 
             # Check DEG results exist
             if 'rank_genes_groups' not in adata.uns:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_gsea",
-                    "message": "No DEG results found. Run run_deg first.",
-                    "warnings": warnings,
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_gsea",
+                    message="No DEG results found. Run run_deg first.",
+                    adata_obj=adata,
+                    recovery_options=["Run run_deg to generate rank_genes_groups before running GSEA."],
+                )
 
             # Get DEG validity info for caveats
             deg_validity = get_deg_validity(adata)
@@ -3730,12 +5923,12 @@ def process_tool_call(
             try:
                 import gseapy
             except ImportError:
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_gsea",
-                    "message": "gseapy not installed. Use install_package tool first.",
-                    "install_command": "pip install gseapy"
-                }, indent=2), adata
+                return _error_result(
+                    tool="run_gsea",
+                    message="gseapy not installed.",
+                    adata_obj=adata,
+                    install_hint="pip install gseapy",
+                )
 
             os.makedirs(output_dir, exist_ok=True)
 
@@ -3824,9 +6017,8 @@ def process_tool_call(
                 "clusters_analyzed": clusters_to_analyze,
                 "results": all_results,
                 "recommended_next_steps": [
-                    "Use research_findings on the most significant pathway terms for biological interpretation.",
-                    "Use search_papers for broader literature questions or recent reviews.",
-                    "Use web_search_docs for pathway database or software documentation questions."
+                    "Use search_papers on the most significant pathway terms for biological interpretation and recent reviews.",
+                    "Use web_search for pathway database or software documentation questions."
                 ],
                 "note": "NES > 0 means pathway upregulated in this cluster. FDR < 0.25 is typically significant.",
             }
@@ -3919,16 +6111,146 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "read_file":
+            import re as _re
+            file_path = Path(tool_input["path"]).expanduser()
+            if not file_path.exists():
+                return _error_result(
+                    tool="read_file",
+                    message=f"File not found: {file_path}",
+                    adata_obj=adata,
+                    recovery_options=["Verify the file path exists and is accessible."],
+                )
+
+            max_chars = int(tool_input.get("max_chars") or 20000)
+            suffix = file_path.suffix.lower()
+
+            if suffix == ".pdf":
+                try:
+                    import fitz  # pymupdf
+                except ImportError:
+                    return _error_result(
+                        tool="read_file",
+                        message="pymupdf not installed.",
+                        adata_obj=adata,
+                        install_hint="pip install pymupdf",
+                    )
+
+                doc = fitz.open(str(file_path))
+                n_pages = len(doc)
+
+                # Parse page selection
+                pages_param = tool_input.get("pages", "").strip()
+                if pages_param:
+                    selected = set()
+                    for part in _re.split(r"[,\s]+", pages_param):
+                        if "-" in part:
+                            a, b = part.split("-", 1)
+                            selected.update(range(int(a) - 1, int(b)))
+                        elif part.isdigit():
+                            selected.add(int(part) - 1)
+                    page_indices = sorted(p for p in selected if 0 <= p < n_pages)
+                else:
+                    page_indices = list(range(n_pages))
+
+                # Text extraction
+                parts = []
+                for i in page_indices:
+                    text = doc[i].get_text().strip()
+                    if text:
+                        parts.append(f"[Page {i+1}]\n{text}")
+
+                full_text = "\n\n".join(parts)
+                truncated = len(full_text) > max_chars
+                content = full_text[:max_chars]
+
+                result = {
+                    "status": "ok",
+                    "tool": "read_file",
+                    "path": str(file_path),
+                    "type": "pdf",
+                    "total_pages": n_pages,
+                    "pages_read": [i + 1 for i in page_indices],
+                    "truncated": truncated,
+                    "chars_returned": len(content),
+                    "content": content,
+                }
+
+                # Optional page rendering — lets vision model see figures and plots
+                render_pages = bool(tool_input.get("render_pages", False))
+                if render_pages:
+                    import base64 as _b64
+                    if run_manager is not None:
+                        pdf_pages_dir = run_manager.dirs["figures"] / "pdf_pages"
+                    else:
+                        import tempfile
+                        pdf_pages_dir = Path(tempfile.mkdtemp())
+                    pdf_pages_dir.mkdir(parents=True, exist_ok=True)
+
+                    rendered_paths = []
+                    for i in page_indices:
+                        page = doc[i]
+                        mat = fitz.Matrix(1.5, 1.5)  # 108 DPI — good quality, reasonable size
+                        pix = page.get_pixmap(matrix=mat)
+                        out_path = pdf_pages_dir / f"page_{i + 1}.png"
+                        pix.save(str(out_path))
+                        rendered_paths.append(str(out_path))
+
+                    if rendered_paths:
+                        # First page goes to the vision pipeline via _pending_image
+                        result["image_base64"] = _b64.b64encode(
+                            open(rendered_paths[0], "rb").read()
+                        ).decode()
+                        result["image_mime"] = "image/png"
+                        result["image_context"] = {"output_path": rendered_paths[0]}
+                        result["rendered_page_paths"] = rendered_paths
+                        if len(rendered_paths) > 1:
+                            result["note"] = (
+                                f"Page 1 sent to vision model inline. "
+                                f"Remaining {len(rendered_paths) - 1} page(s) saved to "
+                                f"figures/pdf_pages/ — use review_figure to inspect them."
+                            )
+
+                doc.close()
+                return json.dumps(result, indent=2), adata
+
+            else:
+                # Plain text, markdown, CSV, TSV, JSON, etc.
+                try:
+                    raw = file_path.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    return _error_result(
+                        tool="read_file",
+                        message=str(e),
+                        adata_obj=adata,
+                        recovery_options=["Verify the file is readable and in a supported text format."],
+                    )
+
+                truncated = len(raw) > max_chars
+                content = raw[:max_chars]
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "read_file",
+                    "path": str(file_path),
+                    "type": suffix.lstrip(".") or "text",
+                    "truncated": truncated,
+                    "chars_returned": len(content),
+                    "content": content,
+                }, indent=2), adata
+
         else:
-            return json.dumps({
-                "status": "error",
-                "message": f"Unknown tool: {tool_name}"
-            }), adata
+            return _error_result(
+                tool=tool_name,
+                message=f"Unknown tool: {tool_name}",
+                adata_obj=adata,
+                recovery_options=["Check tool name spelling or use inspect_session to list available tools."],
+            )
 
     except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "tool": tool_name,
-            "message": str(e),
-            "error_type": type(e).__name__
-        }, indent=2), adata
+        return _error_result(
+            tool=tool_name,
+            message=str(e),
+            adata_obj=adata,
+            recovery_options=["Review the error and tool input parameters before retrying."],
+            extra={"error_type": type(e).__name__},
+        )

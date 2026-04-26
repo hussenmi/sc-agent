@@ -3,6 +3,8 @@
 Command-line interface for scagent.
 
 Usage:
+    scagent start                           # Interactive session (recommended)
+    scagent start --data adata.h5ad         # Start and auto-inspect data
     scagent analyze "your request" --data path/to/data.h5
     scagent analyze --data path/to/data.h5  # Auto-analyze
     scagent inspect path/to/data.h5ad
@@ -10,6 +12,9 @@ Usage:
 """
 
 import argparse
+import os
+import shutil
+import subprocess
 import sys
 
 
@@ -19,6 +24,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Start an interactive session (recommended)
+  scagent start
+  scagent start --data pbmc.h5ad
+
   # Full analysis with custom request
   scagent analyze "QC, cluster, and annotate cell types" --data pbmc.h5
 
@@ -36,12 +45,53 @@ Examples:
 
   # Use specific provider/model
   scagent analyze --data pbmc.h5 --provider openai --model gpt-4o
+
+  # Use ChatGPT/Codex login instead of API billing (experimental)
+  scagent login chatgpt
+  scagent analyze --data pbmc.h5 --provider codex
         """
     )
 
     parser.add_argument("--version", action="store_true", help="Show version")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
+    # === start command ===
+    start_parser = subparsers.add_parser(
+        "start",
+        help="Start an interactive session (no initial request required)"
+    )
+    start_parser.add_argument(
+        "--data", "-d",
+        default=None,
+        help="Optional data file to load and inspect at startup"
+    )
+    start_parser.add_argument(
+        "--output", "-o",
+        default=".",
+        help="Output directory for run artifacts (default: current directory)"
+    )
+    start_parser.add_argument(
+        "--name", "-n",
+        default=None,
+        help="Run name for output directory"
+    )
+    start_parser.add_argument(
+        "--provider", "-p",
+        choices=["openai", "anthropic", "groq", "codex"],
+        default=None,
+        help="LLM provider (default: from .env or anthropic)"
+    )
+    start_parser.add_argument(
+        "--model", "-m",
+        default=None,
+        help="Model name (default: provider default)"
+    )
+    start_parser.add_argument(
+        "--context-usage",
+        action="store_true",
+        default=True,
+        help="Show context window usage in the spinner during each model call"
+    )
     # === analyze command ===
     analyze_parser = subparsers.add_parser(
         "analyze",
@@ -70,9 +120,9 @@ Examples:
     )
     analyze_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "groq", "codex"],
         default=None,
-        help="LLM provider (default: from .env or anthropic)"
+        help="LLM provider (default: from .env or anthropic; codex is experimental)"
     )
     analyze_parser.add_argument(
         "--model", "-m",
@@ -146,9 +196,30 @@ Examples:
     )
     chat_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "groq", "codex"],
         default=None,
         help="LLM provider"
+    )
+
+    # === login command ===
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Log in to subscription-backed providers"
+    )
+    login_parser.add_argument(
+        "provider",
+        choices=["chatgpt", "codex"],
+        help="Provider login target. chatgpt and codex both use Codex CLI auth."
+    )
+    login_parser.add_argument(
+        "--device-auth",
+        action="store_true",
+        help="Use Codex device auth flow, helpful on remote/HPC shells."
+    )
+    login_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show current Codex login status instead of starting login."
     )
 
     args = parser.parse_args()
@@ -163,7 +234,9 @@ Examples:
         return 0
 
     # Handle commands
-    if args.command == "analyze":
+    if args.command == "start":
+        return run_start(args)
+    elif args.command == "analyze":
         return run_analyze(args)
     elif args.command == "inspect":
         return run_inspect(args)
@@ -171,6 +244,126 @@ Examples:
         return run_qc(args)
     elif args.command == "chat":
         return run_chat(args)
+    elif args.command == "login":
+        return run_login(args)
+
+    return 0
+
+
+def _maybe_save_on_exit(agent, console) -> None:
+    """Prompt to save adata if data is loaded and unsaved at session end."""
+    if agent.adata is None:
+        return
+    from pathlib import Path
+    from scagent.terminal import read_user_input
+    run_dir = agent.run_manager.run_dir if agent.run_manager else Path(agent.output_dir)
+    default_path = str(run_dir / "final_result.h5ad")
+    try:
+        console.print(f"\n[yellow]You have data in memory. Save before exiting?[/yellow] [dim](Enter path, or press Enter for default: {default_path}, or n to skip)[/dim]")
+        response = read_user_input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if response.lower() in ("n", "no", "skip"):
+        return
+    save_path = response if response and response.lower() not in ("y", "yes") else default_path
+    try:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        agent.adata.write_h5ad(save_path)
+        console.print(f"[green]Saved to {save_path}[/green]")
+    except Exception as e:
+        console.print(f"[red]Save failed: {e}[/red]")
+
+
+def run_start(args):
+    """Start an interactive session."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from scagent.agent import SCAgent
+    from scagent.terminal import read_user_input
+
+    if not sys.stdin.isatty():
+        print("Interactive session requires a TTY. Run scagent start from a terminal.")
+        return 1
+
+    console = Console()
+
+    # Create agent early so we can show the real model name in the welcome
+    agent = SCAgent(
+        provider=args.provider,
+        model=args.model,
+        verbose=True,
+        collaborative=True,
+        output_dir=args.output,
+        show_context_usage=getattr(args, 'context_usage', False),
+    )
+
+    # Welcome panel
+    cwd = os.path.abspath(args.output)
+    data_line = f"  Data:     {os.path.abspath(args.data)}" if args.data else "  Data:     none loaded yet"
+    welcome_text = Text.assemble(
+        ("scagent", "bold cyan"),
+        " — single-cell RNA-seq analysis agent\n\n",
+        ("  Working dir: ", "dim"),
+        (cwd, "white"),
+        "\n",
+        ("  Provider:   ", "dim"),
+        (f"{agent.provider}:{agent.model}", "white"),
+        "\n",
+        ("  Data:       ", "dim"),
+        (os.path.abspath(args.data) if args.data else "none loaded yet", "white"),
+        "\n\n",
+        ("Type your request to begin. Type ", "dim"),
+        ("exit", "bold"),
+        (" or ", "dim"),
+        ("quit", "bold"),
+        (" to end the session.", "dim"),
+    )
+    console.print(Panel(welcome_text, border_style="cyan", padding=(0, 1)))
+
+    run_name = args.name
+
+    # If data was given, auto-inspect it before the first user prompt
+    if args.data:
+        console.print()
+        try:
+            agent.analyze(
+                request="Load and inspect this data. Describe what you find — shape, processing state, metadata, and biology.",
+                data_path=args.data,
+                run_name=run_name,
+            )
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+        run_name = None  # run dir already created; don't rename on follow-ups
+
+    # REPL
+    while True:
+        try:
+            agent._update_context_bar()
+            user_input = read_user_input("\n> ")
+        except (EOFError, KeyboardInterrupt):
+            _maybe_save_on_exit(agent, console)
+            console.print("\n[dim]Session ended.[/dim]")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ("exit", "quit", "q", "done"):
+            _maybe_save_on_exit(agent, console)
+            console.print("[dim]Session ended.[/dim]")
+            break
+
+        try:
+            agent.analyze(
+                request=user_input,
+                data_path=None,
+                run_name=run_name,
+                continue_conversation=True,
+            )
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted. You can continue or type exit to quit.[/yellow]")
+        run_name = None  # run dir created after first turn
 
     return 0
 
@@ -178,6 +371,7 @@ Examples:
 def run_analyze(args):
     """Run autonomous analysis."""
     from scagent.agent import SCAgent
+    from scagent.terminal import read_user_input
 
     if not sys.stdin.isatty():
         print(
@@ -217,12 +411,17 @@ def run_analyze(args):
     print("-" * 50)
 
     # First analysis
-    result = agent.analyze(
-        request=request,
-        data_path=args.data,
-        run_name=args.name,
-        max_iterations=args.max_iterations,
-    )
+    try:
+        result = agent.analyze(
+            request=request,
+            data_path=args.data,
+            run_name=args.name,
+            max_iterations=args.max_iterations,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        if not args.interactive:
+            return 0
 
     # Interactive mode - continue conversation
     if args.interactive:
@@ -234,7 +433,7 @@ def run_analyze(args):
         while True:
             try:
                 # Just show a prompt - the conversation is ongoing
-                user_input = input("\n> ").strip()
+                user_input = read_user_input("\n> ")
 
                 if user_input.lower() in ['done', 'exit', 'quit', 'q']:
                     print("Exiting interactive mode.")
@@ -244,12 +443,15 @@ def run_analyze(args):
                     continue
 
                 # Continue analysis with the same agent (preserves state and conversation)
-                result = agent.analyze(
-                    request=user_input,
-                    data_path=None,  # Use existing loaded data
-                    max_iterations=args.max_iterations,
-                    continue_conversation=True,  # Keep conversation history
-                )
+                try:
+                    result = agent.analyze(
+                        request=user_input,
+                        data_path=None,  # Use existing loaded data
+                        max_iterations=args.max_iterations,
+                        continue_conversation=True,  # Keep conversation history
+                    )
+                except KeyboardInterrupt:
+                    print("\nInterrupted. You can continue or type exit to quit.")
 
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting interactive mode.")
@@ -312,6 +514,30 @@ def run_chat(args):
     print(response)
 
     return 0
+
+
+def run_login(args):
+    """Run subscription-backed login flows."""
+    command = os.environ.get("SCAGENT_CODEX_COMMAND", "codex")
+    if shutil.which(command) is None:
+        print(
+            "Codex CLI was not found. Install Codex or set SCAGENT_CODEX_COMMAND "
+            "to the Codex executable path."
+        )
+        return 1
+
+    if args.status:
+        cmd = [command, "login", "status"]
+    else:
+        cmd = [command, "login"]
+        if args.device_auth:
+            cmd.append("--device-auth")
+        print(
+            "Starting Codex ChatGPT login. This uses Codex/ChatGPT subscription "
+            "auth for the experimental `--provider codex` backend."
+        )
+
+    return subprocess.run(cmd).returncode
 
 
 if __name__ == "__main__":

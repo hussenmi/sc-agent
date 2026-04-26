@@ -127,6 +127,8 @@ class DEGValidityReport:
     groupby: str = ""
     method: str = ""
     layer_used: Optional[str] = None
+    use_raw: bool = False
+    matrix_source: str = "adata.X"
 
     # Issues found
     issues: List[DEGValidityIssue] = field(default_factory=list)
@@ -222,7 +224,12 @@ class DEGValidityReport:
             "groupby": self.groupby,
             "method": self.method,
             "layer_used": self.layer_used,
+            "use_raw": self.use_raw,
+            "matrix_source": self.matrix_source,
             "issues": [i.to_dict() for i in self.issues],
+            "errors": [i.message for i in self.errors],
+            "warnings": [i.message for i in self.warnings],
+            "infos": [i.message for i in self.infos],
             "n_groups": self.n_groups,
             "n_cells_total": self.n_cells_total,
             "cluster_sizes": self.cluster_sizes,
@@ -243,7 +250,10 @@ class DEGValidityReport:
         lines = []
         lines.append(f"DEG Validity Report ({self.validated_at})")
         lines.append(f"  Groups: {self.n_groups} ({self.n_cells_total:,} cells)")
-        lines.append(f"  Method: {self.method}, Layer: {self.layer_used or 'X'}")
+        lines.append(
+            f"  Method: {self.method}, Matrix: {self.matrix_source}, "
+            f"Layer: {self.layer_used or 'None'}, use_raw={self.use_raw}"
+        )
         lines.append(f"  Species: {self.data_species}, Gene format: {self.gene_id_format}")
 
         if self.is_valid and not self.has_warnings:
@@ -278,20 +288,31 @@ def _detect_matrix_type(X) -> str:
     """
     if sp.issparse(X):
         data = X.data
+        if len(data) == 0:
+            return "unknown"
         max_val = X.max()
         min_val = X.min()
+        sample_size = min(100000, len(data))
+        if len(data) > sample_size:
+            rng = np.random.default_rng(0)
+            indices = rng.choice(len(data), sample_size, replace=False)
+            sample_data = data[indices]
+        else:
+            sample_data = data
     else:
-        data = X.flatten()
-        max_val = np.max(X)
-        min_val = np.min(X)
-
-    # Sample for efficiency
-    sample_size = min(100000, len(data))
-    if len(data) > sample_size:
-        indices = np.random.choice(len(data), sample_size, replace=False)
-        sample_data = data[indices]
-    else:
-        sample_data = data
+        arr = np.asarray(X)
+        if arr.size == 0:
+            return "unknown"
+        sample_size = min(100000, arr.size)
+        if arr.size > sample_size:
+            rng = np.random.default_rng(0)
+            rows = rng.integers(0, arr.shape[0], size=sample_size)
+            cols = rng.integers(0, arr.shape[1], size=sample_size) if arr.ndim > 1 else None
+            sample_data = arr[rows, cols] if cols is not None else arr[rows]
+        else:
+            sample_data = arr.ravel()
+        max_val = np.nanmax(sample_data)
+        min_val = np.nanmin(sample_data)
 
     # Check for integer values (counts)
     is_integer = np.allclose(sample_data, np.round(sample_data))
@@ -312,6 +333,52 @@ def _detect_matrix_type(X) -> str:
         return "normalized"
     else:
         return "unknown"
+
+
+def _resolve_expression_source(
+    adata: AnnData,
+    layer: Optional[str],
+    use_raw: Optional[bool],
+) -> Tuple[Any, Optional[str], bool, str, List[DEGValidityIssue]]:
+    """
+    Resolve the exact matrix that rank_genes_groups should use.
+
+    Scanpy defaults to adata.raw when use_raw=None and adata.raw exists. We make
+    that implicit behavior explicit so validation, execution, and reporting all
+    refer to the same matrix.
+    """
+    issues: List[DEGValidityIssue] = []
+
+    if layer:
+        if layer not in adata.layers:
+            issues.append(DEGValidityIssue(
+                severity=IssueSeverity.ERROR,
+                category=IssueCategory.LAYER_COMPATIBILITY,
+                message=f"Requested DEG layer '{layer}' was not found",
+                details={"available_layers": list(adata.layers.keys())},
+                suggestion="Use an available layer, use adata.raw, or omit layer to use adata.X.",
+            ))
+            return adata.X, None, False, "adata.X", issues
+        return adata.layers[layer], layer, False, f"adata.layers['{layer}']", issues
+
+    if use_raw is None:
+        resolved_use_raw = adata.raw is not None
+    elif use_raw:
+        resolved_use_raw = adata.raw is not None
+        if not resolved_use_raw:
+            issues.append(DEGValidityIssue(
+                severity=IssueSeverity.ERROR,
+                category=IssueCategory.LAYER_COMPATIBILITY,
+                message="use_raw=True was requested for DEG, but adata.raw is not set",
+                details={"has_raw": False},
+                suggestion="Set adata.raw after log-normalization or run DEG on a named log-normalized layer.",
+            ))
+    else:
+        resolved_use_raw = False
+
+    if resolved_use_raw:
+        return adata.raw.X, None, True, "adata.raw.X", issues
+    return adata.X, None, False, "adata.X", issues
 
 
 def _detect_species_from_genes(gene_names: List[str]) -> str:
@@ -661,6 +728,7 @@ def validate_deg_input(
     groupby: str = "leiden",
     method: str = "wilcoxon",
     layer: Optional[str] = None,
+    use_raw: Optional[bool] = None,
     target_geneset: str = "MSigDB_Hallmark_2020",
     min_cluster_size: int = 20,
     warn_cluster_size: int = 50,
@@ -684,7 +752,10 @@ def validate_deg_input(
     method : str
         DEG method: 'wilcoxon', 't-test', 'logreg'.
     layer : str, optional
-        Layer to use for DEG. If None, uses adata.X.
+        Layer to use for DEG. If set, overrides adata.raw.
+    use_raw : bool, optional
+        Whether to use adata.raw. If None, mirrors Scanpy's default: use
+        adata.raw when present.
     target_geneset : str
         Target gene set database for compatibility check.
     min_cluster_size : int
@@ -701,13 +772,23 @@ def validate_deg_input(
     DEGValidityReport
         Comprehensive validation report.
     """
+    X, actual_layer, actual_use_raw, matrix_source, source_issues = _resolve_expression_source(
+        adata,
+        layer=layer,
+        use_raw=use_raw,
+    )
+
     report = DEGValidityReport(
         validated_at=datetime.now().isoformat(),
         groupby=groupby,
         method=method,
-        layer_used=layer,
+        layer_used=actual_layer,
+        use_raw=actual_use_raw,
+        matrix_source=matrix_source,
         n_cells_total=adata.n_obs,
     )
+    for issue in source_issues:
+        report.add_issue(issue)
 
     # Check groupby exists
     if groupby not in adata.obs.columns:
@@ -721,21 +802,18 @@ def validate_deg_input(
 
     report.n_groups = adata.obs[groupby].nunique()
 
-    # Detect matrix type
-    if layer is not None and layer in adata.layers:
-        X = adata.layers[layer]
-    else:
-        X = adata.X
-
     report.matrix_type = _detect_matrix_type(X)
 
     # Check layer/method compatibility
     report.issues.extend(_check_layer_method_compatibility(
-        report.matrix_type, method, layer
+        report.matrix_type, method, actual_layer
     ))
 
     # Detect species and gene format
-    gene_names = adata.var_names.tolist()
+    if report.use_raw and adata.raw is not None:
+        gene_names = adata.raw.var_names.tolist()
+    else:
+        gene_names = adata.var_names.tolist()
     report.data_species = _detect_species_from_genes(gene_names)
 
     # Detect gene ID format
@@ -841,7 +919,7 @@ def run_validated_deg(
     method: str = "wilcoxon",
     n_genes: int = 100,
     layer: Optional[str] = None,
-    use_raw: bool = True,
+    use_raw: Optional[bool] = None,
     key_added: str = "rank_genes_groups",
     target_geneset: str = "MSigDB_Hallmark_2020",
     min_cluster_size: int = 20,
@@ -874,8 +952,9 @@ def run_validated_deg(
     layer : str, optional
         Layer to use. If None, Wilcoxon uses the active normalized/log1p
         analysis matrix; other methods may opt into a preserved raw-count layer.
-    use_raw : bool
-        Whether non-Wilcoxon methods may prefer a preserved raw-count layer.
+    use_raw : bool, optional
+        Whether to use adata.raw. If None, mirrors Scanpy's default: use
+        adata.raw when present.
     key_added : str
         Key in adata.uns for results.
     target_geneset : str
@@ -906,23 +985,13 @@ def run_validated_deg(
     if not inplace:
         adata = adata.copy()
 
-    # Preserve workshop best practice: keep raw counts in a layer, but run
-    # Wilcoxon DEG on the active normalized/log1p analysis matrix unless the
-    # caller explicitly requests a different layer.
-    actual_layer = layer
-    if actual_layer is None and use_raw and method != "wilcoxon":
-        for raw_layer in ["raw_counts", "counts", "raw_data"]:
-            if raw_layer in adata.layers:
-                actual_layer = raw_layer
-                logger.info(f"Using '{actual_layer}' layer for DEG")
-                break
-
     # Run pre-validation
     report = validate_deg_input(
         adata,
         groupby=groupby,
         method=method,
-        layer=actual_layer,
+        layer=layer,
+        use_raw=use_raw,
         target_geneset=target_geneset,
         min_cluster_size=min_cluster_size,
         warn_cluster_size=warn_cluster_size,
@@ -931,6 +1000,8 @@ def run_validated_deg(
         batch_key=batch_key,
         batch_confound_threshold=batch_confound_threshold,
     )
+    actual_layer = report.layer_used
+    actual_use_raw = report.use_raw
 
     # Log validation results
     logger.info(report.summary())
@@ -953,6 +1024,7 @@ def run_validated_deg(
         n_genes=n_genes,
         key_added=key_added,
         layer=actual_layer,
+        use_raw=actual_use_raw,
     )
 
     # Run post-validation

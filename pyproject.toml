@@ -26,8 +26,11 @@ dependencies = [
     "celltypist>=1.6",
     "phenograph>=1.5",
     "h5py>=3.7",
-    "scikit-misc>=0.3",  # Required for seurat_v3 HVG selection
-    "rich>=13.0",  # Terminal UI (spinners, progress bars)
+    "scikit-misc>=0.3", # Required for seurat_v3 HVG selection
+    "rich>=13.0", # Terminal UI (spinners, progress bars)
+    "prompt_toolkit>=3.0", # Robust terminal input and bracketed paste handling
+    "pymupdf>=1.27.2.2",
+    "scib-metrics>=0.5.6",
 ]
 
 [project.optional-dependencies]

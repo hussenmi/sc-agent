@@ -64,6 +64,7 @@ skills/
 runs/
 run*
 analysis/
+test_data/
 
 # macOS metadata files
 ._*
@@ -71,3 +72,5 @@ analysis/
 # some files
 test*.py
 scagent/agent/prompts_backup.py
+*.pdf
+claude_local.sh

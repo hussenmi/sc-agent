@@ -135,14 +135,21 @@ class RunManager:
         self._step_counter = 0
 
     def create(self):
-        """Create the run directory structure."""
-        for name, path in self.dirs.items():
-            path.mkdir(parents=True, exist_ok=True)
+        """Create the run root directory and initial manifest.
 
-        # Save initial manifest
+        Subdirectories (figures/, reports/, logs/, gsea/) are created lazily
+        the first time something is written to them — so a session that only
+        inspects data produces a clean directory with just manifest.json.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         self._save_manifest()
-
         return self
+
+    @staticmethod
+    def _ensure(path: Path) -> Path:
+        """Create a directory and its parents if they don't exist."""
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _save_manifest(self):
         """Save manifest to disk."""
@@ -151,7 +158,7 @@ class RunManager:
 
     def append_log(self, message: str, filename: str = "agent.log"):
         """Append a line to a run log file."""
-        log_path = self.dirs["logs"] / filename
+        log_path = self._ensure(self.dirs["logs"]) / filename
         timestamp = datetime.now().isoformat()
         with open(log_path, "a") as f:
             f.write(f"[{timestamp}] {message}\n")
@@ -251,16 +258,16 @@ class RunManager:
         return str(self.dirs["intermediate"] / filename)
 
     def get_figure_path(self, name: str, ext: str = "png") -> str:
-        """Get path for a figure."""
-        return str(self.dirs["figures"] / f"{name}.{ext}")
+        """Get path for a figure. Creates figures/ on first use."""
+        return str(self._ensure(self.dirs["figures"]) / f"{name}.{ext}")
 
     def get_report_path(self, name: str, ext: str = "csv") -> str:
-        """Get path for a report file."""
-        return str(self.dirs["reports"] / f"{name}.{ext}")
+        """Get path for a report file. Creates reports/ on first use."""
+        return str(self._ensure(self.dirs["reports"]) / f"{name}.{ext}")
 
     def write_text_report(self, name: str, content: str, ext: str = "md") -> str:
         """Write a text report into the reports directory and register it."""
-        path = self.dirs["reports"] / f"{name}.{ext}"
+        path = self._ensure(self.dirs["reports"]) / f"{name}.{ext}"
         with open(path, "w") as f:
             f.write(content)
         self.add_output(str(path))
@@ -268,7 +275,7 @@ class RunManager:
 
     def write_json_report(self, name: str, payload: Dict[str, Any]) -> str:
         """Write a JSON report into the reports directory and register it."""
-        path = self.dirs["reports"] / f"{name}.json"
+        path = self._ensure(self.dirs["reports"]) / f"{name}.json"
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
         self.add_output(str(path))
@@ -306,52 +313,56 @@ class RunManager:
 
         self._save_manifest()
 
-    def complete(self, summary: str = ""):
-        """Mark run as completed and save final manifest."""
+    def append_findings(self, request: str, summary: str, tools_used: List[str]) -> str:
+        """Append one turn's findings to the running findings log (conversation.md).
+
+        This is called automatically at the end of every completed turn so the
+        file grows into a readable research journal.  It is separate from
+        summary.md which is only written when the user explicitly requests it.
+        """
+        findings_path = self._ensure(self.dirs["reports"]) / "conversation.md"
+        is_new = not findings_path.exists()
+
+        with open(findings_path, "a") as f:
+            if is_new:
+                f.write(f"# Findings Log: {self.run_id}\n\n")
+                f.write(f"**Dataset:** {', '.join(self.manifest.input_files) or 'unknown'}\n\n")
+                f.write("---\n\n")
+
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            f.write(f"## {ts} — {request[:80]}\n\n")
+
+            meaningful_tools = [t for t in tools_used if t not in ("follow_up", "inspect_run_state")]
+            if meaningful_tools:
+                f.write(f"**Tools:** {', '.join(meaningful_tools)}\n\n")
+
+            if summary:
+                f.write(f"{summary}\n\n")
+
+            f.write("---\n\n")
+
+        return str(findings_path)
+
+    def complete(self, summary: str = "", request: str = ""):
+        """Mark run as completed, append to findings log, save manifest.
+
+        Does NOT write summary.md — that is a curated document the user
+        requests explicitly (e.g. 'give me a summary of what we've done').
+        The findings log (conversation.md) is the auto-maintained research journal.
+        """
         self.manifest.status = "completed"
         self._save_manifest()
 
-        # Write summary report
-        summary_path = self.dirs["reports"] / "summary.md"
-        with open(summary_path, 'w') as f:
-            f.write(f"# Run Summary: {self.run_id}\n\n")
-            f.write(f"**Status:** {self.manifest.status}\n")
-            f.write(f"**Created:** {self.manifest.created_at}\n")
-            f.write(f"**User:** {self.manifest.user}@{self.manifest.host}\n\n")
+        # Collect tools used in this turn from recent steps
+        recent_tools = [
+            s["tool"] for s in self.manifest.steps_completed[-20:]
+        ]
 
-            if self.manifest.request:
-                f.write(f"## Request\n\n{self.manifest.request}\n\n")
+        turn_request = request or self.manifest.request or ""
+        if summary and turn_request:
+            self.append_findings(turn_request, summary, recent_tools)
 
-            f.write("## Steps Completed\n\n")
-            for step in self.manifest.steps_completed:
-                f.write(f"- **{step['tool']}**")
-                if step.get('output_path'):
-                    f.write(f" → `{Path(step['output_path']).name}`")
-                f.write("\n")
-
-            if summary:
-                f.write(f"\n## Summary\n\n{summary}\n")
-
-            if self.manifest.warnings:
-                f.write("\n## Warnings\n\n")
-                for w in self.manifest.warnings:
-                    f.write(f"- {w}\n")
-
-            if self.manifest.artifact_registry:
-                f.write("\n## Artifacts\n\n")
-                for artifact in self.manifest.artifact_registry[-10:]:
-                    label = artifact.get("kind", "artifact")
-                    path = artifact.get("path", "")
-                    f.write(f"- `{label}` → `{Path(path).name}`\n")
-
-            if self.manifest.user_decisions:
-                f.write("\n## Decisions\n\n")
-                for decision in self.manifest.user_decisions[-10:]:
-                    key = decision.get("key", "decision")
-                    value = decision.get("applied_value", decision.get("recommended_value"))
-                    f.write(f"- `{key}` → `{value}`\n")
-
-        return str(summary_path)
+        return str(self.dirs["reports"] / "conversation.md")
 
     def fail(self, error: str):
         """Mark run as failed."""

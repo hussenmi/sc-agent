@@ -17,6 +17,9 @@ import sys
 
 # Test data path
 PBMC_PATH = "/data1/peerd/sharmar1/workshop_2025_files/workshop_data/pbmc_data/pbmc_10k_v3_filtered_feature_bc_matrix.h5"
+SECOND_PATH = "/data1/peerd/ibrahih3/cs_agent/test_data/GSE155249_main.h5ad.gz"
+THIRD_PATH = "/data1/peerd/sharmar1/workshop_2025_files/workshop_code/session_5/batch_uncorrected_data.h5ad"
+FOURTH_PATH = "/data1/peerd/sharmar1/workshop_2025_files/workshop_data/machete_processed_adata.h5ad"
 
 
 def test_inspect(provider: str):

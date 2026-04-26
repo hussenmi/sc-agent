@@ -15,8 +15,8 @@
 - **Differential Expression**: Wilcoxon, t-test, logistic regression
 
 ### Autonomous Agent
-- **Multi-provider**: Works with OpenAI (GPT-4o, GPT-5.4, etc.) or Anthropic (Claude)
-- **18 Built-in Tools**: QC, clustering, annotation, visualization, and more
+- **Multi-provider**: Works with OpenAI, Anthropic, Groq, or experimental ChatGPT/Codex login
+- **32 Built-in Tools**: QC, clustering, annotation, visualization, research, and more
 - **Code Generation**: Dynamically writes and executes Python for custom analyses
 - **Vision Support**: Agent can see and analyze generated plots
 - **Web Search**: Look up gene functions, pathways, best practices
@@ -42,7 +42,7 @@ uv pip install -e ".[agent]"
 Create a `.env` file (copy from `.env.example`):
 
 ```bash
-# API Keys (only one provider required)
+# API Keys (only one API provider required)
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 
@@ -50,6 +50,18 @@ ANTHROPIC_API_KEY=sk-ant-...
 SCAGENT_PROVIDER=openai
 SCAGENT_MODEL=gpt-5.4-mini
 ```
+
+For experimental ChatGPT/Codex subscription-backed runs, log in first and then select
+the Codex provider:
+
+```bash
+scagent login chatgpt
+scagent analyze --data pbmc.h5 --provider codex
+```
+
+This uses Codex/ChatGPT login rather than OpenAI Platform API billing. It is not
+identical to API function-calling mode yet, so keep `openai`, `anthropic`, or `groq`
+as the production path for now.
 
 ## Quick Start
 
@@ -302,6 +314,8 @@ scagent analyze "your request" --data file.h5      # Collaborative agent run
 scagent analyze --data file.h5                     # Let the agent choose a first pass
 scagent analyze --data file.h5 --single-run        # Exit after the initial collaborative turn
 scagent analyze --data file.h5 --provider openai   # Use OpenAI instead of Anthropic
+scagent login chatgpt                              # Log in for experimental Codex provider
+scagent analyze --data file.h5 --provider codex    # Use ChatGPT/Codex login instead of API key
 
 # Direct mode - no LLM
 scagent qc input.h5 output.h5ad                   # Run QC pipeline directly
