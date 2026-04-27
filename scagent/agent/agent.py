@@ -29,6 +29,53 @@ logger = logging.getLogger(__name__)
 
 Provider = Literal["anthropic", "openai", "groq", "codex"]
 
+_SMART_AUTONOMOUS_PROMPT = """
+
+## Smart Autonomous Mode
+
+You are running in smart autonomous mode. **Drive the analysis forward without pausing** — you are the expert. Execute, narrate your reasoning, and keep going. Only stop when you genuinely cannot proceed without information the user alone can provide.
+
+### How to work
+
+**Narrate the WHY, not just the WHAT.** Before each tool call, write one sentence that includes your reasoning — not just the action. Examples:
+- "Running PCA on 30 components — standard for this cell count and matches our lab defaults."
+- "Using Leiden at resolution 1.0 as a starting point; I'll report cluster count and you can adjust if needed."
+- "Running CellTypist with Immune_All_High — this dataset looks like immune cells based on the marker genes."
+
+**Do NOT present numbered options at the end of every turn.** After completing a phase, give a brief status summary (what you found, what's next) and continue unless there's a real reason to stop. Options menus are for decisions, not routine narration.
+
+**Proceed without pausing for:** standard preprocessing (normalization, HVG, PCA, neighbors, UMAP), algorithm parameter choices with established best practices, reversible steps you can re-run with different settings.
+
+### When to use `pause_and_ask`
+
+Use it — and only use it — when:
+1. **You need information only the user has.** Multiple equally plausible batch keys (e.g. `sample_id`, `batch`, `donor`) and nothing in the data resolves the ambiguity. Experimental design details that affect the analysis direction. Cell type context for manual annotation.
+2. **Results are surprising in a consequential way.** Doublet rate >15%. QC removes >30% of cells at any reasonable threshold. Clustering reveals clear batch structure rather than biology. Anything that changes what should happen next in a non-obvious way.
+3. **A genuine fork with large downstream consequences.** Not "which resolution?" — try one and explain. But "should I integrate across disease and control, or analyze them separately?" — that requires the user's scientific intent.
+
+After calling `pause_and_ask`, write the question clearly in your response and end your turn. Do not call any more tools.
+
+### QC filtering always requires confirmation
+
+Even in smart autonomous mode, QC filtering is irreversible and requires the user to see the numbers first:
+1. Run `run_qc(preview_only=True)` — analyze the figures, derive thresholds from the actual distributions
+2. State the proposed thresholds and projected cell removal counts
+3. Call `pause_and_ask` with the specific question ("Proceed with MT <20%, which removes 342/8421 cells (4%)?")
+4. After confirmation, run `run_qc(confirm_filtering=True, ...)` with the agreed thresholds
+
+### Automatic checkpoints
+
+Before QC filtering and batch correction, the system automatically saves an h5ad checkpoint. When the tool result includes `auto_checkpoint_saved`, mention it: "A checkpoint was saved at `<path>` — use `load_data('<path>')` to return to this state if needed."
+
+### Per-phase expectations
+
+- **Loading → inspection:** always call `inspect_data` immediately after `load_data` — never substitute run_code for this step. Then narrate findings and proceed to QC.
+- **QC → normalization → PCA → neighbors → UMAP:** after QC confirmation, run the rest in sequence without pausing; explain each parameter choice in one sentence
+- **Clustering:** run at a starting resolution, report findings, mention that resolution can be adjusted — don't stop to ask unless the cluster structure is genuinely unexpected
+- **Annotation:** run appropriate tool(s), interpret proportions, flag biological surprises; only pause if you need the user's domain knowledge to proceed
+- **Batch correction:** checkpoint auto-saved, run correction, then run neighbors + UMAP, then report integration quality — don't wait between these steps
+"""
+
 FAILURE_PATTERNS = [
     r"\berror:",
     r"\bfailed to\b",
@@ -196,6 +243,7 @@ class SCAgent:
         base_url: Optional[str] = None,
         verbose: bool = True,
         collaborative: bool = True,
+        smart_autonomous: bool = False,
         create_run_dir: bool = True,
         output_dir: str = ".",
         save_checkpoints: bool = False,
@@ -217,6 +265,7 @@ class SCAgent:
         self.provider = provider
         self.verbose = verbose
         self.collaborative = collaborative
+        self.smart_autonomous = smart_autonomous
         self.create_run_dir = create_run_dir
         self.output_dir = output_dir
         self.save_checkpoints = save_checkpoints
@@ -798,7 +847,7 @@ class SCAgent:
         tool_input: Dict[str, Any],
         result_data: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        if not self.collaborative or result_data.get("status") != "ok":
+        if not self.collaborative or self.smart_autonomous or result_data.get("status") != "ok":
             return None
 
         checkpoint: Optional[Dict[str, Any]] = None
@@ -1266,6 +1315,8 @@ class SCAgent:
                 "then call the appropriate tool. Do not include this sentence inside the "
                 "thinking block — write it as plain response text after the closing tag."
             )
+        if self.smart_autonomous:
+            prompt += _SMART_AUTONOMOUS_PROMPT
         return f"{prompt}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
 
     def _current_capabilities(self) -> Dict[str, Any]:
@@ -1773,7 +1824,7 @@ class SCAgent:
         if self.run_manager:
             user_message += f"\nOutput directory: {self.run_manager.run_dir}"
 
-        if self.collaborative and not sys.stdin.isatty():
+        if self.collaborative and not self.smart_autonomous and not sys.stdin.isatty():
             message = (
                 "Collaborative agent mode requires an interactive terminal because the agent must "
                 "pause and ask for decisions at checkpoints."
@@ -2525,6 +2576,7 @@ class SCAgent:
         "web_search":           "Searching web",
         "review_artifact":      "Reviewing artifact",
         "read_file":            "Reading file",
+        "pause_and_ask":        "Pausing for guidance",
     }
 
     # Tools that produce their own tqdm/progress output. Using Rich's console.status()
@@ -2624,6 +2676,7 @@ class SCAgent:
                 tool_input["output_path"] = self.run_manager.get_intermediate_path(_sanitize_name(tool_name))
 
         _prepare_tool_paths()
+        auto_checkpoint_path = self._maybe_auto_checkpoint(tool_name, tool_input)
         self._apply_world_state_overrides(tool_name, tool_input)
         # Don't re-sync here — we already synced at the start of analyze() and after
         # the previous tool call. Re-syncing before execution hits adata.X on every
@@ -2643,6 +2696,8 @@ class SCAgent:
                 "message": "ask_user is no longer used — present options in your final response text.",
                 "user_response": "proceed",
             }, indent=2)
+        elif tool_name == "pause_and_ask":
+            result_json = self._handle_pause_and_ask(tool_input)
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
             result_json = self._handle_install_package(tool_input)
@@ -2758,6 +2813,8 @@ class SCAgent:
                 result_data,
                 before_snapshot,
             )
+            if auto_checkpoint_path and result_data.get("status") == "ok":
+                result_data["auto_checkpoint_saved"] = str(auto_checkpoint_path)
             checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
             if checkpoint is None:
                 checkpoint = self._build_recovery_checkpoint(tool_name, tool_input, result_data)
@@ -3427,6 +3484,62 @@ class SCAgent:
             "selected_action": selected_action,
             "selected_index": selected_index,
         }, indent=2)
+
+    def _handle_pause_and_ask(self, tool_input: Dict[str, Any]) -> str:
+        """Handle pause_and_ask tool — create a pending checkpoint from LLM-initiated pause."""
+        question = tool_input.get("question", "")
+        context = tool_input.get("context", "")
+        options = tool_input.get("options") or []
+        option_actions = ["custom"] * len(options)
+
+        checkpoint = {
+            "kind": "llm_pause",
+            "question": question,
+            "context": context,
+            "options": options,
+            "option_actions": option_actions,
+            "summary": context,
+            "decision_key": "llm_pause",
+            "artifacts": [],
+        }
+        self._set_pending_checkpoint(checkpoint)
+        return json.dumps({
+            "status": "ok",
+            "tool": "pause_and_ask",
+            "paused": True,
+            "question": question,
+            "context": context,
+            "options": options,
+            "message": "Analysis paused. Present the question in your response and end your turn.",
+        }, indent=2)
+
+    def _maybe_auto_checkpoint(self, tool_name: str, tool_input: Dict[str, Any]) -> Optional[str]:
+        """Save adata to a checkpoint file before destructive operations in smart_autonomous mode."""
+        if not self.smart_autonomous or self.adata is None:
+            return None
+
+        is_qc_filter = tool_name == "run_qc" and tool_input.get("confirm_filtering")
+        is_batch_correction = tool_name == "run_batch_correction"
+        if not (is_qc_filter or is_batch_correction):
+            return None
+
+        label = "pre_qc_filter" if is_qc_filter else "pre_batch_correction"
+        try:
+            if self.run_manager:
+                out_path = self.run_manager.get_intermediate_path(label)
+            else:
+                from pathlib import Path as _Path
+                out_path = str(_Path(self.output_dir) / f"checkpoint_{label}.h5ad")
+
+            if self.verbose:
+                print(f"▶ Saving checkpoint {label}...")
+            self.adata.write_h5ad(out_path)
+            if self.verbose:
+                print(f"✓ Checkpoint saved: {out_path}")
+            return out_path
+        except Exception as exc:
+            logger.warning("Auto-checkpoint save failed for %s: %s", label, exc)
+            return None
 
     def _handle_install_package(self, tool_input: Dict[str, Any]) -> str:
         """Handle install_package tool - requires user approval."""

@@ -61,7 +61,7 @@ def get_tools() -> List[Dict[str, Any]]:
                     "filter_mt": {"type": "boolean", "description": "If false, compute and report MT metrics but do not apply a hard MT% cell filter. Use this for source pipelines that inspect MT but do not remove cells by MT%."},
                     "min_genes": {"type": "integer", "description": "Minimum detected genes per cell before cell removal. This is cell-level filtering, distinct from min_cells per gene."},
                     "min_cells": {"type": "integer", "description": "Minimum cells a gene must be expressed in to be kept (default: 3). In preview, shows how many genes would be removed. Present this to the user alongside the projected removal count and confirm before applying."},
-                    "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
+                    "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: false — only set true if user explicitly requests it)"},
                     "remove_mt": {"type": "boolean", "description": "Remove mitochondrial genes from the feature set (default: false)"},
                     "detect_doublets_flag": {"type": "boolean", "description": "Run Scrublet doublet detection (default: true)"},
                     "remove_doublets": {"type": "boolean", "description": "If true, remove cells flagged as predicted doublets in apply mode. Preview mode reports the count only."},
@@ -729,6 +729,36 @@ def get_tools() -> List[Dict[str, Any]]:
                     "reason": {"type": "string", "description": "Why this package is needed"}
                 },
                 "required": ["package", "reason"]
+            }
+        },
+        {
+            "name": "pause_and_ask",
+            "description": (
+                "Pause the analysis and ask the user for guidance. "
+                "Use ONLY when you genuinely cannot proceed without information only the user can provide — "
+                "e.g. ambiguous batch key, surprising results that change the analysis direction, "
+                "or a fork where both paths have large and different downstream consequences. "
+                "Do NOT use for routine preprocessing steps, algorithm defaults, or reversible choices. "
+                "After calling this tool, present the question in your response and end your turn."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The specific question to ask the user. Be concrete — state what you found and what you need to know."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Why you cannot infer the answer yourself. Reference the actual data (e.g. 'I see 3 columns that could be the batch key: sample_id, batch, donor_id')."
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of discrete choices if applicable. Omit for open-ended questions."
+                    }
+                },
+                "required": ["question", "context"]
             }
         },
     ]
@@ -3346,7 +3376,7 @@ def process_tool_call(
             n_before, g_before = adata.n_obs, adata.n_vars
 
             detect_doublets_flag = tool_input.get("detect_doublets_flag", True)
-            remove_ribo = tool_input.get("remove_ribo", True)
+            remove_ribo = tool_input.get("remove_ribo", False)
             remove_mt = tool_input.get("remove_mt", False)
             remove_doublets = bool(tool_input.get("remove_doublets", False))
             filter_mt = bool(tool_input.get("filter_mt", True))

@@ -73,4 +73,5 @@ test_data/
 test*.py
 scagent/agent/prompts_backup.py
 *.pdf
+*.png
 claude_local.sh

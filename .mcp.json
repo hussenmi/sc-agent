@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "biocontext": {
+      "command": "/data1/peerd/ibrahih3/tools/miniconda3/bin/biocontext_kb"
+    },
+    "pubmed": {
+      "command": "/data1/peerd/ibrahih3/tools/miniconda3/bin/pubmedmcp"
+    }
+  }
+}

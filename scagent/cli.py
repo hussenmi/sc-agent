@@ -92,6 +92,20 @@ Examples:
         default=True,
         help="Show context window usage in the spinner during each model call"
     )
+    start_mode = start_parser.add_mutually_exclusive_group()
+    start_mode.add_argument(
+        "--smart",
+        dest="smart_autonomous",
+        action="store_true",
+        default=True,
+        help="Smart autonomous mode: agent drives analysis, pauses only when it needs your input (default)"
+    )
+    start_mode.add_argument(
+        "--collaborative",
+        dest="smart_autonomous",
+        action="store_false",
+        help="Collaborative mode: agent pauses at every major checkpoint and presents options"
+    )
     # === analyze command ===
     analyze_parser = subparsers.add_parser(
         "analyze",
@@ -158,6 +172,20 @@ Examples:
         "--checkpoints",
         action="store_true",
         help="Save intermediate h5ad files (default: only save final)"
+    )
+    analyze_mode2 = analyze_parser.add_mutually_exclusive_group()
+    analyze_mode2.add_argument(
+        "--smart",
+        dest="smart_autonomous",
+        action="store_true",
+        default=True,
+        help="Smart autonomous mode: agent drives analysis, pauses only when it needs your input (default)"
+    )
+    analyze_mode2.add_argument(
+        "--collaborative",
+        dest="smart_autonomous",
+        action="store_false",
+        help="Collaborative mode: agent pauses at every major checkpoint and presents options"
     )
 
     # === inspect command ===
@@ -289,11 +317,13 @@ def run_start(args):
     console = Console()
 
     # Create agent early so we can show the real model name in the welcome
+    smart = getattr(args, 'smart_autonomous', True)
     agent = SCAgent(
         provider=args.provider,
         model=args.model,
         verbose=True,
-        collaborative=True,
+        collaborative=not smart,
+        smart_autonomous=smart,
         output_dir=args.output,
         show_context_usage=getattr(args, 'context_usage', False),
     )
@@ -393,11 +423,13 @@ def run_analyze(args):
         )
 
     # Create agent
+    smart = getattr(args, 'smart_autonomous', True)
     agent = SCAgent(
         provider=args.provider,
         model=args.model,
         verbose=not args.quiet,
-        collaborative=True,
+        collaborative=not smart,
+        smart_autonomous=smart,
         output_dir=args.output,
         save_checkpoints=args.checkpoints,
     )
@@ -405,7 +437,7 @@ def run_analyze(args):
     print(f"Data: {args.data}")
     print(f"Provider: {agent.provider}:{agent.model}")
     print(f"Session mode: {'interactive follow-up' if args.interactive else 'single-run'}")
-    print("Analysis style: collaborative checkpoints")
+    print(f"Analysis style: {'smart autonomous' if smart else 'collaborative checkpoints'}")
     print(f"Checkpoints: {'enabled' if args.checkpoints else 'final only'}")
     print(f"Request: {request[:100]}{'...' if len(request) > 100 else ''}")
     print("-" * 50)
