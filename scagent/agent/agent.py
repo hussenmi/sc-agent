@@ -27,7 +27,7 @@ from .world_state import AgentWorldState, artifact_id_from_path
 
 logger = logging.getLogger(__name__)
 
-Provider = Literal["anthropic", "openai", "groq", "codex"]
+Provider = Literal["anthropic", "openai", "groq", "codex", "gemini"]
 
 _SMART_AUTONOMOUS_PROMPT = """
 
@@ -55,25 +55,37 @@ Use it — and only use it — when:
 
 After calling `pause_and_ask`, write the question clearly in your response and end your turn. Do not call any more tools.
 
-### QC filtering always requires confirmation
-
-Even in smart autonomous mode, QC filtering is irreversible and requires the user to see the numbers first:
-1. Run `run_qc(preview_only=True)` — analyze the figures, derive thresholds from the actual distributions
-2. State the proposed thresholds and projected cell removal counts
-3. Call `pause_and_ask` with the specific question ("Proceed with MT <20%, which removes 342/8421 cells (4%)?")
-4. After confirmation, run `run_qc(confirm_filtering=True, ...)` with the agreed thresholds
-
 ### Automatic checkpoints
 
-Before QC filtering and batch correction, the system automatically saves an h5ad checkpoint. When the tool result includes `auto_checkpoint_saved`, mention it: "A checkpoint was saved at `<path>` — use `load_data('<path>')` to return to this state if needed."
+Before batch correction, the system automatically saves an h5ad checkpoint. When the tool result includes `auto_checkpoint_saved`, mention it: "A checkpoint was saved at `<path>` — use `load_data('<path>')` to return to this state if needed."
 
-### Per-phase expectations
+### The pipeline is a continuous flow — a tool result is an input, not a stopping point
 
-- **Loading → inspection:** always call `inspect_data` immediately after `load_data` — never substitute run_code for this step. Then narrate findings and proceed to QC.
-- **QC → normalization → PCA → neighbors → UMAP:** after QC confirmation, run the rest in sequence without pausing; explain each parameter choice in one sentence
-- **Clustering:** run at a starting resolution, report findings, mention that resolution can be adjusted — don't stop to ask unless the cluster structure is genuinely unexpected
-- **Annotation:** run appropriate tool(s), interpret proportions, flag biological surprises; only pause if you need the user's domain knowledge to proceed
-- **Batch correction:** checkpoint auto-saved, run correction, then run neighbors + UMAP, then report integration quality — don't wait between these steps
+You are executing an analysis pipeline. When a tool returns results, your response is: **one sentence noting the key number, then the next tool call**. That's it. You do not write comprehensive reports between pipeline steps. You do not end your turn with text only unless you have reached a genuine pause point.
+
+**Standard pipeline for an open-ended "analyze this" request:**
+
+```
+load_data
+  → inspect_data
+  → run_qc                    [narrate: MT% range, doublet rate, n_genes shape — 2 sentences max]
+  → normalize_and_hvg         [narrate: "X HVGs selected."]
+  → run_pca                   [narrate: "PCA done, 30 components."]
+  → run_neighbors             [narrate: "Neighbor graph built."]
+  → run_umap                  [narrate: "UMAP computed." → then run_code for QC overlay → then run_clustering]
+  → run_clustering(res=1.5)   [narrate: "N clusters."]
+  → run_cluster_qc            [narrate full table + evidence]
+  → PAUSE: present removal proposal, wait for confirmation
+  → [loop: normalize_and_hvg → run_pca → run_neighbors → run_umap → run_clustering → run_cluster_qc → until clean]
+  → run_celltypist
+  → run_code for DEGs
+  → bc_get_panglaodb_marker_genes per label (MCP)
+  → correct labels, final UMAP
+```
+
+**Each `→` is a tool call in the same response turn. The only places you stop and wait are: cluster removal confirmation, user domain knowledge, or surprising results.**
+
+After `run_cluster_qc`: this IS a stopping point — you present the full per-cluster table with evidence, propose which clusters to remove, and wait for the user to confirm before removing anything.
 """
 
 FAILURE_PATTERNS = [
@@ -148,6 +160,7 @@ ACTION_TOOL_NAMES = {
     "score_gene_signature",
     "query_cells",
     "save_data",
+    "run_cluster_qc",
     "run_code",
     "run_shell",
     "install_package",
@@ -242,8 +255,8 @@ class SCAgent:
         model: Optional[str] = None,
         base_url: Optional[str] = None,
         verbose: bool = True,
-        collaborative: bool = True,
-        smart_autonomous: bool = False,
+        collaborative: bool = False,
+        smart_autonomous: bool = True,
         create_run_dir: bool = True,
         output_dir: str = ".",
         save_checkpoints: bool = False,
@@ -290,6 +303,7 @@ class SCAgent:
         self.show_context_usage: bool = show_context_usage
 
         self._silence_noisy_loggers()
+        self._mcp_client: Optional[Any] = None  # MCPClientManager, if available
 
         if provider == "anthropic":
             self._init_anthropic(api_key, model)
@@ -305,10 +319,15 @@ class SCAgent:
                 base_url or "https://api.groq.com/openai/v1"
             )
             self.provider = "groq"  # Keep track of actual provider
+        elif provider == "gemini":
+            self._init_gemini(api_key, model)
         else:
             raise ValueError(
-                f"Unknown provider: {provider}. Use 'anthropic', 'openai', 'groq', or 'codex'."
+                f"Unknown provider: {provider}. Use 'anthropic', 'openai', 'groq', 'codex', or 'gemini'."
             )
+
+        # Connect to MCP servers after provider init so self.tools is already set
+        self._init_mcp()
 
     @staticmethod
     def _silence_noisy_loggers() -> None:
@@ -335,6 +354,65 @@ class SCAgent:
             "harmonypy",
         ):
             _logging.getLogger(name).setLevel(_logging.WARNING)
+
+    def close(self) -> None:
+        """Shut down MCP connections and any other resources. Safe to call multiple times."""
+        if self._mcp_client is not None:
+            try:
+                self._mcp_client.stop()
+            except Exception:
+                pass
+            self._mcp_client = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _init_mcp(self) -> None:
+        """Connect to MCP servers configured in .mcp.json and merge their tools."""
+        try:
+            from ..mcp.client import MCPClientManager
+        except ImportError:
+            logger.debug("mcp package not installed — MCP tools unavailable")
+            return
+
+        try:
+            manager = MCPClientManager.from_config()
+            manager.start()
+            if not manager.connected_servers:
+                if self.verbose and manager._server_configs:
+                    logger.warning("MCP: no servers connected (check .mcp.json and server binaries)")
+                return
+
+            self._mcp_client = manager
+            # Convert MCP schemas (always Anthropic format) to match self.tools format.
+            # OpenAI format uses {"type": "function", "function": {..., "parameters": ...}};
+            # Anthropic format uses {"name": ..., "description": ..., "input_schema": ...}.
+            mcp_schemas = manager.tool_schemas
+            if self.tools and self.tools[0].get("type") == "function":
+                # self.tools is already in OpenAI format — convert MCP schemas to match
+                mcp_schemas = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": t["name"],
+                            "description": t.get("description", ""),
+                            "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+                        },
+                    }
+                    for t in mcp_schemas
+                ]
+            self.tools = self.tools + mcp_schemas
+
+            if self.verbose:
+                tool_count = len(manager.tool_schemas)
+                servers = ", ".join(
+                    f"{s} ({sum(1 for t in manager._tool_to_server.values() if t == s)} tools)"
+                    for s in manager.connected_servers
+                )
+                logger.info("MCP: connected — %s | %d tools added", servers, tool_count)
+
+        except Exception as e:
+            logger.warning("MCP init failed: %s — continuing without MCP tools", e)
 
     def _init_anthropic(self, api_key: Optional[str], model: Optional[str]):
         """Initialize Anthropic client."""
@@ -387,6 +465,34 @@ class SCAgent:
         self.model = codex_model or "codex-default"
         self.tools = get_openai_tools()
 
+    def _init_gemini(self, api_key: Optional[str], model: Optional[str]):
+        """Initialize Google Gemini via its OpenAI-compatible API.
+
+        Google exposes a drop-in OpenAI-compatible endpoint at
+        https://generativelanguage.googleapis.com/v1beta/openai/
+        so the standard OpenAI SDK works directly — just swap the base_url
+        and pass GOOGLE_API_KEY as the api_key.
+        """
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("openai not installed. Install with: pip install openai")
+
+        if api_key is None:
+            api_key = os.environ.get("GOOGLE_API_KEY")
+            if api_key is None:
+                raise ValueError(
+                    "No API key provided. Set GOOGLE_API_KEY environment variable "
+                    "or pass api_key parameter."
+                )
+
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+        self.model = model or "gemini-3.1-flash"
+        self.tools = get_openai_tools()
+        self._context_limit = self._resolve_context_limit()
 
     # Map of LaTeX commands to Unicode/text used inside inline math blocks
     _LATEX_COMMANDS = {
@@ -554,9 +660,15 @@ class SCAgent:
         return "gemma" in (self.model or "").lower()
 
     def _is_action_tool(self, tool_name: str) -> bool:
+        # MCP tools never mutate adata — treat them as inspection tools
+        if self._mcp_client and self._mcp_client.has_tool(tool_name):
+            return False
         return tool_name in ACTION_TOOL_NAMES
 
     def _is_inspection_tool(self, tool_name: str) -> bool:
+        # MCP tools are always read-only
+        if self._mcp_client and self._mcp_client.has_tool(tool_name):
+            return True
         return tool_name in INSPECTION_TOOL_NAMES
 
     def _build_image_message(self, images: List[Dict[str, str]], provider: str) -> Dict[str, Any]:
@@ -1836,7 +1948,7 @@ class SCAgent:
         # Route to provider-specific implementation
         if self.provider == "anthropic":
             return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
-        elif self.provider in {"openai", "groq"}:
+        elif self.provider in {"openai", "groq", "gemini"}:
             return self._analyze_openai(user_message, max_iterations, continue_conversation)
         elif self.provider == "codex":
             return self._analyze_codex(user_message, max_iterations, continue_conversation)
@@ -2227,7 +2339,12 @@ class SCAgent:
         # Any custom base_url (local or remote vLLM) — try to fetch the real limit
         try:
             base_url = str(getattr(self.client, 'base_url', ''))
-            cloud_hosts = ("api.openai.com", "api.anthropic.com", "api.groq.com")
+            cloud_hosts = (
+                "api.openai.com",
+                "api.anthropic.com",
+                "api.groq.com",
+                "generativelanguage.googleapis.com",  # Google Gemini
+            )
             is_cloud = any(h in base_url for h in cloud_hosts)
             if not is_cloud and base_url:
                 for m in self.client.models.list().data:
@@ -2251,6 +2368,9 @@ class SCAgent:
             return 128_000
         if "llama" in model or "mixtral" in model or "gemma" in model:
             return 128_000
+        # Gemini models — all 3.x models have 1M context
+        if "gemini" in model:
+            return 1_048_576
 
         return 128_000  # safe default
 
@@ -2567,6 +2687,7 @@ class SCAgent:
         "run_spectra":          "Spectra factor analysis",
         "score_gene_signature": "Scoring gene signature",
         "query_cells":          "Querying Scimilarity reference database",
+        "run_cluster_qc":       "Cluster QC assessment",
         "run_code":             "Running code",
         "run_shell":            "Running shell command",
         "generate_figure":      "Generating figure",
@@ -2713,7 +2834,25 @@ class SCAgent:
                 label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
 
             def _dispatch():
-                """Call process_tool_call with warning capture."""
+                """Call process_tool_call (native tools) or MCP client (external tools)."""
+                # Route to MCP client if this is an external MCP tool
+                if self._mcp_client and self._mcp_client.has_tool(tool_name):
+                    try:
+                        result_dict = self._mcp_client.call_tool(tool_name, tool_input)
+                        return json.dumps(result_dict, indent=2, default=str), self.adata
+                    except Exception as mcp_err:
+                        err_payload = {
+                            "status": "error",
+                            "tool": tool_name,
+                            "message": str(mcp_err),
+                            "recovery_options": [
+                                "Check that the MCP server is running and the tool name is correct.",
+                                "Try run_code as a fallback for custom analysis.",
+                            ],
+                        }
+                        return json.dumps(err_payload, indent=2), self.adata
+
+                # Native tool dispatch with Python warning capture
                 import warnings as _warnings
                 with _warnings.catch_warnings(record=True) as _caught:
                     _warnings.simplefilter("always")

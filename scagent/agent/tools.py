@@ -48,14 +48,18 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_qc",
-            "description": "Run or preview the quality control pipeline: QC metrics, doublet detection, cell/gene filtering. Use preview_only=true first in collaborative workflows so the user can review proposed removals before filters are applied. Do not assume intermediate h5ad saving is desired.",
+            "description": "Compute QC metrics and run doublet detection. Default behavior (flag_only=true) computes metrics, stores QC flags as obs columns, generates violin plots with log1p-transformed counts for readable axes, and does NOT remove any cells — removal happens later at cluster level via run_cluster_qc. Use confirm_filtering=true only when the user explicitly requests global threshold-based filtering as a fallback.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
                     "output_path": {"type": "string", "description": "Optional path to save a processed h5ad. Prefer saving only final outputs unless the user explicitly asks for checkpoints."},
-                    "preview_only": {"type": "boolean", "description": "If true, do not filter. Instead compute full QC metrics, estimate removals, and generate pre-filter QC figures."},
-                    "confirm_filtering": {"type": "boolean", "description": "Required to apply cell/gene filtering. Set true only after the user has explicitly confirmed the previewed thresholds, parameters, and removal counts."},
+                    "flag_only": {"type": "boolean", "description": "If true (default), compute metrics and store QC flags (qc_flag_high_mt, qc_flag_low_lib, qc_flag_low_genes) but do not remove any cells. This is the standard first pass — removal decisions are made after clustering via run_cluster_qc."},
+                    "mt_flag_threshold": {"type": "number", "description": "MT% threshold for qc_flag_high_mt (default: 25 for cells, 5 for nuclei). Used for flagging only when flag_only=true."},
+                    "lib_flag_threshold": {"type": "number", "description": "Library size threshold for qc_flag_low_lib (default: 500 counts). Used for flagging only when flag_only=true."},
+                    "genes_flag_threshold": {"type": "integer", "description": "n_genes threshold for qc_flag_low_genes (default: 200). Used for flagging only when flag_only=true."},
+                    "preview_only": {"type": "boolean", "description": "Legacy alias for flag_only. If true, do not filter. Compute metrics, estimate removals, and generate QC figures."},
+                    "confirm_filtering": {"type": "boolean", "description": "Required to apply global threshold-based cell/gene filtering. Use only when the user explicitly requests this approach instead of cluster-level QC. Set true only after previewing thresholds and removal counts."},
                     "data_type": {"type": "string", "enum": ["single_cell", "single_nucleus"], "description": "Hint for MT threshold direction: 'single_nucleus' starts at 5%, 'single_cell' at 20%. The actual threshold must be chosen from the QC figure — always inspect the distribution before filtering."},
                     "mt_threshold": {"type": "number", "description": "Max MT% threshold. Overrides data_type if provided."},
                     "filter_mt": {"type": "boolean", "description": "If false, compute and report MT metrics but do not apply a hard MT% cell filter. Use this for source pipelines that inspect MT but do not remove cells by MT%."},
@@ -592,6 +596,23 @@ def get_tools() -> List[Dict[str, Any]]:
                         "type": "integer",
                         "description": "Number of control genes sampled per bin (default: 50). Set to len(gene_list) for a tighter control."
                     }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "run_cluster_qc",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells — presents proposed removals for user confirmation. Call this after first clustering to identify low-quality, doublet-enriched, or ambiguous clusters before annotation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cluster_key": {"type": "string", "description": "obs column to group by (default: leiden)"},
+                    "doublet_threshold": {"type": "number", "description": "Mean doublet score above which to flag as doublet-enriched (default: 0.3)"},
+                    "mt_threshold": {"type": "number", "description": "Mean MT% above which a cluster is flagged as elevated (default: 25)"},
+                    "low_lib_fraction": {"type": "number", "description": "Fraction of global median library size below which lib size is considered low (default: 0.5)"},
+                    "low_genes_fraction": {"type": "number", "description": "Fraction of global median n_genes below which gene count is considered low (default: 0.5)"},
+                    "save_checkpoint": {"type": "boolean", "description": "Save an h5ad checkpoint before any removal (default: true)"},
+                    "checkpoint_path": {"type": "string", "description": "Path for checkpoint file (default: <output_dir>/checkpoint_pre_cleanup.h5ad)"}
                 },
                 "required": []
             }
@@ -3383,7 +3404,9 @@ def process_tool_call(
             min_genes = tool_input.get("min_genes")
             min_cells = tool_input.get("min_cells", 3)
             requested_mt_threshold = tool_input.get("mt_threshold")
-            preview_only = bool(tool_input.get("preview_only", False))
+            # flag_only is the new primary mode; preview_only is a legacy alias
+            flag_only = bool(tool_input.get("flag_only", True))
+            preview_only = bool(tool_input.get("preview_only", False)) or flag_only
             confirm_filtering = bool(tool_input.get("confirm_filtering", False))
             scrublet_expected_doublet_rate = float(tool_input.get("scrublet_expected_doublet_rate") or 0.06)
             scrublet_sim_doublet_ratio = float(tool_input.get("scrublet_sim_doublet_ratio") or 2.0)
@@ -3531,6 +3554,20 @@ def process_tool_call(
                 else:
                     raise
 
+            # Compute and store QC flag columns for cluster-level cleanup later.
+            # Flags are observations, not filters — no cells are removed here.
+            if flag_only and 'pct_counts_mt' in adata.obs.columns:
+                median_mt_for_flags = float(adata.obs['pct_counts_mt'].median())
+                mt_flag_threshold = float(tool_input.get("mt_flag_threshold") or (5.0 if median_mt_for_flags < 2.0 else 25.0))
+                lib_flag_threshold = float(tool_input.get("lib_flag_threshold") or 500.0)
+                genes_flag_threshold = int(tool_input.get("genes_flag_threshold") or 200)
+                adata.obs['qc_flag_high_mt'] = adata.obs['pct_counts_mt'] > mt_flag_threshold
+                adata.obs['qc_flag_low_lib'] = adata.obs['total_counts'] < lib_flag_threshold
+                adata.obs['qc_flag_low_genes'] = adata.obs['n_genes_by_counts'] < genes_flag_threshold
+                n_flag_mt = int(adata.obs['qc_flag_high_mt'].sum())
+                n_flag_lib = int(adata.obs['qc_flag_low_lib'].sum())
+                n_flag_genes = int(adata.obs['qc_flag_low_genes'].sum())
+
             # Use adata directly — no copy needed, metrics are already there
             qc_preview = adata
 
@@ -3613,18 +3650,19 @@ def process_tool_call(
                 try:
                     qc_plot_adata = adata.copy()
 
-                    # Add log-transformed columns for visualization
-                    if "total_counts" in qc_plot_adata.obs.columns:
-                        qc_plot_adata.obs["log10_total_counts"] = np.log10(qc_plot_adata.obs["total_counts"] + 1)
-                    if "n_genes_by_counts" in qc_plot_adata.obs.columns:
-                        qc_plot_adata.obs["log10_n_genes"] = np.log10(qc_plot_adata.obs["n_genes_by_counts"] + 1)
+                    # Use log1p columns from calculate_qc_metrics (log1p=True adds these automatically).
+                    # Fall back to computing log10 only if log1p columns are absent.
+                    if "log1p_total_counts" not in qc_plot_adata.obs.columns and "total_counts" in qc_plot_adata.obs.columns:
+                        qc_plot_adata.obs["log1p_total_counts"] = np.log1p(qc_plot_adata.obs["total_counts"])
+                    if "log1p_n_genes_by_counts" not in qc_plot_adata.obs.columns and "n_genes_by_counts" in qc_plot_adata.obs.columns:
+                        qc_plot_adata.obs["log1p_n_genes_by_counts"] = np.log1p(qc_plot_adata.obs["n_genes_by_counts"])
 
-                    # --- Figure 1: Main QC violin plots (log counts, log genes, MT%, ribo%) ---
+                    # --- Figure 1: Main QC violin plots (log1p counts, log1p genes, MT%, ribo%) ---
                     main_violin_keys = []
-                    if "log10_total_counts" in qc_plot_adata.obs.columns:
-                        main_violin_keys.append("log10_total_counts")
-                    if "log10_n_genes" in qc_plot_adata.obs.columns:
-                        main_violin_keys.append("log10_n_genes")
+                    if "log1p_total_counts" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("log1p_total_counts")
+                    if "log1p_n_genes_by_counts" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("log1p_n_genes_by_counts")
                     if "pct_counts_mt" in qc_plot_adata.obs.columns:
                         main_violin_keys.append("pct_counts_mt")
                     if "pct_counts_ribo" in qc_plot_adata.obs.columns:
@@ -3922,24 +3960,40 @@ def process_tool_call(
             ]
 
             if preview_only:
+                # In flag_only mode: strip all filter-suggestive content from the result.
+                # If we return mt_threshold_options, recommendation, filtering_plan, etc.,
+                # the model will respond to that data and propose global filtering — even if
+                # the system prompt says not to. The result must only contain observational
+                # metrics and an unambiguous next-step instruction.
+                _obs = qc_preview.obs
+                flag_summary = {}
+                if flag_only:
+                    flag_summary = {
+                        "qc_flag_high_mt": int(_obs['qc_flag_high_mt'].sum()) if 'qc_flag_high_mt' in _obs else 0,
+                        "qc_flag_low_lib": int(_obs['qc_flag_low_lib'].sum()) if 'qc_flag_low_lib' in _obs else 0,
+                        "qc_flag_low_genes": int(_obs['qc_flag_low_genes'].sum()) if 'qc_flag_low_genes' in _obs else 0,
+                        "predicted_doublets": predicted_doublets,
+                    }
                 preview_result = {
                     "status": "ok",
                     "tool": "run_qc",
-                    "mode": "preview",
+                    "mode": "flag_only" if flag_only else "preview",
                     "before": {"n_cells": n_before, "n_genes": g_before},
-                    "after": {"n_cells": n_before, "n_genes": g_before},
-                    "data_type_confirmed": data_type_confirmed,
-                    "recommendation": recommendation,
-                    "filtering_plan": filtering_plan,
-                    "qc_decisions": qc_decisions,
                     "metrics": {
-                        "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
-                        "doublet_rate": float(qc_preview.obs['predicted_doublet'].mean()) if 'predicted_doublet' in qc_preview.obs else None,
-                        "cells_below_min_genes": cells_low_genes,
-                        "genes_below_min_cells": genes_low_cells,
-                        "predicted_doublets": predicted_doublets,
-                        "cells_over_mt_threshold": cells_over_mt,
+                        "median_pct_mt": round(float(_obs['pct_counts_mt'].median()), 2) if 'pct_counts_mt' in _obs else None,
+                        "median_total_counts": round(float(_obs['total_counts'].median()), 0) if 'total_counts' in _obs else None,
+                        "median_n_genes": round(float(_obs['n_genes_by_counts'].median()), 0) if 'n_genes_by_counts' in _obs else None,
+                        "doublet_rate_pct": round(float(_obs['predicted_doublet'].mean()) * 100, 1) if 'predicted_doublet' in _obs else None,
+                        "n_mt_genes_detected": n_mt_genes_detected,
+                        "n_ribo_genes_detected": n_ribo_genes_detected,
                     },
+                    **({"flags_stored_in_obs": flag_summary} if flag_only else {"qc_decisions": qc_decisions}),
+                    "next_step": (
+                        "QC metrics and flags are stored in adata.obs. No cells were removed. "
+                        "Proceed immediately to normalize_and_hvg — filtering decisions are deferred to cluster-level QC after embedding."
+                        if flag_only else
+                        "Review the figures and proposed thresholds, then confirm to apply filtering."
+                    ),
                     "warnings": warnings,
                     "figures": figure_outputs,
                     "batch_strategy": batch_strategy,
@@ -3965,12 +4019,12 @@ def process_tool_call(
                     preview_result,
                     adata,
                     dataset_changed=False,
-                    summary="Previewed QC metrics, thresholds, and doublet strategy without filtering cells.",
+                    summary="QC metrics computed and flags stored. No cells removed — proceeding to normalization.",
                     artifacts_created=artifact_payloads,
                     decisions_raised=decisions,
                     verification=_build_verification(
                         "passed",
-                        "QC preview completed and reported a concrete batch strategy.",
+                        "QC flag-only pass completed.",
                         verification_checks,
                     ),
                 )
@@ -6267,6 +6321,150 @@ def process_tool_call(
                     "chars_returned": len(content),
                     "content": content,
                 }, indent=2), adata
+
+        elif tool_name == "run_cluster_qc":
+            import pandas as pd
+
+            if adata is None:
+                return _error_result(
+                    tool="run_cluster_qc",
+                    message="No in-memory data available. Load and cluster data first.",
+                    recovery_options=["Run load_data, then normalize/cluster before running cluster QC."],
+                )
+
+            cluster_key = tool_input.get("cluster_key", "leiden")
+            if cluster_key not in adata.obs.columns:
+                available = [c for c in adata.obs.columns if adata.obs[c].dtype.name == "category"]
+                return _error_result(
+                    tool="run_cluster_qc",
+                    message=f"Cluster key '{cluster_key}' not found in adata.obs. Available categorical columns: {available}",
+                    adata_obj=adata,
+                    recovery_options=["Run run_clustering first, or specify the correct cluster_key."],
+                )
+
+            required_cols = ["total_counts", "n_genes_by_counts", "pct_counts_mt"]
+            missing = [c for c in required_cols if c not in adata.obs.columns]
+            if missing:
+                return _error_result(
+                    tool="run_cluster_qc",
+                    message=f"QC metrics not computed. Missing obs columns: {missing}. Run run_qc first.",
+                    adata_obj=adata,
+                    recovery_options=["Run run_qc (flag_only=true) to compute QC metrics before cluster QC."],
+                )
+
+            doublet_threshold = float(tool_input.get("doublet_threshold", 0.3))
+            mt_threshold = float(tool_input.get("mt_threshold", 25.0))
+            low_lib_frac = float(tool_input.get("low_lib_fraction", 0.5))
+            low_genes_frac = float(tool_input.get("low_genes_fraction", 0.5))
+            save_checkpoint = bool(tool_input.get("save_checkpoint", True))
+
+            has_doublet = "doublet_score" in adata.obs.columns
+            has_flag_mt = "qc_flag_high_mt" in adata.obs.columns
+            has_flag_lib = "qc_flag_low_lib" in adata.obs.columns
+
+            agg_dict = {
+                "n_cells": ("total_counts", "count"),
+                "mean_lib_size": ("total_counts", "mean"),
+                "mean_n_genes": ("n_genes_by_counts", "mean"),
+                "mean_mt": ("pct_counts_mt", "mean"),
+            }
+            if has_doublet:
+                agg_dict["mean_doublet"] = ("doublet_score", "mean")
+            if has_flag_mt:
+                agg_dict["frac_flagged_mt"] = ("qc_flag_high_mt", "mean")
+            if has_flag_lib:
+                agg_dict["frac_flagged_lib"] = ("qc_flag_low_lib", "mean")
+            if "pct_counts_ribo" in adata.obs.columns:
+                agg_dict["mean_ribo"] = ("pct_counts_ribo", "mean")
+
+            cluster_qc = adata.obs.groupby(cluster_key).agg(**agg_dict).round(2)
+
+            global_lib = float(adata.obs["total_counts"].median())
+            global_genes = float(adata.obs["n_genes_by_counts"].median())
+
+            classifications = {}
+            proposed_removal = []
+            ambiguous = []
+            clean = []
+
+            for cluster in cluster_qc.index:
+                row = cluster_qc.loc[cluster]
+                mean_mt = float(row["mean_mt"])
+                mean_lib = float(row["mean_lib_size"])
+                mean_genes = float(row["mean_n_genes"])
+                mean_doublet = float(row.get("mean_doublet", 0.0))
+
+                lib_low = mean_lib < low_lib_frac * global_lib
+                genes_low = mean_genes < low_genes_frac * global_genes
+                mt_high = mean_mt > mt_threshold
+                doublet_high = mean_doublet > doublet_threshold and "mean_doublet" in row.index
+
+                if mt_high and lib_low and genes_low:
+                    cls = "dying_degraded"
+                    proposed_removal.append(str(cluster))
+                elif mt_high and not lib_low:
+                    cls = "ambiguous_high_mt"
+                    ambiguous.append(str(cluster))
+                elif doublet_high and mean_lib > 1.5 * global_lib:
+                    cls = "doublet_enriched"
+                    proposed_removal.append(str(cluster))
+                elif lib_low and genes_low and not mt_high:
+                    cls = "empty_droplets"
+                    proposed_removal.append(str(cluster))
+                else:
+                    cls = "clean"
+                    clean.append(str(cluster))
+
+                classifications[str(cluster)] = cls
+
+            cells_proposed = int(adata.obs[cluster_key].isin(proposed_removal).sum())
+            cells_ambiguous = int(adata.obs[cluster_key].isin(ambiguous).sum())
+            cells_total = adata.n_obs
+
+            checkpoint_path = None
+            if save_checkpoint:
+                import os as _os
+                _base = str(run_manager.run_dir) if run_manager else "."
+                cp_default = _os.path.join(_base, "checkpoint_pre_cleanup.h5ad")
+                checkpoint_path = tool_input.get("checkpoint_path") or cp_default
+                write_h5ad_safe(adata, checkpoint_path)
+
+            cluster_table = cluster_qc.reset_index().rename(columns={cluster_key: "cluster"}).to_dict("records")
+
+            result = {
+                "status": "ok",
+                "tool": "run_cluster_qc",
+                "cluster_key": cluster_key,
+                "n_clusters": len(cluster_qc),
+                "global_lib_median": round(global_lib, 1),
+                "global_genes_median": round(global_genes, 1),
+                "cluster_table": cluster_table,
+                "classifications": classifications,
+                "proposed_removal": proposed_removal,
+                "ambiguous": ambiguous,
+                "clean": clean,
+                "cells_in_proposed_removal": cells_proposed,
+                "cells_ambiguous": cells_ambiguous,
+                "pct_proposed": round(cells_proposed / cells_total * 100, 1),
+                "cells_remaining_if_removed": cells_total - cells_proposed,
+                "checkpoint_path": checkpoint_path,
+                "thresholds_used": {
+                    "mt_threshold": mt_threshold,
+                    "doublet_threshold": doublet_threshold,
+                    "low_lib_fraction": low_lib_frac,
+                    "low_genes_fraction": low_genes_frac,
+                },
+                "state": make_state(adata),
+            }
+            artifacts = []
+            if checkpoint_path:
+                artifacts.append(_artifact_payload(checkpoint_path, role="checkpoint", metadata={"stage": "pre_cluster_qc_cleanup"}))
+            return _finalize_result(
+                result, adata,
+                dataset_changed=False,
+                summary=f"Cluster QC: {len(proposed_removal)} clusters proposed for removal ({cells_proposed} cells, {result['pct_proposed']}%), {len(ambiguous)} ambiguous.",
+                artifacts_created=artifacts,
+            )
 
         else:
             return _error_result(

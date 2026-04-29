@@ -91,12 +91,13 @@ def calculate_qc_metrics(
     n_ribo_genes = adata.var['ribo'].sum()
     logger.info(f"Found {n_ribo_genes} ribosomal genes")
 
-    # Calculate MT and ribo content
+    # Calculate MT and ribo content; log1p=True adds log1p_total_counts and
+    # log1p_n_genes_by_counts columns which give compact 0–10 values for violin plots.
     sc.pp.calculate_qc_metrics(
         adata,
         qc_vars=['mt', 'ribo'],
         percent_top=None,
-        log1p=False,
+        log1p=True,
         inplace=True,
     )
 

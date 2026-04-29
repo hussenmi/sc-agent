@@ -77,7 +77,7 @@ Examples:
     )
     start_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini"],
         default=None,
         help="LLM provider (default: from .env or anthropic)"
     )
@@ -134,7 +134,7 @@ Examples:
     )
     analyze_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini"],
         default=None,
         help="LLM provider (default: from .env or anthropic; codex is experimental)"
     )
@@ -224,7 +224,7 @@ Examples:
     )
     chat_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini"],
         default=None,
         help="LLM provider"
     )
@@ -317,7 +317,9 @@ def run_start(args):
     console = Console()
 
     # Create agent early so we can show the real model name in the welcome
-    smart = getattr(args, 'smart_autonomous', True)
+    smart = getattr(args, 'smart_autonomous', None)
+    if smart is None:
+        smart = True  # default to smart mode when neither --smart nor --collaborative given
     agent = SCAgent(
         provider=args.provider,
         model=args.model,
@@ -423,7 +425,9 @@ def run_analyze(args):
         )
 
     # Create agent
-    smart = getattr(args, 'smart_autonomous', True)
+    smart = getattr(args, 'smart_autonomous', None)
+    if smart is None:
+        smart = True  # default to smart mode when neither --smart nor --collaborative given
     agent = SCAgent(
         provider=args.provider,
         model=args.model,

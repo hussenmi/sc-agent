@@ -65,6 +65,7 @@ runs/
 run*
 analysis/
 test_data/
+pbmc_auto/
 
 # macOS metadata files
 ._*

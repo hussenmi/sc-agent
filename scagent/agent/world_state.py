@@ -856,4 +856,17 @@ class AgentWorldState:
                 entry["score_stats"] = result.get("score_stats")
             return entry
 
+        if tool_name == "run_cluster_qc":
+            return {
+                "tool": "run_cluster_qc",
+                "timestamp": ts,
+                "cluster_key": result.get("cluster_key"),
+                "n_clusters": result.get("n_clusters"),
+                "proposed_removal": result.get("proposed_removal", []),
+                "ambiguous": result.get("ambiguous", []),
+                "cells_proposed": result.get("cells_in_proposed_removal"),
+                "pct_proposed": result.get("pct_proposed"),
+                "checkpoint_path": result.get("checkpoint_path"),
+            }
+
         return None

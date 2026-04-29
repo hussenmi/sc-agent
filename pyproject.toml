@@ -31,6 +31,7 @@ dependencies = [
     "prompt_toolkit>=3.0", # Robust terminal input and bracketed paste handling
     "pymupdf>=1.27.2.2",
     "scib-metrics>=0.5.6",
+    "mcp[cli]>=1.27.0",
 ]
 
 [project.optional-dependencies]
