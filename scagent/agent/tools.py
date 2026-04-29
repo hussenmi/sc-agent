@@ -207,7 +207,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_scimilarity",
-            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Model path is pre-configured via SCIMILARITY_MODEL_PATH env var - do NOT ask the user for a model path. Different from CellTypist - use when you want embedding-based annotation.",
+            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Automatically selects the human or mouse model based on gene names — do NOT ask the user for a model path. Different from CellTypist - use when you want embedding-based annotation.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -4947,11 +4947,7 @@ def process_tool_call(
                 context="cluster_key",
             ) or "leiden"
 
-            # Only pass model_path if specified, otherwise use default
-            if model_path:
-                run_scimilarity(adata, model_path=model_path, cluster_key=cluster_key)
-            else:
-                run_scimilarity(adata, cluster_key=cluster_key)
+            run_scimilarity(adata, model_path=model_path or None, cluster_key=cluster_key)
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_scimilarity")
             if output_path:
@@ -5012,7 +5008,7 @@ def process_tool_call(
             )
 
         elif tool_name == "query_cells":
-            from ..annotation.scimilarity import query_cells as _query_cells, DEFAULT_MODEL_PATH
+            from ..annotation.scimilarity import query_cells as _query_cells
 
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             if adata is None:
@@ -5058,7 +5054,7 @@ def process_tool_call(
                     group_key=tool_input.get("group_key"),
                     group_value=tool_input.get("group_value"),
                     k=k,
-                    model_path=DEFAULT_MODEL_PATH,
+                    model_path=tool_input.get("model_path") or None,
                     raw_layer=raw_layer,
                 )
             except (FileNotFoundError, ImportError) as e:

@@ -372,7 +372,8 @@ def run_start(args):
     while True:
         try:
             agent._update_context_bar()
-            user_input = read_user_input("\n> ")
+            console.print("\n[dim]─────────────────────────────────────────[/dim]")
+            user_input = read_user_input("> ")
         except (EOFError, KeyboardInterrupt):
             _maybe_save_on_exit(agent, console)
             console.print("\n[dim]Session ended.[/dim]")

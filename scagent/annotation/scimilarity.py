@@ -13,19 +13,79 @@ import logging
 
 from ..config.defaults import SCIMILARITY_DEFAULTS
 
+import os
+
 logger = logging.getLogger(__name__)
 
-# Default model path on the HPC system (IRIS)
-DEFAULT_MODEL_PATH = "/data1/peerd/ibrahih3/scimilarity/docs/notebooks/models/model_v1.1"
+# Model paths — human vs mouse models have different gene orders and were trained
+# on different reference datasets; using the wrong model produces meaningless results.
+_MODEL_PATH_HUMAN = os.environ.get(
+    "SCIMILARITY_MODEL_PATH",
+    "/data1/peerd/ibrahih3/scimilarity/docs/notebooks/models/model_v1.1",
+)
+_MODEL_PATH_MOUSE = os.environ.get(
+    "SCIMILARITY_MODEL_PATH_MOUSE",
+    "/data1/peerd/ibrahih3/scimilarity/scimilarity_models_mouse/final_model_6M",
+)
 
-import os
-# Allow override via environment variable
-DEFAULT_MODEL_PATH = os.environ.get("SCIMILARITY_MODEL_PATH", DEFAULT_MODEL_PATH)
+# Keep for backwards compat (used by query_cells import in tools.py)
+DEFAULT_MODEL_PATH = _MODEL_PATH_HUMAN
+
+
+def detect_organism(adata: AnnData) -> str:
+    """
+    Infer organism from gene names and adata.uns.
+
+    Returns 'human' or 'mouse'. Human genes are predominantly all-uppercase
+    (GAPDH, ACTB); mouse genes are mixed-case (Gapdh, Actb).
+    """
+    # Explicit annotation wins
+    organism = adata.uns.get("organism", adata.uns.get("species", "")).lower()
+    if "human" in organism or "homo" in organism:
+        return "human"
+    if "mouse" in organism or "mus" in organism:
+        return "mouse"
+
+    # Infer from gene name casing — sample up to 200 genes, skip MT/mt genes
+    genes = [g for g in adata.var_names if not g.upper().startswith("MT-")][:200]
+    if not genes:
+        logger.warning("No genes to inspect for organism detection — defaulting to human")
+        return "human"
+
+    # A gene is "mouse-like" if it starts with an uppercase letter followed by
+    # at least one lowercase letter (e.g. Gapdh, Cd3e, H2-Aa)
+    mouse_like = sum(
+        1 for g in genes
+        if len(g) > 1 and g[0].isupper() and g[1].islower()
+    )
+    frac = mouse_like / len(genes)
+    organism = "mouse" if frac > 0.5 else "human"
+    logger.info(
+        f"Organism detection: {mouse_like}/{len(genes)} genes look mouse-like "
+        f"({frac:.0%}) → '{organism}'"
+    )
+    return organism
+
+
+def get_model_path(adata: AnnData, model_path: Optional[str] = None) -> tuple[str, str]:
+    """
+    Return (model_path, organism) to use for this dataset.
+
+    If model_path is explicitly provided it is used as-is. Otherwise the organism
+    is detected from gene names and the matching default model path is returned.
+    """
+    if model_path:
+        # Can't reliably detect organism from an arbitrary path — trust the caller
+        return model_path, "unknown"
+    organism = detect_organism(adata)
+    path = _MODEL_PATH_MOUSE if organism == "mouse" else _MODEL_PATH_HUMAN
+    logger.info(f"Selected Scimilarity model for '{organism}': {path}")
+    return path, organism
 
 
 def prepare_for_scimilarity(
     adata: AnnData,
-    model_path: str = DEFAULT_MODEL_PATH,
+    model_path: Optional[str] = None,
     raw_layer: Optional[str] = None,
 ) -> AnnData:
     """
@@ -58,7 +118,7 @@ def prepare_for_scimilarity(
 
     logger.info("Preparing data for Scimilarity annotation...")
 
-    # Load model to get gene order
+    model_path, _ = get_model_path(adata, model_path)
     ca = CellAnnotation(model_path=model_path)
 
     # Find raw counts
@@ -100,7 +160,7 @@ def prepare_for_scimilarity(
 
 def run_scimilarity(
     adata: AnnData,
-    model_path: str = DEFAULT_MODEL_PATH,
+    model_path: Optional[str] = None,
     target_celltypes: Optional[List[str]] = None,
     raw_layer: Optional[str] = None,
     cluster_key: str = 'leiden',
@@ -140,7 +200,8 @@ def run_scimilarity(
     if not inplace:
         adata = adata.copy()
 
-    logger.info(f"Running Scimilarity annotation with model at {model_path}")
+    model_path, organism = get_model_path(adata, model_path)
+    logger.info(f"Running Scimilarity annotation for '{organism}' with model at {model_path}")
 
     # Prepare data
     adata_sci, ca = prepare_for_scimilarity(adata, model_path=model_path, raw_layer=raw_layer)
@@ -200,7 +261,7 @@ def query_cells(
     group_key: Optional[str] = None,
     group_value: Optional[str] = None,
     k: int = 50,
-    model_path: str = DEFAULT_MODEL_PATH,
+    model_path: Optional[str] = None,
     raw_layer: Optional[str] = None,
 ) -> dict:
     """
@@ -249,7 +310,9 @@ def query_cells(
     except ImportError:
         raise ImportError("scimilarity not installed. Install with: pip install scimilarity")
 
-    import os
+    model_path, organism = get_model_path(adata, model_path)
+    logger.info(f"CellQuery using '{organism}' model at {model_path}")
+
     knn_path = os.path.join(model_path, "cellsearch", "full_kNN.bin")
     if not os.path.exists(knn_path):
         raise FileNotFoundError(

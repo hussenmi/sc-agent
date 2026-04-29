@@ -22,30 +22,19 @@ GPUS=${3:-"auto"}
 
 HF_DIR="/data1/peerd/ibrahih3/hf"
 SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_gemma4.sif"}
-LOG_HOST=$(hostname -s 2>/dev/null || echo unknown)
-LOG_TS=$(date +%Y%m%d_%H%M%S)
-LOG="/data1/peerd/ibrahih3/tmp/vllm_${LOG_HOST}_${PORT}_$(echo "$MODEL" | sed 's|/|_|g')_${LOG_TS}.log"
+LOG="/data1/peerd/ibrahih3/tmp/vllm_$(echo $MODEL | sed 's|/|_|g').log"
 
 mkdir -p /data1/peerd/ibrahih3/tmp
-
-HOST_SHORT=$(hostname -s 2>/dev/null || hostname)
-if [[ "$HOST_SHORT" =~ ^isc[bcd] ]]; then
-  if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-    echo "WARNING: $HOST_SHORT looks like a compute node, but no Slurm job allocation is active."
-    echo "         H100 nodes in particular may kill or reject processes started outside an allocation."
-  elif [[ -n "${SLURM_JOB_NODELIST:-}" ]] && [[ "$SLURM_JOB_NODELIST" != *"$HOST_SHORT"* ]]; then
-    echo "WARNING: Running on $HOST_SHORT, but current Slurm job $SLURM_JOB_ID is allocated to $SLURM_JOB_NODELIST."
-    echo "         Starting vLLM outside the allocated node can fail unpredictably."
-  fi
-fi
 
 # ── Per-model settings ────────────────────────────────────────────────────────
 # Add a new model by appending a line here. Fields:
 #   HF repo ID | served name (used in .env) | weight size GB | KV KB/token | parser | max ctx K | quant | reasoning_parser
 # weight size GB: actual loaded size (use FP8 weight size for pre-quantized FP8 checkpoints)
 # quant: leave blank for BF16; set to "fp8" for pre-quantized FP8 checkpoints
-#   - blank: standard BF16 checkpoint sizing
-#   - fp8:   pre-quantized FP8 checkpoint sizing (~half of BF16)
+#   - blank: on H100, online FP8 quantization is applied (--quantization fp8); weight size
+#            must reflect BF16 size since BF16 is loaded first before quantizing
+#   - fp8:   vLLM auto-detects quantization; weight size reflects FP8 size (~half of BF16);
+#            larger context window is safe since weights load directly as FP8
 # parser: tool-call parser — must match how the model emits tool calls (vllm --help lists valid names)
 # reasoning_parser: set for models with thinking/reasoning mode (e.g. qwen3); leave blank otherwise
 MODEL_TABLE=(
@@ -85,24 +74,9 @@ for entry in "${MODEL_TABLE[@]}"; do
   fi
 done
 
-# Models that resolve to a multimodal ConditionalGeneration class in vLLM
-# tend to spend extra memory on encoder setup even for text-only workloads.
-IS_HYBRID_MODEL=0
-case "$MODEL" in
-  Qwen/Qwen3.6-*|google/gemma-4-*|RedHatAi/gemma-4-*)
-    IS_HYBRID_MODEL=1
-    ;;
-esac
-
 # Resolve GPU count: auto = minimum needed to fit model + reasonable KV cache
 GPU_VRAM=80
-GPU_MEM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
-if [[ "$GPU_MEM_MIB" =~ ^[0-9]+$ ]] && [[ "$GPU_MEM_MIB" -gt 0 ]]; then
-  GPU_VRAM=$(( GPU_MEM_MIB / 1024 ))
-fi
-
-MEM_UTIL=${VLLM_MEM_UTIL:-"0.90"}
-UTIL=$(awk -v u="$MEM_UTIL" 'BEGIN { printf "%d", u * 100 }')
+UTIL=90  # percent
 
 if [[ "$GPUS" == "auto" ]]; then
   for n in 1 2 4 8; do
@@ -119,56 +93,16 @@ fi
 
 # Detect GPU and apply GPU-specific settings
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+FP8_FLAGS=""
+MEM_UTIL="0.90"
 EXTRA_FLAGS=""
-CACHE_FLAGS=""
-MM_FLAGS=""
-SCHED_FLAGS=""
-GDN_FLAGS=""
 if [[ "$GPU_NAME" == *"H100"* ]]; then
   # H100: CUDA graph compilation is more aggressive than A100 (batch sizes up to 8192 vs 2048),
   # causing OOM during graph capture. enforce-eager disables CUDA graphs entirely — H100's
   # raw tensor core throughput is fast enough without them for interactive workloads.
+  # VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS not needed when CUDA graphs are disabled.
   EXTRA_FLAGS="--enforce-eager"
-
-  # Single-GPU H100 runs with hybrid VLM checkpoints can still die during
-  # encoder/KV warmup even after graphs are disabled. Default to a safer
-  # profile; all knobs can be overridden via env vars when needed.
-  if [[ -z "${VLLM_MEM_UTIL:-}" ]]; then
-    MEM_UTIL="0.80"
-  fi
-  UTIL=$(awk -v u="$MEM_UTIL" 'BEGIN { printf "%d", u * 100 }')
-
-  if [[ -n "${VLLM_KV_CACHE_DTYPE:-}" ]]; then
-    KV_CACHE_DTYPE="$VLLM_KV_CACHE_DTYPE"
-    CACHE_FLAGS="--kv-cache-dtype $KV_CACHE_DTYPE"
-  fi
-
-  MAX_BATCHED_TOKENS=${VLLM_MAX_BATCHED_TOKENS:-4096}
-  MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-8}
-  case "$MODEL" in
-    Qwen/Qwen3.6-*)
-      # Qwen3.6 GDN layers need a lower batch-token cap during vLLM startup.
-      # vLLM issue: https://github.com/vllm-project/vllm/issues/37714
-      if [[ -z "${VLLM_MAX_BATCHED_TOKENS:-}" ]]; then
-        MAX_BATCHED_TOKENS=2096
-      fi
-      if [[ -z "${VLLM_GDN_PREFILL_BACKEND:-}" ]]; then
-        GDN_FLAGS="--gdn-prefill-backend triton"
-      else
-        GDN_FLAGS="--gdn-prefill-backend $VLLM_GDN_PREFILL_BACKEND"
-      fi
-      ;;
-  esac
-  SCHED_FLAGS="--max-num-batched-tokens $MAX_BATCHED_TOKENS --max-num-seqs $MAX_NUM_SEQS"
-
-  if [[ $TP -eq 1 && $IS_HYBRID_MODEL -eq 1 && "${VLLM_TEXT_ONLY:-0}" == "1" ]]; then
-    MM_FLAGS="--language-model-only --mm-processor-cache-gb 0"
-    echo "Mode:     text-only (hybrid encoder disabled by VLLM_TEXT_ONLY=1)"
-  elif [[ $IS_HYBRID_MODEL -eq 1 ]]; then
-    echo "Mode:     multimodal"
-  fi
-
-  echo "GPU:      $GPU_NAME → eager mode (safer H100 startup profile)"
+  echo "GPU:      $GPU_NAME"
 else
   echo "GPU:      ${GPU_NAME:-unknown}"
 fi
@@ -179,33 +113,12 @@ KV_BUDGET=$(( USABLE - MODEL_VRAM ))
 MAX_CTX=$(( KV_BUDGET * 1024 * 1024 / KV_KB ))
 NATIVE_CAP=$(( ${ctx_k:-128} * 1024 ))
 CTX=$(( MAX_CTX < NATIVE_CAP ? MAX_CTX : NATIVE_CAP ))
-
-if [[ "$GPU_NAME" == *"H100"* && "$TP" -eq 1 && -z "${VLLM_MAX_MODEL_LEN:-}" ]]; then
-  H100_CTX_CAP=$(( ${VLLM_H100_CTX_CAP_K:-32} * 1024 ))
-  CTX=$(( CTX < H100_CTX_CAP ? CTX : H100_CTX_CAP ))
-fi
-
 CTX_K=$(( CTX / 1024 ))
-
-if [[ -n "${VLLM_MAX_MODEL_LEN:-}" ]]; then
-  CTX="$VLLM_MAX_MODEL_LEN"
-  CTX_K=$(( CTX / 1024 ))
-fi
 
 echo "Model:    $MODEL"
 echo "Served:   $SERVED_NAME"
 echo "GPUs:     $TP  (tensor-parallel-size)"
 echo "Context:  ${CTX_K}K tokens"
-echo "Mem util: $MEM_UTIL"
-if [[ -n "$CACHE_FLAGS" ]]; then
-  echo "KV cache: ${KV_CACHE_DTYPE}"
-fi
-if [[ -n "$SCHED_FLAGS" ]]; then
-  echo "Batching: tokens=$MAX_BATCHED_TOKENS seqs=$MAX_NUM_SEQS"
-fi
-if [[ -n "$GDN_FLAGS" ]]; then
-  echo "GDN:      ${VLLM_GDN_PREFILL_BACKEND:-triton}"
-fi
 echo "Parser:   $PARSER"
 echo "Port:     $PORT"
 echo "Log:      $LOG"
@@ -240,12 +153,8 @@ singularity exec --nv \
     --tensor-parallel-size "$TP" \
     --gpu-memory-utilization "$MEM_UTIL" \
     --max-model-len "$CTX" \
-    $CACHE_FLAGS \
-    $MM_FLAGS \
-    $SCHED_FLAGS \
-    $GDN_FLAGS \
+    $FP8_FLAGS \
     $EXTRA_FLAGS \
-    ${VLLM_EXTRA_FLAGS:-} \
     --enable-auto-tool-choice \
     --tool-call-parser "$PARSER" \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
@@ -259,11 +168,6 @@ echo ""
 
 for i in $(seq 1 120); do
   sleep 5
-  if ! kill -0 "$PID" 2>/dev/null; then
-    echo "Server exited before becoming healthy — check log: $LOG"
-    tail -n 60 "$LOG"
-    exit 1
-  fi
   if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
     echo "Server ready at http://localhost:$PORT/v1"
     echo "  SCAGENT_MODEL=$SERVED_NAME"
