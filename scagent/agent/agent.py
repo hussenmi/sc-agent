@@ -300,6 +300,8 @@ class SCAgent:
         self._context_limit: int = 128_000  # overwritten by _init_* below
         self._last_estimated_tokens: int = 0
         self._last_actual_tokens: int = 0   # exact count from API response usage field
+        self._tool_schema_tokens: int = 0   # precomputed at init; refreshed after MCP merge
+        self._token_estimate_calibration: float = 1.0  # ratchets up after each API response
         self.show_context_usage: bool = show_context_usage
 
         self._silence_noisy_loggers()
@@ -328,6 +330,15 @@ class SCAgent:
 
         # Connect to MCP servers after provider init so self.tools is already set
         self._init_mcp()
+
+        # Apply SCAGENT_CONTEXT_LIMIT env override last — wins over any provider default
+        _env_limit = os.environ.get("SCAGENT_CONTEXT_LIMIT")
+        if _env_limit:
+            try:
+                self._context_limit = int(_env_limit)
+                logger.info(f"Context limit overridden by SCAGENT_CONTEXT_LIMIT: {self._context_limit:,}")
+            except ValueError:
+                pass  # warning already emitted in _resolve_context_limit if called; otherwise silent
 
     @staticmethod
     def _silence_noisy_loggers() -> None:
@@ -402,6 +413,7 @@ class SCAgent:
                     for t in mcp_schemas
                 ]
             self.tools = self.tools + mcp_schemas
+            self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
             if self.verbose:
                 tool_count = len(manager.tool_schemas)
@@ -433,6 +445,7 @@ class SCAgent:
         self.model = model or "claude-sonnet-4-20250514"
         self.tools = get_tools()
         self._context_limit = 200_000  # all Claude models support 200K
+        self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
     def _init_openai(self, api_key: Optional[str], model: Optional[str], base_url: Optional[str] = None):
         """Initialize OpenAI-compatible client (works with OpenAI, Groq, Together, etc.)."""
@@ -457,6 +470,7 @@ class SCAgent:
         self.model = model or "gpt-4o"
         self.tools = get_openai_tools()
         self._context_limit = self._resolve_context_limit()
+        self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
     def _init_codex(self, model: Optional[str]):
         """Initialize Codex CLI bridge for ChatGPT-login-backed runs."""
@@ -464,6 +478,7 @@ class SCAgent:
         self.client = CodexCLIClient(model=codex_model, cwd=os.getcwd())
         self.model = codex_model or "codex-default"
         self.tools = get_openai_tools()
+        self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
     def _init_gemini(self, api_key: Optional[str], model: Optional[str]):
         """Initialize Google Gemini via its OpenAI-compatible API.
@@ -493,6 +508,7 @@ class SCAgent:
         self.model = model or "gemini-3.1-flash"
         self.tools = get_openai_tools()
         self._context_limit = self._resolve_context_limit()
+        self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
     # Map of LaTeX commands to Unicode/text used inside inline math blocks
     _LATEX_COMMANDS = {
@@ -2197,19 +2213,59 @@ class SCAgent:
 
         try:
             for iteration in range(max_iterations):
-                messages = self._trim_messages_if_needed(messages, anthropic=True)
-                response = self._with_llm_status(
-                    lambda: self.client.messages.create(
-                        model=self.model,
-                        max_tokens=4096,
-                        system=self._build_system_prompt(),
-                        tools=self.tools,
-                        messages=messages,
-                    )
+                system_prompt = self._build_system_prompt()
+                trim_target, hard_limit = self._compute_message_budget(system_prompt)
+                messages = self._trim_messages_if_needed(
+                    messages, anthropic=True,
+                    trim_target=trim_target, hard_limit=hard_limit,
                 )
+                try:
+                    response = self._with_llm_status(
+                        lambda: self.client.messages.create(
+                            model=self.model,
+                            max_tokens=4096,
+                            system=system_prompt,
+                            tools=self.tools,
+                            messages=messages,
+                        )
+                    )
+                except Exception as _api_err:
+                    if self._is_context_overflow_error(_api_err):
+                        messages = self._emergency_trim(messages, anthropic=True)
+                        try:
+                            response = self._with_llm_status(
+                                lambda: self.client.messages.create(
+                                    model=self.model,
+                                    max_tokens=4096,
+                                    system=self._build_system_prompt(),
+                                    tools=self.tools,
+                                    messages=messages,
+                                )
+                            )
+                        except Exception as _retry_err:
+                            if self._is_context_overflow_error(_retry_err):
+                                self._print(
+                                    "[red]Context window exhausted — unable to recover after "
+                                    "emergency trim. Start a new session. Your analysis state "
+                                    "is preserved in world state.[/red]"
+                                )
+                                if self.run_manager:
+                                    self.run_manager.fail("context_window_exhausted")
+                                return final_result or ""
+                            raise
+                    else:
+                        raise
 
                 if response.usage and hasattr(response.usage, 'input_tokens') and response.usage.input_tokens:
                     self._last_actual_tokens = response.usage.input_tokens
+                    # Calibrate estimate ratio — ratchets upward, never down, capped at 4x
+                    _current_est = self._estimate_tokens(messages)
+                    if _current_est > 0 and self._last_actual_tokens > _current_est:
+                        _new_ratio = self._last_actual_tokens / _current_est
+                        self._token_estimate_calibration = max(
+                            self._token_estimate_calibration,
+                            min(_new_ratio, 4.0),
+                        )
 
                 if response.stop_reason == "tool_use":
                     tool_results = []
@@ -2332,18 +2388,39 @@ class SCAgent:
         """
         Determine the context window size for the current model.
 
-        For local/custom vLLM servers, queries the /v1/models endpoint which
-        reports max_model_len — the actual GPU-memory-constrained limit.
-        For cloud providers, returns known limits by model name.
+        Priority order (highest wins):
+          1. SCAGENT_CONTEXT_LIMIT env var — user override
+          2. vLLM /v1/models max_model_len — actual GPU-constrained limit
+          3. K-size parsed from model name (e.g. "262k", "128k")
+          4. Cloud model name dict — known limits by provider
+          5. Generic Qwen fallback — 32K with a visible warning
+          6. Hard default — 128K
+
+        Never silently falls through: each step logs what was found and why.
         """
-        # Any custom base_url (local or remote vLLM) — try to fetch the real limit
+        # --- Priority 1: env var override ---
+        env_limit = os.environ.get("SCAGENT_CONTEXT_LIMIT")
+        if env_limit:
+            try:
+                limit = int(env_limit)
+                logger.info(f"Context limit from SCAGENT_CONTEXT_LIMIT env var: {limit:,}")
+                self._print(f"[dim]Context limit set by SCAGENT_CONTEXT_LIMIT: {limit:,} tokens[/dim]")
+                return limit
+            except ValueError:
+                logger.warning(
+                    f"SCAGENT_CONTEXT_LIMIT={env_limit!r} is not a valid integer — ignoring"
+                )
+
+        model = (self.model or "").lower()
+
+        # --- Priority 2: vLLM /v1/models max_model_len ---
         try:
             base_url = str(getattr(self.client, 'base_url', ''))
             cloud_hosts = (
                 "api.openai.com",
                 "api.anthropic.com",
                 "api.groq.com",
-                "generativelanguage.googleapis.com",  # Google Gemini
+                "generativelanguage.googleapis.com",
             )
             is_cloud = any(h in base_url for h in cloud_hosts)
             if not is_cloud and base_url:
@@ -2351,13 +2428,29 @@ class SCAgent:
                     if m.id == self.model:
                         limit = getattr(m, 'max_model_len', None)
                         if limit and int(limit) > 0:
-                            logger.info(f"Context limit from vLLM: {int(limit):,} tokens")
+                            logger.info(
+                                f"Context limit from vLLM (max_model_len): {int(limit):,} tokens"
+                            )
+                            self._print(
+                                f"[dim]Context limit from vLLM: {int(limit):,} tokens[/dim]"
+                            )
                             return int(limit)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                f"vLLM model query failed ({e}); falling through to name-based detection"
+            )
 
-        # Known cloud limits by model name
-        model = (self.model or "").lower()
+        # --- Priority 3: parse K-size from model name ---
+        k_match = re.search(r'(\d+)k\b', model)
+        if k_match:
+            limit = int(k_match.group(1)) * 1024
+            logger.info(f"Context limit parsed from model name '{self.model}': {limit:,} tokens")
+            self._print(
+                f"[dim]Context limit inferred from model name: {limit:,} tokens[/dim]"
+            )
+            return limit
+
+        # --- Priority 4: cloud model name dict ---
         if "claude" in model:
             return 200_000
         if "gpt-5" in model:
@@ -2368,11 +2461,28 @@ class SCAgent:
             return 128_000
         if "llama" in model or "mixtral" in model or "gemma" in model:
             return 128_000
-        # Gemini models — all 3.x models have 1M context
         if "gemini" in model:
             return 1_048_576
 
-        return 128_000  # safe default
+        # --- Priority 5: generic Qwen fallback ---
+        if "qwen" in model:
+            limit = 32_768
+            msg = (
+                f"WARNING: Qwen model '{self.model}' detected but context size could not be "
+                f"determined from the model name or vLLM. Defaulting to {limit:,} tokens — "
+                f"this is conservative. Set SCAGENT_CONTEXT_LIMIT=<actual_size> in your "
+                f"environment to override, or use a vLLM server that reports max_model_len."
+            )
+            logger.warning(msg)
+            print(f"\n\033[33m{msg}\033[0m\n")  # visible yellow, bypasses Rich
+            return limit
+
+        # --- Priority 6: hard default ---
+        logger.info(
+            f"Context limit: using default 128,000 tokens "
+            f"(model '{self.model}' not recognized by name)"
+        )
+        return 128_000
 
     @staticmethod
     def _estimate_tokens(messages: list) -> int:
@@ -2392,100 +2502,195 @@ class SCAgent:
         except Exception:
             return 0
 
-    def _trim_messages_if_needed(self, messages: list, *, anthropic: bool = False) -> list:
+    def _calibrated_estimate(self, content) -> int:
+        """Return _estimate_tokens scaled by the calibration factor.
+
+        Calibration starts at 1.0 and ratchets upward (never down, capped at 4x)
+        as we compare char-based estimates against actual API token counts. This
+        compensates for tokenizers (e.g. Qwen) that produce more tokens per
+        character than the 1-token-per-4-chars baseline.
         """
-        Trim old tool results when approaching the context limit.
+        raw = self._estimate_tokens(content)
+        return int(raw * self._token_estimate_calibration)
 
-        Why this is safe: the system prompt is rebuilt every iteration and
-        includes world_state.snapshot() — a structured summary of every
-        analysis step taken, the current data shape, clusters, annotations,
-        decisions made, and recent events.  A trimmed tool result from 10
-        turns ago is genuinely redundant: the model already acted on it and
-        its effects are captured in world_state.
+    def _compute_message_budget(self, system_prompt: str) -> tuple:
+        """Compute available token budget for message history.
 
-        Strategy (in order of aggressiveness):
-          1. Replace content of old tool-result messages with a short note
-          2. Truncate long assistant narrations in old messages
+        Fixed overhead on every API call:
+          - Tool schemas: precomputed at init in self._tool_schema_tokens
+          - System prompt: re-estimated each call (world_state snapshot grows)
+          - Completion reserve: 4096 (matches max_tokens / max_completion_tokens)
+          - Safety margin: 3% of context_limit or 2000, whichever is larger
+
+        Returns (trim_target, hard_limit):
+          trim_target  — aim to be below this before the API call (proactive trim)
+          hard_limit   — absolute ceiling; triggers emergency trim if exceeded
+        """
+        COMPLETION_RESERVE = 4096
+        system_tokens = len(system_prompt) // 4
+        safety_margin = max(2000, int(self._context_limit * 0.03))
+        available = (
+            self._context_limit
+            - self._tool_schema_tokens
+            - system_tokens
+            - COMPLETION_RESERVE
+            - safety_margin
+        )
+        available = max(available, 4000)
+        trim_target = int(available * 0.85)
+        hard_limit = available
+        return trim_target, hard_limit
+
+    def _report_trim(self, freed: int, before: int, after: int, emergency: bool = False) -> None:
+        """Log and print context compaction results."""
+        if freed <= 0:
+            return
+        tier = "EMERGENCY" if emergency else "normal"
+        limit_k = (
+            f"{self._context_limit // 1000}K"
+            if self._context_limit >= 1000 else str(self._context_limit)
+        )
+        self._print(
+            f"[dim]Context compacted ({tier}) — freed ~{freed:,} tokens "
+            f"(was {before:,}, now ~{after:,} / {limit_k}). "
+            f"Analysis state preserved in world state.[/dim]"
+        )
+        if self.run_manager:
+            self.run_manager.append_log(
+                f"CONTEXT_COMPACT tier={tier} freed={freed} before={before} after={after}"
+            )
+
+    def _trim_messages_if_needed(
+        self,
+        messages: list,
+        *,
+        anthropic: bool = False,
+        trim_target: int = -1,
+        hard_limit: int = -1,
+    ) -> list:
+        """
+        Trim old tool results and assistant narrations when approaching context budget.
+
+        Three tiers based on how far over budget the messages are:
+          1. token_basis <= trim_target                  → no-op
+          2. trim_target < token_basis <= hard_limit     → normal trim
+               pass 1: replace old tool results (largest first)
+               pass 2: truncate assistant narrations to 600 chars
+          3. token_basis > hard_limit                    → emergency trim
+               clear ALL trimmable tool results (no min-size threshold)
+               truncate ALL assistant narrations to 200 chars
+
+        When trim_target / hard_limit are -1 (default), the budget is computed
+        internally from _compute_message_budget — preserves backward compat.
+
+        After trimming, if still above hard_limit: log a visible warning but do
+        not crash. The overflow catch in the analysis loop is the safety net.
 
         Always preserved:
           - System message (index 0, OpenAI format)
           - The most recent KEEP_TAIL messages verbatim
-          - All user messages (they're small and contain the user's intent)
+          - All user messages (never trimmed)
         """
-        threshold = int(self._context_limit * 0.75)
-        self._last_estimated_tokens = self._estimate_tokens(messages)
-        # Use whichever is higher: our estimate OR the last actual count from the
-        # API response. Since we only add messages between API calls, the current
-        # count is always >= last_actual, so this is a reliable lower bound that
-        # prevents under-trimming when the char-based estimate is too low.
-        token_basis = max(self._last_estimated_tokens, self._last_actual_tokens or 0)
-        if token_basis <= threshold:
-            return messages
-
-        messages = list(messages)  # shallow copy — entries are replaced, not mutated
+        if trim_target == -1 or hard_limit == -1:
+            system_prompt = self._build_system_prompt()
+            trim_target, hard_limit = self._compute_message_budget(system_prompt)
 
         KEEP_TAIL = 6
-        TRIM_MIN_CHARS = 300     # don't bother trimming small results
+        TRIM_MIN_CHARS = 300
         MAX_ASSISTANT_CHARS = 600
-
-        # System message lives at index 0 in OpenAI format; Anthropic passes it separately
-        first_trimmable = 0
-        if not anthropic and messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
-            first_trimmable = 1
-
-        protected_from = max(first_trimmable, len(messages) - KEEP_TAIL)
-
+        EMERGENCY_ASSISTANT_CHARS = 200
         PLACEHOLDER = (
             "[trimmed — result was processed; "
             "current analysis state is reflected in the system prompt above]"
         )
 
+        self._last_estimated_tokens = self._estimate_tokens(messages)
+        calibrated = self._calibrated_estimate(messages)
+        token_basis = max(calibrated, self._last_actual_tokens or 0)
+
+        if token_basis <= trim_target:
+            return messages
+
+        emergency = token_basis > hard_limit
+
+        messages = list(messages)  # shallow copy — entries are replaced, not mutated
+
+        first_trimmable = 0
+        if not anthropic and messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            first_trimmable = 1
+
+        protected_from = max(first_trimmable, len(messages) - KEEP_TAIL)
         trimmed_before = token_basis
 
-        # Pass 1: replace large tool results
+        # --- Pass 1: replace tool results, largest first ---
+        # Collect candidates with their size, sort descending so the biggest go first
+        candidates = []
         for i in range(first_trimmable, protected_from):
             msg = messages[i]
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role")
-
             if role == "tool":
                 content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > TRIM_MIN_CHARS:
-                    messages[i] = {**msg, "content": PLACEHOLDER}
-
+                if isinstance(content, str):
+                    char_len = len(content)
+                    if emergency or char_len > TRIM_MIN_CHARS:
+                        candidates.append((i, char_len, "openai_tool"))
             elif role == "user" and isinstance(msg.get("content"), list):
-                # Anthropic format: tool results are blocks inside user messages
+                total = sum(
+                    len(b.get("content", ""))
+                    for b in msg["content"]
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                    and isinstance(b.get("content", ""), str)
+                    and (emergency or len(b.get("content", "")) > TRIM_MIN_CHARS)
+                )
+                if total > 0:
+                    candidates.append((i, total, "anthropic_tool"))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        for i, _char_len, fmt in candidates:
+            msg = messages[i]
+            if fmt == "openai_tool":
+                messages[i] = {**msg, "content": PLACEHOLDER}
+            else:
                 new_blocks, changed = [], False
                 for block in msg["content"]:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        inner = block.get("content", "")
-                        if isinstance(inner, str) and len(inner) > TRIM_MIN_CHARS:
-                            new_blocks.append({**block, "content": PLACEHOLDER})
-                            changed = True
-                            continue
-                    new_blocks.append(block)
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                        and isinstance(block.get("content", ""), str)
+                        and (emergency or len(block.get("content", "")) > TRIM_MIN_CHARS)
+                    ):
+                        new_blocks.append({**block, "content": PLACEHOLDER})
+                        changed = True
+                    else:
+                        new_blocks.append(block)
                 if changed:
                     messages[i] = {**msg, "content": new_blocks}
 
-        if self._estimate_tokens(messages) <= threshold:
+        post_pass1 = self._estimate_tokens(messages)
+        if not emergency and post_pass1 <= trim_target:
+            freed = trimmed_before - post_pass1
+            self._report_trim(freed, trimmed_before, post_pass1)
             return messages
 
-        # Pass 2: truncate long assistant narrations
+        # --- Pass 2: truncate assistant narrations ---
+        max_chars = EMERGENCY_ASSISTANT_CHARS if emergency else MAX_ASSISTANT_CHARS
         for i in range(first_trimmable, protected_from):
             msg = messages[i]
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 continue
             content = msg.get("content")
-            if isinstance(content, str) and len(content) > MAX_ASSISTANT_CHARS:
-                messages[i] = {**msg, "content": content[:MAX_ASSISTANT_CHARS] + " [truncated]"}
+            if isinstance(content, str) and len(content) > max_chars:
+                messages[i] = {**msg, "content": content[:max_chars] + " [truncated]"}
             elif isinstance(content, list):
                 new_blocks, changed = [], False
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = block.get("text", "")
-                        if len(text) > MAX_ASSISTANT_CHARS:
-                            new_blocks.append({**block, "text": text[:MAX_ASSISTANT_CHARS] + " [truncated]"})
+                        if len(text) > max_chars:
+                            new_blocks.append({**block, "text": text[:max_chars] + " [truncated]"})
                             changed = True
                             continue
                     new_blocks.append(block)
@@ -2494,28 +2699,73 @@ class SCAgent:
 
         remaining = self._estimate_tokens(messages)
         freed = trimmed_before - remaining
-        if freed > 0:
-            limit_k = f"{self._context_limit // 1000}K" if self._context_limit >= 1000 else str(self._context_limit)
-            self._print(
-                f"[dim]⚡ Context compacted — freed ~{freed:,} tokens "
-                f"(was {trimmed_before:,}, now ~{remaining:,} / {limit_k}). "
-                f"Analysis state preserved in world state.[/dim]"
-            )
-            if self.run_manager:
-                self.run_manager.append_log(
-                    f"CONTEXT_COMPACT freed={freed} before={trimmed_before} after={remaining}"
-                )
-        if remaining > threshold:
+        self._report_trim(freed, trimmed_before, remaining, emergency=emergency)
+
+        if remaining > hard_limit:
             logger.warning(
-                f"Context still large after trimming ({remaining:,} tokens estimated). "
-                f"Limit: {self._context_limit:,}. Session may be approaching its limit."
+                f"Context still above hard_limit after trimming "
+                f"({remaining:,} > {hard_limit:,}). Overflow catch in API loop is the safety net."
             )
             self._print(
                 f"[yellow]⚠ Context still large after compaction (~{remaining:,} tokens). "
-                f"Consider starting a new session if responses degrade.[/yellow]"
+                f"If the next API call fails, an emergency retry will be attempted.[/yellow]"
             )
 
         return messages
+
+    @staticmethod
+    def _is_context_overflow_error(e: Exception) -> bool:
+        """Return True if the exception indicates a context window overflow.
+
+        Intentionally broad: a false positive (extra emergency trim) is cheaper
+        than a false negative (the session crashing). Checks OpenAI, Anthropic,
+        and generic vLLM / local server error messages.
+        """
+        try:
+            import openai as _openai
+            if isinstance(e, _openai.BadRequestError):
+                msg = str(e).lower()
+                if any(kw in msg for kw in (
+                    "context_length_exceeded", "maximum context",
+                    "context window", "too many tokens", "exceed",
+                )):
+                    return True
+        except ImportError:
+            pass
+
+        try:
+            import anthropic as _anthropic
+            if isinstance(e, _anthropic.BadRequestError):
+                msg = str(e).lower()
+                if any(kw in msg for kw in (
+                    "context_length_exceeded", "maximum context",
+                    "context window", "too many tokens", "prompt is too long",
+                )):
+                    return True
+        except ImportError:
+            pass
+
+        # Generic fallback: covers Groq, vLLM, and other OpenAI-compatible servers
+        msg = str(e).lower()
+        return any(kw in msg for kw in (
+            "context_length_exceeded",
+            "context window",
+            "maximum context length",
+            "too many tokens",
+            "exceeds the model",
+        ))
+
+    def _emergency_trim(self, messages: list, *, anthropic: bool = False) -> list:
+        """Force maximum trimming regardless of budget — called on overflow error."""
+        self._print(
+            "[yellow]Context overflow detected — applying emergency trim before retry.[/yellow]"
+        )
+        logger.warning("Context overflow error caught; applying emergency trim")
+        # trim_target=0, hard_limit=0 forces the emergency tier unconditionally
+        return self._trim_messages_if_needed(
+            messages, anthropic=anthropic,
+            trim_target=0, hard_limit=0,
+        )
 
     def _analyze_openai(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using OpenAI API."""
@@ -2540,18 +2790,51 @@ class SCAgent:
 
         try:
             for iteration in range(max_iterations):
+                system_prompt = self._build_system_prompt()
                 if messages and messages[0].get("role") == "system":
-                    messages[0]["content"] = self._build_system_prompt()
-                messages = self._trim_messages_if_needed(messages)
-                response = self._with_llm_status(
-                    lambda: self.client.chat.completions.create(
-                        model=self.model,
-                        max_completion_tokens=4096,
-                        tools=self.tools,
-                        messages=messages,
-                        **gemma_extra,
-                    )
+                    messages[0]["content"] = system_prompt
+                trim_target, hard_limit = self._compute_message_budget(system_prompt)
+                messages = self._trim_messages_if_needed(
+                    messages, trim_target=trim_target, hard_limit=hard_limit,
                 )
+                try:
+                    response = self._with_llm_status(
+                        lambda: self.client.chat.completions.create(
+                            model=self.model,
+                            max_completion_tokens=4096,
+                            tools=self.tools,
+                            messages=messages,
+                            **gemma_extra,
+                        )
+                    )
+                except Exception as _api_err:
+                    if self._is_context_overflow_error(_api_err):
+                        messages = self._emergency_trim(messages)
+                        if messages and messages[0].get("role") == "system":
+                            messages[0]["content"] = self._build_system_prompt()
+                        try:
+                            response = self._with_llm_status(
+                                lambda: self.client.chat.completions.create(
+                                    model=self.model,
+                                    max_completion_tokens=4096,
+                                    tools=self.tools,
+                                    messages=messages,
+                                    **gemma_extra,
+                                )
+                            )
+                        except Exception as _retry_err:
+                            if self._is_context_overflow_error(_retry_err):
+                                self._print(
+                                    "[red]Context window exhausted — unable to recover after "
+                                    "emergency trim. Start a new session. Your analysis state "
+                                    "is preserved in world state.[/red]"
+                                )
+                                if self.run_manager:
+                                    self.run_manager.fail("context_window_exhausted")
+                                return final_result or ""
+                            raise
+                    else:
+                        raise
 
                 choice = response.choices[0]
                 message = choice.message
@@ -2560,6 +2843,14 @@ class SCAgent:
                 # already returned). Used for the context bar display.
                 if response.usage and response.usage.prompt_tokens:
                     self._last_actual_tokens = response.usage.prompt_tokens
+                    # Calibrate estimate ratio — ratchets upward, never down, capped at 4x
+                    _current_est = self._estimate_tokens(messages)
+                    if _current_est > 0 and self._last_actual_tokens > _current_est:
+                        _new_ratio = self._last_actual_tokens / _current_est
+                        self._token_estimate_calibration = max(
+                            self._token_estimate_calibration,
+                            min(_new_ratio, 4.0),
+                        )
 
                 if choice.finish_reason == "tool_calls" and message.tool_calls:
                     # Add assistant message with tool calls
