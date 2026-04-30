@@ -675,6 +675,23 @@ class SCAgent:
     def _is_gemma_model(self) -> bool:
         return "gemma" in (self.model or "").lower()
 
+    def _is_thinking_model(self) -> bool:
+        """Return True for models that support enable_thinking chat template kwargs."""
+        m = (self.model or "").lower()
+        return "gemma" in m or "qwen" in m
+
+    def _thinking_extra(self) -> dict:
+        """Return extra_body to enable thinking if SCAGENT_THINKING=1 and model supports it.
+
+        Server default is thinking=off (set via --default-chat-template-kwargs in start_vllm.sh).
+        This re-enables it per-request when the env var is set.
+        """
+        if not self._is_thinking_model():
+            return {}
+        if os.environ.get("SCAGENT_THINKING", "0") == "1":
+            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
+        return {}
+
     def _is_action_tool(self, tool_name: str) -> bool:
         # MCP tools never mutate adata — treat them as inspection tools
         if self._mcp_client and self._mcp_client.has_tool(tool_name):
@@ -2781,12 +2798,7 @@ class SCAgent:
             ]
         final_result = ""
         auto_recovery_attempts = 0
-        # Gemma 4 requires enable_thinking=True in the chat template to generate
-        # thinking blocks — without it the model skips the reasoning step entirely.
-        gemma_extra = (
-            {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
-            if self._is_gemma_model() else {}
-        )
+        thinking_extra = self._thinking_extra()
 
         try:
             for iteration in range(max_iterations):
@@ -2804,7 +2816,7 @@ class SCAgent:
                             max_completion_tokens=4096,
                             tools=self.tools,
                             messages=messages,
-                            **gemma_extra,
+                            **thinking_extra,
                         )
                     )
                 except Exception as _api_err:
@@ -2819,7 +2831,7 @@ class SCAgent:
                                     max_completion_tokens=4096,
                                     tools=self.tools,
                                     messages=messages,
-                                    **gemma_extra,
+                                    **thinking_extra,
                                 )
                             )
                         except Exception as _retry_err:
@@ -4079,8 +4091,7 @@ class SCAgent:
                         {"role": "system", "content": self._build_system_prompt()},
                         {"role": "user", "content": message},
                     ],
-                    **({"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
-                       if self._is_gemma_model() else {}),
+                    **self._thinking_extra(),
                 )
             )
             return self._strip_model_artifacts(response.choices[0].message.content or "")

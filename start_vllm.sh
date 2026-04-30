@@ -19,6 +19,7 @@
 MODEL=${1:-"Qwen/Qwen2.5-Coder-32B-Instruct"}
 PORT=${2:-8000}
 GPUS=${3:-"auto"}
+THINKING=${THINKING:-0}   # set THINKING=1 to enable model thinking/reasoning mode
 
 HF_DIR="/data1/peerd/ibrahih3/hf"
 SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_gemma4.sif"}
@@ -93,18 +94,61 @@ fi
 
 # Detect GPU and apply GPU-specific settings
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-FP8_FLAGS=""
 MEM_UTIL="0.90"
-EXTRA_FLAGS=""
+# Use array so flags with embedded spaces/JSON pass through correctly
+EXTRA_FLAGS=()
 if [[ "$GPU_NAME" == *"H100"* ]]; then
-  # H100: CUDA graph compilation is more aggressive than A100 (batch sizes up to 8192 vs 2048),
-  # causing OOM during graph capture. enforce-eager disables CUDA graphs entirely — H100's
-  # raw tensor core throughput is fast enough without them for interactive workloads.
-  # VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS not needed when CUDA graphs are disabled.
-  EXTRA_FLAGS="--enforce-eager"
+  # vLLM V1 (>=0.6) uses FULL_DECODE_ONLY CUDA graph capture by default, which avoids
+  # the large-batch prefill OOM that required --enforce-eager on older versions.
+  # CUDA graphs are now enabled — ~20-25% lower per-token latency vs enforce-eager.
   echo "GPU:      $GPU_NAME"
 else
   echo "GPU:      ${GPU_NAME:-unknown}"
+fi
+
+# Prefix caching: on by default in vLLM V1. Explicit flag for V0 compatibility.
+EXTRA_FLAGS+=("--enable-prefix-caching")
+
+# Single-user interactive session: limit concurrent sequences.
+# Default (256) pre-allocates KV cache slots for 256 phantom sessions and blows
+# out the speculative decoding token budget (256 * k draft slots required).
+EXTRA_FLAGS+=("--max-num-seqs" "8")
+
+# Thinking mode: off by default for speed (3-10x faster TTFT for routine tool calls).
+# Override: THINKING=1 bash start_vllm.sh <model>   or   export THINKING=1
+# Agent-side toggle: set SCAGENT_THINKING=1 in .env to re-enable per-request.
+if [[ "$THINKING" == "0" ]]; then
+  EXTRA_FLAGS+=("--default-chat-template-kwargs" '{"enable_thinking": false}')
+fi
+
+# Speculative decoding: per-model draft models for faster decode.
+# Only active when thinking is OFF — acceptance rate collapses with think tokens.
+# Draft model weights must be downloaded with download_model.sh first.
+if [[ "$THINKING" == "0" ]]; then
+  case "$MODEL" in
+    Qwen/Qwen3.6-27B|Qwen/Qwen3.6-27B-FP8)
+      DRAFT_HOST="$HF_DIR/hub/models--z-lab--Qwen3.6-27B-DFlash"
+      DRAFT_HASH=$(cat "$DRAFT_HOST/refs/main" 2>/dev/null)
+      DRAFT_LOCAL="/hf_cache/hub/models--z-lab--Qwen3.6-27B-DFlash/snapshots/$DRAFT_HASH"
+      if [[ -n "$DRAFT_HASH" && -d "$DRAFT_HOST/snapshots/$DRAFT_HASH" ]]; then
+        EXTRA_FLAGS+=("--speculative-config" "{\"method\":\"dflash\",\"model\":\"$DRAFT_LOCAL\",\"num_speculative_tokens\":15}")
+        echo "Speculative: DFlash ($DRAFT_LOCAL, k=15)"
+      else
+        echo "Speculative: skipped (z-lab/Qwen3.6-27B-DFlash not downloaded)"
+      fi
+      ;;
+    google/gemma-4-31b-it|RedHatAi/gemma-4-31B-it-FP8-Dynamic)
+      DRAFT_HOST="$HF_DIR/hub/models--RedHatAI--gemma-4-31B-it-speculator.eagle3"
+      DRAFT_HASH=$(cat "$DRAFT_HOST/refs/main" 2>/dev/null)
+      DRAFT_LOCAL="/hf_cache/hub/models--RedHatAI--gemma-4-31B-it-speculator.eagle3/snapshots/$DRAFT_HASH"
+      if [[ -n "$DRAFT_HASH" && -d "$DRAFT_HOST/snapshots/$DRAFT_HASH" ]]; then
+        EXTRA_FLAGS+=("--speculative-config" "{\"model\":\"$DRAFT_LOCAL\",\"num_speculative_tokens\":3,\"method\":\"eagle3\"}")
+        echo "Speculative: EAGLE-3 ($DRAFT_LOCAL, k=3)"
+      else
+        echo "Speculative: skipped (RedHatAI/gemma-4-31B-it-speculator.eagle3 not downloaded)"
+      fi
+      ;;
+  esac
 fi
 
 # Context window: KV budget → tokens, capped at model native max (128K)
@@ -154,8 +198,7 @@ singularity exec --nv \
     --tensor-parallel-size "$TP" \
     --gpu-memory-utilization "$MEM_UTIL" \
     --max-model-len "$CTX" \
-    $FP8_FLAGS \
-    $EXTRA_FLAGS \
+    "${EXTRA_FLAGS[@]}" \
     --enable-auto-tool-choice \
     --tool-call-parser "$PARSER" \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
@@ -167,7 +210,10 @@ PID=$!
 echo "PID: $PID"
 echo ""
 
-for i in $(seq 1 120); do
+# First startup with CUDA graphs enabled takes longer — torch.compile + DeepGEMM
+# warmup can add several minutes. Compiled artifacts are cached to VLLM_CACHE_ROOT
+# (/tmp/vllm_cache) so subsequent startups are faster. Timeout: 15 min.
+for i in $(seq 1 180); do
   sleep 5
   if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
     echo "Server ready at http://localhost:$PORT/v1"
