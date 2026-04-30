@@ -140,7 +140,7 @@ If MT genes dominate the top list alongside low lib and low n_genes → treat as
 - Classification and evidence ("all three metrics are below global median")
 - Cells removed / remaining count
 
-After confirmed removal: re-run neighbors and UMAP on cleaned data, re-cluster, and run `run_cluster_qc` again. Stop iterating when no clusters are flagged or all remaining clusters have plausible QC metrics.
+After confirmed removal: re-run the full embedding pipeline on cleaned data — `run_pca` → `run_neighbors` → `run_umap` → `run_clustering` — then run `run_cluster_qc` again. Always include `run_pca`; subsetting cells invalidates the existing PC space. Stop iterating when no clusters are flagged or all remaining clusters have plausible QC metrics.
 
 **Report each iteration**: "Iteration N: removed X cells (clusters Y, Z — reasons) — N_remaining remaining. Iteration N+1: no flagged clusters — stopping."
 
@@ -207,7 +207,7 @@ The standard flow is:
 2. `run_clustering` — cluster the data
 3. `run_cluster_qc` — get per-cluster QC table, classifications, proposed removals
 4. Present the table to the user with evidence, ask for confirmation
-5. Remove confirmed clusters via `run_code`, then re-embed and re-cluster
+5. Remove confirmed clusters via `run_code`, then re-run `run_pca` → `run_neighbors` → `run_umap` → `run_clustering`
 
 **For cluster removal via `run_code`**:
 ```python
