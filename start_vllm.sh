@@ -123,8 +123,11 @@ fi
 
 # Speculative decoding: per-model draft models for faster decode.
 # Only active when thinking is OFF — acceptance rate collapses with think tokens.
+# Only active on H100: BF16 models on A100 leave insufficient VRAM headroom for
+# the draft model + CUDA graph buffers, causing an illegal memory access crash
+# during graph profiling. H100 online FP8 halves weight memory, making it safe.
 # Draft model weights must be downloaded with download_model.sh first.
-if [[ "$THINKING" == "0" ]]; then
+if [[ "$THINKING" == "0" && "$GPU_NAME" == *"H100"* ]]; then
   case "$MODEL" in
     Qwen/Qwen3.6-27B|Qwen/Qwen3.6-27B-FP8)
       DRAFT_HOST="$HF_DIR/hub/models--z-lab--Qwen3.6-27B-DFlash"
@@ -149,6 +152,8 @@ if [[ "$THINKING" == "0" ]]; then
       fi
       ;;
   esac
+elif [[ "$THINKING" == "0" && ( "$MODEL" == "Qwen/Qwen3.6-27B" || "$MODEL" == "Qwen/Qwen3.6-27B-FP8" || "$MODEL" == "google/gemma-4-31b-it" || "$MODEL" == "RedHatAi/gemma-4-31B-it-FP8-Dynamic" ) ]]; then
+  echo "Speculative: skipped (H100 only — A100 BF16 lacks VRAM headroom for draft model)"
 fi
 
 # Context window: KV budget → tokens, capped at model native max (128K)
