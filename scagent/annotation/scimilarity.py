@@ -32,6 +32,15 @@ _MODEL_PATH_MOUSE = os.environ.get(
 DEFAULT_MODEL_PATH = _MODEL_PATH_HUMAN
 
 
+def _normalize_organism(organism: Optional[str]) -> str:
+    value = (organism or "").strip().lower()
+    if value in {"human", "homo sapiens", "homo_sapiens", "hs", "hg38", "hg19"}:
+        return "human"
+    if value in {"mouse", "murine", "mus musculus", "mus_musculus", "mm", "mm10", "mm39"}:
+        return "mouse"
+    return "unknown"
+
+
 def detect_organism(adata: AnnData) -> str:
     """
     Infer organism from gene names and adata.uns.
@@ -39,45 +48,39 @@ def detect_organism(adata: AnnData) -> str:
     Returns 'human' or 'mouse'. Human genes are predominantly all-uppercase
     (GAPDH, ACTB); mouse genes are mixed-case (Gapdh, Actb).
     """
-    # Explicit annotation wins
-    organism = adata.uns.get("organism", adata.uns.get("species", "")).lower()
-    if "human" in organism or "homo" in organism:
-        return "human"
-    if "mouse" in organism or "mus" in organism:
-        return "mouse"
+    from ..analysis.context import infer_biological_context
 
-    # Infer from gene name casing — sample up to 200 genes, skip MT/mt genes
-    genes = [g for g in adata.var_names if not g.upper().startswith("MT-")][:200]
-    if not genes:
-        logger.warning("No genes to inspect for organism detection — defaulting to human")
-        return "human"
+    context = infer_biological_context(adata).to_dict()
+    organism = _normalize_organism(context.get("species"))
+    if organism in {"human", "mouse"}:
+        return organism
 
-    # A gene is "mouse-like" if it starts with an uppercase letter followed by
-    # at least one lowercase letter (e.g. Gapdh, Cd3e, H2-Aa)
-    mouse_like = sum(
-        1 for g in genes
-        if len(g) > 1 and g[0].isupper() and g[1].islower()
+    raise ValueError(
+        "Scimilarity organism is ambiguous. Provide organism='human' or organism='mouse', "
+        "or set adata.uns['species']/adata.uns['organism'] before running annotation."
     )
-    frac = mouse_like / len(genes)
-    organism = "mouse" if frac > 0.5 else "human"
-    logger.info(
-        f"Organism detection: {mouse_like}/{len(genes)} genes look mouse-like "
-        f"({frac:.0%}) → '{organism}'"
-    )
-    return organism
 
 
-def get_model_path(adata: AnnData, model_path: Optional[str] = None) -> tuple[str, str]:
+def get_model_path(
+    adata: AnnData,
+    model_path: Optional[str] = None,
+    organism: Optional[str] = None,
+) -> tuple[str, str]:
     """
     Return (model_path, organism) to use for this dataset.
 
-    If model_path is explicitly provided it is used as-is. Otherwise the organism
-    is detected from gene names and the matching default model path is returned.
+    If model_path is explicitly provided it is used as-is. Otherwise organism
+    must be provided or resolvable from structured dataset context.
     """
+    organism = _normalize_organism(organism)
+    if organism == "unknown":
+        previous = adata.uns.get("scimilarity", {}) if hasattr(adata, "uns") else {}
+        if isinstance(previous, dict):
+            organism = _normalize_organism(previous.get("selected_organism"))
     if model_path:
-        # Can't reliably detect organism from an arbitrary path — trust the caller
-        return model_path, "unknown"
-    organism = detect_organism(adata)
+        return model_path, organism
+    if organism == "unknown":
+        organism = detect_organism(adata)
     path = _MODEL_PATH_MOUSE if organism == "mouse" else _MODEL_PATH_HUMAN
     logger.info(f"Selected Scimilarity model for '{organism}': {path}")
     return path, organism
@@ -86,6 +89,7 @@ def get_model_path(adata: AnnData, model_path: Optional[str] = None) -> tuple[st
 def prepare_for_scimilarity(
     adata: AnnData,
     model_path: Optional[str] = None,
+    organism: Optional[str] = None,
     raw_layer: Optional[str] = None,
 ) -> AnnData:
     """
@@ -118,7 +122,7 @@ def prepare_for_scimilarity(
 
     logger.info("Preparing data for Scimilarity annotation...")
 
-    model_path, _ = get_model_path(adata, model_path)
+    model_path, _ = get_model_path(adata, model_path, organism=organism)
     ca = CellAnnotation(model_path=model_path)
 
     # Find raw counts
@@ -161,6 +165,7 @@ def prepare_for_scimilarity(
 def run_scimilarity(
     adata: AnnData,
     model_path: Optional[str] = None,
+    organism: Optional[str] = None,
     target_celltypes: Optional[List[str]] = None,
     raw_layer: Optional[str] = None,
     cluster_key: str = 'leiden',
@@ -200,11 +205,17 @@ def run_scimilarity(
     if not inplace:
         adata = adata.copy()
 
-    model_path, organism = get_model_path(adata, model_path)
+    requested_organism = _normalize_organism(organism)
+    model_path, organism = get_model_path(adata, model_path, organism=organism)
     logger.info(f"Running Scimilarity annotation for '{organism}' with model at {model_path}")
 
     # Prepare data
-    adata_sci, ca = prepare_for_scimilarity(adata, model_path=model_path, raw_layer=raw_layer)
+    adata_sci, ca = prepare_for_scimilarity(
+        adata,
+        model_path=model_path,
+        organism=organism,
+        raw_layer=raw_layer,
+    )
 
     # Get embeddings
     adata_sci.obsm["X_scimilarity"] = ca.get_embeddings(adata_sci.X)
@@ -242,6 +253,15 @@ def run_scimilarity(
 
         # Also transfer embeddings
         adata.obsm['X_scimilarity'] = adata_sci.obsm['X_scimilarity']
+        adata.uns['scimilarity'] = {
+            "requested_organism": requested_organism,
+            "selected_organism": organism,
+            "model_path": model_path,
+            "n_celltypes": int(adata_sci.obs['predictions_unconstrained'].nunique()),
+            "embedding_key": "X_scimilarity",
+            "prediction_key": "scimilarity_predictions_unconstrained",
+            "representative_prediction_key": "scimilarity_representative_prediction",
+        }
 
         logger.info("Scimilarity results transferred to adata")
 
@@ -262,6 +282,7 @@ def query_cells(
     group_value: Optional[str] = None,
     k: int = 50,
     model_path: Optional[str] = None,
+    organism: Optional[str] = None,
     raw_layer: Optional[str] = None,
 ) -> dict:
     """
@@ -310,7 +331,7 @@ def query_cells(
     except ImportError:
         raise ImportError("scimilarity not installed. Install with: pip install scimilarity")
 
-    model_path, organism = get_model_path(adata, model_path)
+    model_path, organism = get_model_path(adata, model_path, organism=organism)
     logger.info(f"CellQuery using '{organism}' model at {model_path}")
 
     knn_path = os.path.join(model_path, "cellsearch", "full_kNN.bin")
@@ -335,7 +356,12 @@ def query_cells(
             )
 
         # Prepare the aligned adata — centroid search needs layers["counts"]
-        adata_sci, _ = prepare_for_scimilarity(adata, model_path=model_path, raw_layer=raw_layer)
+            adata_sci, _ = prepare_for_scimilarity(
+                adata,
+                model_path=model_path,
+                organism=organism,
+                raw_layer=raw_layer,
+            )
 
         # Mark query cells in adata_sci (1 = in group, 0 = not)
         centroid_col = "__query_group__"
@@ -382,7 +408,12 @@ def query_cells(
             query_embedding = np.array(adata.obsm["X_scimilarity"])[mask]
         else:
             logger.info("X_scimilarity not found — computing embeddings for query cells")
-            adata_sci, ca = prepare_for_scimilarity(adata, model_path=model_path, raw_layer=raw_layer)
+            adata_sci, ca = prepare_for_scimilarity(
+                adata,
+                model_path=model_path,
+                organism=organism,
+                raw_layer=raw_layer,
+            )
             all_embeddings = ca.get_embeddings(adata_sci.X)
             query_embedding = all_embeddings[mask]
 
@@ -407,6 +438,8 @@ def query_cells(
 
     return {
         "query_type": query_type,
+        "organism": organism,
+        "model_path": model_path,
         "n_query_cells": n_query_cells,
         "k": k,
         "n_results": len(results_df),

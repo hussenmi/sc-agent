@@ -156,6 +156,8 @@ class AgentWorldState:
     outstanding_decisions: List[DecisionRecord] = field(default_factory=list)
     resolved_decisions: List[DecisionRecord] = field(default_factory=list)
     user_preferences: Dict[str, Any] = field(default_factory=dict)
+    context_hints: List[str] = field(default_factory=list)
+    annotation_validation: Dict[str, Any] = field(default_factory=dict)
     last_action: Dict[str, Any] = field(default_factory=dict)
     recent_events: List[Dict[str, Any]] = field(default_factory=list)
     latest_verification: Dict[str, Any] = field(default_factory=dict)
@@ -350,6 +352,8 @@ class AgentWorldState:
             "outstanding_decisions": [decision.to_dict() for decision in self.outstanding_decisions],
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions],
             "user_preferences": self.user_preferences,
+            "context_hints": self.context_hints,
+            "annotation_validation": self.annotation_validation,
             "last_action": self.last_action,
             "recent_events": self.recent_events,
             "latest_verification": self.latest_verification,
@@ -373,6 +377,9 @@ class AgentWorldState:
             "artifacts": [artifact.to_dict() for artifact in self.artifacts[-8:]],
             "outstanding_decisions": [decision.to_dict() for decision in self.outstanding_decisions[-5:]],
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions[-5:]],
+            "user_preferences": self.user_preferences,
+            "context_hints": self.context_hints[-8:],
+            "annotation_validation": self.annotation_validation,
             "latest_verification": self.latest_verification,
             "last_action": self.last_action,
             # Cap in the system-prompt snapshot to keep context small on long
@@ -386,6 +393,15 @@ class AgentWorldState:
 
     def set_active_request(self, request: str) -> None:
         self.active_request = request
+
+    def add_context_hint(self, hint: str) -> None:
+        """Persist a user/tool-provided biological or workflow hint."""
+        normalized = " ".join(str(hint or "").split())
+        if not normalized:
+            return
+        if normalized not in self.context_hints:
+            self.context_hints.append(normalized)
+            self.context_hints = self.context_hints[-20:]
 
     @staticmethod
     def _adata_fingerprint(adata) -> tuple:
@@ -423,6 +439,7 @@ class AgentWorldState:
             obs_columns_detail,
             semantic_roles_to_dict,
         )
+        from ..analysis.context import infer_biological_context
 
 
         # Re-use the cached DataState if adata's structure hasn't changed.
@@ -447,6 +464,14 @@ class AgentWorldState:
             "has_clusters": state.has_clusters,
             "has_celltypes": state.has_celltype_annotations,
         }
+        context_text = " ".join(
+            part for part in [self.active_request, request_text, *self.context_hints] if part
+        )
+        biological_context = infer_biological_context(
+            adata,
+            text_context=context_text,
+            _precomputed_state=state,
+        ).to_dict()
         self.analysis_stage = _stage_from_processing(processing)
         self.data_summary = {
             "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
@@ -461,6 +486,7 @@ class AgentWorldState:
             "cell_type_key": state.cell_type_key,
             "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
             "obs_columns_detail": obs_columns_detail(adata.obs, adata.n_obs),
+            "biological_context": biological_context,
         }
         self.metadata_candidates = [
             metadata_candidate_to_dict(candidate)
@@ -553,6 +579,8 @@ class AgentWorldState:
         if adata is not None:
             self.sync_from_adata(adata, request_text=self.active_request)
 
+        self._update_annotation_validation(tool_name, result)
+
         for artifact_payload in result.get("artifacts_created", []):
             self.register_artifact(artifact_payload)
         for decision_payload in result.get("decisions_raised", []):
@@ -596,6 +624,72 @@ class AgentWorldState:
             # Guard against unbounded growth on very long sessions.
             if len(self.step_log) > 200:
                 self.step_log = self.step_log[-200:]
+
+    def _update_annotation_validation(self, tool_name: str, result: Dict[str, Any]) -> None:
+        """Track whether automated annotation has external marker validation."""
+        status = result.get("status")
+        if status not in {"ok", "success"}:
+            return
+
+        if tool_name in {"run_celltypist", "run_scimilarity"}:
+            breakdown = result.get("cell_type_breakdown") or {}
+            expected_labels = sorted(str(label) for label in breakdown.keys())
+            self.annotation_validation = {
+                "required": True,
+                "status": "pending_reference_marker_validation",
+                "annotation_tool": tool_name,
+                "annotation_key": result.get("annotation_key"),
+                "organism": (
+                    result.get("requested_organism")
+                    or result.get("selected_organism")
+                    or result.get("model_organism")
+                ),
+                "expected_annotation_labels": expected_labels,
+                "reference_marker_source": "PanglaoDB or comparable external marker source",
+                "reference_marker_queries": [],
+                "validation_mode": "adjudicate_best_supported_label_not_confirmation",
+                "competing_label_policy": (
+                    "For ambiguous clusters, query and compare plausible alternative "
+                    "labels instead of only searching for support for the first "
+                    "automated label."
+                ),
+                "deg_required": True,
+                "deg_completed": False,
+                "instruction": (
+                    "Run DEG by cluster, query PanglaoDB or a comparable external marker "
+                    "source for proposed and plausible competing labels, compare "
+                    "reference markers against cluster DEGs, and choose the "
+                    "best-supported label before final reporting."
+                ),
+            }
+            return
+
+        if tool_name == "run_deg" and self.annotation_validation.get("required"):
+            self.annotation_validation["deg_completed"] = True
+            if not self.annotation_validation.get("reference_marker_queries"):
+                self.annotation_validation["status"] = "deg_ready_pending_reference_marker_validation"
+            return
+
+        if tool_name == "bc_get_panglaodb_marker_genes":
+            query = result.get("marker_query") or result.get("query") or {}
+            entry = {
+                "source": "PanglaoDB",
+                "species": query.get("species") or result.get("species"),
+                "cell_type": query.get("cell_type") or result.get("cell_type"),
+                "min_sensitivity": query.get("min_sensitivity") or result.get("min_sensitivity"),
+                "queried_at": _utc_now_iso(),
+            }
+            existing = self.annotation_validation.get("reference_marker_queries") or []
+            existing.append(entry)
+            if not self.annotation_validation:
+                self.annotation_validation = {
+                    "required": False,
+                    "status": "reference_markers_queried",
+                    "reference_marker_source": "PanglaoDB",
+                }
+            self.annotation_validation["reference_marker_queries"] = existing[-50:]
+            self.annotation_validation["status"] = "reference_markers_queried_pending_synthesis"
+            self.annotation_validation["reference_marker_source"] = "PanglaoDB"
 
     @staticmethod
     def _extract_step_entry(tool_name: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -658,17 +752,34 @@ class AgentWorldState:
         if tool_name == "normalize_and_hvg":
             hvg = result.get("hvg") or {}
             exclusions = result.get("feature_exclusions") or {}
+            removals = result.get("feature_removals") or {}
+            ribosomal_removal = removals.get("ribosomal_genes") or {}
             return {
                 "tool": "normalize_and_hvg",
                 "timestamp": ts,
                 "target_sum": result.get("target_sum"),
                 "log_transform": result.get("log_transform"),
+                "normalization_source": result.get("normalization_source"),
+                "resolved_source": result.get("resolved_source"),
+                "reset_from_raw_counts": result.get("reset_from_raw_counts"),
+                "reset_reason": result.get("reset_reason"),
+                "input_x_preserved_layer": result.get("input_x_preserved_layer"),
                 "raw_layer_name": result.get("raw_layer_name"),
                 "raw_counts_present": result.get("raw_counts_present"),
                 "raw_counts_integer_like": result.get("raw_counts_integer_like"),
                 "adata_raw_set": result.get("adata_raw_set"),
                 "adata_raw_shape": result.get("adata_raw_shape"),
                 "n_hvg_selected": result.get("n_hvg"),
+                "remove_ribosomal_genes": result.get("remove_ribosomal_genes"),
+                "feature_removals": {
+                    "ribosomal_genes": {
+                        "enabled": ribosomal_removal.get("enabled"),
+                        "patterns": ribosomal_removal.get("patterns"),
+                        "match_mode": ribosomal_removal.get("match_mode"),
+                        "source": ribosomal_removal.get("source"),
+                        "n_removed": ribosomal_removal.get("n_removed"),
+                    }
+                },
                 "hvg_method": hvg.get("method"),
                 "hvg_flavor": hvg.get("flavor"),
                 "hvg_requested_flavor": hvg.get("requested_flavor"),
@@ -772,9 +883,27 @@ class AgentWorldState:
                 "tool": tool_name,
                 "timestamp": ts,
                 "model": result.get("model") or result.get("celltypist_model"),
+                "model_path": result.get("model_path"),
+                "requested_organism": result.get("requested_organism"),
+                "selected_organism": result.get("selected_organism"),
+                "model_organism": result.get("model_organism"),
+                "model_organism_source": result.get("model_organism_source"),
+                "allow_cross_species": result.get("allow_cross_species"),
                 "majority_voting": result.get("majority_voting"),
-                "n_cell_types": result.get("n_cell_types"),
+                "n_cell_types": result.get("n_cell_types") or result.get("n_types"),
                 "label_key": result.get("label_key") or result.get("annotation_key"),
+            }
+
+        if tool_name == "bc_get_panglaodb_marker_genes":
+            query = result.get("marker_query") or result.get("query") or {}
+            return {
+                "tool": "bc_get_panglaodb_marker_genes",
+                "timestamp": ts,
+                "species": query.get("species") or result.get("species"),
+                "cell_type": query.get("cell_type") or result.get("cell_type"),
+                "min_sensitivity": query.get("min_sensitivity") or result.get("min_sensitivity"),
+                "status": result.get("status"),
+                "role": "annotation_reference_marker_validation",
             }
 
         if tool_name == "run_deg":

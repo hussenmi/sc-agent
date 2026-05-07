@@ -95,6 +95,7 @@ fi
 # Detect GPU and apply GPU-specific settings
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
 MEM_UTIL="0.90"
+VLLM_USE_DEEP_GEMM=1
 # Use array so flags with embedded spaces/JSON pass through correctly
 EXTRA_FLAGS=()
 if [[ "$GPU_NAME" == *"H100"* ]]; then
@@ -104,6 +105,21 @@ if [[ "$GPU_NAME" == *"H100"* ]]; then
   echo "GPU:      $GPU_NAME"
 else
   echo "GPU:      ${GPU_NAME:-unknown}"
+fi
+
+# H100 NVL uses NVLink bridge without NVSwitch. FlashInfer's SymmDeviceMemory workspace
+# (requires NVSwitch for GPU-to-GPU multicasting) fails mid-compile. torch.compile then
+# restarts without the allreduce-rms fusion, running the compilation twice. The doubled
+# intermediate tensors stay in PyTorch's CUDA allocator cache (~50 GB) and push the KV-cache
+# profiler to report num_gpu_blocks=0, causing a DeepGEMM crash during graph capture.
+# Pre-disabling the fusion prevents the mid-compile retry and keeps memory stable.
+if [[ "$GPU_NAME" == *"NVL"* ]]; then
+  EXTRA_FLAGS+=("--compilation-config" '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true,"fuse_attn_quant":false,"enable_sp":false,"fuse_gemm_comms":false,"fuse_allreduce_rms":false}}')
+  EXTRA_FLAGS+=("--disable-custom-all-reduce")
+  VLLM_USE_DEEP_GEMM=0
+  echo "Config:   allreduce-rms fusion disabled (H100 NVL — no NVSwitch)"
+  echo "Config:   custom all-reduce disabled (H100 NVL topology workaround)"
+  echo "Config:   DeepGEMM disabled (H100 NVL startup crash workaround)"
 fi
 
 # Prefix caching: on by default in vLLM V1. Explicit flag for V0 compatibility.
@@ -125,7 +141,7 @@ fi
 # Only active when thinking is OFF — acceptance rate collapses with think tokens.
 # Only active on H100: BF16 models on A100 leave insufficient VRAM headroom for
 # the draft model + CUDA graph buffers, causing an illegal memory access crash
-# during graph profiling. H100 online FP8 halves weight memory, making it safe.
+# during graph profiling. FP8 weights (~31 GB) on H100 give enough headroom.
 # Draft model weights must be downloaded with download_model.sh first.
 if [[ "$THINKING" == "0" && "$GPU_NAME" == *"H100"* ]]; then
   case "$MODEL" in
@@ -141,15 +157,7 @@ if [[ "$THINKING" == "0" && "$GPU_NAME" == *"H100"* ]]; then
       fi
       ;;
     google/gemma-4-31b-it|RedHatAi/gemma-4-31B-it-FP8-Dynamic)
-      DRAFT_HOST="$HF_DIR/hub/models--RedHatAI--gemma-4-31B-it-speculator.eagle3"
-      DRAFT_HASH=$(cat "$DRAFT_HOST/refs/main" 2>/dev/null)
-      DRAFT_LOCAL="/hf_cache/hub/models--RedHatAI--gemma-4-31B-it-speculator.eagle3/snapshots/$DRAFT_HASH"
-      if [[ -n "$DRAFT_HASH" && -d "$DRAFT_HOST/snapshots/$DRAFT_HASH" ]]; then
-        EXTRA_FLAGS+=("--speculative-config" "{\"model\":\"$DRAFT_LOCAL\",\"num_speculative_tokens\":3,\"method\":\"eagle3\"}")
-        echo "Speculative: EAGLE-3 ($DRAFT_LOCAL, k=3)"
-      else
-        echo "Speculative: skipped (RedHatAI/gemma-4-31B-it-speculator.eagle3 not downloaded)"
-      fi
+      echo "Speculative: skipped (vLLM EAGLE-3 does not support gemma4_text target models)"
       ;;
   esac
 elif [[ "$THINKING" == "0" && ( "$MODEL" == "Qwen/Qwen3.6-27B" || "$MODEL" == "Qwen/Qwen3.6-27B-FP8" || "$MODEL" == "google/gemma-4-31b-it" || "$MODEL" == "RedHatAi/gemma-4-31B-it-FP8-Dynamic" ) ]]; then
@@ -188,12 +196,20 @@ if [[ ! -d "$MODEL_CACHE" ]]; then
   exit 1
 fi
 
+# Persistent compile cache on shared storage so torch.compile artifacts survive node reboots.
+# Without this, a reboot forces a full recompile (~2-3 min) which peaks GPU memory high enough
+# that the KV cache profiler reports 0 free blocks — causing a crash during CUDA graph capture.
+MODEL_TAG=$(echo "$MODEL" | sed 's|/|_|g')
+mkdir -p "$HF_DIR/vllm_compile_cache/$MODEL_TAG"
+
 SINGULARITYENV_HF_HUB_CACHE=/hf_cache/hub \
 SINGULARITYENV_HF_HUB_OFFLINE=1 \
 SINGULARITYENV_TRANSFORMERS_OFFLINE=1 \
 SINGULARITYENV_PYTHONNOUSERSITE=1 \
-SINGULARITYENV_TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_vllm \
-SINGULARITYENV_VLLM_CACHE_ROOT=/tmp/vllm_cache \
+SINGULARITYENV_TORCHINDUCTOR_CACHE_DIR="/hf_cache/vllm_compile_cache/$MODEL_TAG/torchinductor" \
+SINGULARITYENV_VLLM_CACHE_ROOT="/hf_cache/vllm_compile_cache/$MODEL_TAG/vllm" \
+SINGULARITYENV_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+SINGULARITYENV_VLLM_USE_DEEP_GEMM="$VLLM_USE_DEEP_GEMM" \
 SINGULARITYENV_TMPDIR=/tmp \
 singularity exec --nv \
   --bind "$HF_DIR":/hf_cache \
@@ -217,7 +233,7 @@ echo ""
 
 # First startup with CUDA graphs enabled takes longer — torch.compile + DeepGEMM
 # warmup can add several minutes. Compiled artifacts are cached to VLLM_CACHE_ROOT
-# (/tmp/vllm_cache) so subsequent startups are faster. Timeout: 15 min.
+# ($HF_DIR/vllm_compile_cache/<model>) so subsequent startups are faster. Timeout: 15 min.
 for i in $(seq 1 180); do
   sleep 5
   if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then

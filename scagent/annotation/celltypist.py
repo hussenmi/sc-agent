@@ -5,7 +5,8 @@ CRITICAL: CellTypist requires data normalized to target_sum=10000.
 This module handles the special normalization requirements.
 """
 
-from typing import Optional, Union, List
+from typing import Any, Dict, Optional, Union, List
+from pathlib import Path
 import scanpy as sc
 from anndata import AnnData
 import logging
@@ -13,6 +14,111 @@ import logging
 from ..config.defaults import CELLTYPIST_DEFAULTS
 
 logger = logging.getLogger(__name__)
+
+
+_KNOWN_HUMAN_MODELS = {
+    "Immune_All_Low.pkl",
+    "Immune_All_High.pkl",
+    "Adult_COVID19_PBMC.pkl",
+    "COVID19_HumanChallenge_Blood.pkl",
+    "COVID19_Immune_Landscape.pkl",
+}
+
+
+def _model_basename(model: str) -> str:
+    return Path(str(model or "")).name
+
+
+def celltypist_models_description(force_update: bool = False):
+    """Return the installed CellTypist model catalog, using the package API."""
+    try:
+        from celltypist import models
+    except ImportError:
+        raise ImportError("celltypist not installed. Install with: pip install celltypist")
+
+    try:
+        return models.models_description(on_the_fly=bool(force_update))
+    except TypeError:
+        return models.models_description()
+
+
+def infer_celltypist_model_organism(
+    model: str,
+    *,
+    force_update: bool = False,
+    catalog=None,
+) -> Dict[str, Any]:
+    """Infer model organism from CellTypist model metadata and name."""
+    basename = _model_basename(model)
+    if not basename:
+        return {"organism": "unknown", "source": "missing_model_name", "model": model}
+    if str(model).startswith(("/", "./")):
+        return {
+            "organism": "unknown",
+            "source": "explicit_model_path",
+            "model": model,
+            "model_name": basename,
+            "reason": "Explicit model paths do not expose CellTypist catalog metadata.",
+        }
+
+    description = ""
+    try:
+        if catalog is None:
+            catalog = celltypist_models_description(force_update=force_update)
+        if "model" in catalog.columns:
+            row = catalog[catalog["model"].astype(str) == basename]
+            if not row.empty and "description" in row.columns:
+                description = str(row.iloc[0]["description"])
+    except Exception as exc:
+        catalog = None
+        catalog_error = str(exc)
+    else:
+        catalog_error = None
+
+    text = f"{basename} {description}".lower()
+    source = "celltypist_model_catalog" if description else "model_name"
+    organism = "unknown"
+    reason = ""
+
+    if basename in _KNOWN_HUMAN_MODELS:
+        organism = "human"
+        source = "known_celltypist_model"
+        reason = "Known CellTypist immune/blood model trained for human annotations."
+    elif any(token in text for token in ("mouse", "murine", "mice")):
+        organism = "mouse"
+        reason = "Model name or description indicates mouse/murine data."
+    elif any(token in text for token in ("human", "homo sapiens", "donor", "patient", "covid19", "covid-19")):
+        organism = "human"
+        reason = "Model name or description indicates human data."
+
+    payload = {
+        "organism": organism,
+        "source": source,
+        "model": model,
+        "model_name": basename,
+        "description": description,
+        "reason": reason,
+    }
+    if catalog_error:
+        payload["catalog_error"] = catalog_error
+    return payload
+
+
+def available_celltypist_models_for_organism(organism: str, *, force_update: bool = False) -> List[str]:
+    """List locally known CellTypist models whose metadata matches organism."""
+    target = str(organism or "").lower()
+    if target not in {"human", "mouse"}:
+        return []
+    try:
+        catalog = celltypist_models_description(force_update=force_update)
+    except Exception:
+        return []
+    matches: List[str] = []
+    for model in catalog.get("model", []):
+        info = infer_celltypist_model_organism(str(model), force_update=False, catalog=catalog)
+        if info.get("organism") == target:
+            matches.append(str(model))
+    return matches
 
 
 def prepare_for_celltypist(
@@ -139,6 +245,8 @@ def prepare_for_celltypist(
 def run_celltypist(
     adata: AnnData,
     model: str = CELLTYPIST_DEFAULTS.model,
+    organism: Optional[str] = None,
+    allow_cross_species: bool = False,
     majority_voting: bool = CELLTYPIST_DEFAULTS.majority_voting,
     over_clustering: Optional[str] = "leiden",
     mode: str = 'best match',
@@ -158,6 +266,10 @@ def run_celltypist(
         AnnData object.
     model : str, default 'Immune_All_Low.pkl'
         CellTypist model to use.
+    organism : {'human', 'mouse'}, optional
+        Dataset organism. If provided, it is checked against model metadata.
+    allow_cross_species : bool, default False
+        Allow species/model mismatch as an explicit expert override.
     majority_voting : bool, default True
         Use majority voting for cluster-level annotation.
     over_clustering : str, optional
@@ -186,6 +298,27 @@ def run_celltypist(
         adata = adata.copy()
 
     logger.info(f"Running CellTypist with model '{model}'")
+
+    requested_organism = str(organism or "").strip().lower()
+    if requested_organism and requested_organism not in {"human", "mouse"}:
+        raise ValueError(
+            f"CellTypist organism must be 'human' or 'mouse' when provided; got {organism!r}."
+        )
+    model_info = infer_celltypist_model_organism(model)
+    model_organism = model_info.get("organism")
+    if (
+        requested_organism
+        and model_organism in {"human", "mouse"}
+        and requested_organism != model_organism
+        and not allow_cross_species
+    ):
+        raise ValueError(
+            f"Refusing to run CellTypist model '{_model_basename(model)}' because "
+            f"the dataset organism is '{requested_organism}' but the model appears "
+            f"to be '{model_organism}'. Choose a {requested_organism}-compatible "
+            "model, use Scimilarity/marker validation, or set allow_cross_species=true "
+            "only if you intentionally want a non-definitive cross-species run."
+        )
 
     if majority_voting and over_clustering and over_clustering not in adata.obs.columns:
         raise ValueError(
@@ -245,6 +378,18 @@ def run_celltypist(
     # Log summary
     n_celltypes = adata_preds.obs['predicted_labels'].nunique()
     logger.info(f"CellTypist complete: {n_celltypes} cell types annotated")
+
+    adata.uns["celltypist"] = {
+        "model": model,
+        "model_name": _model_basename(model),
+        "requested_organism": requested_organism or None,
+        "model_organism": model_organism,
+        "model_organism_source": model_info.get("source"),
+        "model_description": model_info.get("description"),
+        "allow_cross_species": bool(allow_cross_species),
+        "majority_voting": bool(majority_voting),
+        "over_clustering": over_clustering if majority_voting else None,
+    }
 
     if not inplace:
         return adata

@@ -297,9 +297,18 @@ class SCAgent:
             "asked_questions": [],
         }
         self._pending_checkpoint: Optional[Dict[str, Any]] = None
+        self._active_cleanup_authorization: Optional[Dict[str, Any]] = None
         self._context_limit: int = 128_000  # overwritten by _init_* below
+        self._vertex_key_file: Optional[str] = None
+        self._vertex_project: Optional[str] = None
+        self._vertex_region: Optional[str] = None
+        self._vertex_token_expiry: float = 0.0
         self._last_estimated_tokens: int = 0
         self._last_actual_tokens: int = 0   # exact count from API response usage field
+        self._context_display_tokens: int = 0
+        self._context_display_source: str = ""
+        self._context_display_trim_target: int = 0
+        self._context_display_hard_limit: int = 0
         self._tool_schema_tokens: int = 0   # precomputed at init; refreshed after MCP merge
         self._token_estimate_calibration: float = 1.0  # ratchets up after each API response
         self.show_context_usage: bool = show_context_usage
@@ -323,9 +332,11 @@ class SCAgent:
             self.provider = "groq"  # Keep track of actual provider
         elif provider == "gemini":
             self._init_gemini(api_key, model)
+        elif provider == "vertex":
+            self._init_vertex(api_key, model)
         else:
             raise ValueError(
-                f"Unknown provider: {provider}. Use 'anthropic', 'openai', 'groq', 'codex', or 'gemini'."
+                f"Unknown provider: {provider}. Use 'anthropic', 'openai', 'groq', 'codex', 'gemini', or 'vertex'."
             )
 
         # Connect to MCP servers after provider init so self.tools is already set
@@ -510,6 +521,101 @@ class SCAgent:
         self._context_limit = self._resolve_context_limit()
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
+    def _init_vertex(self, api_key: Optional[str], model: Optional[str]):
+        """Initialize Google Vertex AI via its OpenAI-compatible endpoint.
+
+        Vertex AI authenticates with short-lived OAuth2 Bearer tokens, not API keys.
+        Tokens are obtained via gcloud using the service account at
+        GOOGLE_APPLICATION_CREDENTIALS (or SCAGENT_VERTEX_KEY_FILE).
+        """
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("openai not installed. Install with: pip install openai")
+
+        key_file = (
+            os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.environ.get("SCAGENT_VERTEX_KEY_FILE")
+        )
+        project = os.environ.get("SCAGENT_VERTEX_PROJECT")
+        region = os.environ.get("SCAGENT_VERTEX_REGION", "us-central1")
+
+        if project is None and key_file:
+            import json as _json
+            with open(key_file) as _f:
+                _sa = _json.load(_f)
+            project = _sa.get("project_id")
+
+        if not project:
+            raise ValueError(
+                "Vertex AI requires a project ID. "
+                "Set SCAGENT_VERTEX_PROJECT or GOOGLE_APPLICATION_CREDENTIALS."
+            )
+
+        self._vertex_key_file = key_file
+        self._vertex_project = project
+        self._vertex_region = region
+
+        token = self._get_vertex_token()
+        base_url = (
+            f"https://{region}-aiplatform.googleapis.com/v1beta1"
+            f"/projects/{project}/locations/{region}/endpoints/openapi"
+        )
+        self.client = OpenAI(api_key=token, base_url=base_url)
+        self._vertex_token_expiry = __import__("time").time() + 3600
+
+        m = model or "gemini-3.1-flash"
+        self.model = m if m.startswith("google/") else f"google/{m}"
+        self.tools = get_openai_tools()
+        self._context_limit = int(os.environ.get("SCAGENT_CONTEXT_LIMIT", "1000000"))
+        self._tool_schema_tokens = self._estimate_tokens(self.tools)
+
+    def _get_vertex_token(self) -> str:
+        """Get an OAuth2 access token from gcloud for Vertex AI."""
+        import subprocess
+        if self._vertex_key_file:
+            activate = subprocess.run(
+                [
+                    "gcloud", "auth", "activate-service-account",
+                    "--key-file", self._vertex_key_file, "--quiet",
+                ],
+                capture_output=True, text=True,
+            )
+            if activate.returncode != 0:
+                raise RuntimeError(
+                    f"gcloud service account activation failed: {activate.stderr.strip()}"
+                )
+        result = subprocess.run(
+            ["gcloud", "auth", "print-access-token"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"gcloud auth print-access-token failed: {result.stderr.strip()}"
+            )
+        token = result.stdout.strip()
+        if not token:
+            raise RuntimeError("gcloud returned an empty access token")
+        return token
+
+    def _refresh_vertex_token_if_needed(self):
+        """Recreate the Vertex AI client with a fresh Bearer token when close to expiry."""
+        if self.provider != "vertex":
+            return
+        import time
+        if time.time() < self._vertex_token_expiry - 300:
+            return  # still valid for 5+ minutes
+        from openai import OpenAI
+        token = self._get_vertex_token()
+        region = self._vertex_region
+        project = self._vertex_project
+        base_url = (
+            f"https://{region}-aiplatform.googleapis.com/v1beta1"
+            f"/projects/{project}/locations/{region}/endpoints/openapi"
+        )
+        self.client = OpenAI(api_key=token, base_url=base_url)
+        self._vertex_token_expiry = time.time() + 3600
+
     # Map of LaTeX commands to Unicode/text used inside inline math blocks
     _LATEX_COMMANDS = {
         r"\rightarrow": "→",
@@ -672,22 +778,79 @@ class SCAgent:
         payload["pending_checkpoint"] = self._pending_checkpoint
         return json.dumps(payload, indent=2)
 
+    def _followup_state_checkpoint(self, request: str) -> str:
+        """Build a compact authoritative-state reminder for follow-up turns."""
+        data_summary = self.world_state.data_summary or {}
+        capabilities = data_summary.get("capabilities", {})
+        compact_data_summary = {
+            "shape": data_summary.get("shape"),
+            "processing": data_summary.get("processing"),
+            "cluster_key": data_summary.get("cluster_key"),
+            "n_clusters": data_summary.get("n_clusters"),
+            "cell_type_key": data_summary.get("cell_type_key"),
+            "batch_key": data_summary.get("batch_key"),
+            "biological_context": data_summary.get("biological_context"),
+            "available_cluster_keys": capabilities.get("cluster_keys", []),
+            "annotation_keys": capabilities.get("annotation_keys", []),
+        }
+        checkpoint = {
+            "latest_user_request": request,
+            "analysis_stage": self.world_state.analysis_stage,
+            "current_data_summary": compact_data_summary,
+            "last_action": self.world_state.last_action,
+            "recent_events": self.world_state.recent_events[-8:],
+            "recent_step_log": self.world_state.step_log[-12:],
+            "outstanding_decisions": [
+                d.to_dict() if hasattr(d, "to_dict") else d
+                for d in self.world_state.outstanding_decisions[-5:]
+            ],
+            "resolved_decisions": [
+                d.to_dict() if hasattr(d, "to_dict") else d
+                for d in self.world_state.resolved_decisions[-5:]
+            ],
+        }
+        guidance = (
+            "Follow-up state checkpoint: the live in-memory AnnData and world "
+            "state below are authoritative. Use earlier transcript only as "
+            "background. Do not replay destructive actions from older transcript "
+            "text, such as removing clusters or cells, unless the current state "
+            "still validates that exact action. If a destructive action depends "
+            "on cluster IDs, cell counts, or annotations, inspect or verify the "
+            "current state first."
+        )
+        return f"{guidance}\n\n```json\n{json.dumps(checkpoint, indent=2, default=str)}\n```"
+
     def _is_gemma_model(self) -> bool:
         return "gemma" in (self.model or "").lower()
 
     def _is_thinking_model(self) -> bool:
-        """Return True for models that support enable_thinking chat template kwargs."""
+        """Return True for models that have controllable thinking/reasoning modes."""
         m = (self.model or "").lower()
-        return "gemma" in m or "qwen" in m
+        return "gemma" in m or "qwen" in m or "deepseek" in m
 
     def _thinking_extra(self) -> dict:
-        """Return extra_body to enable thinking if SCAGENT_THINKING=1 and model supports it.
+        """Return extra kwargs to control thinking mode and reasoning effort.
 
-        Server default is thinking=off (set via --default-chat-template-kwargs in start_vllm.sh).
-        This re-enables it per-request when the env var is set.
+        DeepSeek API (cloud): thinking ON by default.
+          SCAGENT_THINKING=0  → disable thinking entirely.
+          SCAGENT_THINKING_EFFORT=high|max  → reasoning depth (default: high).
+
+        vLLM local models (Qwen/Gemma): thinking OFF by default (server default).
+          SCAGENT_THINKING=1  → enable via chat_template_kwargs.
         """
         if not self._is_thinking_model():
             return {}
+        m = (self.model or "").lower()
+        if "deepseek" in m:
+            thinking_on = os.environ.get("SCAGENT_THINKING", "1") != "0"
+            if not thinking_on:
+                return {"extra_body": {"thinking": {"type": "disabled"}}}
+            effort = os.environ.get("SCAGENT_THINKING_EFFORT", "high")
+            kwargs: dict = {"extra_body": {"thinking": {"type": "enabled"}}}
+            if effort in ("high", "max"):
+                kwargs["reasoning_effort"] = effort
+            return kwargs
+        # vLLM local models (Qwen/Gemma)
         if os.environ.get("SCAGENT_THINKING", "0") == "1":
             return {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
         return {}
@@ -704,18 +867,85 @@ class SCAgent:
             return True
         return tool_name in INSPECTION_TOOL_NAMES
 
+    def _annotation_validation_guard(self, tool_name: str, tool_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Prevent finalization immediately after automated annotation without marker validation."""
+        validation = getattr(self.world_state, "annotation_validation", {}) or {}
+        if not validation.get("required"):
+            return None
+        if validation.get("reference_marker_queries"):
+            return None
+
+        is_final_save = tool_name == "save_data"
+        is_final_report_code = False
+        if tool_name == "run_code":
+            text = " ".join(
+                str(tool_input.get(key, ""))
+                for key in ("description", "code")
+            ).lower()
+            final_terms = (
+                "write_report",
+                "final report",
+                "summary report",
+                "analysis complete",
+                "save final",
+                ".write_h5ad",
+                "write_h5ad",
+            )
+            validation_terms = (
+                "panglaodb",
+                "reference marker",
+                "marker validation",
+                "validate annotation",
+                "validate cell type",
+            )
+            is_final_report_code = any(term in text for term in final_terms) and not any(
+                term in text for term in validation_terms
+            )
+
+        if not (is_final_save or is_final_report_code):
+            return None
+
+        return {
+            "status": "needs_validation",
+            "tool": tool_name,
+            "message": (
+                "Automated cell type annotation is present, but no external marker "
+                "validation has been run yet. Do not finalize or save the analysis "
+                "as complete based only on model training knowledge."
+            ),
+            "annotation_validation": validation,
+            "required_next_steps": [
+                "Run run_deg by the primary cluster key if marker DEGs are not already available.",
+                "Call bc_get_panglaodb_marker_genes for each proposed cell type label, using Hs for human or Mm for mouse.",
+                "For ambiguous clusters, also query plausible competing labels suggested by the DEGs or lineage context.",
+                "Compare high-sensitivity PanglaoDB markers and marker specificity against cluster DEGs.",
+                "Choose the best-supported label; revise unsupported labels, broaden them, or mark them uncertain before final report/save.",
+            ],
+        }
+
+    def _supports_vision(self) -> bool:
+        """Return False for models whose API doesn't accept image_url content (e.g. DeepSeek v4)."""
+        m = (self.model or "").lower()
+        if "deepseek" in m:
+            return False
+        return True
+
     def _build_image_message(self, images: List[Dict[str, str]], provider: str) -> Dict[str, Any]:
         """Build a user message containing one or more figures with a role-aware prompt."""
         roles = {img.get("role", "figure") for img in images}
         paths_str = ", ".join(img["path"] for img in images)
-        if "qc_figure" in roles:
+        has_qc_figure = "qc_figure" in roles or any(
+            "qc" in Path(img.get("path", "")).name.lower()
+            for img in images
+        )
+        if has_qc_figure:
             prompt_text = (
                 f"Here {'is the QC figure' if len(images) == 1 else 'are the QC figures'} ({paths_str}). "
-                "Look at the distributions carefully and suggest specific filtering thresholds based on what you see — "
-                "e.g. an MT% cutoff that captures the low-quality tail, a min_genes value that separates "
-                "empty droplets from real cells, whether doublet removal looks warranted. "
-                "Cite the specific values visible in the plots. "
-                "Present these as your suggestions with projected removal counts, and ask the user to confirm before applying."
+                "Use it as a quick sanity check for the flag-only QC pass: briefly note whether the distributions "
+                "look broadly healthy and whether low-count, low-gene, high-MT, or doublet tails are present. "
+                "Do not propose global filtering thresholds, do not ask the user to confirm QC-only filtering, "
+                "and do not stop after this visual review. The standard workflow decides removals after "
+                "normalization, embedding, clustering, and run_cluster_qc. Continue with the next pipeline tool."
             )
         else:
             n = len(images)
@@ -723,7 +953,9 @@ class SCAgent:
                 f"Here {'is the' if n == 1 else 'are the'} generated "
                 f"figure{'s' if n > 1 else ''} ({paths_str}). "
                 "Interpret it in the context of the current analysis — what does it show, "
-                "what are the key observations, and is there anything the user should act on?"
+                "what are the key observations, and is there anything the user should act on? "
+                "If the original user request is an ongoing analysis pipeline and no genuine decision point "
+                "has been reached, keep the interpretation brief and continue with the next appropriate tool."
             )
 
         content: List[Any] = [{"type": "text", "text": prompt_text}]
@@ -1471,6 +1703,211 @@ class SCAgent:
         text = (value or "").strip().lower()
         return text in {"y", "yes", "1", "ok", "okay", "sure", "continue", "do it", "run it", "compute it"}
 
+    def _is_strict_cleanup_yes(self, value: str) -> bool:
+        text = " ".join((value or "").strip().lower().split())
+        text = text.strip(" .,!?:;")
+        if text in {
+            "y",
+            "yes",
+            "ok",
+            "okay",
+            "sure",
+            "do it",
+            "remove",
+            "remove them",
+            "remove it",
+            "go ahead",
+            "proceed with removal",
+        }:
+            return True
+        if re.match(r"^(yes|y|ok|okay|sure|go ahead|do it)\b", text):
+            return not re.search(r"\b(no|not|don't|dont|keep)\b", text)
+        return bool(
+            re.search(r"\b(remove|drop|filter|exclude)\b", text)
+            and not re.search(r"\b(no|not|don't|dont|keep|without removing)\b", text)
+        )
+
+    def _is_cleanup_no(self, value: str) -> bool:
+        text = " ".join((value or "").strip().lower().split())
+        text = text.strip(" .,!?:;")
+        if text in {
+            "n",
+            "no",
+            "nope",
+            "keep",
+            "keep them",
+            "keep it",
+            "do not remove",
+            "don't remove",
+            "dont remove",
+            "proceed without removing",
+        }:
+            return True
+        return bool(
+            re.match(r"^(no|n|nope)\b", text)
+            or re.search(r"\b(keep|do not remove|don't remove|dont remove|without removing)\b", text)
+        )
+
+    def _mentioned_cluster_labels(self, value: str) -> set[str]:
+        text = (value or "").lower()
+        labels: set[str] = set()
+        for match in re.finditer(
+            r"\bclusters?\s+([0-9a-z_,\s]+?)(?=\b(?:or|and|then|before|after|to|from|with|but|because|instead|$))",
+            text,
+        ):
+            chunk = match.group(1)
+            labels.update(re.findall(r"\b[0-9]+[a-z]?\b", chunk))
+        return labels
+
+    def _cleanup_policy(self) -> Dict[str, Any]:
+        policy = self.world_state.get_confirmed_value("cluster_cleanup_policy")
+        if isinstance(policy, dict):
+            return policy
+        return {
+            "mode": "confirm",
+            "max_pct_without_confirmation": 0.0,
+            "stop_for_ambiguous": True,
+            "require_exact_count": True,
+        }
+
+    def _is_auto_cleanup_allowed(self, proposal: Dict[str, Any]) -> tuple[bool, str]:
+        policy = self._cleanup_policy()
+        if policy.get("mode") != "auto_obvious":
+            return False, "cluster cleanup policy requires user confirmation"
+        if proposal.get("ambiguous"):
+            return False, "ambiguous clusters require confirmation"
+        proposed = proposal.get("proposed_removal") or []
+        if not proposed:
+            return False, "no proposed removals"
+        max_pct = float(policy.get("max_pct_without_confirmation", 5.0))
+        pct = float(proposal.get("pct_proposed") or 0.0)
+        if pct > max_pct:
+            return False, f"proposed removal {pct:.1f}% exceeds auto-cleanup limit {max_pct:.1f}%"
+        cluster_decisions = proposal.get("cluster_decisions") or {}
+        not_obvious = []
+        for cluster in proposed:
+            decision = cluster_decisions.get(str(cluster), {})
+            if (
+                decision.get("recommended_action") != "propose_removal"
+                or decision.get("severity") != "obvious"
+            ):
+                not_obvious.append(str(cluster))
+        if not_obvious:
+            return False, f"cluster cleanup requires confirmation for: {', '.join(not_obvious)}"
+        return True, "user granted auto-cleanup for obvious cluster-level QC removals"
+
+    def _cluster_cleanup_checkpoint_from_result(self, result_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        proposed = [str(cluster) for cluster in result_data.get("proposed_removal", []) or []]
+        if not proposed:
+            return None
+        cells = int(result_data.get("cells_in_proposed_removal") or 0)
+        pct = float(result_data.get("pct_proposed") or 0.0)
+        cluster_key = result_data.get("cluster_key") or self.world_state.data_summary.get("cluster_key") or "leiden"
+        cluster_decisions = result_data.get("cluster_decisions") or {}
+        proposal = {
+            "cluster_key": cluster_key,
+            "proposed_removal": proposed,
+            "cluster_decisions": cluster_decisions,
+            "cells_in_proposed_removal": cells,
+            "pct_proposed": pct,
+            "cells_remaining_if_removed": result_data.get("cells_remaining_if_removed"),
+            "ambiguous": [str(cluster) for cluster in result_data.get("ambiguous", []) or []],
+            "n_clusters": result_data.get("n_clusters"),
+            "thresholds_used": result_data.get("thresholds_used", {}),
+            "checkpoint_path": result_data.get("checkpoint_path"),
+            "cluster_table": result_data.get("cluster_table", []),
+        }
+        auto_allowed, auto_reason = self._is_auto_cleanup_allowed(proposal)
+        options, option_actions = self._checkpoint_options([
+            ("Remove the proposed low-quality clusters and rerun embedding", "remove_proposed_clusters"),
+            ("Keep the proposed clusters and proceed", "keep_proposed_clusters"),
+            ("Inspect cluster QC details before deciding", "review_cluster_qc"),
+            ("Something else", "custom"),
+        ])
+        summary = (
+            f"Cluster QC proposes removing {len(proposed)} cluster(s) "
+            f"({', '.join(proposed)}) from '{cluster_key}', totaling {cells} cells "
+            f"({pct:.1f}%)."
+        )
+        return {
+            "kind": "cluster_qc_cleanup",
+            "question": "Cluster QC found low-quality clusters. Should I remove them before continuing?",
+            "options": options,
+            "default": options[0],
+            "decision_key": "cluster_qc_cleanup",
+            "summary": summary,
+            "recommendation": options[0],
+            "option_actions": option_actions,
+            "proposal": proposal,
+            "auto_allowed": auto_allowed,
+            "auto_reason": auto_reason,
+            "requires_user_confirmation": not auto_allowed,
+        }
+
+    def _authorize_pending_cleanup_from_user(self, request: str) -> bool:
+        checkpoint = self._pending_checkpoint or {}
+        if checkpoint.get("kind") != "cluster_qc_cleanup":
+            return False
+        proposal = checkpoint.get("proposal") or {}
+        if self._is_strict_cleanup_yes(request):
+            mentioned = self._mentioned_cluster_labels(request)
+            proposed = {str(label) for label in proposal.get("proposed_removal", [])}
+            if mentioned and mentioned != proposed:
+                return False
+            self._active_cleanup_authorization = {
+                "source": "user_confirmation",
+                "proposal": proposal,
+                "reason": "User explicitly confirmed the pending cluster cleanup.",
+            }
+            self.world_state.resolve_decision(
+                "cluster_qc_cleanup",
+                "remove_proposed_clusters",
+                source="user",
+                message=request,
+            )
+            self._clear_pending_checkpoint(request)
+            return True
+        if self._is_cleanup_no(request):
+            self.world_state.resolve_decision(
+                "cluster_qc_cleanup",
+                "keep_proposed_clusters",
+                source="user",
+                message=request,
+            )
+            self._clear_pending_checkpoint(request)
+            return True
+        return False
+
+    def _looks_like_direct_cleanup_request(self, message: str) -> bool:
+        text = (message or "").lower()
+        return bool(
+            re.search(r"\b(remove|drop|filter|exclude|subset out)\b", text)
+            and re.search(r"\b(cluster|clusters|cells?)\b", text)
+        )
+
+    def _cleanup_authorization_for_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if tool_name != "run_code":
+            return None
+        if self._active_cleanup_authorization:
+            return dict(self._active_cleanup_authorization)
+        checkpoint = self._pending_checkpoint or {}
+        if checkpoint.get("kind") == "cluster_qc_cleanup":
+            proposal = checkpoint.get("proposal") or {}
+            auto_allowed, auto_reason = self._is_auto_cleanup_allowed(proposal)
+            if auto_allowed:
+                return {
+                    "source": "auto_policy",
+                    "proposal": proposal,
+                    "reason": auto_reason,
+                }
+        if self._looks_like_direct_cleanup_request(self._active_request):
+            return {
+                "source": "direct_user_request",
+                "proposal": {},
+                "reason": "The latest user request directly requested cell or cluster removal.",
+            }
+        return None
+
     def _run_reconciled_action(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool and return parsed result. Used for checkpoint option handling."""
         result_json = self._execute_tool(tool_name, tool_input)
@@ -1507,6 +1944,73 @@ class SCAgent:
         """Persist explicit user corrections so later tools can reuse them mechanically."""
         if not message:
             return
+
+        text = " ".join(message.lower().split())
+
+        confirm_cleanup_patterns = [
+            r"\bask me\b.*\b(before|prior to)\b.*\b(remove|filter|drop|exclude)\b",
+            r"\bconfirm\b.*\b(before|prior to)\b.*\b(remove|filter|drop|exclude)\b",
+            r"\bdon't remove\b.*\bwithout\b.*\b(confirm|ask)",
+            r"\bdo not remove\b.*\bwithout\b.*\b(confirm|ask)",
+        ]
+        auto_cleanup_patterns = [
+            r"\b(don't|dont|do not)\s+ask\b.*\b(remove|filter|drop|exclude|cleanup|clean up)\b",
+            r"\b(remove|filter|drop|exclude|cleanup|clean up)\b.*\bwithout asking\b",
+            r"\b(you|agent)\s+(decide|choose)\b.*\b(threshold|remove|filter|cleanup|clean up)\b",
+            r"\bchoose\b.*\b(threshold|cutoff|cutoffs)\b.*\b(remove|filter|drop|exclude)\b",
+            r"\bif\b.*\b(removing|filtering|cleanup|cleaning)\b.*\b(needs|should)\b.*\b(just )?(do it|remove|proceed)\b",
+            r"\bautomatically\b.*\b(remove|filter|drop|exclude|cleanup|clean up)\b",
+            r"\bbe autonomous\b.*\b(remove|filter|drop|exclude|cleanup|clean up)\b",
+        ]
+        if any(re.search(pattern, text) for pattern in confirm_cleanup_patterns):
+            policy = {
+                "mode": "confirm",
+                "max_pct_without_confirmation": 0.0,
+                "stop_for_ambiguous": True,
+                "require_exact_count": True,
+                "set_by_user_message": message,
+            }
+            self.world_state.resolve_decision(
+                "cluster_cleanup_policy",
+                policy,
+                source="user",
+                message=message,
+            )
+            if self.run_manager:
+                self.run_manager.add_user_decision(
+                    {
+                        "key": "cluster_cleanup_policy",
+                        "policy_action": "user_preference",
+                        "status": "user_corrected",
+                        "applied_value": policy,
+                        "user_message": message,
+                    }
+                )
+        elif any(re.search(pattern, text) for pattern in auto_cleanup_patterns):
+            policy = {
+                "mode": "auto_obvious",
+                "max_pct_without_confirmation": 5.0,
+                "stop_for_ambiguous": True,
+                "require_exact_count": True,
+                "require_checkpoint": True,
+                "set_by_user_message": message,
+            }
+            self.world_state.resolve_decision(
+                "cluster_cleanup_policy",
+                policy,
+                source="user",
+                message=message,
+            )
+            if self.run_manager:
+                self.run_manager.add_user_decision(
+                    {
+                        "key": "cluster_cleanup_policy",
+                        "policy_action": "user_preference",
+                        "status": "user_corrected",
+                        "applied_value": policy,
+                        "user_message": message,
+                    }
+                )
 
         batch_patterns = [
             r"\buse\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s+(?:the\s+)?batch(?:\s+key|\s+column)?\b",
@@ -1673,6 +2177,14 @@ class SCAgent:
                         "details": f"Figure output path: {output_path}",
                     }
                 )
+        for preflight in result_data.get("preflight_checks", []) or []:
+            checks.append(
+                {
+                    "name": preflight.get("name", "preflight_check"),
+                    "status": preflight.get("status", "warning"),
+                    "details": json.dumps(preflight, default=str),
+                }
+            )
 
         verification_status = "passed" if all(check["status"] == "passed" for check in checks) else "warning"
         return {
@@ -1691,9 +2203,23 @@ class SCAgent:
     ) -> Dict[str, Any]:
         after_snapshot = self.world_state.snapshot()
 
+        if tool_name == "bc_get_panglaodb_marker_genes":
+            result_data.setdefault(
+                "marker_query",
+                {
+                    "species": tool_input.get("species"),
+                    "cell_type": tool_input.get("cell_type"),
+                    "min_sensitivity": tool_input.get("min_sensitivity"),
+                },
+            )
+
         if "state_delta" not in result_data:
             before_stage = before_snapshot.get("analysis_stage", "uninitialized")
             after_stage = after_snapshot.get("analysis_stage", before_stage)
+            before_summary = before_snapshot.get("data_summary") or {}
+            after_summary = after_snapshot.get("data_summary") or {}
+            before_shape = before_summary.get("shape")
+            after_shape = after_summary.get("shape")
             before_processing = (before_snapshot.get("data_summary") or {}).get("processing", {})
             after_processing = (after_snapshot.get("data_summary") or {}).get("processing", {})
             changed_flags = {}
@@ -1703,24 +2229,29 @@ class SCAgent:
                         "before": before_processing.get(key),
                         "after": after_processing.get(key),
                     }
+            dataset_changed = tool_name in {
+                "run_qc",
+                "normalize_and_hvg",
+                "run_pca",
+                "run_neighbors",
+                "run_umap",
+                "run_clustering",
+                "compare_clusterings",
+                "run_celltypist",
+                "run_scimilarity",
+                "run_batch_correction",
+                "run_deg",
+            }
+            if tool_name == "run_code":
+                dataset_changed = bool(changed_flags) or before_shape != after_shape
             result_data["state_delta"] = {
                 "tool": tool_name,
                 "summary": result_data.get("message") or f"{tool_name} completed.",
-                "dataset_changed": tool_name in {
-                    "run_qc",
-                    "normalize_and_hvg",
-                    "run_pca",
-                    "run_neighbors",
-                    "run_umap",
-                    "run_clustering",
-                    "compare_clusterings",
-                    "run_celltypist",
-                    "run_scimilarity",
-                    "run_batch_correction",
-                    "run_deg",
-                },
+                "dataset_changed": dataset_changed,
                 "stage_before": before_stage,
                 "stage_after": after_stage,
+                "shape_before": before_shape,
+                "shape_after": after_shape,
                 "changed_flags": changed_flags,
                 "notes": [],
             }
@@ -1868,12 +2399,95 @@ class SCAgent:
         except (EOFError, KeyboardInterrupt):
             return "quit"
 
+    def _handle_max_iterations_reached(
+        self,
+        messages: List[Dict[str, Any]],
+        max_iterations: int,
+        *,
+        message_format: str = "openai",
+    ) -> str:
+        """Persist and report an explicit resumable pause at the tool-call limit."""
+        final_result = (
+            f"Paused because this turn reached the tool-call limit "
+            f"({max_iterations}). The current AnnData state is still in memory "
+            "and the run manifest has been updated. Send a follow-up such as "
+            "`continue` to resume from the current state; completed filtering "
+            "or cleanup steps should not be repeated unless the live data still "
+            "validates that action."
+        )
+
+        if message_format == "anthropic":
+            messages.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": final_result}],
+            })
+        else:
+            messages.append({"role": "assistant", "content": final_result})
+
+        self._conversation_history = messages
+        if self.run_manager:
+            self.run_manager.append_event(
+                "iteration_limit_reached",
+                {
+                    "max_iterations": max_iterations,
+                    "request": self._active_request,
+                    "last_action": self.world_state.last_action,
+                },
+            )
+            self.run_manager.complete(summary=final_result, request=self._active_request)
+
+        self._print("\n" + "-" * 50)
+        self._print(final_result)
+        if self.run_manager:
+            self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
+        return final_result
+
+    def _handle_unexpected_provider_stop(
+        self,
+        messages: List[Dict[str, Any]],
+        reason: str,
+        *,
+        message_format: str = "openai",
+    ) -> str:
+        """Persist and report a resumable pause for unexpected provider stops."""
+        final_result = (
+            f"Paused because the model provider returned an unexpected stop "
+            f"reason: {reason}. The current AnnData state is still in memory "
+            "and the run manifest has been updated. Send a follow-up with how "
+            "you want to proceed, or say `continue` to resume from the current state."
+        )
+        if message_format == "anthropic":
+            messages.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": final_result}],
+            })
+        else:
+            messages.append({"role": "assistant", "content": final_result})
+
+        self._conversation_history = messages
+        if self.run_manager:
+            self.run_manager.append_event(
+                "unexpected_provider_stop",
+                {
+                    "reason": reason,
+                    "request": self._active_request,
+                    "last_action": self.world_state.last_action,
+                },
+            )
+            self.run_manager.complete(summary=final_result, request=self._active_request)
+
+        self._print("\n" + "-" * 50)
+        self._print(final_result)
+        if self.run_manager:
+            self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
+        return final_result
+
     def analyze(
         self,
         request: str,
         data_path: Optional[str] = None,
         run_name: Optional[str] = None,
-        max_iterations: int = 20,
+        max_iterations: int = 75,
         continue_conversation: bool = False,
     ) -> str:
         """
@@ -1895,8 +2509,8 @@ class SCAgent:
             If None and self.adata exists, uses already-loaded data.
         run_name : str, optional
             Name for the run directory.
-        max_iterations : int, default 20
-            Maximum number of tool calls.
+        max_iterations : int, default 75
+            Maximum number of tool calls per turn before an explicit resumable pause.
         continue_conversation : bool, default False
             If True, continue from previous conversation history.
             Useful for interactive follow-up questions.
@@ -1955,9 +2569,11 @@ class SCAgent:
             self.run_manager.append_event("follow_up_request", {"request": request})
 
         # Clear any stale checkpoint - the LLM's response options take precedence
-        # The LLM knows what options it presented and will interpret numbered inputs correctly
+        # First translate explicit user confirmation into a one-shot cleanup
+        # authorization. Otherwise the LLM's response options take precedence.
         if self._pending_checkpoint:
-            self._clear_pending_checkpoint("superseded by new response")
+            if not self._authorize_pending_cleanup_from_user(request):
+                self._clear_pending_checkpoint("superseded by new response")
 
         # Build initial message
         user_message = request
@@ -1966,6 +2582,7 @@ class SCAgent:
         elif is_followup:
             # Inform agent that data is already loaded
             user_message += f"\n\n[Data already loaded in memory: {self.adata.n_obs} cells x {self.adata.n_vars} genes]"
+            user_message += f"\n\n{self._followup_state_checkpoint(request)}"
         if self.run_manager:
             user_message += f"\nOutput directory: {self.run_manager.run_dir}"
 
@@ -1981,7 +2598,7 @@ class SCAgent:
         # Route to provider-specific implementation
         if self.provider == "anthropic":
             return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
-        elif self.provider in {"openai", "groq", "gemini"}:
+        elif self.provider in {"openai", "groq", "gemini", "vertex"}:
             return self._analyze_openai(user_message, max_iterations, continue_conversation)
         elif self.provider == "codex":
             return self._analyze_codex(user_message, max_iterations, continue_conversation)
@@ -2045,19 +2662,25 @@ class SCAgent:
             f"{json.dumps(payload, indent=2, default=str)}"
         )
 
+    @staticmethod
+    def _format_token_count(value: int) -> str:
+        if value >= 1000:
+            return f"{value // 1000}K"
+        return str(value)
+
     def _context_bar_str(self) -> str:
-        """Compact context usage indicator: '▓▓▓░░░░░░░ 28% · 21K/77K'"""
-        # Prefer exact count from the last API response; fall back to estimate
-        used = self._last_actual_tokens or self._last_estimated_tokens
+        """Compact context usage indicator: '▓▓▓░░░░░░░ 28% · ~21K/77K'."""
+        used = self._context_display_tokens or self._last_actual_tokens or self._last_estimated_tokens
         limit = self._context_limit
         if limit <= 0 or used <= 0:
             return ""
         pct = min(used / limit, 1.0)
         filled = int(pct * 10)
         bar = "▓" * filled + "░" * (10 - filled)
-        used_k = f"{used // 1000}K" if used >= 1000 else str(used)
-        limit_k = f"{limit // 1000}K" if limit >= 1000 else str(limit)
-        return f"{bar} {pct:.0%} · {used_k}/{limit_k}"
+        prefix = "~" if self._context_display_source.startswith("estimated") else ""
+        used_k = self._format_token_count(used)
+        limit_k = self._format_token_count(limit)
+        return f"{bar} {pct:.0%} · {prefix}{used_k}/{limit_k}"
 
     def _update_context_bar(self) -> None:
         """
@@ -2068,9 +2691,13 @@ class SCAgent:
         on screen is disturbed. Called both before and after each model call so
         the bar persists after the spinner clears.
         """
-        if not self.show_context_usage or self._last_estimated_tokens <= 0:
+        if not self.show_context_usage:
             return
         try:
+            self._refresh_context_usage_display(source="estimated next prompt")
+            if (self._context_display_tokens or self._last_actual_tokens or self._last_estimated_tokens) <= 0:
+                return
+
             import shutil
             size = shutil.get_terminal_size(fallback=(0, 0))
             cols, rows = size.columns, size.lines
@@ -2081,11 +2708,12 @@ class SCAgent:
             bar = f" {self._context_bar_str()} "
             if len(bar) > cols:
                 # Compact: just percentage and counts, no block bar
-                used = self._last_actual_tokens or self._last_estimated_tokens
+                used = self._context_display_tokens or self._last_actual_tokens or self._last_estimated_tokens
                 pct = min(used / self._context_limit, 1.0)
-                used_k = f"{used // 1000}K" if used >= 1000 else str(used)
-                limit_k = f"{self._context_limit // 1000}K" if self._context_limit >= 1000 else str(self._context_limit)
-                bar = f" {pct:.0%} {used_k}/{limit_k} "
+                prefix = "~" if self._context_display_source.startswith("estimated") else ""
+                used_k = self._format_token_count(used)
+                limit_k = self._format_token_count(self._context_limit)
+                bar = f" {pct:.0%} {prefix}{used_k}/{limit_k} "
             if len(bar) > cols:
                 return  # terminal too narrow even for compact form
 
@@ -2207,8 +2835,11 @@ class SCAgent:
 
                 raise CodexCLIError(f"Codex returned unknown decision kind: {kind}")
 
-            final_result = "Analysis stopped: max iterations reached"
-            self._conversation_history = messages
+            return self._handle_max_iterations_reached(
+                messages,
+                max_iterations,
+                message_format="openai",
+            )
         except Exception as e:
             if self.run_manager:
                 self.run_manager.fail(str(e))
@@ -2275,8 +2906,16 @@ class SCAgent:
 
                 if response.usage and hasattr(response.usage, 'input_tokens') and response.usage.input_tokens:
                     self._last_actual_tokens = response.usage.input_tokens
+                    self._context_display_tokens = self._last_actual_tokens
+                    self._context_display_source = "last actual prompt"
                     # Calibrate estimate ratio — ratchets upward, never down, capped at 4x
-                    _current_est = self._estimate_tokens(messages)
+                    _current_est = self._context_usage_snapshot(
+                        messages,
+                        system_prompt=system_prompt,
+                        anthropic=True,
+                        trim_target=trim_target,
+                        hard_limit=hard_limit,
+                    )["prompt_estimate"]
                     if _current_est > 0 and self._last_actual_tokens > _current_est:
                         _new_ratio = self._last_actual_tokens / _current_est
                         self._token_estimate_calibration = max(
@@ -2342,9 +2981,17 @@ class SCAgent:
 
                 else:
                     logger.warning(f"Unexpected stop reason: {response.stop_reason}")
-                    break
+                    return self._handle_unexpected_provider_stop(
+                        messages,
+                        str(response.stop_reason),
+                        message_format="anthropic",
+                    )
 
-            final_result = "Analysis stopped: max iterations reached"
+            return self._handle_max_iterations_reached(
+                messages,
+                max_iterations,
+                message_format="anthropic",
+            )
 
         except Exception as e:
             if self.run_manager:
@@ -2438,6 +3085,7 @@ class SCAgent:
                 "api.anthropic.com",
                 "api.groq.com",
                 "generativelanguage.googleapis.com",
+                "aiplatform.googleapis.com",
             )
             is_cloud = any(h in base_url for h in cloud_hosts)
             if not is_cloud and base_url:
@@ -2468,16 +3116,23 @@ class SCAgent:
             return limit
 
         # --- Priority 4: cloud model name dict ---
+        # Claude: Opus 4.6/4.7, Sonnet 4.6, and Mythos are 1M; Haiku 4.5 and older are 200K
         if "claude" in model:
+            if any(m in model for m in ("opus-4-6", "opus-4-7", "sonnet-4-6", "mythos")):
+                return 1_000_000
             return 200_000
+        # GPT-5.x: mini variants (gpt-5-mini, gpt-5.4-mini) are 400K; all others are 1M
         if "gpt-5" in model:
-            return 500_000
+            if "mini" in model:
+                return 400_000
+            return 1_000_000
         if "gpt-4o" in model:
             return 128_000
         if "gpt-4-turbo" in model:
             return 128_000
         if "llama" in model or "mixtral" in model or "gemma" in model:
             return 128_000
+        # Gemini 3.x and 2.5: Pro, Flash, and Flash-Lite all support 1M context
         if "gemini" in model:
             return 1_048_576
 
@@ -2530,6 +3185,90 @@ class SCAgent:
         raw = self._estimate_tokens(content)
         return int(raw * self._token_estimate_calibration)
 
+    @staticmethod
+    def _history_messages_for_budget(messages: list, *, anthropic: bool = False) -> list:
+        """Return conversation-history messages without provider system overhead."""
+        if (
+            not anthropic
+            and messages
+            and isinstance(messages[0], dict)
+            and messages[0].get("role") == "system"
+        ):
+            return messages[1:]
+        return messages
+
+    def _context_usage_snapshot(
+        self,
+        messages: Optional[list] = None,
+        *,
+        system_prompt: Optional[str] = None,
+        anthropic: bool = False,
+        trim_target: int = -1,
+        hard_limit: int = -1,
+    ) -> Dict[str, int]:
+        """Estimate the full next prompt and the history portion used for trimming.
+
+        The model sees system prompt + tool schemas + message history. Only the
+        message history can be compacted, so trimming decisions compare history
+        tokens against a history budget. The terminal bar reports the fuller
+        next-prompt estimate so it does not under-report after tool results have
+        been appended since the last API call.
+        """
+        messages = messages if messages is not None else self._conversation_history
+        system_prompt = system_prompt if system_prompt is not None else self._build_system_prompt()
+        if trim_target == -1 or hard_limit == -1:
+            trim_target, hard_limit = self._compute_message_budget(system_prompt)
+
+        system_tokens = int((len(system_prompt) // 4) * self._token_estimate_calibration)
+        tool_schema_tokens = int(self._tool_schema_tokens * self._token_estimate_calibration)
+        history_messages = self._history_messages_for_budget(messages or [], anthropic=anthropic)
+        history_estimate = self._calibrated_estimate(history_messages)
+        overhead = tool_schema_tokens + system_tokens
+        completion_reserve = 4096
+        safety_margin = max(2000, int(self._context_limit * 0.03))
+        hard_prompt_limit = max(0, self._context_limit - completion_reserve - safety_margin)
+
+        return {
+            "history_estimate": history_estimate,
+            "prompt_estimate": overhead + history_estimate,
+            "system_tokens": system_tokens,
+            "tool_schema_tokens": tool_schema_tokens,
+            "overhead_tokens": overhead,
+            "trim_target": trim_target,
+            "hard_limit": hard_limit,
+            "trim_target_prompt": overhead + trim_target,
+            "hard_prompt_limit": hard_prompt_limit,
+        }
+
+    def _refresh_context_usage_display(
+        self,
+        messages: Optional[list] = None,
+        *,
+        system_prompt: Optional[str] = None,
+        anthropic: bool = False,
+        source: str = "estimated next prompt",
+    ) -> Dict[str, int]:
+        """Refresh the context bar from current history instead of stale API usage."""
+        if messages is None:
+            messages = self._conversation_history
+        if not messages:
+            if self._last_actual_tokens:
+                self._context_display_tokens = self._last_actual_tokens
+                self._context_display_source = "last actual prompt"
+            return {}
+
+        snapshot = self._context_usage_snapshot(
+            messages,
+            system_prompt=system_prompt,
+            anthropic=anthropic,
+        )
+        self._last_estimated_tokens = snapshot["prompt_estimate"]
+        self._context_display_tokens = snapshot["prompt_estimate"]
+        self._context_display_source = source
+        self._context_display_trim_target = snapshot["trim_target_prompt"]
+        self._context_display_hard_limit = snapshot["hard_prompt_limit"]
+        return snapshot
+
     def _compute_message_budget(self, system_prompt: str) -> tuple:
         """Compute available token budget for message history.
 
@@ -2544,11 +3283,12 @@ class SCAgent:
           hard_limit   — absolute ceiling; triggers emergency trim if exceeded
         """
         COMPLETION_RESERVE = 4096
-        system_tokens = len(system_prompt) // 4
+        system_tokens = int((len(system_prompt) // 4) * self._token_estimate_calibration)
+        tool_schema_tokens = int(self._tool_schema_tokens * self._token_estimate_calibration)
         safety_margin = max(2000, int(self._context_limit * 0.03))
         available = (
             self._context_limit
-            - self._tool_schema_tokens
+            - tool_schema_tokens
             - system_tokens
             - COMPLETION_RESERVE
             - safety_margin
@@ -2558,23 +3298,36 @@ class SCAgent:
         hard_limit = available
         return trim_target, hard_limit
 
-    def _report_trim(self, freed: int, before: int, after: int, emergency: bool = False) -> None:
+    def _report_trim(
+        self,
+        freed: int,
+        before: int,
+        after: int,
+        emergency: bool = False,
+        *,
+        trim_target: Optional[int] = None,
+        hard_limit: Optional[int] = None,
+    ) -> None:
         """Log and print context compaction results."""
         if freed <= 0:
             return
         tier = "EMERGENCY" if emergency else "normal"
-        limit_k = (
-            f"{self._context_limit // 1000}K"
-            if self._context_limit >= 1000 else str(self._context_limit)
-        )
+        limit_k = self._format_token_count(self._context_limit)
+        detail = f"(next prompt ~{before:,} → ~{after:,} / {limit_k}"
+        if trim_target is not None:
+            detail += f"; trim target ~{trim_target:,}"
+        if hard_limit is not None:
+            detail += f"; hard prompt cap ~{hard_limit:,}"
+        detail += ")"
         self._print(
-            f"[dim]Context compacted ({tier}) — freed ~{freed:,} tokens "
-            f"(was {before:,}, now ~{after:,} / {limit_k}). "
-            f"Analysis state preserved in world state.[/dim]"
+            f"[dim]Context compacted ({tier}) — freed ~{freed:,} estimated prompt tokens "
+            f"{detail}. Analysis state preserved in world state.[/dim]"
         )
         if self.run_manager:
             self.run_manager.append_log(
-                f"CONTEXT_COMPACT tier={tier} freed={freed} before={before} after={after}"
+                "CONTEXT_COMPACT "
+                f"tier={tier} freed={freed} before={before} after={after} "
+                f"trim_target={trim_target} hard_limit={hard_limit}"
             )
 
     def _trim_messages_if_needed(
@@ -2584,6 +3337,7 @@ class SCAgent:
         anthropic: bool = False,
         trim_target: int = -1,
         hard_limit: int = -1,
+        force_emergency: bool = False,
     ) -> list:
         """
         Trim old tool results and assistant narrations when approaching context budget.
@@ -2592,9 +3346,11 @@ class SCAgent:
           1. token_basis <= trim_target                  → no-op
           2. trim_target < token_basis <= hard_limit     → normal trim
                pass 1: replace old tool results (largest first)
+               pass 1.5: replace old tool-call arguments (largest first)
                pass 2: truncate assistant narrations to 600 chars
-          3. token_basis > hard_limit                    → emergency trim
+          3. token_basis > hard_limit OR force_emergency=True  → emergency trim
                clear ALL trimmable tool results (no min-size threshold)
+               clear ALL tool-call arguments (no min-size threshold)
                truncate ALL assistant narrations to 200 chars
 
         When trim_target / hard_limit are -1 (default), the budget is computed
@@ -2611,6 +3367,8 @@ class SCAgent:
         if trim_target == -1 or hard_limit == -1:
             system_prompt = self._build_system_prompt()
             trim_target, hard_limit = self._compute_message_budget(system_prompt)
+        else:
+            system_prompt = self._build_system_prompt()
 
         KEEP_TAIL = 6
         TRIM_MIN_CHARS = 300
@@ -2620,15 +3378,27 @@ class SCAgent:
             "[trimmed — result was processed; "
             "current analysis state is reflected in the system prompt above]"
         )
+        ARGS_PLACEHOLDER_OPENAI = '{"_trimmed":true}'
+        ARGS_PLACEHOLDER_ANTHROPIC = {"_trimmed": True}
 
-        self._last_estimated_tokens = self._estimate_tokens(messages)
-        calibrated = self._calibrated_estimate(messages)
-        token_basis = max(calibrated, self._last_actual_tokens or 0)
+        before_snapshot = self._context_usage_snapshot(
+            messages,
+            system_prompt=system_prompt,
+            anthropic=anthropic,
+            trim_target=trim_target,
+            hard_limit=hard_limit,
+        )
+        token_basis = before_snapshot["history_estimate"]
+        self._last_estimated_tokens = before_snapshot["prompt_estimate"]
+        self._context_display_tokens = before_snapshot["prompt_estimate"]
+        self._context_display_source = "estimated next prompt"
+        self._context_display_trim_target = before_snapshot["trim_target_prompt"]
+        self._context_display_hard_limit = before_snapshot["hard_prompt_limit"]
 
         if token_basis <= trim_target:
             return messages
 
-        emergency = token_basis > hard_limit
+        emergency = force_emergency or (token_basis > hard_limit)
 
         messages = list(messages)  # shallow copy — entries are replaced, not mutated
 
@@ -2637,7 +3407,7 @@ class SCAgent:
             first_trimmable = 1
 
         protected_from = max(first_trimmable, len(messages) - KEEP_TAIL)
-        trimmed_before = token_basis
+        trimmed_before = before_snapshot["prompt_estimate"]
 
         # --- Pass 1: replace tool results, largest first ---
         # Collect candidates with their size, sort descending so the biggest go first
@@ -2686,10 +3456,119 @@ class SCAgent:
                 if changed:
                     messages[i] = {**msg, "content": new_blocks}
 
-        post_pass1 = self._estimate_tokens(messages)
-        if not emergency and post_pass1 <= trim_target:
-            freed = trimmed_before - post_pass1
-            self._report_trim(freed, trimmed_before, post_pass1)
+        post_pass1_snapshot = self._context_usage_snapshot(
+            messages,
+            system_prompt=system_prompt,
+            anthropic=anthropic,
+            trim_target=trim_target,
+            hard_limit=hard_limit,
+        )
+        if not emergency and post_pass1_snapshot["history_estimate"] <= trim_target:
+            after_prompt = post_pass1_snapshot["prompt_estimate"]
+            freed = trimmed_before - after_prompt
+            self._last_estimated_tokens = after_prompt
+            self._context_display_tokens = after_prompt
+            self._context_display_source = "estimated next prompt"
+            self._context_display_trim_target = post_pass1_snapshot["trim_target_prompt"]
+            self._context_display_hard_limit = post_pass1_snapshot["hard_prompt_limit"]
+            self._report_trim(
+                freed,
+                trimmed_before,
+                after_prompt,
+                trim_target=post_pass1_snapshot["trim_target_prompt"],
+                hard_limit=post_pass1_snapshot["hard_prompt_limit"],
+            )
+            return messages
+
+        # --- Pass 1.5: replace large tool-call arguments in old assistant messages ---
+        # Tool results (Pass 1) and tool-call arguments are stored separately:
+        #   OpenAI:   role="assistant" → tool_calls[].function.arguments (JSON string)
+        #   Anthropic: role="assistant" → content[type="tool_use"].input (dict)
+        # Once a tool has been executed, its code/argument payload is redundant —
+        # the result was already processed and world_state records the outcome.
+        candidates_15 = []
+        for i in range(first_trimmable, protected_from):
+            msg = messages[i]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            if not anthropic:
+                tcs = msg.get("tool_calls") or []
+                total = sum(
+                    len(tc.get("function", {}).get("arguments", ""))
+                    for tc in tcs
+                    if isinstance(tc, dict)
+                    and (emergency or len(tc.get("function", {}).get("arguments", "")) > TRIM_MIN_CHARS)
+                )
+                if total > 0:
+                    candidates_15.append((i, total))
+            else:
+                blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
+                total = sum(
+                    len(json.dumps(b.get("input", {})))
+                    for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "tool_use"
+                    and isinstance(b.get("input"), dict)
+                    and (emergency or len(json.dumps(b.get("input", {}))) > TRIM_MIN_CHARS)
+                )
+                if total > 0:
+                    candidates_15.append((i, total))
+
+        candidates_15.sort(key=lambda x: x[1], reverse=True)
+
+        for i, _ in candidates_15:
+            msg = messages[i]
+            if not anthropic:
+                tcs = msg.get("tool_calls") or []
+                new_tcs, changed = [], False
+                for tc in tcs:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        args = func.get("arguments", "")
+                        if isinstance(args, str) and (emergency or len(args) > TRIM_MIN_CHARS):
+                            new_tcs.append({**tc, "function": {**func, "arguments": ARGS_PLACEHOLDER_OPENAI}})
+                            changed = True
+                            continue
+                    new_tcs.append(tc)
+                if changed:
+                    messages[i] = {**msg, "tool_calls": new_tcs}
+            else:
+                blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
+                new_blocks, changed = [], False
+                for block in blocks:
+                    if (
+                        isinstance(block, dict) and block.get("type") == "tool_use"
+                        and isinstance(block.get("input"), dict)
+                    ):
+                        if emergency or len(json.dumps(block["input"])) > TRIM_MIN_CHARS:
+                            new_blocks.append({**block, "input": ARGS_PLACEHOLDER_ANTHROPIC})
+                            changed = True
+                            continue
+                    new_blocks.append(block)
+                if changed:
+                    messages[i] = {**msg, "content": new_blocks}
+
+        post_pass15_snapshot = self._context_usage_snapshot(
+            messages,
+            system_prompt=system_prompt,
+            anthropic=anthropic,
+            trim_target=trim_target,
+            hard_limit=hard_limit,
+        )
+        if not emergency and post_pass15_snapshot["history_estimate"] <= trim_target:
+            after_prompt = post_pass15_snapshot["prompt_estimate"]
+            freed = trimmed_before - after_prompt
+            self._last_estimated_tokens = after_prompt
+            self._context_display_tokens = after_prompt
+            self._context_display_source = "estimated next prompt"
+            self._context_display_trim_target = post_pass15_snapshot["trim_target_prompt"]
+            self._context_display_hard_limit = post_pass15_snapshot["hard_prompt_limit"]
+            self._report_trim(
+                freed,
+                trimmed_before,
+                after_prompt,
+                trim_target=post_pass15_snapshot["trim_target_prompt"],
+                hard_limit=post_pass15_snapshot["hard_prompt_limit"],
+            )
             return messages
 
         # --- Pass 2: truncate assistant narrations ---
@@ -2714,9 +3593,29 @@ class SCAgent:
                 if changed:
                     messages[i] = {**msg, "content": new_blocks}
 
-        remaining = self._estimate_tokens(messages)
-        freed = trimmed_before - remaining
-        self._report_trim(freed, trimmed_before, remaining, emergency=emergency)
+        after_snapshot = self._context_usage_snapshot(
+            messages,
+            system_prompt=system_prompt,
+            anthropic=anthropic,
+            trim_target=trim_target,
+            hard_limit=hard_limit,
+        )
+        remaining = after_snapshot["history_estimate"]
+        after_prompt = after_snapshot["prompt_estimate"]
+        freed = trimmed_before - after_prompt
+        self._last_estimated_tokens = after_prompt
+        self._context_display_tokens = after_prompt
+        self._context_display_source = "estimated next prompt"
+        self._context_display_trim_target = after_snapshot["trim_target_prompt"]
+        self._context_display_hard_limit = after_snapshot["hard_prompt_limit"]
+        self._report_trim(
+            freed,
+            trimmed_before,
+            after_prompt,
+            emergency=emergency,
+            trim_target=after_snapshot["trim_target_prompt"],
+            hard_limit=after_snapshot["hard_prompt_limit"],
+        )
 
         if remaining > hard_limit:
             logger.warning(
@@ -2724,7 +3623,8 @@ class SCAgent:
                 f"({remaining:,} > {hard_limit:,}). Overflow catch in API loop is the safety net."
             )
             self._print(
-                f"[yellow]⚠ Context still large after compaction (~{remaining:,} tokens). "
+                f"[yellow]⚠ Context still large after compaction "
+                f"(history ~{remaining:,}, next prompt ~{after_prompt:,}). "
                 f"If the next API call fails, an emergency retry will be attempted.[/yellow]"
             )
 
@@ -2778,14 +3678,19 @@ class SCAgent:
             "[yellow]Context overflow detected — applying emergency trim before retry.[/yellow]"
         )
         logger.warning("Context overflow error caught; applying emergency trim")
-        # trim_target=0, hard_limit=0 forces the emergency tier unconditionally
+        # trim_target=0: never skip early (token_basis > 0 always)
+        # hard_limit=real_value: post-trim warning shows actual budget, not "X > 0"
+        # force_emergency=True: guarantees max-aggression even if estimate shows under-budget
+        system_prompt = self._build_system_prompt()
+        _, hard_limit = self._compute_message_budget(system_prompt)
         return self._trim_messages_if_needed(
             messages, anthropic=anthropic,
-            trim_target=0, hard_limit=0,
+            trim_target=0, hard_limit=hard_limit, force_emergency=True,
         )
 
     def _analyze_openai(self, user_message: str, max_iterations: int, continue_conversation: bool = False) -> str:
         """Run analysis loop using OpenAI API."""
+        self._refresh_vertex_token_if_needed()
         if continue_conversation and self._conversation_history:
             # Continue from previous conversation
             messages = self._conversation_history.copy()
@@ -2855,8 +3760,15 @@ class SCAgent:
                 # already returned). Used for the context bar display.
                 if response.usage and response.usage.prompt_tokens:
                     self._last_actual_tokens = response.usage.prompt_tokens
+                    self._context_display_tokens = self._last_actual_tokens
+                    self._context_display_source = "last actual prompt"
                     # Calibrate estimate ratio — ratchets upward, never down, capped at 4x
-                    _current_est = self._estimate_tokens(messages)
+                    _current_est = self._context_usage_snapshot(
+                        messages,
+                        system_prompt=system_prompt,
+                        trim_target=trim_target,
+                        hard_limit=hard_limit,
+                    )["prompt_estimate"]
                     if _current_est > 0 and self._last_actual_tokens > _current_est:
                         _new_ratio = self._last_actual_tokens / _current_est
                         self._token_estimate_calibration = max(
@@ -2885,8 +3797,12 @@ class SCAgent:
 
                     # If there are pending figures, inject them as a vision user message
                     if self._pending_images:
-                        messages.append(self._build_image_message(self._pending_images, "openai"))
-                        self._next_llm_status_message = "Analyzing figure..."
+                        if self._supports_vision():
+                            messages.append(self._build_image_message(self._pending_images, "openai"))
+                            self._next_llm_status_message = "Analyzing figure..."
+                        else:
+                            paths = ", ".join(img["path"] for img in self._pending_images)
+                            messages.append({"role": "user", "content": f"Figure(s) saved at {paths}."})
                         self._pending_images = []
 
                 elif choice.finish_reason == "stop":
@@ -2951,17 +3867,28 @@ class SCAgent:
                     # Response was truncated due to length
                     self._print("\n[Warning: Response truncated due to length]")
                     final_result = message.content or ""
+                    messages.append({"role": "assistant", "content": final_result})
                     self._print(final_result)
+                    self._conversation_history = messages
                     if self.run_manager:
                         self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
 
                 else:
                     self._print(f"\n[Debug: finish_reason={choice.finish_reason}]")
                     logger.warning(f"Unexpected finish reason: {choice.finish_reason}")
-                    break
+                    return self._handle_unexpected_provider_stop(
+                        messages,
+                        str(choice.finish_reason),
+                        message_format="openai",
+                    )
 
-            final_result = "Analysis stopped: max iterations reached"
+            return self._handle_max_iterations_reached(
+                messages,
+                max_iterations,
+                message_format="openai",
+            )
 
         except Exception as e:
             if self.run_manager:
@@ -2990,9 +3917,11 @@ class SCAgent:
         "run_spectra":          "Spectra factor analysis",
         "score_gene_signature": "Scoring gene signature",
         "query_cells":          "Querying Scimilarity reference database",
+        "save_data":            "Saving data",
         "run_cluster_qc":       "Cluster QC assessment",
         "run_code":             "Running code",
         "run_shell":            "Running shell command",
+        "install_package":      "Installing package",
         "generate_figure":      "Generating figure",
         "inspect_data":         "Inspecting data",
         "search_papers":        "Searching papers",
@@ -3003,17 +3932,32 @@ class SCAgent:
         "pause_and_ask":        "Pausing for guidance",
     }
 
-    # Tools that produce their own tqdm/progress output. Using Rich's console.status()
-    # (Live display) on these conflicts with tqdm and makes the terminal appear blank.
-    # For these tools we print a start line and let the tool's own output flow through.
+    # Tools that should leave persistent start/done lines in the terminal. This
+    # includes tools with their own tqdm/progress output and the main analysis
+    # actions so the user can see the pipeline history after each step finishes.
     _STREAMING_TOOLS = {
+        "load_data",
+        "normalize_and_hvg",
+        "run_pca",
+        "run_neighbors",
+        "run_clustering",
+        "compare_clusterings",
+        "run_celltypist",
+        "run_scimilarity",
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
         "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets
+        "score_integration",
         "benchmark_integration",  # scib-metrics runs many metrics
         "run_deg",                # rank_genes_groups can be slow
         "run_pseudobulk_deg",     # DESeq2 fitting
         "run_gsea",               # GSEA permutations
+        "run_spectra",
+        "score_gene_signature",
+        "query_cells",
+        "save_data",
+        "run_cluster_qc",
+        "generate_figure",
         "run_code",               # unknown — user code may print progress
     }
 
@@ -3109,6 +4053,11 @@ class SCAgent:
         if self.run_manager:
             self.run_manager.append_log(f"START {tool_name} {json.dumps(tool_input, default=str)}")
 
+        for hint_key in ("context", "biological_context_hint"):
+            hint = tool_input.get(hint_key)
+            if hint:
+                self.world_state.add_context_hint(str(hint))
+
         # ask_user is no longer in the tool list — the agent uses a turn-based
         # model and presents options in its final text response instead.
         # This branch is a safety net in case an older serialized conversation
@@ -3129,6 +4078,17 @@ class SCAgent:
             # For run_code, inject the output_dir before dispatch
             if tool_name == "run_code" and self.run_manager:
                 tool_input["output_dir"] = str(self.run_manager.run_dir)
+            if tool_name in {"run_celltypist", "run_scimilarity"}:
+                biological_context = self._get_biological_context(self._active_request)
+                if biological_context:
+                    tool_input.setdefault("biological_context", biological_context)
+                    species = str(biological_context.get("species") or "").lower()
+                    if species in {"human", "mouse"}:
+                        tool_input.setdefault("organism", species)
+            cleanup_authorization = self._cleanup_authorization_for_tool(tool_name, tool_input)
+            if cleanup_authorization is not None:
+                tool_input["cleanup_authorization"] = cleanup_authorization
+            annotation_validation_block = self._annotation_validation_guard(tool_name, tool_input)
 
             # Build the display label
             if tool_name == "run_code":
@@ -3156,6 +4116,9 @@ class SCAgent:
                         return json.dumps(err_payload, indent=2), self.adata
 
                 # Native tool dispatch with Python warning capture
+                if annotation_validation_block is not None:
+                    return json.dumps(annotation_validation_block, indent=2), self.adata
+
                 import warnings as _warnings
                 with _warnings.catch_warnings(record=True) as _caught:
                     _warnings.simplefilter("always")
@@ -3257,7 +4220,25 @@ class SCAgent:
             )
             if auto_checkpoint_path and result_data.get("status") == "ok":
                 result_data["auto_checkpoint_saved"] = str(auto_checkpoint_path)
-            checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
+            checkpoint = None
+            if tool_name == "run_cluster_qc" and result_data.get("status") == "ok":
+                cleanup_checkpoint = self._cluster_cleanup_checkpoint_from_result(result_data)
+                if cleanup_checkpoint is not None:
+                    result_data["cluster_cleanup_proposal"] = cleanup_checkpoint.get("proposal", {})
+                    result_data["cleanup_policy"] = self._cleanup_policy()
+                    if cleanup_checkpoint.get("auto_allowed"):
+                        self._active_cleanup_authorization = {
+                            "source": "auto_policy",
+                            "proposal": cleanup_checkpoint.get("proposal", {}),
+                            "reason": cleanup_checkpoint.get("auto_reason", ""),
+                        }
+                        result_data["cleanup_authorization_available"] = self._active_cleanup_authorization
+                    else:
+                        checkpoint = cleanup_checkpoint
+                else:
+                    self._active_cleanup_authorization = None
+            if checkpoint is None:
+                checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
             if checkpoint is None:
                 checkpoint = self._build_recovery_checkpoint(tool_name, tool_input, result_data)
             if tool_name == "ask_user":
@@ -3296,6 +4277,13 @@ class SCAgent:
                 )
 
             if status == "ok":
+                if tool_name == "run_code" and tool_input.get("cleanup_authorization"):
+                    self._active_cleanup_authorization = None
+                    if (
+                        self._pending_checkpoint
+                        and self._pending_checkpoint.get("kind") == "cluster_qc_cleanup"
+                    ):
+                        self._clear_pending_checkpoint("cleanup executed")
                 if tool_name == "generate_figure" and result_data.get("output_path"):
                     self._interaction_state["shown_figures"].append({
                         "path": result_data["output_path"],
@@ -3410,6 +4398,7 @@ class SCAgent:
             if self.run_manager.manifest.request:
                 text_parts.append(self.run_manager.manifest.request)
             text_parts.extend(self.run_manager.manifest.input_files)
+        text_parts.extend(getattr(self.world_state, "context_hints", []) or [])
         if extra_text:
             text_parts.append(extra_text)
 

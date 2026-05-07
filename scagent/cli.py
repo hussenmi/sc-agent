@@ -77,7 +77,7 @@ Examples:
     )
     start_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex", "gemini"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini", "vertex"],
         default=None,
         help="LLM provider (default: from .env or anthropic)"
     )
@@ -134,7 +134,7 @@ Examples:
     )
     analyze_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex", "gemini"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini", "vertex"],
         default=None,
         help="LLM provider (default: from .env or anthropic; codex is experimental)"
     )
@@ -146,8 +146,8 @@ Examples:
     analyze_parser.add_argument(
         "--max-iterations",
         type=int,
-        default=20,
-        help="Max tool call iterations (default: 20)"
+        default=75,
+        help="Max tool calls per turn before an explicit resumable pause (default: 75)"
     )
     analyze_parser.add_argument(
         "--quiet", "-q",
@@ -224,7 +224,7 @@ Examples:
     )
     chat_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex", "gemini"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini", "vertex"],
         default=None,
         help="LLM provider"
     )
