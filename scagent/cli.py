@@ -77,7 +77,7 @@ Examples:
     )
     start_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini", "vertex"],
         default=None,
         help="LLM provider (default: from .env or anthropic)"
     )
@@ -91,6 +91,20 @@ Examples:
         action="store_true",
         default=True,
         help="Show context window usage in the spinner during each model call"
+    )
+    start_mode = start_parser.add_mutually_exclusive_group()
+    start_mode.add_argument(
+        "--smart",
+        dest="smart_autonomous",
+        action="store_true",
+        default=True,
+        help="Smart autonomous mode: agent drives analysis, pauses only when it needs your input (default)"
+    )
+    start_mode.add_argument(
+        "--collaborative",
+        dest="smart_autonomous",
+        action="store_false",
+        help="Collaborative mode: agent pauses at every major checkpoint and presents options"
     )
     # === analyze command ===
     analyze_parser = subparsers.add_parser(
@@ -120,7 +134,7 @@ Examples:
     )
     analyze_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini", "vertex"],
         default=None,
         help="LLM provider (default: from .env or anthropic; codex is experimental)"
     )
@@ -132,8 +146,8 @@ Examples:
     analyze_parser.add_argument(
         "--max-iterations",
         type=int,
-        default=20,
-        help="Max tool call iterations (default: 20)"
+        default=75,
+        help="Max tool calls per turn before an explicit resumable pause (default: 75)"
     )
     analyze_parser.add_argument(
         "--quiet", "-q",
@@ -158,6 +172,20 @@ Examples:
         "--checkpoints",
         action="store_true",
         help="Save intermediate h5ad files (default: only save final)"
+    )
+    analyze_mode2 = analyze_parser.add_mutually_exclusive_group()
+    analyze_mode2.add_argument(
+        "--smart",
+        dest="smart_autonomous",
+        action="store_true",
+        default=True,
+        help="Smart autonomous mode: agent drives analysis, pauses only when it needs your input (default)"
+    )
+    analyze_mode2.add_argument(
+        "--collaborative",
+        dest="smart_autonomous",
+        action="store_false",
+        help="Collaborative mode: agent pauses at every major checkpoint and presents options"
     )
 
     # === inspect command ===
@@ -196,7 +224,7 @@ Examples:
     )
     chat_parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic", "groq", "codex"],
+        choices=["openai", "anthropic", "groq", "codex", "gemini", "vertex"],
         default=None,
         help="LLM provider"
     )
@@ -289,11 +317,15 @@ def run_start(args):
     console = Console()
 
     # Create agent early so we can show the real model name in the welcome
+    smart = getattr(args, 'smart_autonomous', None)
+    if smart is None:
+        smart = True  # default to smart mode when neither --smart nor --collaborative given
     agent = SCAgent(
         provider=args.provider,
         model=args.model,
         verbose=True,
-        collaborative=True,
+        collaborative=not smart,
+        smart_autonomous=smart,
         output_dir=args.output,
         show_context_usage=getattr(args, 'context_usage', False),
     )
@@ -340,7 +372,8 @@ def run_start(args):
     while True:
         try:
             agent._update_context_bar()
-            user_input = read_user_input("\n> ")
+            console.print("\n[dim]─────────────────────────────────────────[/dim]")
+            user_input = read_user_input("> ")
         except (EOFError, KeyboardInterrupt):
             _maybe_save_on_exit(agent, console)
             console.print("\n[dim]Session ended.[/dim]")
@@ -393,11 +426,15 @@ def run_analyze(args):
         )
 
     # Create agent
+    smart = getattr(args, 'smart_autonomous', None)
+    if smart is None:
+        smart = True  # default to smart mode when neither --smart nor --collaborative given
     agent = SCAgent(
         provider=args.provider,
         model=args.model,
         verbose=not args.quiet,
-        collaborative=True,
+        collaborative=not smart,
+        smart_autonomous=smart,
         output_dir=args.output,
         save_checkpoints=args.checkpoints,
     )
@@ -405,7 +442,7 @@ def run_analyze(args):
     print(f"Data: {args.data}")
     print(f"Provider: {agent.provider}:{agent.model}")
     print(f"Session mode: {'interactive follow-up' if args.interactive else 'single-run'}")
-    print("Analysis style: collaborative checkpoints")
+    print(f"Analysis style: {'smart autonomous' if smart else 'collaborative checkpoints'}")
     print(f"Checkpoints: {'enabled' if args.checkpoints else 'final only'}")
     print(f"Request: {request[:100]}{'...' if len(request) > 100 else ''}")
     print("-" * 50)

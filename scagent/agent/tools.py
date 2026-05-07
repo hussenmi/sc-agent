@@ -48,20 +48,24 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_qc",
-            "description": "Run or preview the quality control pipeline: QC metrics, doublet detection, cell/gene filtering. Use preview_only=true first in collaborative workflows so the user can review proposed removals before filters are applied. Do not assume intermediate h5ad saving is desired.",
+            "description": "Compute QC metrics and run doublet detection. Default behavior (flag_only=true) computes metrics, stores QC flags as obs columns, generates violin plots with log1p-transformed counts for readable axes, and does NOT remove any cells — removal happens later at cluster level via run_cluster_qc. Use confirm_filtering=true only when the user explicitly requests global threshold-based filtering as a fallback.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad or 10X h5 file (required for initial load, optional if data already in memory)"},
                     "output_path": {"type": "string", "description": "Optional path to save a processed h5ad. Prefer saving only final outputs unless the user explicitly asks for checkpoints."},
-                    "preview_only": {"type": "boolean", "description": "If true, do not filter. Instead compute full QC metrics, estimate removals, and generate pre-filter QC figures."},
-                    "confirm_filtering": {"type": "boolean", "description": "Required to apply cell/gene filtering. Set true only after the user has explicitly confirmed the previewed thresholds, parameters, and removal counts."},
+                    "flag_only": {"type": "boolean", "description": "If true (default), compute metrics and store QC flags (qc_flag_high_mt, qc_flag_low_lib, qc_flag_low_genes) but do not remove any cells. This is the standard first pass — removal decisions are made after clustering via run_cluster_qc."},
+                    "mt_flag_threshold": {"type": "number", "description": "MT% threshold for qc_flag_high_mt (default: 25 for cells, 5 for nuclei). Used for flagging only when flag_only=true."},
+                    "lib_flag_threshold": {"type": "number", "description": "Library size threshold for qc_flag_low_lib (default: 500 counts). Used for flagging only when flag_only=true."},
+                    "genes_flag_threshold": {"type": "integer", "description": "n_genes threshold for qc_flag_low_genes (default: 200). Used for flagging only when flag_only=true."},
+                    "preview_only": {"type": "boolean", "description": "Legacy alias for flag_only. If true, do not filter. Compute metrics, estimate removals, and generate QC figures."},
+                    "confirm_filtering": {"type": "boolean", "description": "Required to apply global threshold-based cell/gene filtering. Use only when the user explicitly requests this approach instead of cluster-level QC. Set true only after previewing thresholds and removal counts."},
                     "data_type": {"type": "string", "enum": ["single_cell", "single_nucleus"], "description": "Hint for MT threshold direction: 'single_nucleus' starts at 5%, 'single_cell' at 20%. The actual threshold must be chosen from the QC figure — always inspect the distribution before filtering."},
                     "mt_threshold": {"type": "number", "description": "Max MT% threshold. Overrides data_type if provided."},
                     "filter_mt": {"type": "boolean", "description": "If false, compute and report MT metrics but do not apply a hard MT% cell filter. Use this for source pipelines that inspect MT but do not remove cells by MT%."},
                     "min_genes": {"type": "integer", "description": "Minimum detected genes per cell before cell removal. This is cell-level filtering, distinct from min_cells per gene."},
                     "min_cells": {"type": "integer", "description": "Minimum cells a gene must be expressed in to be kept (default: 3). In preview, shows how many genes would be removed. Present this to the user alongside the projected removal count and confirm before applying."},
-                    "remove_ribo": {"type": "boolean", "description": "Remove ribosomal genes (default: true)"},
+                    "remove_ribo": {"type": "boolean", "description": "Advanced QC gene-filter option. Leave false in the standard workflow; normalize_and_hvg performs the project-default ribosomal gene removal before normalization/HVG."},
                     "remove_mt": {"type": "boolean", "description": "Remove mitochondrial genes from the feature set (default: false)"},
                     "detect_doublets_flag": {"type": "boolean", "description": "Run Scrublet doublet detection (default: true)"},
                     "remove_doublets": {"type": "boolean", "description": "If true, remove cells flagged as predicted doublets in apply mode. Preview mode reports the count only."},
@@ -81,7 +85,7 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "normalize_and_hvg",
-            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in layer.",
+            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in a layer. By default, ribosomal genes are removed from the analysis object before normalization/HVG so they cannot drive embedding or marker interpretation; set remove_ribosomal_genes=false when the user/source explicitly wants to keep them.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -91,15 +95,19 @@ def get_tools() -> List[Dict[str, Any]]:
                     "target_sum": {"type": "number", "description": "Target counts per cell for normalize_total (default: 10000). Use source/paper value when reproducing a workflow."},
                     "log_transform": {"type": "boolean", "description": "Apply log1p after normalize_total (default: true)."},
                     "raw_layer_name": {"type": "string", "description": "Layer used to preserve/reset raw integer counts (default: raw_counts)."},
-                    "force_reset_from_raw": {"type": "boolean", "description": "If true, reset adata.X from raw_layer_name before normalization when available. Use for retries to avoid double-normalization (default: true)."},
+                    "normalization_source": {"type": "string", "enum": ["auto", "raw_counts", "current_X"], "description": "Source matrix for normalization (default: auto). 'auto' resets from raw_layer_name when X already looks processed; 'raw_counts' forces a raw-count rebuild; 'current_X' is an expert override."},
+                    "preserve_input_x_layer": {"type": "string", "description": "When resetting from raw counts, preserve the pre-reset X in this layer if absent (default: pre_scagent_X). Set to empty string to disable."},
                     "set_raw_after_normalization": {"type": "boolean", "description": "If true, set adata.raw = adata.copy() after normalization/log1p and before later scaling/PCA (default: true)."},
                     "hvg_flavor": {"type": "string", "enum": ["seurat", "seurat_v3", "cell_ranger"], "description": "Scanpy HVG flavor (default: seurat_v3). seurat_v3 uses VST on raw counts and supports batch_key (ranks by median rank across batches). seurat works on log-normalized data."},
                     "hvg_layer": {"type": "string", "description": "Layer for HVG calculation. seurat_v3 requires raw integer counts; if omitted, auto-detects from 'raw_counts', 'raw_data', 'counts' in that order. Only set explicitly if your raw counts are in a non-standard layer."},
                     "batch_key": {"type": "string", "description": "obs column for batch-stratified HVG selection. Recommended for multi-sample data. Supported by all flavors including seurat_v3."},
-                    "hvg_exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex pattern(s) for source-defined features that must not be marked highly_variable. Only pass evidence-backed source/workflow exclusions; do not invent dataset-specific patterns."},
-                    "hvg_exclusion_mode": {"type": "string", "enum": ["post", "pre"], "description": "How to apply source-defined HVG exclusions. 'post' runs HVG then forces excluded features to false; 'pre' computes HVGs only on allowed features (default: post)."},
+                    "remove_ribosomal_genes": {"type": "boolean", "description": "If true (default), physically remove ribosomal genes from this analysis object before normalization/HVG. Set false only when the user/source explicitly says to keep ribosomal genes."},
+                    "ribosomal_remove_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex pattern(s) for ribosomal genes to remove when remove_ribosomal_genes=true. Defaults to human/mouse cytosolic and mitochondrial ribosomal prefixes: RPL/RPS/MRPL/MRPS and Rpl/Rps/Mrpl/Mrps."},
+                    "exclude_ribosomal_from_hvg": {"type": "boolean", "description": "Compatibility/advanced option used only when remove_ribosomal_genes=false. If true, keep ribosomal genes in adata but exclude them before HVG selection. Set false only if the user/source explicitly wants ribosomal genes included in HVG/PCA."},
+                    "hvg_exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Additional regex pattern(s) for features that must not be marked highly_variable. Use for evidence-backed source/workflow exclusions."},
+                    "hvg_exclusion_mode": {"type": "string", "enum": ["post", "pre"], "description": "How to apply HVG exclusions. 'pre' computes HVGs only on allowed features; 'post' runs HVG then forces excluded features to false (default: pre)."},
                     "hvg_exclude_match_mode": {"type": "string", "enum": ["match", "contains", "fullmatch"], "description": "Regex matching mode for hvg_exclude_patterns against var_names (default: match)."},
-                    "hvg_exclusion_source": {"type": "string", "description": "Short provenance for the feature-exclusion rule, e.g. source repo file/function/line or paper method."}
+                    "hvg_exclusion_source": {"type": "string", "description": "Short provenance for any additional feature-exclusion rule, e.g. source repo file/function/line or paper method."}
                 },
                 "required": []
             }
@@ -188,13 +196,15 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_celltypist",
-            "description": "Annotate cell types with CellTypist. Handles target_sum=10000 normalization automatically.",
+            "description": "Annotate cell types with CellTypist. Handles target_sum=10000 normalization automatically and checks dataset organism against model metadata before running.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "model": {"type": "string", "description": "Model name (default: Immune_All_Low.pkl)"},
+                    "organism": {"type": "string", "enum": ["human", "mouse"], "description": "Dataset organism. Use explicit user-provided species when available; if ambiguous, ask before annotation."},
+                    "allow_cross_species": {"type": "boolean", "description": "Expert override to run a species-mismatched CellTypist model as non-definitive exploratory output (default: false)."},
                     "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"},
                     "cluster_key": {"type": "string", "description": "Cluster column to use for CellTypist majority voting (default: leiden)"}
                 },
@@ -203,13 +213,15 @@ def get_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "run_scimilarity",
-            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Model path is pre-configured via SCIMILARITY_MODEL_PATH env var - do NOT ask the user for a model path. Different from CellTypist - use when you want embedding-based annotation.",
+            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Requires a known organism ('human' or 'mouse') or an explicit model_path; if species is ambiguous, ask before running. Different from CellTypist - use when you want embedding-based annotation.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data if already loaded)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "cluster_key": {"type": "string", "description": "Cluster column to use for cluster-level representative predictions (default: leiden)"}
+                    "cluster_key": {"type": "string", "description": "Cluster column to use for cluster-level representative predictions (default: leiden)"},
+                    "organism": {"type": "string", "description": "Dataset organism: 'human' or 'mouse'. Use explicit user-provided species when available."},
+                    "model_path": {"type": "string", "description": "Optional explicit Scimilarity model directory. Overrides organism-based default paths."}
                 },
                 "required": []
             }
@@ -539,6 +551,14 @@ def get_tools() -> List[Dict[str, Any]]:
                     "raw_layer": {
                         "type": "string",
                         "description": "Layer with raw integer counts (used in centroid mode). Leave unset to auto-detect."
+                    },
+                    "organism": {
+                        "type": "string",
+                        "description": "Reference organism for Scimilarity query: 'human' or 'mouse'. Usually inherited from prior run_scimilarity."
+                    },
+                    "model_path": {
+                        "type": "string",
+                        "description": "Optional explicit Scimilarity model directory."
                     }
                 },
                 "required": []
@@ -597,6 +617,23 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "run_cluster_qc",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells — presents proposed removals for user confirmation. Call this after first clustering to identify low-quality, low-complexity, doublet-enriched, or ambiguous clusters before annotation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cluster_key": {"type": "string", "description": "obs column to group by (default: leiden)"},
+                    "doublet_threshold": {"type": "number", "description": "Mean doublet score above which to flag as doublet-enriched (default: 0.3)"},
+                    "mt_threshold": {"type": "number", "description": "Mean MT% above which a cluster is flagged as elevated (default: 25)"},
+                    "low_lib_fraction": {"type": "number", "description": "Fraction of global median library size below which lib size is considered low (default: 0.5)"},
+                    "low_genes_fraction": {"type": "number", "description": "Fraction of global median n_genes below which gene count is considered low (default: 0.5)"},
+                    "save_checkpoint": {"type": "boolean", "description": "Save an h5ad checkpoint before any removal (default: true)"},
+                    "checkpoint_path": {"type": "string", "description": "Path for checkpoint file (default: <output_dir>/checkpoint_pre_cleanup.h5ad)"}
+                },
+                "required": []
+            }
+        },
+        {
             "name": "save_data",
             "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete.",
             "input_schema": {
@@ -618,11 +655,11 @@ def get_tools() -> List[Dict[str, Any]]:
     meta_tools = [
         {
             "name": "run_code",
-            "description": "FLEXIBLE FALLBACK: Execute custom Python code on the AnnData object. This is your most versatile tool - use it for ANY valid request not covered by specialized tools. Examples: custom plots (variance explained, gene correlations, histograms), data filtering (remove clusters, subset cells), calculations (cluster sizes, gene stats), or any scanpy/pandas operation. Access: adata, sc (scanpy), plt (matplotlib), np, pd, output_dir, Path, ensure_dir(path). Use ensure_dir() to create directories before saving. ALWAYS prefer this over saying 'I can't do that'.",
+            "description": "FLEXIBLE FALLBACK: Execute custom Python code on the AnnData object. This is your most versatile tool - use it for ANY valid request not covered by specialized tools. Examples: custom plots (variance explained, gene correlations, histograms), data filtering (remove clusters, subset cells), calculations (cluster sizes, gene stats), or any scanpy/pandas operation. Access: adata, sc (scanpy), plt (matplotlib), np, pd, output_dir, Path, ensure_dir(path). Use ensure_dir() to create directories before saving. For destructive edits, build and validate a candidate first, then assign adata = candidate only as the final step. ALWAYS prefer this over saying 'I can't do that'.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Python code to execute. Has access to: adata, sc, plt, np, pd, output_dir, Path, ensure_dir(), write_report(). Key helpers: ensure_dir(path) creates the dir and returns a Path — use it for figures: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'. write_report(name, content) saves a markdown report to reports/name.md and returns the path — always use this instead of open() when saving text results, never write .txt files. Do NOT import os. When loading 10x h5 files with sc.read_10x_h5(), always call .var_names_make_unique() on each AnnData before concatenating. Use series.iloc[pos] not series[pos] for positional pandas access."},
+                    "code": {"type": "string", "description": "Python code to execute. Has access to: adata, sc, plt, np, pd, output_dir, Path, ensure_dir(), write_report(). Key helpers: ensure_dir(path) creates the dir and returns a Path — use it for figures: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'. write_report(name, content) saves a markdown report to reports/name.md and returns the path — always use this instead of open() when saving text results, never write .txt files. Do NOT import os. For destructive edits, do not mutate adata in-place; create candidate = adata[keep_mask].copy(), validate candidate, then assign adata = candidate as the final step. When loading 10x h5 files with sc.read_10x_h5(), always call .var_names_make_unique() on each AnnData before concatenating. Use series.iloc[pos] not series[pos] for positional pandas access."},
                     "description": {"type": "string", "description": "Brief description of what the code does"},
                     "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
                 },
@@ -729,6 +766,36 @@ def get_tools() -> List[Dict[str, Any]]:
                     "reason": {"type": "string", "description": "Why this package is needed"}
                 },
                 "required": ["package", "reason"]
+            }
+        },
+        {
+            "name": "pause_and_ask",
+            "description": (
+                "Pause the analysis and ask the user for guidance. "
+                "Use ONLY when you genuinely cannot proceed without information only the user can provide — "
+                "e.g. ambiguous batch key, surprising results that change the analysis direction, "
+                "or a fork where both paths have large and different downstream consequences. "
+                "Do NOT use for routine preprocessing steps, algorithm defaults, or reversible choices. "
+                "After calling this tool, present the question in your response and end your turn."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The specific question to ask the user. Be concrete — state what you found and what you need to know."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Why you cannot infer the answer yourself. Reference the actual data (e.g. 'I see 3 columns that could be the batch key: sample_id, batch, donor_id')."
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of discrete choices if applicable. Omit for open-ended questions."
+                    }
+                },
+                "required": ["question", "context"]
             }
         },
     ]
@@ -1047,7 +1114,12 @@ def process_tool_call(
     )
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
-    from ..annotation import run_celltypist, run_scimilarity
+    from ..annotation import (
+        available_celltypist_models_for_organism,
+        infer_celltypist_model_organism,
+        run_celltypist,
+        run_scimilarity,
+    )
     from ..batch import run_scanorama, run_harmony, run_scvi, run_bbknn
 
     from .decision_policy import (
@@ -2292,9 +2364,172 @@ def process_tool_call(
                         ],
                     )
 
+            in_place_destructive_patterns = [
+                (r"\badata\._inplace_subset_(obs|var)\s*\(", "Do not use AnnData in-place subsetting in run_code."),
+                (r"\badata\.(obs|var)\.drop\s*\([^)]*inplace\s*=\s*True", "Do not use inplace=True drops on adata.obs/adata.var in run_code."),
+                (r"\bdel\s+adata\.(obs|var)\s*\[", "Do not delete adata.obs/adata.var columns in run_code."),
+                (r"\badata\.(obs|var)\.pop\s*\(", "Do not pop columns from adata.obs/adata.var in run_code."),
+                (r"\badata\.(obs|var)\s*=\s*adata\.(obs|var)\.drop\s*\(", "Do not replace adata.obs/adata.var with a dropped-column copy in run_code."),
+                (r"\badata\.(obs|var)\s*=\s*adata\.(obs|var)\.loc\s*\[\s*:\s*,", "Do not replace adata.obs/adata.var with a column subset in run_code."),
+                (r"\badata\.(obs|var)\s*=\s*adata\.(obs|var)\s*\[\s*\[", "Do not replace adata.obs/adata.var with a column subset in run_code."),
+            ]
+            for pattern, message in in_place_destructive_patterns:
+                if re.search(pattern, code, flags=re.DOTALL):
+                    return _error_result(
+                        tool="run_code",
+                        message=(
+                            f"{message} Build a candidate object or dataframe, validate it, "
+                            "then assign it back only after all checks pass."
+                        ),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "For cell filtering, use: candidate = adata[~mask].copy(); validate candidate; adata = candidate.",
+                            "For new annotations or metrics, add new obs/var columns instead of deleting existing reference columns.",
+                            "If the user explicitly wants columns deleted, ask them to confirm the exact columns first.",
+                        ],
+                    )
+
             # Load data if needed
             if adata is None and "data_path" in tool_input:
                 adata = get_adata(tool_input, adata)
+
+            preflight_checks = []
+
+            def _expected_cell_count(text: str) -> int | None:
+                """Extract an expected removal count from phrases like '(61 cells)'."""
+                for match in re.finditer(r"\(([\d,]+)\s+cells?\)", text or "", flags=re.IGNORECASE):
+                    try:
+                        return int(match.group(1).replace(",", ""))
+                    except ValueError:
+                        continue
+                return None
+
+            def _literal_string_list(expr: str) -> list[str]:
+                import ast
+
+                try:
+                    value = ast.literal_eval(expr.strip())
+                except Exception:
+                    return []
+                if isinstance(value, (list, tuple, set)):
+                    return [str(item) for item in value]
+                if isinstance(value, str):
+                    return [value]
+                return []
+
+            def _cluster_removal_plan() -> Dict[str, Any] | None:
+                """Extract a cluster-removal plan from generated run_code."""
+                if adata is None or not hasattr(adata, "obs"):
+                    return None
+                combined_text = f"{description}\n{code}"
+                if not re.search(r"\b(remove|drop|filter|exclude|subset)\b", combined_text, flags=re.IGNORECASE):
+                    return None
+                if "[~" not in code and ".copy()" not in code:
+                    return None
+                expected = _expected_cell_count(description) or _expected_cell_count(code)
+
+                obs_ref = r"adata\.obs\[['\"]([^'\"]+)['\"]\](?:\.astype\(['\"]str['\"]\))?"
+
+                isin_match = re.search(
+                    rf"{obs_ref}\.isin\(([^)]*)\)",
+                    code,
+                    flags=re.DOTALL,
+                )
+                if isin_match:
+                    cluster_key = isin_match.group(1)
+                    isin_arg = isin_match.group(2).strip()
+                    labels = _literal_string_list(isin_arg)
+                    if not labels and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", isin_arg):
+                        assign_match = re.search(
+                            rf"{re.escape(isin_arg)}\s*=\s*(\[[^\]]*\])",
+                            code,
+                            flags=re.DOTALL,
+                        )
+                        if assign_match:
+                            labels = _literal_string_list(assign_match.group(1))
+                else:
+                    comparison_match = re.search(
+                        rf"{obs_ref}\s*(==|!=)\s*['\"]([^'\"]+)['\"]",
+                        code,
+                    )
+                    if not comparison_match:
+                        return None
+                    cluster_key = comparison_match.group(1)
+                    labels = [str(comparison_match.group(3))]
+                if not labels or cluster_key not in adata.obs.columns:
+                    return None
+
+                observed = int(adata.obs[cluster_key].astype(str).isin(labels).sum())
+                return {
+                    "name": "destructive_cluster_removal",
+                    "cluster_key": cluster_key,
+                    "labels": labels,
+                    "expected_cells": expected,
+                    "observed_cells": observed,
+                }
+
+            def _validate_cleanup_authorization(plan: Dict[str, Any]) -> Dict[str, Any]:
+                authorization = tool_input.get("cleanup_authorization") or {}
+                proposal = authorization.get("proposal") or {}
+                source = authorization.get("source", "")
+                expected = plan.get("expected_cells")
+                if expected is None and proposal:
+                    expected = proposal.get("cells_in_proposed_removal")
+                    plan["expected_cells"] = expected
+
+                check = {
+                    **plan,
+                    "authorization_source": source or "none",
+                    "status": "passed",
+                    "failures": [],
+                }
+                if not authorization:
+                    check["status"] = "failed"
+                    check["failures"].append("No cleanup authorization was provided.")
+                    return check
+
+                if source in {"auto_policy", "user_confirmation"}:
+                    proposal_key = proposal.get("cluster_key")
+                    proposal_labels = {str(label) for label in proposal.get("proposed_removal", [])}
+                    plan_labels = {str(label) for label in plan.get("labels", [])}
+                    if proposal_key and plan.get("cluster_key") != proposal_key:
+                        check["failures"].append(
+                            f"Code targets cluster key {plan.get('cluster_key')!r}, but authorization is for {proposal_key!r}."
+                        )
+                    if proposal_labels and plan_labels != proposal_labels:
+                        check["failures"].append(
+                            "Code targets labels "
+                            f"{sorted(plan_labels)}, but authorization is for {sorted(proposal_labels)}."
+                        )
+
+                if expected is not None and int(plan.get("observed_cells", -1)) != int(expected):
+                    check["failures"].append(
+                        f"Expected {expected} cells, observed {plan.get('observed_cells')} in the current AnnData."
+                    )
+                if check["failures"]:
+                    check["status"] = "failed"
+                return check
+
+            removal_plan = _cluster_removal_plan()
+            if removal_plan is not None:
+                removal_check = _validate_cleanup_authorization(removal_plan)
+                preflight_checks.append(removal_check)
+                if removal_check["status"] != "passed":
+                    labels = ", ".join(removal_check.get("labels", []))
+                    return _error_result(
+                        tool="run_code",
+                        message=(
+                            "Destructive cluster-removal preflight failed for "
+                            f"{removal_check.get('cluster_key')} in [{labels}]: "
+                            + "; ".join(removal_check.get("failures", []))
+                        ),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Ask the user for confirmation, or use an explicit user-granted auto-cleanup policy.",
+                            "Inspect current cluster sizes before retrying.",
+                            "Only remove clusters that match the current cluster QC proposal and cell counts.",
+                        ],
+                    )
 
             # Helper function for safe directory creation
             from pathlib import Path as _Path
@@ -2372,23 +2607,10 @@ def process_tool_call(
                 if not any(c in msg for c in _cosmetic):
                     captured_output += f"\nWarning ({w.category.__name__}): {msg}"
 
-            # After execution, ensure var_names and obs_names are unique on the live adata.
-            # 10x h5 files can contain duplicate gene symbols; anndata.concat() propagates
-            # them. Leaving duplicates causes silent wrong-gene indexing downstream.
-            # obs_names duplicates arise when concat is called without keys/suffixes.
-            var_names_fixed = False
-            obs_names_fixed = False
-            adata = namespace.get("adata", adata)
-            if adata is not None and not adata.var_names.is_unique:
-                adata.var_names_make_unique()
-                var_names_fixed = True
-            if adata is not None and adata.obs_names.duplicated().any():
-                adata.obs_names_make_unique()
-                obs_names_fixed = True
-
             if exec_error is not None:
                 err_type = type(exec_error).__name__
                 err_msg = str(exec_error)
+                reassigned_adata_discarded = namespace.get("adata", adata) is not adata
 
                 # Give the LLM targeted guidance based on the error type
                 if err_type in ("TypeError", "AttributeError") or "unexpected keyword" in err_msg or "got an unexpected" in err_msg:
@@ -2411,11 +2633,26 @@ def process_tool_call(
                     "error_type": err_type,
                     "message": f"{err_type}: {err_msg}",
                     "output": captured_output[:500] if captured_output else None,
+                    "adata_committed": False,
+                    "reassigned_adata_discarded": reassigned_adata_discarded,
                     "recovery_options": [hint],
                 }, indent=2), adata
 
             adata = namespace.get("adata", adata)
             custom_output_path = namespace.get("output_path")
+
+            # After a clean execution, ensure var_names and obs_names are unique on
+            # the live adata. Delaying this until after the error check prevents a
+            # partially reassigned AnnData from becoming the session state when a
+            # later print/plot/save line fails.
+            var_names_fixed = False
+            obs_names_fixed = False
+            if adata is not None and not adata.var_names.is_unique:
+                adata.var_names_make_unique()
+                var_names_fixed = True
+            if adata is not None and adata.obs_names.duplicated().any():
+                adata.obs_names_make_unique()
+                obs_names_fixed = True
 
             # Check if any figures were created
             figures_saved = []
@@ -2452,6 +2689,7 @@ def process_tool_call(
                 "status": "ok",
                 "tool": "run_code",
                 "description": description,
+                "adata_committed": True,
             }
             if adata is not None:
                 result["shape"] = {"n_cells": adata.n_obs, "n_genes": adata.n_vars}
@@ -2463,6 +2701,8 @@ def process_tool_call(
                 result["ignored_save_to"] = save_to
             if save_warning:
                 result.setdefault("warnings", []).append(save_warning)
+            if preflight_checks:
+                result["preflight_checks"] = preflight_checks
             if code_file:
                 result["code_file"] = code_file
             if custom_output_path:
@@ -3346,14 +3586,16 @@ def process_tool_call(
             n_before, g_before = adata.n_obs, adata.n_vars
 
             detect_doublets_flag = tool_input.get("detect_doublets_flag", True)
-            remove_ribo = tool_input.get("remove_ribo", True)
+            remove_ribo = tool_input.get("remove_ribo", False)
             remove_mt = tool_input.get("remove_mt", False)
             remove_doublets = bool(tool_input.get("remove_doublets", False))
             filter_mt = bool(tool_input.get("filter_mt", True))
             min_genes = tool_input.get("min_genes")
             min_cells = tool_input.get("min_cells", 3)
             requested_mt_threshold = tool_input.get("mt_threshold")
-            preview_only = bool(tool_input.get("preview_only", False))
+            # flag_only is the new primary mode; preview_only is a legacy alias
+            flag_only = bool(tool_input.get("flag_only", True))
+            preview_only = bool(tool_input.get("preview_only", False)) or flag_only
             confirm_filtering = bool(tool_input.get("confirm_filtering", False))
             scrublet_expected_doublet_rate = float(tool_input.get("scrublet_expected_doublet_rate") or 0.06)
             scrublet_sim_doublet_ratio = float(tool_input.get("scrublet_sim_doublet_ratio") or 2.0)
@@ -3501,6 +3743,20 @@ def process_tool_call(
                 else:
                     raise
 
+            # Compute and store QC flag columns for cluster-level cleanup later.
+            # Flags are observations, not filters — no cells are removed here.
+            if flag_only and 'pct_counts_mt' in adata.obs.columns:
+                median_mt_for_flags = float(adata.obs['pct_counts_mt'].median())
+                mt_flag_threshold = float(tool_input.get("mt_flag_threshold") or (5.0 if median_mt_for_flags < 2.0 else 25.0))
+                lib_flag_threshold = float(tool_input.get("lib_flag_threshold") or 500.0)
+                genes_flag_threshold = int(tool_input.get("genes_flag_threshold") or 200)
+                adata.obs['qc_flag_high_mt'] = adata.obs['pct_counts_mt'] > mt_flag_threshold
+                adata.obs['qc_flag_low_lib'] = adata.obs['total_counts'] < lib_flag_threshold
+                adata.obs['qc_flag_low_genes'] = adata.obs['n_genes_by_counts'] < genes_flag_threshold
+                n_flag_mt = int(adata.obs['qc_flag_high_mt'].sum())
+                n_flag_lib = int(adata.obs['qc_flag_low_lib'].sum())
+                n_flag_genes = int(adata.obs['qc_flag_low_genes'].sum())
+
             # Use adata directly — no copy needed, metrics are already there
             qc_preview = adata
 
@@ -3583,18 +3839,19 @@ def process_tool_call(
                 try:
                     qc_plot_adata = adata.copy()
 
-                    # Add log-transformed columns for visualization
-                    if "total_counts" in qc_plot_adata.obs.columns:
-                        qc_plot_adata.obs["log10_total_counts"] = np.log10(qc_plot_adata.obs["total_counts"] + 1)
-                    if "n_genes_by_counts" in qc_plot_adata.obs.columns:
-                        qc_plot_adata.obs["log10_n_genes"] = np.log10(qc_plot_adata.obs["n_genes_by_counts"] + 1)
+                    # Use log1p columns from calculate_qc_metrics (log1p=True adds these automatically).
+                    # Fall back to computing log10 only if log1p columns are absent.
+                    if "log1p_total_counts" not in qc_plot_adata.obs.columns and "total_counts" in qc_plot_adata.obs.columns:
+                        qc_plot_adata.obs["log1p_total_counts"] = np.log1p(qc_plot_adata.obs["total_counts"])
+                    if "log1p_n_genes_by_counts" not in qc_plot_adata.obs.columns and "n_genes_by_counts" in qc_plot_adata.obs.columns:
+                        qc_plot_adata.obs["log1p_n_genes_by_counts"] = np.log1p(qc_plot_adata.obs["n_genes_by_counts"])
 
-                    # --- Figure 1: Main QC violin plots (log counts, log genes, MT%, ribo%) ---
+                    # --- Figure 1: Main QC violin plots (log1p counts, log1p genes, MT%, ribo%) ---
                     main_violin_keys = []
-                    if "log10_total_counts" in qc_plot_adata.obs.columns:
-                        main_violin_keys.append("log10_total_counts")
-                    if "log10_n_genes" in qc_plot_adata.obs.columns:
-                        main_violin_keys.append("log10_n_genes")
+                    if "log1p_total_counts" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("log1p_total_counts")
+                    if "log1p_n_genes_by_counts" in qc_plot_adata.obs.columns:
+                        main_violin_keys.append("log1p_n_genes_by_counts")
                     if "pct_counts_mt" in qc_plot_adata.obs.columns:
                         main_violin_keys.append("pct_counts_mt")
                     if "pct_counts_ribo" in qc_plot_adata.obs.columns:
@@ -3892,24 +4149,40 @@ def process_tool_call(
             ]
 
             if preview_only:
+                # In flag_only mode: strip all filter-suggestive content from the result.
+                # If we return mt_threshold_options, recommendation, filtering_plan, etc.,
+                # the model will respond to that data and propose global filtering — even if
+                # the system prompt says not to. The result must only contain observational
+                # metrics and an unambiguous next-step instruction.
+                _obs = qc_preview.obs
+                flag_summary = {}
+                if flag_only:
+                    flag_summary = {
+                        "qc_flag_high_mt": int(_obs['qc_flag_high_mt'].sum()) if 'qc_flag_high_mt' in _obs else 0,
+                        "qc_flag_low_lib": int(_obs['qc_flag_low_lib'].sum()) if 'qc_flag_low_lib' in _obs else 0,
+                        "qc_flag_low_genes": int(_obs['qc_flag_low_genes'].sum()) if 'qc_flag_low_genes' in _obs else 0,
+                        "predicted_doublets": predicted_doublets,
+                    }
                 preview_result = {
                     "status": "ok",
                     "tool": "run_qc",
-                    "mode": "preview",
+                    "mode": "flag_only" if flag_only else "preview",
                     "before": {"n_cells": n_before, "n_genes": g_before},
-                    "after": {"n_cells": n_before, "n_genes": g_before},
-                    "data_type_confirmed": data_type_confirmed,
-                    "recommendation": recommendation,
-                    "filtering_plan": filtering_plan,
-                    "qc_decisions": qc_decisions,
                     "metrics": {
-                        "median_pct_mt": float(qc_preview.obs['pct_counts_mt'].median()) if 'pct_counts_mt' in qc_preview.obs else None,
-                        "doublet_rate": float(qc_preview.obs['predicted_doublet'].mean()) if 'predicted_doublet' in qc_preview.obs else None,
-                        "cells_below_min_genes": cells_low_genes,
-                        "genes_below_min_cells": genes_low_cells,
-                        "predicted_doublets": predicted_doublets,
-                        "cells_over_mt_threshold": cells_over_mt,
+                        "median_pct_mt": round(float(_obs['pct_counts_mt'].median()), 2) if 'pct_counts_mt' in _obs else None,
+                        "median_total_counts": round(float(_obs['total_counts'].median()), 0) if 'total_counts' in _obs else None,
+                        "median_n_genes": round(float(_obs['n_genes_by_counts'].median()), 0) if 'n_genes_by_counts' in _obs else None,
+                        "doublet_rate_pct": round(float(_obs['predicted_doublet'].mean()) * 100, 1) if 'predicted_doublet' in _obs else None,
+                        "n_mt_genes_detected": n_mt_genes_detected,
+                        "n_ribo_genes_detected": n_ribo_genes_detected,
                     },
+                    **({"flags_stored_in_obs": flag_summary} if flag_only else {"qc_decisions": qc_decisions}),
+                    "next_step": (
+                        "QC metrics and flags are stored in adata.obs. No cells were removed. "
+                        "Proceed immediately to normalize_and_hvg — filtering decisions are deferred to cluster-level QC after embedding."
+                        if flag_only else
+                        "Review the figures and proposed thresholds, then confirm to apply filtering."
+                    ),
                     "warnings": warnings,
                     "figures": figure_outputs,
                     "batch_strategy": batch_strategy,
@@ -3935,12 +4208,12 @@ def process_tool_call(
                     preview_result,
                     adata,
                     dataset_changed=False,
-                    summary="Previewed QC metrics, thresholds, and doublet strategy without filtering cells.",
+                    summary="QC metrics computed and flags stored. No cells removed — proceeding to normalization.",
                     artifacts_created=artifact_payloads,
                     decisions_raised=decisions,
                     verification=_build_verification(
                         "passed",
-                        "QC preview completed and reported a concrete batch strategy.",
+                        "QC flag-only pass completed.",
                         verification_checks,
                     ),
                 )
@@ -4126,23 +4399,113 @@ def process_tool_call(
             target_sum = float(target_sum) if target_sum is not None else None
             log_transform = bool(tool_input.get("log_transform", True))
             raw_layer_name = tool_input.get("raw_layer_name", "raw_counts")
-            force_reset_from_raw = bool(tool_input.get("force_reset_from_raw", True))
+            normalization_source = tool_input.get("normalization_source") or "auto"
+            legacy_force_reset = tool_input.get("force_reset_from_raw")
+            if legacy_force_reset is not None and "normalization_source" not in tool_input:
+                normalization_source = "raw_counts" if bool(legacy_force_reset) else "current_X"
+            preserve_input_x_layer = tool_input.get("preserve_input_x_layer", "pre_scagent_X")
             set_raw_after_normalization = bool(tool_input.get("set_raw_after_normalization", True))
             hvg_flavor = tool_input.get("hvg_flavor", "seurat_v3")
             hvg_layer = tool_input.get("hvg_layer") or None
             batch_key = tool_input.get("batch_key")
+            default_ribo_patterns = [
+                r"^(RPL|RPS|MRPL|MRPS)",
+                r"^(Rpl|Rps|Mrpl|Mrps)",
+            ]
+            remove_ribo_param_present = "remove_ribosomal_genes" in tool_input
+            if remove_ribo_param_present:
+                remove_ribosomal_genes = bool(tool_input.get("remove_ribosomal_genes"))
+            elif tool_input.get("exclude_ribosomal_from_hvg") is False:
+                # Backward compatibility: older prompts used this as the
+                # only way to say ribosomal genes should remain usable.
+                remove_ribosomal_genes = False
+            else:
+                remove_ribosomal_genes = True
+
+            if "exclude_ribosomal_from_hvg" in tool_input:
+                exclude_ribosomal_from_hvg = bool(tool_input.get("exclude_ribosomal_from_hvg"))
+            else:
+                exclude_ribosomal_from_hvg = not remove_ribosomal_genes
+
+            ribosomal_remove_patterns = tool_input.get("ribosomal_remove_patterns") or default_ribo_patterns
+            if isinstance(ribosomal_remove_patterns, str):
+                ribosomal_remove_patterns = [ribosomal_remove_patterns]
+            ribosomal_remove_patterns = [
+                str(pattern) for pattern in ribosomal_remove_patterns if str(pattern)
+            ]
             hvg_exclude_patterns = tool_input.get("hvg_exclude_patterns") or []
             if isinstance(hvg_exclude_patterns, str):
                 hvg_exclude_patterns = [hvg_exclude_patterns]
-            hvg_exclusion_mode = tool_input.get("hvg_exclusion_mode", "post")
+            hvg_exclude_patterns = [str(pattern) for pattern in hvg_exclude_patterns if str(pattern)]
+            if exclude_ribosomal_from_hvg:
+                hvg_exclude_patterns = default_ribo_patterns + hvg_exclude_patterns
+            hvg_exclusion_mode = tool_input.get("hvg_exclusion_mode", "pre")
             hvg_exclude_match_mode = tool_input.get("hvg_exclude_match_mode", "match")
             hvg_exclusion_source = tool_input.get("hvg_exclusion_source")
+            if exclude_ribosomal_from_hvg:
+                if hvg_exclusion_source:
+                    hvg_exclusion_source = (
+                        "scagent retained ribosomal genes by explicit request "
+                        "and excluded them before HVG; "
+                        f"additional source: {hvg_exclusion_source}"
+                    )
+                else:
+                    hvg_exclusion_source = (
+                        "scagent retained ribosomal genes by explicit request "
+                        "and excluded them before HVG"
+                    )
 
             before_shape = (adata.n_obs, adata.n_vars)
+
+            def _feature_mask_from_patterns(var_names, patterns, match_mode="match"):
+                names = [str(name) for name in var_names]
+                mask = np.zeros(len(names), dtype=bool)
+                for pattern in patterns:
+                    regex = re.compile(pattern)
+                    if match_mode == "contains":
+                        mask |= np.asarray([bool(regex.search(name)) for name in names])
+                    elif match_mode == "fullmatch":
+                        mask |= np.asarray([bool(regex.fullmatch(name)) for name in names])
+                    else:
+                        mask |= np.asarray([bool(regex.match(name)) for name in names])
+                return mask
+
+            ribosomal_removal_meta = {
+                "enabled": bool(remove_ribosomal_genes),
+                "patterns": ribosomal_remove_patterns,
+                "match_mode": "match",
+                "source": (
+                    "scagent project default ribosomal gene removal before "
+                    "normalization/HVG"
+                    if remove_ribosomal_genes
+                    else "ribosomal genes retained by explicit request/source setting"
+                ),
+                "n_removed": 0,
+            }
+            if remove_ribosomal_genes:
+                ribo_mask = _feature_mask_from_patterns(
+                    adata.var_names,
+                    ribosomal_remove_patterns,
+                    match_mode="match",
+                )
+                n_ribo_removed = int(ribo_mask.sum())
+                ribosomal_removal_meta["n_removed"] = n_ribo_removed
+                if n_ribo_removed:
+                    removed_names = [str(name) for name in adata.var_names[ribo_mask][:25]]
+                    ribosomal_removal_meta["example_removed_genes"] = removed_names
+                    adata = adata[:, ~ribo_mask].copy()
+                feature_removals = dict(adata.uns.get("feature_removals", {}))
+                feature_removals["ribosomal_genes"] = ribosomal_removal_meta
+                adata.uns["feature_removals"] = feature_removals
 
             def _integer_like_matrix(matrix, n_rows: int = 100, n_cols: int = 100) -> bool:
                 if matrix is None:
                     return False
+                if hasattr(matrix, "data") and hasattr(matrix, "nnz"):
+                    values = np.asarray(matrix.data[:max(n_rows * n_cols, 1)])
+                    if values.size == 0:
+                        return True
+                    return bool(np.allclose(values, np.round(values)))
                 sample = matrix[:min(n_rows, matrix.shape[0]), :min(n_cols, matrix.shape[1])]
                 if hasattr(sample, "toarray"):
                     sample = sample.toarray()
@@ -4156,7 +4519,8 @@ def process_tool_call(
                     log_transform=log_transform,
                     preserve_raw=True,
                     raw_layer_name=raw_layer_name,
-                    force_reset_from_raw=force_reset_from_raw,
+                    normalization_source=normalization_source,
+                    preserve_input_x_layer=preserve_input_x_layer,
                 )
                 if set_raw_after_normalization:
                     adata.raw = adata.copy()
@@ -4177,7 +4541,7 @@ def process_tool_call(
                     message=str(e),
                     adata_obj=adata,
                     recovery_options=[
-                        "Retry normalize_and_hvg with force_reset_from_raw=true "
+                        "Retry normalize_and_hvg with normalization_source='raw_counts' "
                         f"so adata.X is restored from layers['{raw_layer_name}'] before normalization.",
                         "If the dataset was already normalized in this session, "
                         "do not call scanpy normalize/log1p manually on the current X; "
@@ -4228,6 +4592,11 @@ def process_tool_call(
                 "target_sum": target_sum,
                 "log_transform": log_transform,
                 "normalization": adata.uns.get("normalization", {}),
+                "normalization_source": adata.uns.get("normalization", {}).get("normalization_source", normalization_source),
+                "resolved_source": adata.uns.get("normalization", {}).get("resolved_source"),
+                "reset_from_raw_counts": adata.uns.get("normalization", {}).get("reset_from_raw_counts"),
+                "reset_reason": adata.uns.get("normalization", {}).get("reset_reason"),
+                "input_x_preserved_layer": adata.uns.get("normalization", {}).get("input_x_preserved_layer"),
                 "raw_layer_name": raw_layer_name,
                 "raw_counts_present": raw_counts_present,
                 "raw_counts_integer_like": raw_counts_integer_like,
@@ -4235,6 +4604,9 @@ def process_tool_call(
                 "adata_raw_shape": raw_shape,
                 "set_raw_after_normalization": set_raw_after_normalization,
                 "n_hvg": int(adata.var['highly_variable'].sum()),
+                "feature_removals": {
+                    "ribosomal_genes": ribosomal_removal_meta,
+                },
                 "hvg": {
                     "requested_flavor": hvg_meta.get("requested_flavor", hvg_flavor),
                     "flavor": hvg_meta.get("flavor", hvg_flavor),
@@ -4244,10 +4616,13 @@ def process_tool_call(
                     "layer": hvg_meta.get("layer", hvg_layer),
                     "n_hvg_selected": int(adata.var['highly_variable'].sum()),
                 },
+                "remove_ribosomal_genes": remove_ribosomal_genes,
+                "exclude_ribosomal_from_hvg": exclude_ribosomal_from_hvg,
                 "feature_exclusions": exclusion_meta,
                 "metrics": {
                     "n_hvg_selected": int(adata.var['highly_variable'].sum()),
                     "normalized_counts_target_median": normalized_counts_target,
+                    "n_removed_ribosomal_genes": int(ribosomal_removal_meta.get("n_removed", 0) or 0),
                     "n_excluded_features": int(exclusion_meta.get("n_excluded", 0) or 0),
                     "excluded_features_marked_hvg": int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0),
                 },
@@ -4270,12 +4645,27 @@ def process_tool_call(
                     int(adata.var['highly_variable'].sum()) > 0,
                     f"{int(adata.var['highly_variable'].sum())} HVGs are marked.",
                 ),
-                _check(
-                    "excluded_features_not_hvg",
-                    int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0) == 0,
-                    "No excluded features remain marked highly_variable.",
-                ),
             ]
+            if remove_ribosomal_genes:
+                verification_checks.append(
+                    _check(
+                        "ribosomal_gene_removal_recorded",
+                        "feature_removals" in adata.uns
+                        and "ribosomal_genes" in adata.uns["feature_removals"],
+                        (
+                            f"Removed {int(ribosomal_removal_meta.get('n_removed', 0) or 0)} "
+                            "ribosomal genes before normalization/HVG."
+                        ),
+                    )
+                )
+            if int(exclusion_meta.get("n_excluded", 0) or 0):
+                verification_checks.append(
+                    _check(
+                        "excluded_features_not_hvg",
+                        int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0) == 0,
+                        "No excluded features remain marked highly_variable.",
+                    )
+                )
             if set_raw_after_normalization:
                 verification_checks.append(
                     _check(
@@ -4291,7 +4681,8 @@ def process_tool_call(
                 summary=(
                     f"Normalized data to target_sum={target_sum}, "
                     f"selected {int(adata.var['highly_variable'].sum())} HVGs, "
-                    f"and applied {int(exclusion_meta.get('n_excluded', 0) or 0)} source-defined feature exclusions."
+                    f"removed {int(ribosomal_removal_meta.get('n_removed', 0) or 0)} ribosomal genes, "
+                    f"and applied {int(exclusion_meta.get('n_excluded', 0) or 0)} feature exclusions before HVG selection."
                 ),
                 artifacts_created=artifact_payloads,
                 verification=_build_verification(
@@ -4746,6 +5137,80 @@ def process_tool_call(
             model = tool_input.get("model", "Immune_All_Low.pkl")
             majority = tool_input.get("majority_voting", True)
             cluster_key = tool_input.get("cluster_key", "leiden")
+            organism = (tool_input.get("organism") or "").strip().lower()
+            biological_context = tool_input.get("biological_context") or {}
+            if not biological_context and world_state is not None:
+                biological_context = (
+                    (getattr(world_state, "data_summary", {}) or {}).get("biological_context", {})
+                )
+            if not organism and isinstance(biological_context, dict):
+                organism = str(biological_context.get("species") or "").strip().lower()
+            if organism not in {"human", "mouse"}:
+                organism = ""
+            allow_cross_species = bool(tool_input.get("allow_cross_species", False))
+
+            model_info = infer_celltypist_model_organism(model)
+            model_organism = model_info.get("organism")
+            if not organism and model_organism in {"human", "mouse"}:
+                return json.dumps({
+                    "status": "needs_input",
+                    "tool": "run_celltypist",
+                    "message": (
+                        "CellTypist needs dataset organism before using "
+                        f"model '{model}'. The model appears to be {model_organism}, "
+                        "but the current species context is ambiguous."
+                    ),
+                    "required_input": "organism",
+                    "options": ["human", "mouse"],
+                    "model": model,
+                    "model_info": model_info,
+                    "biological_context": biological_context,
+                    "model_discovery": {
+                        "list_models_code": "celltypist.models.models_description()",
+                        "download_model_code": "celltypist.models.download_models(model='<model>.pkl')",
+                        "refresh_catalog_code": "celltypist.models.download_models(force_update=True)",
+                    },
+                    "recovery_options": [
+                        "If the prompt or metadata says human, rerun with organism='human'.",
+                        "If the prompt or metadata says mouse, rerun with organism='mouse'.",
+                        "If species is genuinely unclear, inspect HLA vs H2 markers and ENSG vs ENSMUSG IDs first.",
+                    ],
+                }, indent=2), adata
+            if (
+                organism
+                and model_organism in {"human", "mouse"}
+                and organism != model_organism
+                and not allow_cross_species
+            ):
+                compatible_models = available_celltypist_models_for_organism(organism)
+                return json.dumps({
+                    "status": "needs_input",
+                    "tool": "run_celltypist",
+                    "message": (
+                        f"Refusing to run CellTypist model '{model}' because the "
+                        f"dataset organism is '{organism}', but the model appears "
+                        f"to be '{model_organism}'."
+                    ),
+                    "required_input": "species_compatible_annotation_strategy",
+                    "model": model,
+                    "model_info": model_info,
+                    "requested_organism": organism,
+                    "model_organism": model_organism,
+                    "compatible_celltypist_models": compatible_models[:20],
+                    "biological_context": biological_context,
+                    "model_discovery": {
+                        "list_models_code": "celltypist.models.models_description()",
+                        "download_model_code": "celltypist.models.download_models(model='<model>.pkl')",
+                        "refresh_catalog_code": "celltypist.models.download_models(force_update=True)",
+                        "official_models_url": "https://www.celltypist.org/models",
+                    },
+                    "recovery_options": [
+                        f"Choose a {organism}-compatible CellTypist model if one matches the tissue.",
+                        f"Run Scimilarity with organism='{organism}' and validate markers.",
+                        "Use marker-based/manual annotation and report that CellTypist had no appropriate model.",
+                        "Set allow_cross_species=true only for an explicitly caveated exploratory run.",
+                    ],
+                }, indent=2), adata
             if majority and cluster_key not in adata.obs.columns:
                 return _smart_unavailable_result(
                     tool="run_celltypist",
@@ -4774,6 +5239,8 @@ def process_tool_call(
                 run_celltypist(
                     adata,
                     model=model,
+                    organism=organism or None,
+                    allow_cross_species=allow_cross_species,
                     majority_voting=majority,
                     over_clustering=cluster_key if majority else None,
                 )
@@ -4802,6 +5269,7 @@ def process_tool_call(
             key = 'celltypist_majority_voting' if majority and 'celltypist_majority_voting' in adata.obs else 'celltypist_predicted_labels'
             all_counts = adata.obs[key].value_counts() if key in adata.obs else {}
             total_cells = adata.n_obs
+            celltypist_meta = adata.uns.get("celltypist", {}) if hasattr(adata, "uns") else {}
 
             # Build detailed breakdown with counts and percentages
             type_breakdown = {}
@@ -4821,8 +5289,20 @@ def process_tool_call(
                 "output_path": output_path,
                 "saved": output_path is not None,
                 "model": model,
+                "requested_organism": celltypist_meta.get("requested_organism") or organism or None,
+                "model_organism": celltypist_meta.get("model_organism") or model_organism,
+                "model_organism_source": celltypist_meta.get("model_organism_source") or model_info.get("source"),
+                "model_description": celltypist_meta.get("model_description") or model_info.get("description"),
+                "allow_cross_species": allow_cross_species,
                 "majority_voting": majority,
                 "cluster_key_used": cluster_key if majority else None,
+                "biological_context": biological_context,
+                "model_discovery": {
+                    "list_models_code": "celltypist.models.models_description()",
+                    "download_model_code": "celltypist.models.download_models(model='<model>.pkl')",
+                    "refresh_catalog_code": "celltypist.models.download_models(force_update=True)",
+                    "official_models_url": "https://www.celltypist.org/models",
+                },
                 "total_cells": total_cells,
                 "n_types": len(all_counts),
                 "annotation_key": key,
@@ -4854,6 +5334,16 @@ def process_tool_call(
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             model_path = tool_input.get("model_path")
+            organism = (tool_input.get("organism") or "").strip().lower()
+            biological_context = tool_input.get("biological_context") or {}
+            if not biological_context and world_state is not None:
+                biological_context = (
+                    (getattr(world_state, "data_summary", {}) or {}).get("biological_context", {})
+                )
+            if not organism and isinstance(biological_context, dict):
+                organism = str(biological_context.get("species") or "").strip().lower()
+            if organism not in {"human", "mouse"}:
+                organism = ""
             cluster_key = tool_input.get("cluster_key", "leiden")
             cluster_key = _validate_obs_column(
                 adata,
@@ -4863,11 +5353,31 @@ def process_tool_call(
                 context="cluster_key",
             ) or "leiden"
 
-            # Only pass model_path if specified, otherwise use default
-            if model_path:
-                run_scimilarity(adata, model_path=model_path, cluster_key=cluster_key)
-            else:
-                run_scimilarity(adata, cluster_key=cluster_key)
+            if not model_path and not organism:
+                return json.dumps({
+                    "status": "needs_input",
+                    "tool": "run_scimilarity",
+                    "message": (
+                        "Scimilarity needs an explicit organism before annotation. "
+                        "Human and mouse models are separate, and the current species context is ambiguous."
+                    ),
+                    "required_input": "organism",
+                    "options": ["human", "mouse"],
+                    "biological_context": biological_context,
+                    "recovery_options": [
+                        "If the prompt or metadata says the dataset is human, rerun with organism='human'.",
+                        "If the prompt or metadata says the dataset is mouse, rerun with organism='mouse'.",
+                        "If species is genuinely unclear, inspect gene IDs/markers first (HLA vs H2, ENSG vs ENSMUSG).",
+                    ],
+                }, indent=2), adata
+
+            run_scimilarity(
+                adata,
+                model_path=model_path or None,
+                organism=organism or None,
+                cluster_key=cluster_key,
+            )
+            scimilarity_meta = adata.uns.get("scimilarity", {}) if hasattr(adata, "uns") else {}
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_scimilarity")
             if output_path:
@@ -4903,6 +5413,11 @@ def process_tool_call(
                 "annotation_key": key,
                 "cluster_key_used": cluster_key,
                 "has_embeddings": "X_scimilarity" in adata.obsm,
+                "requested_organism": scimilarity_meta.get("requested_organism") or organism or None,
+                "selected_organism": scimilarity_meta.get("selected_organism"),
+                "model_path": scimilarity_meta.get("model_path") or model_path,
+                "model_source": "explicit_model_path" if model_path else "organism_default",
+                "biological_context": biological_context,
                 "cell_type_breakdown": type_breakdown,
                 "warnings": warnings,
                 "state": make_state(adata)
@@ -4919,6 +5434,11 @@ def process_tool_call(
                     [
                         _check("annotation_key_present", key in adata.obs.columns, f"Annotation column '{key}' exists."),
                         _check(
+                            "organism_selected",
+                            scimilarity_meta.get("selected_organism") in {"human", "mouse"} or bool(model_path),
+                            f"Scimilarity model organism: {scimilarity_meta.get('selected_organism') or 'explicit model path'}.",
+                        ),
+                        _check(
                             "cluster_key_valid",
                             cluster_key in adata.obs.columns,
                             f"Cluster key '{cluster_key}' is available for cluster-level summaries.",
@@ -4928,7 +5448,7 @@ def process_tool_call(
             )
 
         elif tool_name == "query_cells":
-            from ..annotation.scimilarity import query_cells as _query_cells, DEFAULT_MODEL_PATH
+            from ..annotation.scimilarity import query_cells as _query_cells
 
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             if adata is None:
@@ -4974,7 +5494,8 @@ def process_tool_call(
                     group_key=tool_input.get("group_key"),
                     group_value=tool_input.get("group_value"),
                     k=k,
-                    model_path=DEFAULT_MODEL_PATH,
+                    model_path=tool_input.get("model_path") or None,
+                    organism=tool_input.get("organism") or None,
                     raw_layer=raw_layer,
                 )
             except (FileNotFoundError, ImportError) as e:
@@ -6237,6 +6758,203 @@ def process_tool_call(
                     "chars_returned": len(content),
                     "content": content,
                 }, indent=2), adata
+
+        elif tool_name == "run_cluster_qc":
+            import pandas as pd
+
+            if adata is None:
+                return _error_result(
+                    tool="run_cluster_qc",
+                    message="No in-memory data available. Load and cluster data first.",
+                    recovery_options=["Run load_data, then normalize/cluster before running cluster QC."],
+                )
+
+            cluster_key = tool_input.get("cluster_key", "leiden")
+            if cluster_key not in adata.obs.columns:
+                available = [c for c in adata.obs.columns if adata.obs[c].dtype.name == "category"]
+                return _error_result(
+                    tool="run_cluster_qc",
+                    message=f"Cluster key '{cluster_key}' not found in adata.obs. Available categorical columns: {available}",
+                    adata_obj=adata,
+                    recovery_options=["Run run_clustering first, or specify the correct cluster_key."],
+                )
+
+            required_cols = ["total_counts", "n_genes_by_counts", "pct_counts_mt"]
+            missing = [c for c in required_cols if c not in adata.obs.columns]
+            if missing:
+                return _error_result(
+                    tool="run_cluster_qc",
+                    message=f"QC metrics not computed. Missing obs columns: {missing}. Run run_qc first.",
+                    adata_obj=adata,
+                    recovery_options=["Run run_qc (flag_only=true) to compute QC metrics before cluster QC."],
+                )
+
+            doublet_threshold = float(tool_input.get("doublet_threshold", 0.3))
+            mt_threshold = float(tool_input.get("mt_threshold", 25.0))
+            low_lib_frac = float(tool_input.get("low_lib_fraction", 0.5))
+            low_genes_frac = float(tool_input.get("low_genes_fraction", 0.5))
+            save_checkpoint = bool(tool_input.get("save_checkpoint", True))
+
+            has_doublet = "doublet_score" in adata.obs.columns
+            has_flag_mt = "qc_flag_high_mt" in adata.obs.columns
+            has_flag_lib = "qc_flag_low_lib" in adata.obs.columns
+
+            agg_dict = {
+                "n_cells": ("total_counts", "count"),
+                "mean_lib_size": ("total_counts", "mean"),
+                "mean_n_genes": ("n_genes_by_counts", "mean"),
+                "mean_mt": ("pct_counts_mt", "mean"),
+            }
+            if has_doublet:
+                agg_dict["mean_doublet"] = ("doublet_score", "mean")
+            if has_flag_mt:
+                agg_dict["frac_flagged_mt"] = ("qc_flag_high_mt", "mean")
+            if has_flag_lib:
+                agg_dict["frac_flagged_lib"] = ("qc_flag_low_lib", "mean")
+            if "pct_counts_ribo" in adata.obs.columns:
+                agg_dict["mean_ribo"] = ("pct_counts_ribo", "mean")
+
+            cluster_qc = adata.obs.groupby(cluster_key).agg(**agg_dict).round(2)
+
+            global_lib = float(adata.obs["total_counts"].median())
+            global_genes = float(adata.obs["n_genes_by_counts"].median())
+
+            cluster_decisions = {}
+            proposed_removal = []
+            ambiguous = []
+            clean = []
+
+            for cluster in cluster_qc.index:
+                row = cluster_qc.loc[cluster]
+                mean_mt = float(row["mean_mt"])
+                mean_lib = float(row["mean_lib_size"])
+                mean_genes = float(row["mean_n_genes"])
+                mean_doublet = float(row.get("mean_doublet", 0.0))
+
+                lib_low = mean_lib < low_lib_frac * global_lib
+                genes_low = mean_genes < low_genes_frac * global_genes
+                mt_high = mean_mt > mt_threshold
+                doublet_high = mean_doublet > doublet_threshold and "mean_doublet" in row.index
+                high_library = mean_lib > 1.5 * global_lib
+
+                evidence = {
+                    "low_library": bool(lib_low),
+                    "low_genes": bool(genes_low),
+                    "high_mt": bool(mt_high),
+                    "high_doublet_score": bool(doublet_high),
+                    "high_library": bool(high_library),
+                    "mean_library_fraction_of_global_median": round(mean_lib / global_lib, 2) if global_lib else None,
+                    "mean_genes_fraction_of_global_median": round(mean_genes / global_genes, 2) if global_genes else None,
+                }
+                reasons = []
+                if lib_low:
+                    reasons.append(
+                        f"mean library size is below {low_lib_frac:.2g}x the global median"
+                    )
+                if genes_low:
+                    reasons.append(
+                        f"mean detected genes is below {low_genes_frac:.2g}x the global median"
+                    )
+                if mt_high:
+                    reasons.append(f"mean MT% is above {mt_threshold:g}%")
+                if doublet_high:
+                    reasons.append(f"mean doublet score is above {doublet_threshold:g}")
+                if high_library:
+                    reasons.append("mean library size is substantially above the global median")
+
+                if mt_high and lib_low and genes_low:
+                    recommended_action = "propose_removal"
+                    severity = "obvious"
+                    proposed_removal.append(str(cluster))
+                elif mt_high and not lib_low:
+                    recommended_action = "review"
+                    severity = "ambiguous"
+                    ambiguous.append(str(cluster))
+                elif doublet_high and high_library:
+                    recommended_action = "propose_removal"
+                    severity = "obvious"
+                    proposed_removal.append(str(cluster))
+                elif lib_low and genes_low and not mt_high:
+                    recommended_action = "propose_removal"
+                    severity = "obvious"
+                    proposed_removal.append(str(cluster))
+                else:
+                    recommended_action = "keep"
+                    severity = "clean"
+                    if not reasons:
+                        reasons.append("cluster-level QC metrics are within expected ranges")
+                    clean.append(str(cluster))
+
+                cluster_decisions[str(cluster)] = {
+                    "recommended_action": recommended_action,
+                    "severity": severity,
+                    "evidence": evidence,
+                    "reasons": reasons,
+                }
+
+            cluster_labels = adata.obs[cluster_key].astype(str)
+            cells_proposed = int(cluster_labels.isin(proposed_removal).sum())
+            cells_ambiguous = int(cluster_labels.isin(ambiguous).sum())
+            cells_total = adata.n_obs
+
+            checkpoint_path = None
+            if save_checkpoint:
+                import os as _os
+                _base = str(run_manager.run_dir) if run_manager else "."
+                cp_default = _os.path.join(_base, "checkpoint_pre_cleanup.h5ad")
+                checkpoint_path = tool_input.get("checkpoint_path") or cp_default
+                write_h5ad_safe(adata, checkpoint_path)
+
+            cluster_table = cluster_qc.reset_index().rename(columns={cluster_key: "cluster"})
+            cluster_table["cluster"] = cluster_table["cluster"].astype(str)
+            cluster_table["recommended_action"] = cluster_table["cluster"].map(
+                lambda c: cluster_decisions.get(str(c), {}).get("recommended_action", "keep")
+            )
+            cluster_table["severity"] = cluster_table["cluster"].map(
+                lambda c: cluster_decisions.get(str(c), {}).get("severity", "clean")
+            )
+            cluster_table["evidence"] = cluster_table["cluster"].map(
+                lambda c: cluster_decisions.get(str(c), {}).get("evidence", {})
+            )
+            cluster_table["reasons"] = cluster_table["cluster"].map(
+                lambda c: cluster_decisions.get(str(c), {}).get("reasons", [])
+            )
+            cluster_table = cluster_table.to_dict("records")
+
+            result = {
+                "status": "ok",
+                "tool": "run_cluster_qc",
+                "cluster_key": cluster_key,
+                "n_clusters": len(cluster_qc),
+                "global_lib_median": round(global_lib, 1),
+                "global_genes_median": round(global_genes, 1),
+                "cluster_table": cluster_table,
+                "cluster_decisions": cluster_decisions,
+                "proposed_removal": proposed_removal,
+                "ambiguous": ambiguous,
+                "clean": clean,
+                "cells_in_proposed_removal": cells_proposed,
+                "cells_ambiguous": cells_ambiguous,
+                "pct_proposed": round(cells_proposed / cells_total * 100, 1),
+                "cells_remaining_if_removed": cells_total - cells_proposed,
+                "checkpoint_path": checkpoint_path,
+                "thresholds_used": {
+                    "mt_threshold": mt_threshold,
+                    "doublet_threshold": doublet_threshold,
+                    "low_lib_fraction": low_lib_frac,
+                    "low_genes_fraction": low_genes_frac,
+                },
+                "state": make_state(adata),
+            }
+            artifacts = []
+            if checkpoint_path:
+                artifacts.append(_artifact_payload(checkpoint_path, role="checkpoint", metadata={"stage": "pre_cluster_qc_cleanup"}))
+            return _finalize_result(
+                result, adata,
+                dataset_changed=False,
+                summary=f"Cluster QC: {len(proposed_removal)} clusters proposed for removal ({cells_proposed} cells, {result['pct_proposed']}%), {len(ambiguous)} ambiguous.",
+                artifacts_created=artifacts,
+            )
 
         else:
             return _error_result(

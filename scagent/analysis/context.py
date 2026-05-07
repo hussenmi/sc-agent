@@ -44,28 +44,94 @@ def _normalize_text(text: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
 
-def _infer_species(adata: AnnData) -> tuple[str, str]:
-    """Infer species from gene identifiers with provenance label."""
-    sample_names = [str(name) for name in adata.var_names[:100]]
+def _species_from_text(text_context: str) -> tuple[str, str]:
+    """Infer species from explicit user/request text."""
+    if not text_context:
+        return "unknown", "unknown"
+    mouse_hit = bool(re.search(r"\b(mouse|murine|mus musculus|mm10|mm39)\b", text_context))
+    human_hit = bool(re.search(r"\b(human|homo sapiens|hg19|hg38|grch37|grch38)\b", text_context))
+    if mouse_hit and not human_hit:
+        return "mouse", "user_provided"
+    if human_hit and not mouse_hit:
+        return "human", "user_provided"
+    if mouse_hit and human_hit:
+        return "unknown", "ambiguous_user_text"
+    return "unknown", "unknown"
+
+
+def _metadata_species(adata: AnnData) -> tuple[str, str]:
+    """Infer species from explicit AnnData metadata."""
+    organism = str(adata.uns.get("organism", adata.uns.get("species", ""))).lower()
+    if any(token in organism for token in ("mouse", "murine", "mus musculus")):
+        return "mouse", "metadata_derived"
+    if any(token in organism for token in ("human", "homo sapiens")):
+        return "human", "metadata_derived"
+    return "unknown", "unknown"
+
+
+def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, Dict[str, Any]]:
+    """Infer species from user text, metadata, and gene identifiers."""
+    evidence: Dict[str, Any] = {}
+
+    text_species, text_source = _species_from_text(text_context)
+    if text_source == "user_provided":
+        evidence["user_text_species"] = text_species
+        return text_species, text_source, evidence
+    if text_source == "ambiguous_user_text":
+        evidence["ambiguous_user_text"] = True
+        return "unknown", text_source, evidence
+
+    metadata_species, metadata_source = _metadata_species(adata)
+    if metadata_source != "unknown":
+        evidence["metadata_species"] = metadata_species
+        return metadata_species, metadata_source, evidence
+
+    sample_names = [str(name) for name in adata.var_names[:50000]]
     sample_var_values: List[str] = []
     for key in ("gene_ids", "ensembl_id", "gene_symbols", "gene_name"):
         if key in adata.var.columns:
-            sample_var_values.extend([str(v) for v in adata.var[key].astype(str).head(100).tolist()])
+            sample_var_values.extend([str(v) for v in adata.var[key].astype(str).head(50000).tolist()])
 
     combined = sample_names + sample_var_values
     if not combined:
-        return "unknown", "unknown"
+        return "unknown", "unknown", evidence
 
     upper_symbol_like = sum(1 for name in sample_names if re.match(r"^[A-Z0-9-]{2,}$", name))
     title_symbol_like = sum(1 for name in sample_names if re.match(r"^[A-Z][a-z0-9-]{1,}$", name))
     ensg = sum(1 for value in combined if value.startswith("ENSG"))
     ensmusg = sum(1 for value in combined if value.startswith("ENSMUSG"))
+    h2_genes = sum(1 for name in sample_names if re.match(r"^H2[-A-Za-z0-9]*", name))
+    hla_genes = sum(1 for name in sample_names if re.match(r"^HLA[-A-Za-z0-9]*", name))
 
-    if ensmusg > 0 or title_symbol_like > upper_symbol_like * 1.3:
-        return "mouse", "metadata_derived"
-    if ensg > 0 or upper_symbol_like >= max(10, title_symbol_like):
-        return "human", "metadata_derived"
-    return "unknown", "unknown"
+    evidence.update({
+        "n_genes_checked": len(sample_names),
+        "upper_symbol_like": upper_symbol_like,
+        "title_symbol_like": title_symbol_like,
+        "ensg": ensg,
+        "ensmusg": ensmusg,
+        "h2_genes": h2_genes,
+        "hla_genes": hla_genes,
+    })
+
+    if ensmusg > 0 and ensg == 0:
+        return "mouse", "gene_identifier", evidence
+    if ensg > 0 and ensmusg == 0:
+        return "human", "gene_identifier", evidence
+    if h2_genes > 0 and hla_genes == 0:
+        return "mouse", "marker_gene_evidence", evidence
+    if hla_genes > 0 and h2_genes == 0:
+        return "human", "marker_gene_evidence", evidence
+    if ensmusg > 0 and ensg > 0:
+        return "unknown", "conflicting_gene_identifiers", evidence
+    if h2_genes > 0 and hla_genes > 0:
+        return "unknown", "conflicting_marker_gene_evidence", evidence
+    # Gene-symbol casing is not reliable enough to choose species. Some mouse
+    # pipelines uppercase symbols, and some mixed references have inconsistent
+    # casing. Record the evidence, but require user text, metadata, gene IDs, or
+    # species-specific marker families before selecting human or mouse.
+    if title_symbol_like > upper_symbol_like * 1.3 or upper_symbol_like >= max(50, title_symbol_like * 5):
+        return "unknown", "gene_name_case_heuristic_ambiguous", evidence
+    return "unknown", "unknown", evidence
 
 
 def _infer_sample_type(text_context: str, detected_type: str) -> tuple[str, str]:
@@ -203,12 +269,20 @@ def infer_biological_context(
 
     normalized_text = _normalize_text(text_context)
 
-    species, species_source = _infer_species(adata)
+    species, species_source, species_evidence = _infer_species(adata, normalized_text)
     context.species = species
     if species_source != "unknown":
         context.provenance["species"] = species_source
-        if species_source == "metadata_derived":
+        if species_source == "user_provided":
+            context.user_provided["species"] = species
+        elif species_source in {"metadata_derived", "gene_identifier", "marker_gene_evidence"}:
             context.metadata_derived["species"] = species
+            if species_evidence:
+                context.metadata_derived["species_evidence"] = species_evidence
+        else:
+            context.notes.append(f"Species could not be resolved automatically: {species_source}.")
+    elif species_evidence:
+        context.metadata_derived["species_evidence"] = species_evidence
 
     sample_type, sample_source = _infer_sample_type(normalized_text, state.data_type)
     context.sample_type = sample_type
@@ -248,7 +322,7 @@ def infer_biological_context(
     elif context.provenance.get("tissue") == "marker_inferred":
         confidence += 0.2
         context.notes.append("Tissue context is inferred from broad annotation composition and should be treated as provisional.")
-    if context.provenance.get("species") == "metadata_derived":
+    if context.provenance.get("species") in {"user_provided", "metadata_derived", "gene_identifier", "marker_gene_evidence"}:
         confidence += 0.25
     if context.provenance.get("sample_type") in {"user_provided", "metadata_derived"}:
         confidence += 0.15
