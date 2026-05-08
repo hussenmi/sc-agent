@@ -57,7 +57,7 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Test output and workshop slides
+# some folders
 test_output/
 workshop_slides/
 skills/
@@ -66,6 +66,9 @@ run*
 analysis/
 test_data/
 pbmc_auto/
+logs/
+.claude/
+treg_project/
 
 # macOS metadata files
 ._*

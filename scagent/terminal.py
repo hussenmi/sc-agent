@@ -28,12 +28,15 @@ def _configure_readline() -> None:
 
 
 def _get_prompt_session():
-    """Create a prompt_toolkit session that supports safe multi-line paste.
+    """Create a modern prompt_toolkit session for interactive prompts.
 
     prompt_toolkit understands bracketed paste directly. With ``multiline=True``,
     pasted newlines are inserted into the buffer instead of being interpreted as
     separate submissions. The custom Enter binding accepts the whole buffer, so
-    the normal single-line flow still feels like pressing Enter to send.
+    the normal single-line flow still feels like pressing Enter to send. Long
+    pasted prompts keep the cursor at the start so the terminal displays the
+    beginning of the request instead of jumping to the tail. Ctrl-C clears the
+    current draft instead of raising KeyboardInterrupt out of the whole session.
     """
     global _PROMPT_SESSION
     if _PROMPT_SESSION is not None:
@@ -42,10 +45,19 @@ def _get_prompt_session():
     try:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.keys import Keys
     except ImportError:
         return None
 
     bindings = KeyBindings()
+
+    def _is_long_multiline_paste(data: str, event) -> bool:
+        line_count = data.count("\n") + 1
+        try:
+            visible_rows = event.app.output.get_size().rows
+        except Exception:
+            visible_rows = 24
+        return "\n" in data and line_count >= max(12, visible_rows - 6)
 
     @bindings.add("enter")
     def _(event):
@@ -55,10 +67,41 @@ def _get_prompt_session():
     def _(event):
         event.current_buffer.insert_text("\n")
 
+    try:
+        @bindings.add("s-enter")
+        def _(event):
+            event.current_buffer.insert_text("\n")
+    except ValueError:
+        # Some prompt_toolkit versions/terminals cannot name Shift-Enter as a
+        # distinct key. Ctrl-J remains the portable newline fallback.
+        pass
+
+    @bindings.add("escape", "enter")
+    def _(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("c-c")
+    def _(event):
+        buffer = event.current_buffer
+        if buffer.text:
+            buffer.reset()
+        else:
+            buffer.validate_and_handle()
+
+    @bindings.add(Keys.BracketedPaste)
+    def _(event):
+        data = event.data.replace("\r\n", "\n").replace("\r", "\n")
+        buffer = event.current_buffer
+        paste_start = buffer.cursor_position
+        buffer.insert_text(data)
+        if _is_long_multiline_paste(data, event):
+            buffer.cursor_position = paste_start
+
     _PROMPT_SESSION = PromptSession(
         multiline=True,
         key_bindings=bindings,
-        prompt_continuation="... ",
+        mouse_support=True,
+        prompt_continuation="",
     )
     return _PROMPT_SESSION
 
@@ -86,7 +129,7 @@ def read_user_input(prompt: str = "", *, strip: bool = True) -> str:
         print("Paste mode — paste your full prompt, then finish with a line containing only :end")
         lines = []
         while True:
-            line = input("... ")
+            line = input()
             line = line.replace("\r\n", "\n").replace("\r", "\n")
             if line.strip() in {":end", '"""'}:
                 response = "\n".join(lines)
