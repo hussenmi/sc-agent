@@ -2,42 +2,48 @@
 # Start a local LLM server using vLLM inside a Singularity container.
 # The server exposes an OpenAI-compatible API that scagent connects to.
 #
+# Adapts to the GPU it finds — A100, H100 PCIe, H100 NVL, or H100 SXM —
+# and picks weights/quant/fusions/speculative method accordingly.
+#
 # Arguments:
-#   MODEL  HuggingFace repo ID of the model to serve (default: Qwen2.5-Coder-32B)
-#   PORT   Port the HTTP API listens on — scagent uses SCAGENT_BASE_URL=http://localhost:PORT/v1
-#   GPUS   Number of GPUs (auto = minimum needed). More GPUs = larger context window,
-#          because extra VRAM goes to the KV cache (conversation memory), not model weights.
-#          32B on 1 GPU → 32K ctx.  32B on 2 GPUs → 128K ctx.  70B needs 4 GPUs for 128K ctx.
+#   MODEL  HuggingFace repo ID (default: Qwen2.5-Coder-32B-Instruct)
+#   PORT   API port — scagent uses SCAGENT_BASE_URL=http://localhost:PORT/v1
+#   GPUS   Number of GPUs (auto = minimum to fit model + reasonable KV cache)
+#
+# Environment overrides:
+#   THINKING=1   Enable model reasoning/thinking mode (slower TTFT)
+#   SPEC=0       Disable speculative decoding
+#   SPEC=1       Force-enable for models that have a configured method
 #
 # Examples:
-#   bash start_vllm.sh                                             # Qwen2.5-Coder-32B, 1 GPU, 32K ctx
-#   bash start_vllm.sh Qwen/Qwen3-32B 8000 2                      # Qwen3-32B, 2 GPUs, 128K ctx
-#   bash start_vllm.sh meta-llama/Llama-3.3-70B-Instruct 8000 4   # Llama 70B, 4 GPUs, 128K ctx
+#   bash start_vllm.sh Qwen/Qwen3.6-27B-FP8 8000 2     # FP8 — H100 only
+#   bash start_vllm.sh Qwen/Qwen3.6-27B 8000 2         # BF16 — required on A100
+#   bash start_vllm.sh meta-llama/Llama-3.3-70B-Instruct 8000 4
 #
 # Download a model first with:  bash download_model.sh <model_id>
 
 MODEL=${1:-"Qwen/Qwen2.5-Coder-32B-Instruct"}
 PORT=${2:-8000}
 GPUS=${3:-"auto"}
-THINKING=${THINKING:-0}   # set THINKING=1 to enable model thinking/reasoning mode
+THINKING=${THINKING:-0}
+SPEC=${SPEC:-"auto"}
 
 HF_DIR="/data1/peerd/ibrahih3/hf"
 SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_gemma4.sif"}
-LOG="/data1/peerd/ibrahih3/tmp/vllm_$(echo $MODEL | sed 's|/|_|g').log"
+# Log path includes hostname so launches from different nodes don't clobber each
+# other on the shared filesystem.
+LOG_DIR="/data1/peerd/ibrahih3/cs_agent/logs"
+LOG="$LOG_DIR/vllm_$(hostname -s)_$(echo $MODEL | sed 's|/|_|g').log"
 
-mkdir -p /data1/peerd/ibrahih3/tmp
+mkdir -p "$LOG_DIR"
 
 # ── Per-model settings ────────────────────────────────────────────────────────
-# Add a new model by appending a line here. Fields:
-#   HF repo ID | served name (used in .env) | weight size GB | KV KB/token | parser | max ctx K | quant | reasoning_parser
-# weight size GB: actual loaded size (use FP8 weight size for pre-quantized FP8 checkpoints)
-# quant: leave blank for BF16; set to "fp8" for pre-quantized FP8 checkpoints
-#   - blank: on H100, online FP8 quantization is applied (--quantization fp8); weight size
-#            must reflect BF16 size since BF16 is loaded first before quantizing
-#   - fp8:   vLLM auto-detects quantization; weight size reflects FP8 size (~half of BF16);
-#            larger context window is safe since weights load directly as FP8
-# parser: tool-call parser — must match how the model emits tool calls (vllm --help lists valid names)
-# reasoning_parser: set for models with thinking/reasoning mode (e.g. qwen3); leave blank otherwise
+# Add a new model by appending a line. Fields:
+#   HF repo ID | served name | weight GB | KV KB/token | parser | max ctx K | quant | reasoning_parser
+# weight GB: actual loaded size (FP8 weight size for pre-quantized FP8 checkpoints)
+# parser: tool-call parser — must match how the model emits tool calls
+# quant: blank for BF16; "fp8" for pre-quantized FP8 checkpoints (rejected on Ampere)
+# reasoning_parser: set for models with thinking mode (e.g. qwen3); blank otherwise
 MODEL_TABLE=(
   "Qwen/Qwen2.5-Coder-32B-Instruct          | Qwen2.5-Coder-32B-Instruct  |  64 | 256  | qwen3_xml   | 128 |"
   "Qwen/Qwen2.5-72B-Instruct                | Qwen2.5-72B-Instruct        | 144 | 640  | qwen3_xml   |  32 |"
@@ -60,30 +66,85 @@ KV_KB=256
 PARSER="hermes"
 MODEL_QUANT=""
 REASONING_PARSER=""
+ctx_k=128
 
 for entry in "${MODEL_TABLE[@]}"; do
-  IFS='|' read -r repo name mvram kvkb parser ctx_k quant reasoning_parser <<< "$entry"
+  IFS='|' read -r repo name mvram kvkb parser ctxk quant reasoning_parser <<< "$entry"
   repo=$(echo "$repo" | xargs)
   if [[ "$MODEL" == "$repo" ]]; then
     SERVED_NAME=$(echo "$name"             | xargs)
     MODEL_VRAM=$(echo "$mvram"             | xargs)
     KV_KB=$(echo "$kvkb"                   | xargs)
     PARSER=$(echo "$parser"                | xargs)
+    ctx_k=$(echo "$ctxk"                   | xargs)
     MODEL_QUANT=$(echo "$quant"            | xargs)
     REASONING_PARSER=$(echo "$reasoning_parser" | xargs)
     break
   fi
 done
 
-# Resolve GPU count: auto = minimum needed to fit model + reasonable KV cache
-GPU_VRAM=80
+# ── GPU detection ─────────────────────────────────────────────────────────────
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+GPU_MEM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+
+if [[ -z "$GPU_NAME" ]]; then
+  echo "ERROR: nvidia-smi not available or no GPU detected"
+  exit 1
+fi
+
+GPU_VRAM=$(( GPU_MEM_MIB / 1024 ))
+
+# Classify hardware. The axis that matters for vLLM kernel selection on Hopper is
+# whether NVSwitch is present — SXM boards have it, PCIe and NVL don't. Without
+# NVSwitch, FlashInfer's SymmDeviceMemory multicast fails and several fusions
+# must be disabled. The SKU name is a proxy: SXM/HBM3 → has NVSwitch.
+case "$GPU_CC" in
+  8.0)
+    HW_CLASS="ampere"                  # A100
+    ;;
+  9.0)
+    if [[ "$GPU_NAME" == *"SXM"* || "$GPU_NAME" == *"HBM3"* ]]; then
+      HW_CLASS="hopper_nvswitch"       # H100 SXM
+    else
+      HW_CLASS="hopper_no_nvswitch"    # H100 PCIe / H100 NVL
+    fi
+    ;;
+  *)
+    HW_CLASS="unknown"
+    ;;
+esac
+
+echo "GPU:      $GPU_NAME (cc=$GPU_CC, ${GPU_VRAM}GB)"
+echo "Class:    $HW_CLASS"
+
+# Reject FP8 weights on Ampere — Marlin would silently dequantize to BF16 on every
+# forward pass. Slower than just running BF16 directly with no benefit.
+if [[ "$HW_CLASS" == "ampere" && "$MODEL_QUANT" == "fp8" ]]; then
+  echo ""
+  echo "ERROR: FP8 model on A100 has no native FP8 support (compute capability 8.0)."
+  echo "       Marlin would dequantize to BF16 on every forward pass — slower than BF16 direct."
+  case "$MODEL" in
+    Qwen/Qwen3.6-27B-FP8)
+      echo "       Use the BF16 sibling instead:"
+      echo "         bash start_vllm.sh Qwen/Qwen3.6-27B $PORT $GPUS"
+      ;;
+    RedHatAi/gemma-4-31B-it-FP8-Dynamic)
+      echo "       Use the BF16 sibling instead:"
+      echo "         bash start_vllm.sh google/gemma-4-31b-it $PORT $GPUS"
+      ;;
+  esac
+  exit 1
+fi
+
+# ── GPU count autoselect ──────────────────────────────────────────────────────
 UTIL=90  # percent
 
 if [[ "$GPUS" == "auto" ]]; then
   for n in 1 2 4 8; do
     USABLE=$(( n * GPU_VRAM * UTIL / 100 ))
     KV_BUDGET=$(( USABLE - MODEL_VRAM ))
-    if [[ $KV_BUDGET -ge 8 ]]; then   # need at least 8GB for KV cache
+    if [[ $KV_BUDGET -ge 8 ]]; then
       TP=$n
       break
     fi
@@ -92,79 +153,88 @@ else
   TP=$GPUS
 fi
 
-# Detect GPU and apply GPU-specific settings
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+# ── Hardware-specific flags ───────────────────────────────────────────────────
 MEM_UTIL="0.90"
 VLLM_USE_DEEP_GEMM=1
-# Use array so flags with embedded spaces/JSON pass through correctly
 EXTRA_FLAGS=()
-if [[ "$GPU_NAME" == *"H100"* ]]; then
-  # vLLM V1 (>=0.6) uses FULL_DECODE_ONLY CUDA graph capture by default, which avoids
-  # the large-batch prefill OOM that required --enforce-eager on older versions.
-  # CUDA graphs are now enabled — ~20-25% lower per-token latency vs enforce-eager.
-  echo "GPU:      $GPU_NAME"
-else
-  echo "GPU:      ${GPU_NAME:-unknown}"
-fi
 
-# H100 NVL uses NVLink bridge without NVSwitch. FlashInfer's SymmDeviceMemory workspace
-# (requires NVSwitch for GPU-to-GPU multicasting) fails mid-compile. torch.compile then
-# restarts without the allreduce-rms fusion, running the compilation twice. The doubled
-# intermediate tensors stay in PyTorch's CUDA allocator cache (~50 GB) and push the KV-cache
-# profiler to report num_gpu_blocks=0, causing a DeepGEMM crash during graph capture.
-# Pre-disabling the fusion prevents the mid-compile retry and keeps memory stable.
-if [[ "$GPU_NAME" == *"NVL"* ]]; then
-  EXTRA_FLAGS+=("--compilation-config" '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true,"fuse_attn_quant":false,"enable_sp":false,"fuse_gemm_comms":false,"fuse_allreduce_rms":false}}')
-  EXTRA_FLAGS+=("--disable-custom-all-reduce")
-  VLLM_USE_DEEP_GEMM=0
-  echo "Config:   allreduce-rms fusion disabled (H100 NVL — no NVSwitch)"
-  echo "Config:   custom all-reduce disabled (H100 NVL topology workaround)"
-  echo "Config:   DeepGEMM disabled (H100 NVL startup crash workaround)"
-fi
+case "$HW_CLASS" in
+  ampere)
+    # BF16 throughput is the best path on Ampere. FP8 KV cache roughly doubles
+    # effective KV memory, recovering most of what BF16 weights cost vs FP8.
+    EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
+    VLLM_USE_DEEP_GEMM=0
+    echo "Config:   BF16 weights + FP8 KV cache"
+    ;;
+  hopper_no_nvswitch)
+    # H100 PCIe and NVL both lack NVSwitch (NVL pairs use an NVLink bridge at best;
+    # NVL pairs that aren't bridged talk over PCIe). FlashInfer's SymmDeviceMemory
+    # workspace requires NVSwitch for GPU-to-GPU multicasting and
+    # fails mid-compile. torch.compile then restarts without the allreduce-rms
+    # fusion, running compilation twice. The doubled intermediate tensors stay in
+    # PyTorch's CUDA allocator cache (~50 GB) and push the KV-cache profiler to
+    # report num_gpu_blocks=0, causing a DeepGEMM crash during graph capture.
+    # Pre-disabling the fusion prevents the mid-compile retry and keeps memory stable.
+    EXTRA_FLAGS+=("--compilation-config" '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true,"fuse_attn_quant":false,"enable_sp":false,"fuse_gemm_comms":false,"fuse_allreduce_rms":false}}')
+    EXTRA_FLAGS+=("--disable-custom-all-reduce")
+    EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
+    VLLM_USE_DEEP_GEMM=0
+    echo "Config:   FP8 weights + FP8 KV cache"
+    echo "Config:   SymmMem-dependent fusions disabled (no NVSwitch)"
+    echo "Config:   custom all-reduce disabled, DeepGEMM disabled"
+    ;;
+  hopper_nvswitch)
+    EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
+    echo "Config:   FP8 weights + FP8 KV cache + DeepGEMM + SymmMem fusions"
+    ;;
+  *)
+    echo "WARNING:  Unknown GPU class — using vLLM defaults"
+    ;;
+esac
 
 # Prefix caching: on by default in vLLM V1. Explicit flag for V0 compatibility.
 EXTRA_FLAGS+=("--enable-prefix-caching")
 
-# Single-user interactive session: limit concurrent sequences.
-# Default (256) pre-allocates KV cache slots for 256 phantom sessions and blows
-# out the speculative decoding token budget (256 * k draft slots required).
+# Single-user interactive session: limit concurrent sequences. Default (256)
+# pre-allocates KV slots for 256 phantom sessions and blows out memory headroom.
 EXTRA_FLAGS+=("--max-num-seqs" "8")
 
-# Thinking mode: off by default for speed (3-10x faster TTFT for routine tool calls).
+# Thinking mode: off by default for speed (3-10× faster TTFT for routine tool calls).
 # Override: THINKING=1 bash start_vllm.sh <model>   or   export THINKING=1
-# Agent-side toggle: set SCAGENT_THINKING=1 in .env to re-enable per-request.
 if [[ "$THINKING" == "0" ]]; then
   EXTRA_FLAGS+=("--default-chat-template-kwargs" '{"enable_thinking": false}')
 fi
 
-# Speculative decoding: per-model draft models for faster decode.
-# Only active when thinking is OFF — acceptance rate collapses with think tokens.
-# Only active on H100: BF16 models on A100 leave insufficient VRAM headroom for
-# the draft model + CUDA graph buffers, causing an illegal memory access crash
-# during graph profiling. FP8 weights (~31 GB) on H100 give enough headroom.
-# Draft model weights must be downloaded with download_model.sh first.
-if [[ "$THINKING" == "0" && "$GPU_NAME" == *"H100"* ]]; then
+# ── Speculative decoding ──────────────────────────────────────────────────────
+# Per the official vLLM recipe page, Qwen3.6-27B uses MTP (Multi-Token Prediction)
+# baked into the target model itself — no separate draft model, no extra VRAM,
+# no SymmMem fight. Replaces the older DFlash setup which had ~5% acceptance with
+# this checkpoint (the Qwen3.6 DFlash drafter is still in training as of 2026-04-27).
+#
+#   SPEC=auto (default)  — on for models with a configured method
+#   SPEC=0               — off
+#   SPEC=1               — force-enable (no-op if no method configured)
+#
+# Speculative is also disabled when THINKING=1 — acceptance collapses on reasoning tokens.
+if [[ "$THINKING" == "0" && "$SPEC" != "0" ]]; then
   case "$MODEL" in
     Qwen/Qwen3.6-27B|Qwen/Qwen3.6-27B-FP8)
-      DRAFT_HOST="$HF_DIR/hub/models--z-lab--Qwen3.6-27B-DFlash"
-      DRAFT_HASH=$(cat "$DRAFT_HOST/refs/main" 2>/dev/null)
-      DRAFT_LOCAL="/hf_cache/hub/models--z-lab--Qwen3.6-27B-DFlash/snapshots/$DRAFT_HASH"
-      if [[ -n "$DRAFT_HASH" && -d "$DRAFT_HOST/snapshots/$DRAFT_HASH" ]]; then
-        EXTRA_FLAGS+=("--speculative-config" "{\"method\":\"dflash\",\"model\":\"$DRAFT_LOCAL\",\"num_speculative_tokens\":15}")
-        echo "Speculative: DFlash ($DRAFT_LOCAL, k=15)"
-      else
-        echo "Speculative: skipped (z-lab/Qwen3.6-27B-DFlash not downloaded)"
+      EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":1}')
+      echo "Speculative: MTP (k=1, native to Qwen3.6)"
+      ;;
+    *)
+      if [[ "$SPEC" == "1" ]]; then
+        echo "Speculative: requested but no method configured for $MODEL"
       fi
       ;;
-    google/gemma-4-31b-it|RedHatAi/gemma-4-31B-it-FP8-Dynamic)
-      echo "Speculative: skipped (vLLM EAGLE-3 does not support gemma4_text target models)"
-      ;;
   esac
-elif [[ "$THINKING" == "0" && ( "$MODEL" == "Qwen/Qwen3.6-27B" || "$MODEL" == "Qwen/Qwen3.6-27B-FP8" || "$MODEL" == "google/gemma-4-31b-it" || "$MODEL" == "RedHatAi/gemma-4-31B-it-FP8-Dynamic" ) ]]; then
-  echo "Speculative: skipped (H100 only — A100 BF16 lacks VRAM headroom for draft model)"
+elif [[ "$THINKING" == "1" ]]; then
+  echo "Speculative: disabled (THINKING=1)"
+elif [[ "$SPEC" == "0" ]]; then
+  echo "Speculative: disabled (SPEC=0)"
 fi
 
-# Context window: KV budget → tokens, capped at model native max (128K)
+# ── Context window: KV budget → tokens, capped at model native max ────────────
 USABLE=$(( TP * GPU_VRAM * UTIL / 100 ))
 KV_BUDGET=$(( USABLE - MODEL_VRAM ))
 MAX_CTX=$(( KV_BUDGET * 1024 * 1024 / KV_KB ))
@@ -196,10 +266,10 @@ if [[ ! -d "$MODEL_CACHE" ]]; then
   exit 1
 fi
 
-# Persistent compile cache on shared storage so torch.compile artifacts survive node reboots.
-# Without this, a reboot forces a full recompile (~2-3 min) which peaks GPU memory high enough
-# that the KV cache profiler reports 0 free blocks — causing a crash during CUDA graph capture.
-MODEL_TAG=$(echo "$MODEL" | sed 's|/|_|g')
+# Persistent compile cache — keyed by model AND hardware class so A100/H100 caches
+# don't collide. Without this, a cache hit from a different GPU class can cause a
+# crash during CUDA graph capture (compiled kernels reference unavailable instructions).
+MODEL_TAG="$(echo "$MODEL" | sed 's|/|_|g')_${HW_CLASS}"
 mkdir -p "$HF_DIR/vllm_compile_cache/$MODEL_TAG"
 
 SINGULARITYENV_HF_HUB_CACHE=/hf_cache/hub \
@@ -210,6 +280,7 @@ SINGULARITYENV_TORCHINDUCTOR_CACHE_DIR="/hf_cache/vllm_compile_cache/$MODEL_TAG/
 SINGULARITYENV_VLLM_CACHE_ROOT="/hf_cache/vllm_compile_cache/$MODEL_TAG/vllm" \
 SINGULARITYENV_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
 SINGULARITYENV_VLLM_USE_DEEP_GEMM="$VLLM_USE_DEEP_GEMM" \
+SINGULARITYENV_VLLM_ENGINE_READY_TIMEOUT_S=1800 \
 SINGULARITYENV_TMPDIR=/tmp \
 singularity exec --nv \
   --bind "$HF_DIR":/hf_cache \
@@ -231,11 +302,19 @@ PID=$!
 echo "PID: $PID"
 echo ""
 
-# First startup with CUDA graphs enabled takes longer — torch.compile + DeepGEMM
-# warmup can add several minutes. Compiled artifacts are cached to VLLM_CACHE_ROOT
-# ($HF_DIR/vllm_compile_cache/<model>) so subsequent startups are faster. Timeout: 15 min.
+# First startup with CUDA graphs takes longer — torch.compile + DeepGEMM warmup
+# can add several minutes. Compiled artifacts are cached under VLLM_CACHE_ROOT
+# so subsequent startups are faster. Timeout: 15 min.
+# Fails fast if vLLM exits during startup instead of polling until timeout.
 for i in $(seq 1 180); do
   sleep 5
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "vLLM exited during startup — last lines of log:"
+    tail -20 "$LOG"
+    echo ""
+    echo "Full log: $LOG"
+    exit 1
+  fi
   if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
     echo "Server ready at http://localhost:$PORT/v1"
     echo "  SCAGENT_MODEL=$SERVED_NAME"
