@@ -670,6 +670,60 @@ class AgentWorldState:
                 self.annotation_validation["status"] = "deg_ready_pending_reference_marker_validation"
             return
 
+        if tool_name == "prepare_annotation":
+            cluster_summaries = result.get("clusters") or []
+            ambiguous = result.get("ambiguous_clusters") or []
+            queries_required = result.get("panglaodb_queries_required") or []
+            existing_queries = (
+                list(self.annotation_validation.get("reference_marker_queries", []))
+                if isinstance(self.annotation_validation, dict) else []
+            )
+            self.annotation_validation = {
+                "required": True,
+                "status": "proposal_staged_pending_panglaodb",
+                "annotation_tool": "manual_marker_workflow",
+                "annotation_key": result.get("annotation_key"),
+                "cluster_key": result.get("cluster_key"),
+                "n_clusters": result.get("n_clusters"),
+                "n_ambiguous": len(ambiguous),
+                "ambiguous_clusters": ambiguous,
+                "shared_markers_flagged": result.get("shared_markers_flagged") or [],
+                "scoring_method": result.get("scoring_method"),
+                "panglaodb_queries_required": queries_required,
+                "reference_marker_queries": existing_queries,
+                "reference_marker_source": "PanglaoDB",
+                "deg_required": True,
+                "deg_completed": True,
+                "finalized": False,
+                "instruction": (
+                    "Query PanglaoDB for every entry in panglaodb_queries_required, compare "
+                    "markers against each cluster's top_degs, then call finalize_annotation."
+                ),
+            }
+            return
+
+        if tool_name == "finalize_annotation":
+            payload = result.get("annotation_validation") or {}
+            existing_queries = (
+                list(self.annotation_validation.get("reference_marker_queries", []))
+                if isinstance(self.annotation_validation, dict) else []
+            )
+            self.annotation_validation = {
+                "required": True,
+                "status": "validated_and_finalized",
+                "annotation_tool": "manual_marker_workflow",
+                "annotation_key": result.get("annotation_key"),
+                "cluster_key": result.get("cluster_key"),
+                "n_clusters_validated": payload.get("n_clusters_validated"),
+                "label_counts": result.get("label_counts") or {},
+                "panglaodb_validated": True,
+                "finalized": True,
+                "reference_marker_queries": existing_queries,
+                "reference_marker_source": "PanglaoDB",
+                "per_cluster_evidence": payload.get("per_cluster_evidence", {}),
+            }
+            return
+
         if tool_name == "bc_get_panglaodb_marker_genes":
             query = result.get("marker_query") or result.get("query") or {}
             entry = {
@@ -892,6 +946,32 @@ class AgentWorldState:
                 "majority_voting": result.get("majority_voting"),
                 "n_cell_types": result.get("n_cell_types") or result.get("n_types"),
                 "label_key": result.get("label_key") or result.get("annotation_key"),
+            }
+
+        if tool_name == "prepare_annotation":
+            return {
+                "tool": "prepare_annotation",
+                "timestamp": ts,
+                "cluster_key": result.get("cluster_key"),
+                "annotation_key": result.get("annotation_key"),
+                "n_clusters": result.get("n_clusters"),
+                "n_ambiguous": result.get("n_ambiguous"),
+                "ambiguous_clusters": result.get("ambiguous_clusters"),
+                "shared_markers_flagged": result.get("shared_markers_flagged"),
+                "scoring_method": result.get("scoring_method"),
+                "panglaodb_queries_required": result.get("panglaodb_queries_required"),
+            }
+
+        if tool_name == "finalize_annotation":
+            return {
+                "tool": "finalize_annotation",
+                "timestamp": ts,
+                "annotation_key": result.get("annotation_key"),
+                "cluster_key": result.get("cluster_key"),
+                "n_clusters_labeled": result.get("n_clusters_labeled"),
+                "label_counts": result.get("label_counts"),
+                "panglaodb_validated": True,
+                "role": "manual_annotation_finalized",
             }
 
         if tool_name == "bc_get_panglaodb_marker_genes":

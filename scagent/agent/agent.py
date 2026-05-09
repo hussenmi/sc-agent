@@ -150,6 +150,8 @@ ACTION_TOOL_NAMES = {
     "compare_clusterings",
     "run_celltypist",
     "run_scimilarity",
+    "prepare_annotation",
+    "finalize_annotation",
     "run_batch_correction",
     "score_integration",
     "benchmark_integration",
@@ -3910,6 +3912,8 @@ class SCAgent:
         "compare_clusterings":  "Comparing clusterings",
         "run_celltypist":       "Cell type annotation",
         "run_scimilarity":      "Scimilarity annotation",
+        "prepare_annotation":   "Preparing annotation proposal",
+        "finalize_annotation":  "Finalizing annotation",
         "run_batch_correction": "Batch correction",
         "run_deg":              "Differential expression",
         "run_pseudobulk_deg":  "Pseudobulk DEG (DESeq2)",
@@ -3944,6 +3948,7 @@ class SCAgent:
         "compare_clusterings",
         "run_celltypist",
         "run_scimilarity",
+        "prepare_annotation",     # runs rank_genes_groups, can be slow
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
         "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets

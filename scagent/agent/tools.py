@@ -227,6 +227,82 @@ def get_tools() -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "prepare_annotation",
+            "description": (
+                "Prepare a structured annotation proposal for all clusters: compute DEGs, score marker genes "
+                "against clusters using normalized expression fractions (not raw means), flag ambiguous clusters "
+                "where top-2 candidate labels are close, and identify shared markers that don't discriminate. "
+                "Stores the proposal in adata.uns['annotation_proposal'] and returns per-cluster candidates "
+                "with competing labels and the specific PanglaoDB queries you must run next. "
+                "This is step 1 of 2 in the annotation workflow — after this, query PanglaoDB for each "
+                "proposed label AND each competing label, then call finalize_annotation with the evidence."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cluster_key": {"type": "string", "description": "obs column with cluster labels (default: leiden)"},
+                    "marker_dict": {
+                        "type": "object",
+                        "description": (
+                            "Optional dict mapping cell-type label to list of marker gene names. "
+                            "If provided, scoring uses normalized expression fraction (fraction of cells "
+                            "expressing each marker > 0), averaged across all markers in the list. "
+                            "This is less biased than raw mean expression and length-normalized. "
+                            "Example: {\"T cell\": [\"CD3D\", \"CD3E\"], \"B cell\": [\"CD19\", \"MS4A1\"]}"
+                        ),
+                        "additionalProperties": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "n_deg_genes": {"type": "integer", "description": "Number of top DEGs to extract per cluster for PanglaoDB comparison (default: 20)"},
+                    "deg_key": {"type": "string", "description": "adata.uns key for existing DEG results (default: rank_genes_groups). If the key exists, DEGs are read from it; otherwise rank_genes_groups is run automatically."},
+                    "annotation_key": {"type": "string", "description": "Name of the obs column that finalize_annotation will write (default: cell_type). Stored in the proposal so finalize_annotation knows where to write."},
+                    "ambiguity_threshold": {"type": "number", "description": "Max allowed difference between top-2 normalized scores for a cluster to be flagged as ambiguous (default: 0.10). Clusters with top-2 delta below this are flagged."},
+                    "shared_marker_threshold": {"type": "number", "description": "Fraction of cell-type lists a gene must appear in to be considered a shared/non-discriminating marker (default: 0.5)."}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "finalize_annotation",
+            "description": (
+                "Write final cell-type annotation labels to adata.obs after PanglaoDB evidence has been "
+                "collected. Requires: (1) prepare_annotation was called first (proposal in adata.uns), "
+                "(2) evidence_summary maps every cluster to a label with PanglaoDB evidence. "
+                "Writes adata.obs[annotation_key] and records the full evidence in adata.uns['annotation_validation']. "
+                "This is step 2 of 2 — never call this before querying PanglaoDB for each proposed label "
+                "and each competing label from the prepare_annotation output."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "evidence_summary": {
+                        "type": "object",
+                        "description": (
+                            "Required. Dict mapping cluster_id (as string) to annotation evidence. "
+                            "Each entry must include: 'label' (final cell-type string), "
+                            "'panglaodb_queried' (true/false), 'supporting_genes' (list of marker "
+                            "genes that matched PanglaoDB), 'confidence' ('high'/'medium'/'low'). "
+                            "Example: {\"0\": {\"label\": \"T cell\", \"panglaodb_queried\": true, "
+                            "\"supporting_genes\": [\"CD3D\", \"CD3E\"], \"confidence\": \"high\"}}"
+                        ),
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "panglaodb_queried": {"type": "boolean"},
+                                "supporting_genes": {"type": "array", "items": {"type": "string"}},
+                                "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+                            },
+                            "required": ["label", "panglaodb_queried"]
+                        }
+                    },
+                    "annotation_key": {"type": "string", "description": "obs column to write labels into (default: reads from adata.uns['annotation_proposal']['annotation_key'] or 'cell_type')"},
+                    "cluster_key": {"type": "string", "description": "obs column with cluster ids (default: reads from adata.uns['annotation_proposal']['cluster_key'] or 'leiden')"},
+                    "overwrite": {"type": "boolean", "description": "If true, overwrite an existing annotation column (default: false — raises an error if the column already exists)"}
+                },
+                "required": ["evidence_summary"]
+            }
+        },
+        {
             "name": "run_batch_correction",
             "description": (
                 "Correct batch effects using Harmony, BBKNN, Scanorama, or scVI. "
@@ -2530,6 +2606,31 @@ def process_tool_call(
                             "Only remove clusters that match the current cluster QC proposal and cell counts.",
                         ],
                     )
+
+            # Soft warning: direct obs annotation assignment without the prepare/finalize workflow
+            _anno_assign = re.search(
+                r'\badata\.obs\s*\[\s*[\'"][^\'"]+[\'"]\s*\]\s*='
+                r'(?!.*\.astype|.*\.map\(|.*int|.*float|.*bool|.*isin)',
+                code,
+                flags=re.DOTALL,
+            )
+            if _anno_assign and adata is not None:
+                _proposal_exists = bool((adata.uns.get('annotation_proposal') or {}) if hasattr(adata, 'uns') else False)
+                _validated = bool((adata.uns.get('annotation_validation') or {}).get('panglaodb_validated') if hasattr(adata, 'uns') else False)
+                if not _validated:
+                    preflight_checks.append({
+                        "name": "direct_annotation_assignment",
+                        "status": "warning",
+                        "details": (
+                            "Direct obs column assignment detected. If this is a cell-type annotation, "
+                            "use prepare_annotation → PanglaoDB queries → finalize_annotation instead "
+                            "of assigning labels directly in run_code. "
+                            + ("prepare_annotation has been called; proceed to PanglaoDB queries then finalize_annotation."
+                               if _proposal_exists else
+                               "prepare_annotation has NOT been called yet — call it first to get DEGs, "
+                               "scoring, and the list of PanglaoDB queries needed before finalizing labels.")
+                        ),
+                    })
 
             # Helper function for safe directory creation
             from pathlib import Path as _Path
@@ -6954,6 +7055,514 @@ def process_tool_call(
                 dataset_changed=False,
                 summary=f"Cluster QC: {len(proposed_removal)} clusters proposed for removal ({cells_proposed} cells, {result['pct_proposed']}%), {len(ambiguous)} ambiguous.",
                 artifacts_created=artifacts,
+            )
+
+        elif tool_name == "prepare_annotation":
+            import scanpy as sc
+            import scipy.sparse as sp
+            import numpy as _np
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return _error_result(
+                    tool="prepare_annotation",
+                    message="No data in memory. Load a dataset first.",
+                    adata_obj=adata,
+                    recovery_options=["Run load_data with the path to your h5ad."],
+                )
+
+            cluster_key = tool_input.get("cluster_key", "leiden")
+            if cluster_key not in adata.obs.columns:
+                return _smart_unavailable_result(
+                    tool="prepare_annotation",
+                    message=f"Cluster column '{cluster_key}' not found in adata.obs.",
+                    adata_obj=adata,
+                    missing_prerequisites=["clustering"],
+                    recovery_options=[
+                        "Run run_clustering first to produce a cluster column.",
+                        f"Pass an existing cluster column via cluster_key. Available columns: {list(adata.obs.columns)[:30]}",
+                    ],
+                )
+
+            annotation_key = tool_input.get("annotation_key", "cell_type")
+            marker_dict = tool_input.get("marker_dict") or {}
+            n_deg_genes = int(tool_input.get("n_deg_genes", 20))
+            deg_key = tool_input.get("deg_key", "rank_genes_groups")
+            ambiguity_threshold = float(tool_input.get("ambiguity_threshold", 0.10))
+            shared_marker_threshold = float(tool_input.get("shared_marker_threshold", 0.5))
+            expression_threshold = float(tool_input.get("expression_threshold", 0.0))
+            force_recompute = bool(tool_input.get("force_recompute_deg", False))
+            deg_method = tool_input.get("deg_method", "wilcoxon")
+
+            cluster_series = adata.obs[cluster_key].astype(str)
+            cluster_ids = sorted(cluster_series.unique(), key=lambda s: (len(s), s))
+            cluster_sizes = {c: int((cluster_series == c).sum()) for c in cluster_ids}
+
+            need_recompute = force_recompute or (deg_key not in adata.uns)
+            if not need_recompute:
+                cached = adata.uns.get(deg_key, {})
+                cached_groupby = None
+                params = cached.get("params") if isinstance(cached, dict) else None
+                if isinstance(params, dict):
+                    cached_groupby = params.get("groupby")
+                if cached_groupby != cluster_key:
+                    need_recompute = True
+
+            if need_recompute:
+                sc.tl.rank_genes_groups(
+                    adata,
+                    groupby=cluster_key,
+                    method=deg_method,
+                    key_added=deg_key,
+                    use_raw=False,
+                    n_genes=max(n_deg_genes, 50),
+                )
+
+            rgg = adata.uns.get(deg_key, {})
+            names = rgg.get("names") if isinstance(rgg, dict) else None
+            scores = rgg.get("scores") if isinstance(rgg, dict) else None
+            pvals_adj = rgg.get("pvals_adj") if isinstance(rgg, dict) else None
+            logfcs = rgg.get("logfoldchanges") if isinstance(rgg, dict) else None
+
+            top_degs_per_cluster: Dict[str, List[Dict[str, Any]]] = {}
+            if names is not None and hasattr(names, "dtype") and names.dtype.names:
+                rec_groups = list(names.dtype.names)
+                for g in rec_groups:
+                    entries = []
+                    n_take = min(n_deg_genes, len(names[g]))
+                    for i in range(n_take):
+                        try:
+                            gene = str(names[g][i])
+                        except Exception:
+                            continue
+                        entry = {"gene": gene}
+                        if scores is not None:
+                            try:
+                                entry["score"] = float(scores[g][i])
+                            except Exception:
+                                pass
+                        if logfcs is not None:
+                            try:
+                                entry["logfc"] = float(logfcs[g][i])
+                            except Exception:
+                                pass
+                        if pvals_adj is not None:
+                            try:
+                                entry["pval_adj"] = float(pvals_adj[g][i])
+                            except Exception:
+                                pass
+                        entries.append(entry)
+                    top_degs_per_cluster[str(g)] = entries
+
+            shared_markers: List[str] = []
+            label_marker_lists: Dict[str, List[str]] = {}
+            if marker_dict:
+                var_set = set(adata.var_names.astype(str))
+                for label, genes in marker_dict.items():
+                    if not isinstance(genes, list):
+                        continue
+                    present = [str(g) for g in genes if str(g) in var_set]
+                    label_marker_lists[str(label)] = present
+
+                if shared_marker_threshold > 0 and label_marker_lists:
+                    gene_label_count: Dict[str, int] = {}
+                    for genes in label_marker_lists.values():
+                        for g in set(genes):
+                            gene_label_count[g] = gene_label_count.get(g, 0) + 1
+                    n_labels = len(label_marker_lists)
+                    threshold_count = max(2, int(round(shared_marker_threshold * n_labels)))
+                    shared_markers = sorted(
+                        g for g, c in gene_label_count.items() if c >= threshold_count
+                    )
+
+            score_matrix: Dict[str, Dict[str, float]] = {}
+            ambiguous_clusters: List[str] = []
+            cluster_summaries: List[Dict[str, Any]] = []
+
+            X_layer = tool_input.get("deg_layer")
+            X_source = adata.layers[X_layer] if X_layer and X_layer in adata.layers else adata.X
+
+            if label_marker_lists:
+                gene_to_idx = {str(g): i for i, g in enumerate(adata.var_names)}
+                cluster_masks = {c: (cluster_series == c).values for c in cluster_ids}
+                for label, genes in label_marker_lists.items():
+                    discriminating = [g for g in genes if g not in shared_markers] or genes
+                    idxs = [gene_to_idx[g] for g in discriminating if g in gene_to_idx]
+                    if not idxs:
+                        for c in cluster_ids:
+                            score_matrix.setdefault(c, {})[label] = 0.0
+                        continue
+                    sub = X_source[:, idxs]
+                    if sp.issparse(sub):
+                        expressed = (sub > expression_threshold).astype("float32")
+                    else:
+                        expressed = (_np.asarray(sub) > expression_threshold).astype("float32")
+                    for c in cluster_ids:
+                        mask = cluster_masks[c]
+                        n_in = int(mask.sum())
+                        if n_in == 0:
+                            score_matrix.setdefault(c, {})[label] = 0.0
+                            continue
+                        if sp.issparse(expressed):
+                            sub_expr = expressed[mask, :]
+                            frac = float(sub_expr.sum() / (n_in * len(idxs)))
+                        else:
+                            frac = float(expressed[mask, :].mean())
+                        score_matrix.setdefault(c, {})[label] = frac
+
+            for c in cluster_ids:
+                summary: Dict[str, Any] = {
+                    "cluster_id": c,
+                    "n_cells": cluster_sizes[c],
+                    "top_degs": [d["gene"] for d in top_degs_per_cluster.get(c, [])][:n_deg_genes],
+                    "top_degs_detail": top_degs_per_cluster.get(c, []),
+                }
+                if score_matrix.get(c):
+                    ranked = sorted(score_matrix[c].items(), key=lambda kv: kv[1], reverse=True)
+                    top_label, top_score = ranked[0]
+                    runner_up = ranked[1] if len(ranked) > 1 else (None, 0.0)
+                    delta = float(top_score - runner_up[1])
+                    is_ambiguous = delta < ambiguity_threshold and top_score > 0
+                    summary.update({
+                        "proposed_label": top_label,
+                        "proposed_score": round(top_score, 4),
+                        "competing_labels": [
+                            {"label": lbl, "score": round(s, 4), "delta_from_top": round(top_score - s, 4)}
+                            for lbl, s in ranked[1:4] if s > 0
+                        ],
+                        "is_ambiguous": is_ambiguous,
+                        "ambiguity_delta": round(delta, 4),
+                    })
+                    if is_ambiguous:
+                        ambiguous_clusters.append(c)
+                else:
+                    summary.update({
+                        "proposed_label": None,
+                        "proposed_score": None,
+                        "competing_labels": [],
+                        "is_ambiguous": True,
+                        "ambiguity_delta": None,
+                    })
+                    ambiguous_clusters.append(c)
+                cluster_summaries.append(summary)
+
+            panglaodb_queries: List[Dict[str, Any]] = []
+            seen_queries: set = set()
+            for entry in cluster_summaries:
+                proposed = entry.get("proposed_label")
+                if proposed and proposed not in seen_queries:
+                    panglaodb_queries.append({
+                        "cell_type": proposed,
+                        "reason": f"proposed label for cluster {entry['cluster_id']}",
+                    })
+                    seen_queries.add(proposed)
+                if entry.get("is_ambiguous"):
+                    for comp in entry.get("competing_labels", []):
+                        label = comp.get("label")
+                        if label and label not in seen_queries:
+                            panglaodb_queries.append({
+                                "cell_type": label,
+                                "reason": f"competing label for ambiguous cluster {entry['cluster_id']}",
+                            })
+                            seen_queries.add(label)
+
+            proposal = {
+                "cluster_key": cluster_key,
+                "annotation_key": annotation_key,
+                "n_clusters": len(cluster_ids),
+                "cluster_ids": cluster_ids,
+                "clusters": cluster_summaries,
+                "shared_markers": shared_markers,
+                "ambiguous_clusters": ambiguous_clusters,
+                "label_marker_lists_used": {k: list(v) for k, v in label_marker_lists.items()},
+                "scoring_method": "normalized_expression_fraction" if label_marker_lists else "deg_only",
+                "ambiguity_threshold": ambiguity_threshold,
+                "shared_marker_threshold": shared_marker_threshold,
+                "panglaodb_queries_required": panglaodb_queries,
+                "deg_key": deg_key,
+                "deg_method": deg_method,
+            }
+            try:
+                adata.uns["annotation_proposal"] = proposal
+            except Exception:
+                pass
+
+            result = {
+                "status": "ok",
+                "tool": "prepare_annotation",
+                "cluster_key": cluster_key,
+                "annotation_key": annotation_key,
+                "n_clusters": len(cluster_ids),
+                "n_ambiguous": len(ambiguous_clusters),
+                "ambiguous_clusters": ambiguous_clusters,
+                "shared_markers_flagged": shared_markers,
+                "scoring_method": proposal["scoring_method"],
+                "clusters": cluster_summaries,
+                "panglaodb_queries_required": panglaodb_queries,
+                "next_steps": [
+                    "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate).",
+                    "Compare PanglaoDB markers against each cluster's top_degs to confirm or revise the proposed label.",
+                    "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
+                    "Once every cluster has external evidence, call finalize_annotation with evidence_summary.",
+                ],
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result, adata,
+                dataset_changed=False,
+                summary=(
+                    f"Annotation proposal staged for {len(cluster_ids)} clusters "
+                    f"({len(ambiguous_clusters)} ambiguous, {len(shared_markers)} shared markers flagged). "
+                    f"Now query PanglaoDB for {len(panglaodb_queries)} candidate labels."
+                ),
+                verification=_build_verification(
+                    "passed",
+                    "Annotation proposal written to adata.uns['annotation_proposal'].",
+                    [
+                        _check(
+                            "proposal_stored",
+                            "annotation_proposal" in adata.uns,
+                            "annotation_proposal present on adata.uns.",
+                        ),
+                        _check(
+                            "degs_available",
+                            bool(top_degs_per_cluster),
+                            f"Top DEGs extracted for {len(top_degs_per_cluster)} clusters.",
+                        ),
+                    ],
+                ),
+            )
+
+        elif tool_name == "finalize_annotation":
+            import pandas as _pd
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message="No data in memory.",
+                    adata_obj=adata,
+                    recovery_options=["Load data first."],
+                )
+
+            proposal = adata.uns.get("annotation_proposal")
+            if not isinstance(proposal, dict) or not proposal.get("cluster_ids"):
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        "No annotation_proposal found on adata.uns. finalize_annotation requires "
+                        "prepare_annotation to be run first."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Call prepare_annotation first to produce DEGs and a proposal.",
+                        "Then query PanglaoDB for each candidate label and call finalize_annotation with evidence.",
+                    ],
+                )
+
+            evidence = tool_input.get("evidence_summary")
+            if not isinstance(evidence, dict) or not evidence:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message="evidence_summary is required and must map every cluster to a label with evidence.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Pass evidence_summary={cluster_id: {label, panglaodb_queried, supporting_genes, confidence}} for every cluster.",
+                    ],
+                )
+
+            cluster_key = tool_input.get("cluster_key") or proposal.get("cluster_key", "leiden")
+            annotation_key = tool_input.get("annotation_key") or proposal.get("annotation_key", "cell_type")
+            overwrite = bool(tool_input.get("overwrite", False))
+            allow_partial = bool(tool_input.get("allow_partial", False))
+
+            if cluster_key not in adata.obs.columns:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=f"Cluster column '{cluster_key}' missing from adata.obs.",
+                    adata_obj=adata,
+                    recovery_options=["Re-run prepare_annotation with the correct cluster_key."],
+                )
+            if annotation_key in adata.obs.columns and not overwrite:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        f"Column '{annotation_key}' already exists on adata.obs. "
+                        "Pass overwrite=true to replace it, or use a different annotation_key."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        f"Retry with overwrite=true if you intend to replace '{annotation_key}'.",
+                        "Pick a new annotation_key that does not collide with an existing column.",
+                    ],
+                )
+
+            proposal_clusters = [str(c) for c in proposal.get("cluster_ids", [])]
+            evidence_str = {str(k): v for k, v in evidence.items()}
+            missing_clusters = [c for c in proposal_clusters if c not in evidence_str]
+            unknown_clusters = [c for c in evidence_str.keys() if c not in proposal_clusters]
+
+            ambiguous_set = set(str(c) for c in proposal.get("ambiguous_clusters", []))
+            validation_failures: List[str] = []
+            per_cluster_validation: Dict[str, Dict[str, Any]] = {}
+
+            if missing_clusters and not allow_partial:
+                validation_failures.append(
+                    f"Missing evidence for {len(missing_clusters)} clusters: {missing_clusters[:10]}"
+                )
+            if unknown_clusters:
+                validation_failures.append(
+                    f"evidence_summary references {len(unknown_clusters)} clusters not in the proposal: {unknown_clusters[:10]}"
+                )
+
+            any_panglaodb = False
+            for cid, ev in evidence_str.items():
+                if not isinstance(ev, dict):
+                    validation_failures.append(f"Cluster {cid}: evidence is not an object.")
+                    continue
+                checks: Dict[str, Any] = {"cluster_id": cid}
+                label = ev.get("label")
+                if not isinstance(label, str) or not label.strip():
+                    validation_failures.append(f"Cluster {cid}: missing or empty 'label'.")
+                    checks["label_ok"] = False
+                else:
+                    checks["label"] = label
+                    checks["label_ok"] = True
+
+                pq = bool(ev.get("panglaodb_queried", False))
+                checks["panglaodb_queried"] = pq
+                if pq:
+                    any_panglaodb = True
+
+                supporting = ev.get("supporting_genes") or []
+                checks["n_supporting_genes"] = len(supporting) if isinstance(supporting, list) else 0
+                if isinstance(supporting, list) and len(supporting) == 0:
+                    validation_failures.append(
+                        f"Cluster {cid}: supporting_genes is empty — every label must cite at least one cluster DEG that matched a PanglaoDB marker."
+                    )
+
+                competing = ev.get("competing_labels_considered")
+                if cid in ambiguous_set:
+                    if not isinstance(competing, list) or len(competing) == 0:
+                        validation_failures.append(
+                            f"Cluster {cid} was flagged ambiguous by prepare_annotation but evidence provides no competing_labels_considered."
+                        )
+                checks["competing_labels_considered"] = competing or []
+
+                conf = ev.get("confidence")
+                if conf not in {"high", "medium", "low"}:
+                    validation_failures.append(f"Cluster {cid}: confidence must be 'high', 'medium', or 'low'.")
+                checks["confidence"] = conf
+
+                per_cluster_validation[cid] = checks
+
+            if not any_panglaodb:
+                validation_failures.append(
+                    "No cluster has panglaodb_queried=true. At least one PanglaoDB query must back the labels — "
+                    "this tool refuses to write annotations without external marker validation."
+                )
+
+            if validation_failures:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message="Evidence validation failed: " + "; ".join(validation_failures[:6]),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Query PanglaoDB for each proposed label and competing label.",
+                        "Fill supporting_genes with the cluster DEGs that match PanglaoDB markers.",
+                        "For ambiguous clusters, list the alternative labels you considered in competing_labels_considered.",
+                        "Resubmit finalize_annotation with the corrected evidence_summary.",
+                    ],
+                    extra={
+                        "validation_failures": validation_failures,
+                        "per_cluster_validation": per_cluster_validation,
+                    },
+                )
+
+            cluster_to_label: Dict[str, str] = {}
+            for cid in proposal_clusters:
+                ev = evidence_str.get(cid)
+                if isinstance(ev, dict) and isinstance(ev.get("label"), str):
+                    cluster_to_label[cid] = ev["label"]
+                elif allow_partial:
+                    cluster_to_label[cid] = "Unassigned"
+
+            try:
+                series = adata.obs[cluster_key].astype(str).map(cluster_to_label)
+                if not allow_partial and series.isna().any():
+                    return _error_result(
+                        tool="finalize_annotation",
+                        message="Mapping produced NaNs — some cluster ids in obs were not in the evidence.",
+                        adata_obj=adata,
+                        recovery_options=["Re-run prepare_annotation; verify the cluster_key matches."],
+                    )
+                series = series.fillna("Unassigned")
+                adata.obs[annotation_key] = _pd.Categorical(series.values)
+            except Exception as e:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=f"Failed to write annotation column: {e}",
+                    adata_obj=adata,
+                    recovery_options=["Inspect cluster_key dtype and evidence_summary keys; ensure they're strings."],
+                )
+
+            label_counts: Dict[str, int] = {}
+            for v in adata.obs[annotation_key].astype(str).values:
+                label_counts[v] = label_counts.get(v, 0) + 1
+
+            validation_payload = {
+                "annotation_key": annotation_key,
+                "cluster_key": cluster_key,
+                "panglaodb_validated": True,
+                "n_clusters_validated": len([c for c in per_cluster_validation.values() if c.get("panglaodb_queried")]),
+                "per_cluster_evidence": per_cluster_validation,
+                "label_counts": label_counts,
+                "finalized": True,
+            }
+            try:
+                adata.uns["annotation_validation"] = validation_payload
+            except Exception:
+                pass
+
+            result = {
+                "status": "ok",
+                "tool": "finalize_annotation",
+                "annotation_key": annotation_key,
+                "cluster_key": cluster_key,
+                "n_clusters_labeled": len(cluster_to_label),
+                "label_counts": label_counts,
+                "cell_type_breakdown": label_counts,
+                "annotation_validation": validation_payload,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result, adata,
+                dataset_changed=True,
+                summary=(
+                    f"Wrote final annotation '{annotation_key}' for {len(cluster_to_label)} clusters "
+                    f"({len(label_counts)} unique labels, all PanglaoDB-validated)."
+                ),
+                verification=_build_verification(
+                    "passed",
+                    "Annotation finalized with external marker evidence.",
+                    [
+                        _check(
+                            "annotation_column_written",
+                            annotation_key in adata.obs.columns,
+                            f"adata.obs['{annotation_key}'] present.",
+                        ),
+                        _check(
+                            "validation_recorded",
+                            "annotation_validation" in adata.uns,
+                            "adata.uns['annotation_validation'] recorded.",
+                        ),
+                        _check(
+                            "panglaodb_evidence_present",
+                            any_panglaodb,
+                            "At least one cluster has PanglaoDB-backed evidence.",
+                        ),
+                    ],
+                ),
             )
 
         else:

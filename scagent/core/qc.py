@@ -261,11 +261,19 @@ def _run_scrublet_per_batch(
         mask = (adata.obs[batch_key] == batch).values
         sub = adata[mask]
 
-        X = sub.X
+        # Scrublet requires raw counts — prefer raw_counts layer over X,
+        # which may be log-normalized or contain NaNs from outer-join fill.
+        if 'raw_counts' in sub.layers:
+            X = sub.layers['raw_counts']
+        else:
+            X = sub.X
         if sp.issparse(X):
             X = X.tocsc().astype(np.float32)
         else:
             X = np.asarray(X, dtype=np.float32)
+        # Replace any NaNs (from outer-join zero-fill after normalization) with 0
+        if np.isnan(X).any() if not sp.issparse(X) else False:
+            X = np.nan_to_num(X, nan=0.0)
 
         safe_n = min(n_prin_comps, X.shape[1] - 1, X.shape[0] - 1)
         if safe_n < 2:
