@@ -162,9 +162,23 @@ case "$HW_CLASS" in
   ampere)
     # BF16 throughput is the best path on Ampere. FP8 KV cache roughly doubles
     # effective KV memory, recovering most of what BF16 weights cost vs FP8.
-    EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
-    VLLM_USE_DEEP_GEMM=0
-    echo "Config:   BF16 weights + FP8 KV cache"
+    # Use E5M2 explicitly: bare "fp8" defaults to E4M3 (fp8e4nv) which Triton
+    # cannot compile on cc=8.0. Qwen incidentally avoids the Triton path; Gemma 4
+    # fuses FP8 casts into its RMS-norm kernel and crashes there. E5M2 is the
+    # format A100 actually supports natively and works for most models.
+    #
+    # Gemma 4 is the exception: vLLM's attention module hard-asserts kv_cache_dtype
+    # in {"fp8","fp8_e4m3"} for the Gemma 4 path, rejecting E5M2 outright. So on
+    # A100 + Gemma 4 we have no working FP8 KV option (E4M3 fails Triton, E5M2
+    # fails vLLM's assert) and must fall back to BF16 KV cache.
+    if [[ "$PARSER" == "gemma4" ]]; then
+      VLLM_USE_DEEP_GEMM=0
+      echo "Config:   BF16 weights + BF16 KV cache (Gemma 4 on A100 — FP8 KV not supported)"
+    else
+      EXTRA_FLAGS+=("--kv-cache-dtype" "fp8_e5m2")
+      VLLM_USE_DEEP_GEMM=0
+      echo "Config:   BF16 weights + FP8 KV cache (E5M2)"
+    fi
     ;;
   hopper_no_nvswitch)
     # H100 PCIe and NVL both lack NVSwitch (NVL pairs use an NVLink bridge at best;

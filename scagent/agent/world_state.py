@@ -152,6 +152,7 @@ class AgentWorldState:
     metadata_candidates: List[Dict[str, Any]] = field(default_factory=list)
     clustering_registry: List[Dict[str, Any]] = field(default_factory=list)
     annotation_sources: List[str] = field(default_factory=list)
+    cluster_qc_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     artifacts: List[ArtifactRecord] = field(default_factory=list)
     outstanding_decisions: List[DecisionRecord] = field(default_factory=list)
     resolved_decisions: List[DecisionRecord] = field(default_factory=list)
@@ -175,6 +176,7 @@ class AgentWorldState:
 
     def _derive_capabilities(self, adata) -> Dict[str, Any]:
         processing = self.data_summary.get("processing", {})
+        cluster_qc = self.data_summary.get("cluster_qc", {})
         cluster_keys = [
             record.get("key")
             for record in self.clustering_registry
@@ -247,9 +249,12 @@ class AgentWorldState:
             # Annotation
             if processing.get("has_clusters"):
                 available_actions.extend(["run_celltypist", "run_scimilarity"])
+                if processing.get("has_qc_metrics"):
+                    available_actions.append("run_cluster_qc")
             else:
                 blocked_actions.append({"action": "run_celltypist", "needs": "clustering"})
                 blocked_actions.append({"action": "run_scimilarity", "needs": "clustering"})
+                blocked_actions.append({"action": "run_cluster_qc", "needs": "QC metrics and clustering"})
 
             # DEG
             if processing.get("has_clusters") or self.annotation_sources:
@@ -330,6 +335,9 @@ class AgentWorldState:
             "can_plot_umap": bool(processing.get("has_umap")),
             "can_plot_cluster_umap": bool(processing.get("has_umap") and processing.get("has_clusters")),
             "can_run_clustering": bool(processing.get("has_neighbors") or processing.get("has_pca")),
+            "can_run_cluster_qc": bool(processing.get("has_qc_metrics") and processing.get("has_clusters")),
+            "cluster_qc_fresh": bool(cluster_qc.get("fresh")),
+            "cluster_qc_status": cluster_qc.get("status"),
             "can_run_annotation": bool(processing.get("has_clusters")),
             "can_run_deg": bool(processing.get("has_clusters") or self.annotation_sources),
             "can_review_markers": deg_available,
@@ -348,6 +356,7 @@ class AgentWorldState:
             "metadata_candidates": self.metadata_candidates,
             "clustering_registry": self.clustering_registry,
             "annotation_sources": self.annotation_sources,
+            "cluster_qc_registry": self.cluster_qc_registry,
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
             "outstanding_decisions": [decision.to_dict() for decision in self.outstanding_decisions],
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions],
@@ -374,6 +383,7 @@ class AgentWorldState:
             "metadata_candidates": self.metadata_candidates[:3],
             "clustering_registry": self.clustering_registry[:6],
             "annotation_sources": self.annotation_sources,
+            "cluster_qc": self.data_summary.get("cluster_qc", {}),
             "artifacts": [artifact.to_dict() for artifact in self.artifacts[-8:]],
             "outstanding_decisions": [decision.to_dict() for decision in self.outstanding_decisions[-5:]],
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions[-5:]],
@@ -416,6 +426,61 @@ class AgentWorldState:
             tuple(sorted(adata.obsp.keys())),
             tuple(sorted(adata.layers.keys())),
         )
+
+    @staticmethod
+    def _cell_set_fingerprint(adata) -> str:
+        """Fingerprint the current cell set so cluster-QC freshness survives column changes."""
+        digest = hashlib.sha1()
+        digest.update(str(adata.n_obs).encode("utf-8"))
+        digest.update(b"|")
+        digest.update(str(adata.n_vars).encode("utf-8"))
+        for name in adata.obs_names:
+            digest.update(b"|")
+            digest.update(str(name).encode("utf-8", errors="replace"))
+        return digest.hexdigest()[:16]
+
+    def _cluster_qc_summary(self, adata, cluster_key: Optional[str], processing: Dict[str, Any]) -> Dict[str, Any]:
+        if adata is None:
+            return {"status": "not_applicable", "reason": "no data loaded"}
+        if not processing.get("has_clusters") or not cluster_key:
+            return {"status": "not_applicable", "reason": "no clustering available"}
+        if not processing.get("has_qc_metrics"):
+            return {
+                "status": "not_ready",
+                "cluster_key": cluster_key,
+                "fresh": False,
+                "reason": "QC metrics are not present, so cluster-level QC cannot run yet",
+            }
+
+        cell_set = self._cell_set_fingerprint(adata)
+        n_clusters = int(adata.obs[cluster_key].nunique()) if cluster_key in adata.obs.columns else None
+        record = self.cluster_qc_registry.get(str(cluster_key))
+        if record and record.get("cell_set") == cell_set and record.get("n_clusters") == n_clusters:
+            status = "fresh_clean"
+            if record.get("proposed_removal") or record.get("ambiguous"):
+                status = "fresh_review_required"
+            return {
+                "status": status,
+                "cluster_key": cluster_key,
+                "fresh": True,
+                "checked_at": record.get("checked_at"),
+                "proposed_removal": record.get("proposed_removal", []),
+                "ambiguous": record.get("ambiguous", []),
+                "cells_in_proposed_removal": record.get("cells_in_proposed_removal"),
+                "pct_proposed": record.get("pct_proposed"),
+                "reason": "cluster QC is fresh for the active clustering and current cell set",
+            }
+
+        stale_reason = "no cluster-level QC has been run for the active clustering"
+        if record:
+            stale_reason = "cluster-level QC is stale because the cell set or cluster count changed"
+        return {
+            "status": "needed",
+            "cluster_key": cluster_key,
+            "fresh": False,
+            "reason": stale_reason,
+            "recommended_next_action": "run_cluster_qc",
+        }
 
     def invalidate_inspect_cache(self) -> None:
         """Force the next sync_from_adata to re-run inspect_data."""
@@ -488,6 +553,11 @@ class AgentWorldState:
             "obs_columns_detail": obs_columns_detail(adata.obs, adata.n_obs),
             "biological_context": biological_context,
         }
+        self.data_summary["cluster_qc"] = self._cluster_qc_summary(
+            adata,
+            state.cluster_key,
+            processing,
+        )
         self.metadata_candidates = [
             metadata_candidate_to_dict(candidate)
             for candidate in state.metadata_candidates
@@ -624,6 +694,48 @@ class AgentWorldState:
             # Guard against unbounded growth on very long sessions.
             if len(self.step_log) > 200:
                 self.step_log = self.step_log[-200:]
+
+        if tool_name in {"run_clustering", "compare_clusterings"} and result.get("status") in {"ok", "success"}:
+            keys: List[str] = []
+            if result.get("cluster_key"):
+                keys.append(str(result.get("cluster_key")))
+            if result.get("primary_cluster_key"):
+                keys.append(str(result.get("primary_cluster_key")))
+            for comparison in result.get("comparisons", []) or []:
+                if comparison.get("cluster_key"):
+                    keys.append(str(comparison.get("cluster_key")))
+            for key in keys:
+                self.cluster_qc_registry.pop(key, None)
+            if adata is not None:
+                self.data_summary["cluster_qc"] = self._cluster_qc_summary(
+                    adata,
+                    self.data_summary.get("cluster_key"),
+                    self.data_summary.get("processing", {}),
+                )
+
+        if tool_name == "run_cluster_qc" and result.get("status") in {"ok", "success"} and adata is not None:
+            cluster_key = result.get("cluster_key")
+            if cluster_key:
+                n_clusters = None
+                if cluster_key in adata.obs.columns:
+                    n_clusters = int(adata.obs[cluster_key].nunique())
+                self.cluster_qc_registry[str(cluster_key)] = {
+                    "cluster_key": str(cluster_key),
+                    "cell_set": self._cell_set_fingerprint(adata),
+                    "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
+                    "n_clusters": n_clusters,
+                    "checked_at": _utc_now_iso(),
+                    "proposed_removal": [str(c) for c in result.get("proposed_removal", []) or []],
+                    "ambiguous": [str(c) for c in result.get("ambiguous", []) or []],
+                    "cells_in_proposed_removal": result.get("cells_in_proposed_removal"),
+                    "pct_proposed": result.get("pct_proposed"),
+                    "thresholds_used": result.get("thresholds_used", {}),
+                }
+                self.data_summary["cluster_qc"] = self._cluster_qc_summary(
+                    adata,
+                    self.data_summary.get("cluster_key"),
+                    self.data_summary.get("processing", {}),
+                )
 
     def _update_annotation_validation(self, tool_name: str, result: Dict[str, Any]) -> None:
         """Track whether automated annotation has external marker validation."""

@@ -11,6 +11,7 @@ import numpy as np
 import scipy.sparse as sp
 import scanpy as sc
 from anndata import AnnData
+import pandas as pd
 import logging
 
 from ..config.defaults import CLUSTERING_DEFAULTS
@@ -84,6 +85,7 @@ def run_phenograph(
     primary_metric: str = CLUSTERING_DEFAULTS.phenograph_metric,
     use_rep: str = 'X_pca',
     key_added: str = 'pheno_leiden',
+    random_state: int = CLUSTERING_DEFAULTS.leiden_random_state,
     inplace: bool = True,
 ) -> Optional[AnnData]:
     """
@@ -111,6 +113,8 @@ def run_phenograph(
         Representation to use for KNN.
     key_added : str, default 'pheno_leiden'
         Key to add to adata.obs for cluster assignments.
+    random_state : int, default 0
+        Random seed passed to phenograph.cluster.
     inplace : bool, default True
         Modify adata in place.
 
@@ -127,24 +131,46 @@ def run_phenograph(
 
     logger.info(f"Running PhenoGraph clustering with k={k}, resolution={resolution}")
 
-    sc.external.tl.phenograph(
-        adata,
+    try:
+        import phenograph
+    except ImportError as exc:
+        raise ImportError(
+            "PhenoGraph clustering requires the 'phenograph' package. "
+            "Install it or use method='leiden'."
+        ) from exc
+
+    X = adata.obsm[use_rep]
+    if sp.issparse(X):
+        X = X.toarray()
+    X = np.asarray(X)
+
+    communities, graph, q = phenograph.cluster(
+        X,
         clustering_algo=clustering_algo,
         k=k,
         jaccard=True,
         primary_metric=primary_metric,
         resolution_parameter=resolution,
+        seed=random_state,
     )
 
-    # CRITICAL: Convert any PhenoGraph Jaccard graph to CSR format.
-    # PhenoGraph stores the graph in COO format (key name varies by version,
-    # e.g. 'pheno_jaccard_ig', 'jaccard_ig', 'pheno_jaccard'), but Scanpy
-    # expects CSR. Scan obsp rather than hardcoding one key.
-    for obsp_key in list(adata.obsp.keys()):
-        if 'jaccard' in obsp_key.lower() or 'pheno' in obsp_key.lower():
-            if not sp.isspmatrix_csr(adata.obsp[obsp_key]):
-                adata.obsp[obsp_key] = sp.csr_matrix(adata.obsp[obsp_key])
-                logger.info(f"Converted {obsp_key} to CSR format")
+    if communities is None:
+        raise ValueError("PhenoGraph did not return community labels.")
+
+    adata.obs[key_added] = pd.Categorical(np.asarray(communities).astype(str))
+
+    graph_key = f"{key_added}_graph"
+    adata.obsp[graph_key] = graph if sp.isspmatrix_csr(graph) else sp.csr_matrix(graph)
+    adata.uns[f"{key_added}_phenograph"] = {
+        "Q": float(q) if q is not None else None,
+        "k": int(k),
+        "clustering_algo": clustering_algo,
+        "resolution": float(resolution),
+        "primary_metric": primary_metric,
+        "use_rep": use_rep,
+        "random_state": int(random_state) if random_state is not None else None,
+        "graph_key": graph_key,
+    }
 
     n_clusters = adata.obs[key_added].nunique()
     logger.info(f"PhenoGraph clustering complete: {n_clusters} clusters")

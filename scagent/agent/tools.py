@@ -22,9 +22,17 @@ import re
 logger = logging.getLogger(__name__)
 
 
-def get_tools() -> List[Dict[str, Any]]:
+def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
     """
     Get Claude API tool definitions for single-cell analysis.
+
+    Parameters
+    ----------
+    include_describe_image : bool
+        If True, also register the ``describe_image`` tool that routes a saved
+        figure through the vision sidecar. The agent should only enable this
+        when ``_use_sidecar_for_images()`` is True so the tool stays invisible
+        to multimodal-main runs.
 
     Returns
     -------
@@ -171,6 +179,9 @@ def get_tools() -> List[Dict[str, Any]]:
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"},
+                    "k": {"type": "integer", "description": "PhenoGraph nearest-neighbor k (default: 30; ignored for Leiden)"},
+                    "use_rep": {"type": "string", "description": "Representation for PhenoGraph clustering (default: X_pca; ignored for Leiden)"},
+                    "random_state": {"type": "integer", "description": "Random seed for clustering when supported (default: 0)"},
                     "cluster_key": {"type": "string", "description": "Optional explicit obs column to store this clustering result. If omitted, scagent will keep primary aliases like 'leiden' stable and store comparisons under deterministic keys like 'leiden_res_0_5'."},
                     "make_primary": {"type": "boolean", "description": "If true, promote this clustering to the default alias for the method (for example 'leiden') while preserving the explicit result key."}
                 },
@@ -186,6 +197,9 @@ def get_tools() -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolutions": {"type": "array", "items": {"type": "number"}, "description": "List of resolutions to compare"},
+                    "k": {"type": "integer", "description": "PhenoGraph nearest-neighbor k (default: 30; ignored for Leiden)"},
+                    "use_rep": {"type": "string", "description": "Representation for PhenoGraph clustering (default: X_pca; ignored for Leiden)"},
+                    "random_state": {"type": "integer", "description": "Random seed for clustering when supported (default: 0)"},
                     "generate_figures": {"type": "boolean", "description": "If true and UMAP is present, save one figure per clustering"},
                     "figure_dir": {"type": "string", "description": "Optional directory for generated comparison figures"},
                     "include_images": {"type": "boolean", "description": "If true, include image data for generated figures"},
@@ -494,7 +508,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save PNG figure"},
-                    "plot_type": {"type": "string", "enum": ["umap", "violin", "dotplot", "heatmap"], "description": "Plot type"},
+                    "plot_type": {"type": "string", "enum": ["umap", "tsne", "violin", "dotplot", "heatmap"], "description": "Plot type. Use 'tsne' when the dataset has obsm['X_tsne'] but no UMAP (e.g. when reproducing a paper that uses t-SNE)."},
                     "color_by": {"type": "string", "description": "Column or gene to color by"},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"},
                     "include_image": {"type": "boolean", "description": "If true, include image data for model review (default: true)"}
@@ -1072,16 +1086,49 @@ def get_tools() -> List[Dict[str, Any]]:
         },
     ]
 
-    return action_tools + meta_tools + inspection_tools
+    tools = action_tools + meta_tools + inspection_tools
+
+    if include_describe_image:
+        tools.append({
+            "name": "describe_image",
+            "description": (
+                "Get a structured textual description of a saved figure from the vision "
+                "sidecar model. Use this to (re-)inspect a figure or ask a specific "
+                "follow-up question about it. This is the only way you can examine a "
+                "figure — the main model you are is text-only. The sidecar returns "
+                "sections: WHAT_THIS_IS / KEY_OBSERVATIONS / NUMBERS_VISIBLE / "
+                "ANOMALIES / ACTIONABLE_FLAGS / OPEN_QUESTIONS."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "figure_path": {
+                        "type": "string",
+                        "description": "Absolute or run-relative path to the figure file (PNG/JPG).",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "Optional focused question for the sidecar, e.g. "
+                            "'do clusters 4 and 7 separate by batch?' or "
+                            "'is there a small island top-right of the UMAP?'"
+                        ),
+                    },
+                },
+                "required": ["figure_path"],
+            },
+        })
+
+    return tools
 
 
-def get_openai_tools() -> List[Dict[str, Any]]:
+def get_openai_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
     """
     Get OpenAI-format tool definitions.
 
     OpenAI uses a different schema format than Anthropic.
     """
-    anthropic_tools = get_tools()
+    anthropic_tools = get_tools(include_describe_image=include_describe_image)
     openai_tools = []
 
     for tool in anthropic_tools:
@@ -1396,6 +1443,12 @@ def process_tool_call(
             next_priority = "run_pca"
         elif not state.has_clusters:
             next_priority = "run_clustering"
+        elif (
+            world_state is not None
+            and isinstance(getattr(world_state, "data_summary", None), dict)
+            and (world_state.data_summary.get("cluster_qc", {}) or {}).get("status") == "needed"
+        ):
+            next_priority = "run_cluster_qc"
         else:
             next_priority = "annotation_or_deg"
 
@@ -1652,12 +1705,24 @@ def process_tool_call(
         resolution: float,
         cluster_key: str,
         make_primary: bool,
+        k: int | None = None,
+        use_rep: str | None = None,
+        random_state: int = 0,
     ):
         normalized_method = "phenograph" if str(method).lower() == "phenograph" else "leiden"
         if normalized_method == "leiden":
-            run_leiden(adata_obj, resolution=resolution, key_added=cluster_key)
+            run_leiden(adata_obj, resolution=resolution, random_state=random_state, key_added=cluster_key)
         else:
-            run_phenograph(adata_obj, resolution=resolution, key_added=cluster_key)
+            phenograph_kwargs = {
+                "resolution": resolution,
+                "key_added": cluster_key,
+                "random_state": random_state,
+            }
+            if k is not None:
+                phenograph_kwargs["k"] = int(k)
+            if use_rep is not None:
+                phenograph_kwargs["use_rep"] = use_rep
+            run_phenograph(adata_obj, **phenograph_kwargs)
 
         register_clustering(
             adata_obj,
@@ -1719,7 +1784,14 @@ def process_tool_call(
             if color_by in ("", None):
                 color_by = None
             elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
-                raise ValueError(f"'{color_by}' is not available for UMAP coloring.")
+                raise ValueError(f"'{color_by}' is not available for {plot_type.upper()} coloring.")
+        elif plot_type == "tsne":
+            if "X_tsne" not in adata_obj.obsm:
+                raise ValueError("t-SNE embedding not found in obsm['X_tsne']. Compute it via sc.tl.tsne or run_code first.")
+            if color_by in ("", None):
+                color_by = None
+            elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
+                raise ValueError(f"'{color_by}' is not available for {plot_type.upper()} coloring.")
 
         # For large datasets, rasterized scatter is orders of magnitude faster than
         # vector rendering (the matplotlib default).  vector_friendly=False tells
@@ -1742,6 +1814,14 @@ def process_tool_call(
                 sc.pl.umap(adata_obj, **kwargs)
             else:
                 sc.pl.umap(adata_obj, color=color_by, **kwargs)
+        elif plot_type == "tsne":
+            kwargs = dict(ax=ax, show=False)
+            if dot_size is not None:
+                kwargs["size"] = dot_size
+            if color_by is None:
+                sc.pl.tsne(adata_obj, **kwargs)
+            else:
+                sc.pl.tsne(adata_obj, color=color_by, **kwargs)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -4998,6 +5078,9 @@ def process_tool_call(
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             method = tool_input.get("method", "leiden")
             resolution = float(tool_input.get("resolution", 1.0))
+            k = tool_input.get("k")
+            use_rep = tool_input.get("use_rep")
+            random_state = int(tool_input.get("random_state", 0))
             requested_cluster_key = tool_input.get("cluster_key")
             cluster_key, default_make_primary = _resolve_clustering_output_key(
                 adata,
@@ -5020,6 +5103,9 @@ def process_tool_call(
                 resolution=resolution,
                 cluster_key=cluster_key,
                 make_primary=bool(make_primary),
+                k=k,
+                use_rep=use_rep,
+                random_state=random_state,
             )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_clustering")
@@ -5045,6 +5131,11 @@ def process_tool_call(
                 "primary_alias_available": result_payload["primary_alias_available"],
                 "primary_alias_created": result_payload["primary_alias_created"],
                 "make_primary": bool(make_primary),
+                "parameters": {
+                    "k": int(k) if k is not None else None,
+                    "use_rep": use_rep,
+                    "random_state": random_state,
+                },
                 "n_clusters": result_payload["n_clusters"],
                 "cluster_sizes": result_payload["cluster_sizes"],
                 "available_clusterings": result_payload["clusterings"],
@@ -5101,6 +5192,9 @@ def process_tool_call(
             resolutions = [float(value) for value in tool_input.get("resolutions", [])]
             if not resolutions:
                 raise ValueError("compare_clusterings requires at least one resolution.")
+            k = tool_input.get("k")
+            use_rep = tool_input.get("use_rep")
+            random_state = int(tool_input.get("random_state", 0))
 
             compare_results = []
             figure_dir = tool_input.get("figure_dir")
@@ -5120,12 +5214,20 @@ def process_tool_call(
                     resolution=resolution,
                     cluster_key=cluster_key,
                     make_primary=False,
+                    k=k,
+                    use_rep=use_rep,
+                    random_state=random_state,
                 )
                 compare_entry = {
                     "resolution": result_payload["resolution"],
                     "cluster_key": result_payload["cluster_key"],
                     "n_clusters": result_payload["n_clusters"],
                     "cluster_sizes": result_payload["cluster_sizes"],
+                    "parameters": {
+                        "k": int(k) if k is not None else None,
+                        "use_rep": use_rep,
+                        "random_state": random_state,
+                    },
                 }
 
                 if generate_figures and "X_umap" in adata.obsm:
@@ -6671,27 +6773,35 @@ def process_tool_call(
             color_by = tool_input.get("color_by")
             genes = tool_input.get("genes", [])
             include_image = tool_input.get("include_image", True)
-            if plot_type == "umap" and "X_umap" not in adata.obsm:
+            _embedding_key = {"umap": "X_umap", "tsne": "X_tsne"}.get(plot_type)
+            if _embedding_key is not None and _embedding_key not in adata.obsm:
                 return _smart_unavailable_result(
                     tool="generate_figure",
-                    message="UMAP cannot be rendered because the embedding is not available on the current in-memory dataset.",
+                    message=(
+                        f"{plot_type.upper()} cannot be rendered because the "
+                        f"embedding (obsm['{_embedding_key}']) is not available "
+                        "on the current in-memory dataset."
+                    ),
                     adata_obj=adata,
                     missing_prerequisites=["embedding"],
-                    recovery_options=[
-                        "Run PCA, neighbors, and UMAP first.",
-                        "If you only need a summary of current state, inspect the session instead of plotting.",
-                    ],
+                    recovery_options=(
+                        ["Run PCA, neighbors, and UMAP first.",
+                         "If you only need a summary of current state, inspect the session instead of plotting."]
+                        if plot_type == "umap" else
+                        [f"Compute t-SNE first (e.g. sc.tl.tsne(adata) via run_code) so obsm['{_embedding_key}'] is populated.",
+                         "If a UMAP exists instead, switch plot_type to 'umap'."]
+                    ),
                     extra={"plot_type": plot_type, "color_by": color_by},
                 )
-            if plot_type == "umap" and color_by not in (None, "") and color_by not in adata.obs.columns and color_by not in adata.var_names:
+            if plot_type in ("umap", "tsne") and color_by not in (None, "") and color_by not in adata.obs.columns and color_by not in adata.var_names:
                 return _smart_unavailable_result(
                     tool="generate_figure",
-                    message=f"UMAP coloring key '{color_by}' is not available on the current in-memory dataset.",
+                    message=f"{plot_type.upper()} coloring key '{color_by}' is not available on the current in-memory dataset.",
                     adata_obj=adata,
                     missing_prerequisites=["valid_color_key"],
                     recovery_options=[
                         "Use one of the available obs columns or genes for coloring.",
-                        "Render a plain UMAP without coloring.",
+                        f"Render a plain {plot_type.upper()} without coloring.",
                     ],
                     extra={"plot_type": plot_type, "requested_color_by": color_by},
                 )
@@ -6712,7 +6822,7 @@ def process_tool_call(
             verification_checks = [
                 _check("figure_exists", os.path.exists(output_path), f"Figure exists at {output_path}."),
             ]
-            if plot_type == "umap":
+            if plot_type in ("umap", "tsne") and color_by not in (None, ""):
                 verification_checks.append(
                     _check(
                         "color_key_valid",
