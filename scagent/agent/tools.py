@@ -13,7 +13,7 @@ import os
 os.environ.setdefault('TQDM_NCOLS', '60')
 os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import json
 import logging
 from pathlib import Path
@@ -277,12 +277,15 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "where top-2 candidate labels are close, and identify shared markers that don't discriminate. "
                 "If CellTypist or Scimilarity columns are present, summarize their dominant cluster-level labels "
                 "as reference-derived candidate labels so DEG/PanglaoDB validation can adjudicate them. "
+                "Also stage reverse PanglaoDB marker lookups for a panel of top non-nuisance DEGs per cluster, "
+                "so plausible alternative labels can be discovered from observed markers instead of relying on "
+                "a single gene or hard-coded ambiguity lists. "
                 "Stores the proposal in adata.uns['annotation_proposal'] and returns per-cluster candidates "
-                "with competing labels and the specific PanglaoDB queries you must run next. "
+                "with competing labels and the specific PanglaoDB label and reverse-marker queries you must run next. "
                 "This is the validation/adjudication stage, not a replacement for reference-based annotation "
                 "when a compatible CellTypist or Scimilarity model is available. After this, query PanglaoDB "
-                "for each proposed label, reference-derived candidate label, and competing label, then call "
-                "finalize_annotation with the evidence."
+                "for each proposed label, reference-derived candidate label, competing label, and staged DEG "
+                "gene-symbol reverse lookup, then call finalize_annotation with the evidence."
             ),
             "input_schema": {
                 "type": "object",
@@ -311,6 +314,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                             "scimilarity_predictions_unconstrained, or scimilarity_representative_prediction. "
                             "If omitted, prepare_annotation auto-detects those standard columns when present."
                         )
+                    },
+                    "panglaodb_species": {"type": "string", "enum": ["Hs", "Mm"], "description": "Optional PanglaoDB species code to include in staged queries: Hs for human, Mm for mouse."},
+                    "reverse_lookup_n_genes_per_cluster": {"type": "integer", "description": "Number of top non-nuisance DEGs per cluster to stage for PanglaoDB gene_symbol reverse lookup (default: 10; use 0 to disable)."},
+                    "reverse_lookup_max_unique_genes": {"type": "integer", "description": "Maximum unique DEG gene_symbol reverse lookup queries to stage across all clusters (default: 120). Genes are selected round-robin across clusters so small/high-numbered clusters are represented."},
+                    "reverse_lookup_exclude_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Regex patterns for genes to exclude from reverse lookup as nuisance markers. Defaults exclude MT, ribosomal, MALAT1, and common hemoglobin genes; cell-cycle genes are not excluded by default."
                     },
                     "ambiguity_threshold": {"type": "number", "description": "Max allowed difference between top-2 normalized scores for a cluster to be flagged as ambiguous (default: 0.10). Clusters with top-2 delta below this are flagged."},
                     "shared_marker_threshold": {"type": "number", "description": "Fraction of cell-type lists a gene must appear in to be considered a shared/non-discriminating marker (default: 0.5)."}
@@ -341,6 +352,10 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                             "When reference labels were used, include 'reference_annotation_support' "
                             "and 'reference_annotation_conflicts' so the final record preserves whether "
                             "CellTypist/Scimilarity agreed with the DEG/PanglaoDB evidence. "
+                            "When reverse marker lookup was used, include 'reverse_marker_support' "
+                            "(candidate PanglaoDB labels and the DEG genes supporting each) and "
+                            "'panglaodb_label_used' if the final biological label had to be validated "
+                            "through a broader PanglaoDB vocabulary label. "
                             "Example: {\"0\": {\"label\": \"T cell\", \"panglaodb_queried\": true, "
                             "\"supporting_genes\": [\"CD3D\", \"CD3E\"], \"confidence\": \"high\"}}"
                         ),
@@ -353,6 +368,8 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                                 "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                                 "reference_annotation_support": {"type": "object"},
                                 "reference_annotation_conflicts": {"type": "array", "items": {"type": "string"}},
+                                "reverse_marker_support": {"type": "object"},
+                                "panglaodb_label_used": {"type": "string"},
                                 "reasoning": {"type": "string"}
                             },
                             "required": ["label", "panglaodb_queried"]
@@ -7544,6 +7561,7 @@ def process_tool_call(
             )
 
         elif tool_name == "prepare_annotation":
+            import re as _re
             import scanpy as sc
             import scipy.sparse as sp
             import numpy as _np
@@ -7579,6 +7597,59 @@ def process_tool_call(
             expression_threshold = float(tool_input.get("expression_threshold", 0.0))
             force_recompute = bool(tool_input.get("force_recompute_deg", False))
             deg_method = tool_input.get("deg_method", "wilcoxon")
+            panglaodb_species = tool_input.get("panglaodb_species")
+            reverse_lookup_n_genes = max(
+                0, int(tool_input.get("reverse_lookup_n_genes_per_cluster", 10))
+            )
+            reverse_lookup_max_unique = max(
+                0, int(tool_input.get("reverse_lookup_max_unique_genes", 120))
+            )
+            default_reverse_exclude_patterns = [
+                r"^MT-",
+                r"^mt-",
+                r"^RPL",
+                r"^RPS",
+                r"^MRPL",
+                r"^MRPS",
+                r"^Rpl",
+                r"^Rps",
+                r"^Mrpl",
+                r"^Mrps",
+                r"^MALAT1$",
+                r"^Malat1$",
+                r"^HB[ABDEGMQZ]",
+                r"^Hb[ab]",
+                r"^RP\d",
+                r"^AC\d",
+                r"^AL\d",
+                r"^AP\d",
+                r"^LINC\d",
+                r"\.\d+$",
+            ]
+            supplied_reverse_exclude = tool_input.get("reverse_lookup_exclude_patterns")
+            reverse_exclude_patterns = (
+                [str(p) for p in supplied_reverse_exclude]
+                if isinstance(supplied_reverse_exclude, list)
+                else default_reverse_exclude_patterns
+            )
+            try:
+                reverse_exclude_regexes = [
+                    _re.compile(p) for p in reverse_exclude_patterns if str(p).strip()
+                ]
+            except Exception:
+                reverse_exclude_regexes = [
+                    _re.compile(p) for p in default_reverse_exclude_patterns
+                ]
+
+            def _reverse_exclude_reason(gene: str) -> Optional[str]:
+                for rx in reverse_exclude_regexes:
+                    try:
+                        if rx.search(gene):
+                            return rx.pattern
+                    except Exception:
+                        continue
+                return None
+
             supplied_reference_keys = tool_input.get("reference_annotation_keys")
             standard_reference_keys = [
                 "celltypist_majority_voting",
@@ -7661,6 +7732,37 @@ def process_tool_call(
                                 pass
                         entries.append(entry)
                     top_degs_per_cluster[str(g)] = entries
+            elif isinstance(names, dict):
+                for g, gene_values in names.items():
+                    entries = []
+                    try:
+                        genes_iter = list(gene_values)
+                    except Exception:
+                        genes_iter = []
+                    n_take = min(n_deg_genes, len(genes_iter))
+                    for i in range(n_take):
+                        try:
+                            gene = str(genes_iter[i])
+                        except Exception:
+                            continue
+                        entry = {"gene": gene}
+                        if isinstance(scores, dict) and g in scores:
+                            try:
+                                entry["score"] = float(list(scores[g])[i])
+                            except Exception:
+                                pass
+                        if isinstance(logfcs, dict) and g in logfcs:
+                            try:
+                                entry["logfc"] = float(list(logfcs[g])[i])
+                            except Exception:
+                                pass
+                        if isinstance(pvals_adj, dict) and g in pvals_adj:
+                            try:
+                                entry["pval_adj"] = float(list(pvals_adj[g])[i])
+                            except Exception:
+                                pass
+                        entries.append(entry)
+                    top_degs_per_cluster[str(g)] = entries
 
             shared_markers: List[str] = []
             label_marker_lists: Dict[str, List[str]] = {}
@@ -7687,6 +7789,8 @@ def process_tool_call(
             ambiguous_clusters: List[str] = []
             cluster_summaries: List[Dict[str, Any]] = []
             reference_annotation_summary: Dict[str, List[Dict[str, Any]]] = {}
+            reverse_lookup_by_cluster: Dict[str, List[str]] = {}
+            reverse_lookup_excluded_by_cluster: Dict[str, List[Dict[str, str]]] = {}
 
             X_layer = tool_input.get("deg_layer")
             X_source = adata.layers[X_layer] if X_layer and X_layer in adata.layers else adata.X
@@ -7718,6 +7822,26 @@ def process_tool_call(
                         else:
                             frac = float(expressed[mask, :].mean())
                         score_matrix.setdefault(c, {})[label] = frac
+
+            if reverse_lookup_n_genes > 0:
+                for c in cluster_ids:
+                    selected: List[str] = []
+                    excluded: List[Dict[str, str]] = []
+                    seen_cluster_genes: set = set()
+                    for entry in top_degs_per_cluster.get(c, []):
+                        gene = str(entry.get("gene") or "").strip()
+                        if not gene or gene in seen_cluster_genes:
+                            continue
+                        seen_cluster_genes.add(gene)
+                        reason = _reverse_exclude_reason(gene)
+                        if reason:
+                            excluded.append({"gene": gene, "reason": f"matched exclude pattern {reason}"})
+                            continue
+                        selected.append(gene)
+                        if len(selected) >= reverse_lookup_n_genes:
+                            break
+                    reverse_lookup_by_cluster[c] = selected
+                    reverse_lookup_excluded_by_cluster[c] = excluded[:20]
 
             if valid_reference_keys:
                 for c in cluster_ids:
@@ -7763,6 +7887,8 @@ def process_tool_call(
                     "n_cells": cluster_sizes[c],
                     "top_degs": [d["gene"] for d in top_degs_per_cluster.get(c, [])][:n_deg_genes],
                     "top_degs_detail": top_degs_per_cluster.get(c, []),
+                    "reverse_lookup_genes": reverse_lookup_by_cluster.get(c, []),
+                    "reverse_lookup_excluded_genes": reverse_lookup_excluded_by_cluster.get(c, []),
                 }
                 if reference_annotation_summary.get(c):
                     summary["reference_annotations"] = reference_annotation_summary[c]
@@ -7826,6 +7952,41 @@ def process_tool_call(
                         })
                         seen_queries.add(label)
 
+            panglaodb_reverse_queries: List[Dict[str, Any]] = []
+            reverse_gene_to_clusters: Dict[str, List[str]] = {}
+            for c, genes in reverse_lookup_by_cluster.items():
+                for g in genes:
+                    reverse_gene_to_clusters.setdefault(g, []).append(c)
+            selected_reverse_genes: List[str] = []
+            seen_reverse_genes: set = set()
+            max_depth = max((len(v) for v in reverse_lookup_by_cluster.values()), default=0)
+            for rank in range(max_depth):
+                for c in cluster_ids:
+                    genes = reverse_lookup_by_cluster.get(c, [])
+                    if rank >= len(genes):
+                        continue
+                    gene = genes[rank]
+                    if gene in seen_reverse_genes:
+                        continue
+                    selected_reverse_genes.append(gene)
+                    seen_reverse_genes.add(gene)
+                    if len(selected_reverse_genes) >= reverse_lookup_max_unique:
+                        break
+                if len(selected_reverse_genes) >= reverse_lookup_max_unique:
+                    break
+            for gene in selected_reverse_genes:
+                query: Dict[str, Any] = {
+                    "gene_symbol": gene,
+                    "reason": (
+                        "reverse marker lookup from top cluster DEGs; aggregate returned "
+                        "cell types across multiple genes before choosing candidate labels"
+                    ),
+                    "clusters": reverse_gene_to_clusters.get(gene, []),
+                }
+                if panglaodb_species in {"Hs", "Mm"}:
+                    query["species"] = panglaodb_species
+                panglaodb_reverse_queries.append(query)
+
             proposal = {
                 "cluster_key": cluster_key,
                 "annotation_key": annotation_key,
@@ -7838,10 +7999,17 @@ def process_tool_call(
                 "reference_annotation_keys": valid_reference_keys,
                 "missing_reference_annotation_keys": missing_reference_keys,
                 "reference_annotation_summary": reference_annotation_summary,
+                "reverse_lookup_n_genes_per_cluster": reverse_lookup_n_genes,
+                "reverse_lookup_max_unique_genes": reverse_lookup_max_unique,
+                "reverse_lookup_exclude_patterns": reverse_exclude_patterns,
+                "reverse_lookup_by_cluster": reverse_lookup_by_cluster,
+                "reverse_lookup_excluded_by_cluster": reverse_lookup_excluded_by_cluster,
                 "scoring_method": "normalized_expression_fraction" if label_marker_lists else "deg_only",
                 "ambiguity_threshold": ambiguity_threshold,
                 "shared_marker_threshold": shared_marker_threshold,
                 "panglaodb_queries_required": panglaodb_queries,
+                "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
+                "panglaodb_species": panglaodb_species,
                 "deg_key": deg_key,
                 "deg_method": deg_method,
             }
@@ -7870,9 +8038,16 @@ def process_tool_call(
                 ) if not valid_reference_keys else None,
                 "clusters": cluster_summaries,
                 "panglaodb_queries_required": panglaodb_queries,
+                "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
+                "reverse_lookup_n_genes_per_cluster": reverse_lookup_n_genes,
+                "reverse_lookup_max_unique_genes": reverse_lookup_max_unique,
+                "reverse_lookup_exclude_patterns": reverse_exclude_patterns,
+                "panglaodb_species": panglaodb_species,
                 "next_steps": [
                     "If no reference_annotation_keys are present and CellTypist or Scimilarity is compatible, run reference annotation before finalizing broad cell-type labels.",
                     "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate).",
+                    "For each entry in panglaodb_reverse_marker_queries_required, call bc_get_panglaodb_marker_genes with gene_symbol and species; aggregate returned cell_type values per cluster across multiple genes.",
+                    "Do not infer alternatives from a single top gene. Treat reverse-lookup labels as candidates only when supported by multiple DEG genes, then query those cell_type labels directly.",
                     "Compare PanglaoDB markers against each cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
                     "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
                     "Once every cluster has external evidence, call finalize_annotation with evidence_summary.",
@@ -7885,7 +8060,8 @@ def process_tool_call(
                 summary=(
                     f"Annotation proposal staged for {len(cluster_ids)} clusters "
                     f"({len(ambiguous_clusters)} ambiguous, {len(shared_markers)} shared markers flagged). "
-                    f"Now query PanglaoDB for {len(panglaodb_queries)} candidate labels."
+                    f"Now query PanglaoDB for {len(panglaodb_queries)} candidate labels "
+                    f"and {len(panglaodb_reverse_queries)} reverse marker genes."
                 ),
                 verification=_build_verification(
                     "passed",
@@ -8025,6 +8201,10 @@ def process_tool_call(
                 if "reference_annotation_conflicts" in ev:
                     conflicts = ev.get("reference_annotation_conflicts")
                     checks["reference_annotation_conflicts"] = conflicts if isinstance(conflicts, list) else [str(conflicts)]
+                if "reverse_marker_support" in ev:
+                    checks["reverse_marker_support"] = ev.get("reverse_marker_support")
+                if "panglaodb_label_used" in ev:
+                    checks["panglaodb_label_used"] = str(ev.get("panglaodb_label_used"))
                 if "reasoning" in ev:
                     checks["reasoning"] = str(ev.get("reasoning"))
 

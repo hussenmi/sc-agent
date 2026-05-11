@@ -786,6 +786,7 @@ class AgentWorldState:
             cluster_summaries = result.get("clusters") or []
             ambiguous = result.get("ambiguous_clusters") or []
             queries_required = result.get("panglaodb_queries_required") or []
+            reverse_queries_required = result.get("panglaodb_reverse_marker_queries_required") or []
             existing_queries = (
                 list(self.annotation_validation.get("reference_marker_queries", []))
                 if isinstance(self.annotation_validation, dict) else []
@@ -804,14 +805,17 @@ class AgentWorldState:
                 "reference_annotation_keys": result.get("reference_annotation_keys") or [],
                 "reference_annotation_notice": result.get("reference_annotation_notice"),
                 "panglaodb_queries_required": queries_required,
+                "panglaodb_reverse_marker_queries_required": reverse_queries_required,
                 "reference_marker_queries": existing_queries,
                 "reference_marker_source": "PanglaoDB",
                 "deg_required": True,
                 "deg_completed": True,
                 "finalized": False,
                 "instruction": (
-                    "Query PanglaoDB for every entry in panglaodb_queries_required, compare "
-                    "markers against each cluster's top_degs, then call finalize_annotation."
+                    "Query PanglaoDB for every entry in panglaodb_queries_required and "
+                    "panglaodb_reverse_marker_queries_required, aggregate reverse gene-symbol "
+                    "hits across multiple DEGs, compare markers against each cluster's top_degs, "
+                    "then call finalize_annotation."
                 ),
             }
             return
@@ -1091,6 +1095,9 @@ class AgentWorldState:
                 "reference_annotation_keys": result.get("reference_annotation_keys"),
                 "reference_annotation_notice": result.get("reference_annotation_notice"),
                 "panglaodb_queries_required": result.get("panglaodb_queries_required"),
+                "panglaodb_reverse_marker_queries_required": result.get("panglaodb_reverse_marker_queries_required"),
+                "reverse_lookup_n_genes_per_cluster": result.get("reverse_lookup_n_genes_per_cluster"),
+                "reverse_lookup_max_unique_genes": result.get("reverse_lookup_max_unique_genes"),
             }
 
         if tool_name == "finalize_annotation":

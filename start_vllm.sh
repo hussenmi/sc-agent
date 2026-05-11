@@ -31,7 +31,7 @@ PORT=${2:-8000}
 GPUS=${3:-"auto"}
 THINKING=${THINKING:-0}
 SPEC=${SPEC:-"auto"}
-LONG_CTX=${LONG_CTX:-0}
+LONG_CTX=${LONG_CTX:-1}
 
 HF_DIR="/data1/peerd/ibrahih3/hf"
 SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_gemma4.sif"}
