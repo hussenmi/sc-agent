@@ -78,10 +78,11 @@ load_data
   → run_cluster_qc            [narrate full table + evidence]
   → PAUSE: present removal proposal, wait for confirmation
   → [loop: normalize_and_hvg → run_pca → run_neighbors → run_umap → run_clustering → run_cluster_qc → until clean]
-  → run_celltypist
-  → run_code for DEGs
-  → bc_get_panglaodb_marker_genes per label (MCP)
-  → correct labels, final UMAP
+  → run_celltypist and/or run_scimilarity when organism/model compatibility allows
+  → prepare_annotation with reference annotation keys
+  → bc_get_panglaodb_marker_genes per candidate and plausible competitor (MCP)
+  → finalize_annotation with DEG, reference-label, and PanglaoDB evidence
+  → final UMAP
 ```
 
 **Each `→` is a tool call in the same response turn. The only places you stop and wait are: cluster removal confirmation, user domain knowledge, or surprising results.**
@@ -142,6 +143,7 @@ AUTO_RECOVERY_ATTEMPTS = 2
 
 ACTION_TOOL_NAMES = {
     "load_data",
+    "run_cellbender",
     "run_qc",
     "normalize_and_hvg",
     "run_pca",
@@ -1860,12 +1862,60 @@ class SCAgent:
         text = (value or "").strip().lower()
         return text in {"y", "yes", "1", "ok", "okay", "sure", "continue", "do it", "run it", "compute it"}
 
+    def _checkpoint_action_from_user_response(
+        self,
+        checkpoint: Dict[str, Any],
+        value: str,
+    ) -> Optional[str]:
+        """Resolve common natural replies to a pending checkpoint action."""
+        text = " ".join((value or "").strip().lower().split())
+        text = text.strip(" .,!?:;")
+        option_actions = checkpoint.get("option_actions") or []
+        options = checkpoint.get("options") or []
+
+        numbered_match = re.match(r"^(?:option|choice|number|#)?\s*([1-9][0-9]*)\b", text)
+        if text.isdigit() or numbered_match:
+            number = numbered_match.group(1) if numbered_match else text
+            index = int(number) - 1
+            if 0 <= index < len(option_actions):
+                return option_actions[index]
+
+        ordinal_index = {
+            "first": 0,
+            "1st": 0,
+            "one": 0,
+            "second": 1,
+            "2nd": 1,
+            "two": 1,
+            "third": 2,
+            "3rd": 2,
+            "three": 2,
+            "fourth": 3,
+            "4th": 3,
+            "four": 3,
+        }
+        for ordinal, index in ordinal_index.items():
+            if re.match(rf"^(?:(?:option|choice|number)\s+)?{ordinal}\b", text):
+                if 0 <= index < len(option_actions):
+                    return option_actions[index]
+
+        request_words = {w for w in re.findall(r"[a-z0-9]+", text) if len(w) > 2}
+        for option, action in zip(options, option_actions):
+            option_text = " ".join(str(option).strip().lower().split()).strip(" .,!?:;")
+            if text and text == option_text:
+                return action
+            option_words = {w for w in re.findall(r"[a-z0-9]+", option_text) if len(w) > 2}
+            if option_words and len(option_words & request_words) >= min(3, len(option_words)):
+                return action
+        return None
+
     def _is_strict_cleanup_yes(self, value: str) -> bool:
         text = " ".join((value or "").strip().lower().split())
         text = text.strip(" .,!?:;")
         if text in {
             "y",
             "yes",
+            "1",
             "ok",
             "okay",
             "sure",
@@ -2006,7 +2056,8 @@ class SCAgent:
         if checkpoint.get("kind") != "cluster_qc_cleanup":
             return False
         proposal = checkpoint.get("proposal") or {}
-        if self._is_strict_cleanup_yes(request):
+        selected_action = self._checkpoint_action_from_user_response(checkpoint, request)
+        if selected_action == "remove_proposed_clusters":
             mentioned = self._mentioned_cluster_labels(request)
             proposed = {str(label) for label in proposal.get("proposed_removal", [])}
             if mentioned and mentioned != proposed:
@@ -2024,7 +2075,7 @@ class SCAgent:
             )
             self._clear_pending_checkpoint(request)
             return True
-        if self._is_cleanup_no(request):
+        if selected_action == "keep_proposed_clusters":
             self.world_state.resolve_decision(
                 "cluster_qc_cleanup",
                 "keep_proposed_clusters",
@@ -2057,6 +2108,15 @@ class SCAgent:
                     "proposal": proposal,
                     "reason": auto_reason,
                 }
+            return {
+                "source": "user_confirmation",
+                "proposal": proposal,
+                "reason": (
+                    "A cluster cleanup checkpoint is pending. The model interpreted the "
+                    "latest user reply in that context; destructive-code preflight must "
+                    "verify the exact proposed clusters and cell count before execution."
+                ),
+            }
         if self._looks_like_direct_cleanup_request(self._active_request):
             return {
                 "source": "direct_user_request",
@@ -2730,7 +2790,8 @@ class SCAgent:
         # authorization. Otherwise the LLM's response options take precedence.
         if self._pending_checkpoint:
             if not self._authorize_pending_cleanup_from_user(request):
-                self._clear_pending_checkpoint("superseded by new response")
+                if self._pending_checkpoint.get("kind") != "cluster_qc_cleanup":
+                    self._clear_pending_checkpoint("superseded by new response")
 
         # Build initial message
         user_message = request
@@ -4089,6 +4150,7 @@ class SCAgent:
 
     _TOOL_LABELS = {
         "load_data":            "Loading dataset",
+        "run_cellbender":       "Running CellBender",
         "run_qc":               "Running QC",
         "score_integration":    "Scoring integration quality",
         "benchmark_integration": "Benchmarking integration (scib-metrics)",
@@ -4125,11 +4187,55 @@ class SCAgent:
         "describe_image":       "Describing figure (vision sidecar)",
     }
 
+    _MCP_TOOL_LABELS = {
+        # biocontext marker and annotation validation
+        "bc_get_panglaodb_marker_genes": "Querying PanglaoDB markers",
+        "bc_get_panglaodb_options": "Loading PanglaoDB options",
+        "bc_get_cell_ontology_terms": "Searching Cell Ontology",
+        "bc_search_ontology_terms": "Searching ontology terms",
+        "bc_get_term_details": "Loading ontology term details",
+        "bc_get_term_hierarchical_children": "Loading ontology hierarchy",
+        "bc_get_available_ontologies": "Loading ontology list",
+        # biocontext gene, protein, and pathway evidence
+        "bc_get_human_protein_atlas_info": "Querying Human Protein Atlas",
+        "bc_get_go_terms_by_gene": "Querying GO terms",
+        "bc_get_reactome_info_by_identifier": "Querying Reactome",
+        "bc_get_string_id": "Mapping STRING identifier",
+        "bc_get_string_interactions": "Querying STRING interactions",
+        "bc_get_string_network_image": "Generating STRING network",
+        "bc_get_string_similarity_scores": "Querying STRING similarity",
+        "bc_get_ensembl_id_from_gene_symbol": "Mapping Ensembl gene ID",
+        "bc_get_kegg_id_by_gene_symbol": "Mapping KEGG gene ID",
+        "bc_query_kegg": "Querying KEGG",
+        "bc_get_uniprot_id_by_protein_symbol": "Mapping UniProt protein ID",
+        "bc_get_uniprot_protein_info": "Querying UniProt",
+        "bc_get_alphafold_info_by_protein_symbol": "Querying AlphaFold",
+        "bc_get_protein_domains": "Querying protein domains",
+        "bc_get_interpro_entry": "Querying InterPro entry",
+        "bc_search_interpro_entries": "Searching InterPro",
+        # literature MCPs
+        "search_abstracts": "Searching PubMed abstracts",
+        "bc_get_europepmc_articles": "Searching Europe PMC",
+        "bc_get_europepmc_fulltext": "Fetching Europe PMC full text",
+        "bc_get_biorxiv_preprint_details": "Fetching bioRxiv preprint",
+        "bc_get_recent_biorxiv_preprints": "Searching bioRxiv preprints",
+        "bc_search_google_scholar_publications": "Searching Google Scholar",
+        # translational/drug/trial MCPs
+        "bc_query_open_targets_graphql": "Querying Open Targets",
+        "bc_get_open_targets_query_examples": "Loading Open Targets examples",
+        "bc_get_open_targets_graphql_schema": "Loading Open Targets schema",
+        "bc_search_drugs_fda": "Searching FDA drugs",
+        "bc_get_drug_label_info": "Fetching FDA drug label",
+        "bc_search_studies": "Searching clinical trials",
+        "bc_get_study_details": "Fetching clinical trial details",
+    }
+
     # Tools that should leave persistent start/done lines in the terminal. This
     # includes tools with their own tqdm/progress output and the main analysis
     # actions so the user can see the pipeline history after each step finishes.
     _STREAMING_TOOLS = {
         "load_data",
+        "run_cellbender",
         "normalize_and_hvg",
         "run_pca",
         "run_neighbors",
@@ -4153,7 +4259,38 @@ class SCAgent:
         "run_cluster_qc",
         "generate_figure",
         "run_code",               # unknown — user code may print progress
+        "run_shell",              # external system checks/commands should be visible in terminal history
     }
+
+    def _display_label_for_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
+        """Return a concise terminal label for native and MCP tools."""
+        if tool_name == "run_code":
+            return self._TOOL_LABELS.get(tool_name, tool_input.get("description", "Running code"))
+
+        if tool_name in self._TOOL_LABELS:
+            return self._TOOL_LABELS[tool_name]
+        if tool_name in self._MCP_TOOL_LABELS:
+            return self._MCP_TOOL_LABELS[tool_name]
+
+        if self._mcp_client and self._mcp_client.has_tool(tool_name):
+            if tool_name.startswith("bc_get_"):
+                stem = tool_name.removeprefix("bc_get_")
+                return "Querying " + stem.replace("_", " ").title()
+            if tool_name.startswith("bc_search_"):
+                stem = tool_name.removeprefix("bc_search_")
+                return "Searching " + stem.replace("_", " ").title()
+            if tool_name.startswith("bc_query_"):
+                stem = tool_name.removeprefix("bc_query_")
+                return "Querying " + stem.replace("_", " ").title()
+            return "Using MCP tool " + tool_name.replace("_", " ")
+
+        return tool_name.replace("_", " ").title()
+
+    def _should_print_persistent_tool_progress(self, tool_name: str) -> bool:
+        """Whether verbose mode should leave durable start/done lines."""
+        if tool_name in self._STREAMING_TOOLS:
+            return True
+        return bool(self._mcp_client and self._mcp_client.has_tool(tool_name))
 
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Execute a tool and return JSON result."""
@@ -4333,10 +4470,7 @@ class SCAgent:
             annotation_validation_block = self._annotation_validation_guard(tool_name, tool_input)
 
             # Build the display label
-            if tool_name == "run_code":
-                label = self._TOOL_LABELS.get(tool_name, tool_input.get('description', 'Running code'))
-            else:
-                label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
+            label = self._display_label_for_tool(tool_name, tool_input)
 
             def _dispatch():
                 """Call process_tool_call (native tools) or MCP client (external tools)."""
@@ -4382,10 +4516,11 @@ class SCAgent:
                         pass
                 return _rj, _ad
 
-            if self.verbose and tool_name in self._STREAMING_TOOLS:
+            if self.verbose and self._should_print_persistent_tool_progress(tool_name):
                 # Streaming tools produce their own tqdm/progress output. Using
                 # Rich's Live (console.status) fights with tqdm and blanks the
-                # terminal. Print a start line and let the tool's output flow.
+                # terminal. MCP calls should also leave a durable audit trail in
+                # the live terminal because they are external evidence queries.
                 console.print(f"[cyan]▶[/cyan] {label}...")
                 result_json, self.adata = _dispatch()
                 console.print(f"[green]✓[/green] {label} done")
@@ -4534,8 +4669,14 @@ class SCAgent:
             if status == "ok":
                 if tool_name == "run_code" and tool_input.get("cleanup_authorization"):
                     self._active_cleanup_authorization = None
+                    cleanup_executed = any(
+                        check.get("name") == "destructive_cluster_removal"
+                        and check.get("status") == "passed"
+                        for check in result_data.get("preflight_checks", []) or []
+                    )
                     if (
-                        self._pending_checkpoint
+                        cleanup_executed
+                        and self._pending_checkpoint
                         and self._pending_checkpoint.get("kind") == "cluster_qc_cleanup"
                     ):
                         self._clear_pending_checkpoint("cleanup executed")
@@ -5173,6 +5314,21 @@ class SCAgent:
 
     def _handle_pause_and_ask(self, tool_input: Dict[str, Any]) -> str:
         """Handle pause_and_ask tool — create a pending checkpoint from LLM-initiated pause."""
+        if (self._pending_checkpoint or {}).get("kind") == "cluster_qc_cleanup":
+            checkpoint = self._pending_checkpoint or {}
+            return json.dumps({
+                "status": "ok",
+                "tool": "pause_and_ask",
+                "paused": True,
+                "question": checkpoint.get("question", tool_input.get("question", "")),
+                "context": checkpoint.get("summary", tool_input.get("context", "")),
+                "options": checkpoint.get("options", tool_input.get("options", [])),
+                "message": (
+                    "Analysis paused at the existing cluster cleanup checkpoint. "
+                    "Present the question in your response and end your turn."
+                ),
+            }, indent=2)
+
         question = tool_input.get("question", "")
         context = tool_input.get("context", "")
         options = tool_input.get("options") or []

@@ -55,6 +55,35 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "run_cellbender",
+            "description": (
+                "Run CellBender remove-background on a raw/unfiltered droplet matrix before standard scagent analysis. "
+                "Use this for ambient RNA/background removal when the user provides raw droplet data. "
+                "Do not run this on already filtered, normalized, or post-CellBender data. "
+                "The tool validates inputs, captures stdout/stderr logs, verifies the output h5, and only loads "
+                "the cleaned output as the primary dataset when load_output=true."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "input_path": {"type": "string", "description": "Path to the raw/unfiltered input for CellBender. Prefer raw_feature_bc_matrix.h5; CellBender also supports some raw matrix directories and other unfiltered formats."},
+                    "output_path": {"type": "string", "description": "Path for CellBender's cleaned output h5. Defaults to <run_dir>/cellbender/<input_stem>_cellbender.h5."},
+                    "expected_cells": {"type": "integer", "description": "Optional CellBender --expected-cells value. For CellBender v0.3+, omit this initially unless defaults fail or the user/source provides a reason."},
+                    "total_droplets_included": {"type": "integer", "description": "Optional CellBender --total-droplets-included value. For CellBender v0.3+, omit this initially unless defaults fail or UMI-curve review supports a manual value."},
+                    "fpr": {"type": "number", "description": "Optional CellBender --fpr value. Default is CellBender's own conservative setting; larger values remove more background but risk removing signal."},
+                    "epochs": {"type": "integer", "description": "Optional CellBender --epochs value."},
+                    "use_cuda": {"type": "boolean", "description": "If true, pass --cuda to CellBender. Only use when GPU availability has been checked."},
+                    "cellbender_executable": {"type": "string", "description": "Executable or absolute path. Defaults to SCAGENT_CELLBENDER, then 'cellbender' on PATH."},
+                    "extra_args": {"type": "array", "items": {"type": "string"}, "description": "Advanced extra command-line args for cellbender remove-background. Do not include --input or --output."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds. Default is 86400 (24 hours)."},
+                    "workdir": {"type": "string", "description": "Working directory for the CellBender subprocess. Defaults to the output directory."},
+                    "load_output": {"type": "boolean", "description": "If true, load the CellBender output h5 as the primary in-memory dataset after success. Default false."},
+                    "force_replace_primary": {"type": "boolean", "description": "Required with load_output=true when a primary dataset is already loaded."}
+                },
+                "required": ["input_path"]
+            }
+        },
+        {
             "name": "run_qc",
             "description": "Compute QC metrics and run doublet detection. Default behavior (flag_only=true) computes metrics, stores QC flags as obs columns, generates violin plots with log1p-transformed counts for readable axes, and does NOT remove any cells — removal happens later at cluster level via run_cluster_qc. Use confirm_filtering=true only when the user explicitly requests global threshold-based filtering as a fallback.",
             "input_schema": {
@@ -246,10 +275,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "Prepare a structured annotation proposal for all clusters: compute DEGs, score marker genes "
                 "against clusters using normalized expression fractions (not raw means), flag ambiguous clusters "
                 "where top-2 candidate labels are close, and identify shared markers that don't discriminate. "
+                "If CellTypist or Scimilarity columns are present, summarize their dominant cluster-level labels "
+                "as reference-derived candidate labels so DEG/PanglaoDB validation can adjudicate them. "
                 "Stores the proposal in adata.uns['annotation_proposal'] and returns per-cluster candidates "
                 "with competing labels and the specific PanglaoDB queries you must run next. "
-                "This is step 1 of 2 in the annotation workflow — after this, query PanglaoDB for each "
-                "proposed label AND each competing label, then call finalize_annotation with the evidence."
+                "This is the validation/adjudication stage, not a replacement for reference-based annotation "
+                "when a compatible CellTypist or Scimilarity model is available. After this, query PanglaoDB "
+                "for each proposed label, reference-derived candidate label, and competing label, then call "
+                "finalize_annotation with the evidence."
             ),
             "input_schema": {
                 "type": "object",
@@ -269,6 +302,16 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "n_deg_genes": {"type": "integer", "description": "Number of top DEGs to extract per cluster for PanglaoDB comparison (default: 20)"},
                     "deg_key": {"type": "string", "description": "adata.uns key for existing DEG results (default: rank_genes_groups). If the key exists, DEGs are read from it; otherwise rank_genes_groups is run automatically."},
                     "annotation_key": {"type": "string", "description": "Name of the obs column that finalize_annotation will write (default: cell_type). Stored in the proposal so finalize_annotation knows where to write."},
+                    "reference_annotation_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional obs columns containing reference-based candidate labels, such as "
+                            "celltypist_majority_voting, celltypist_predicted_labels, "
+                            "scimilarity_predictions_unconstrained, or scimilarity_representative_prediction. "
+                            "If omitted, prepare_annotation auto-detects those standard columns when present."
+                        )
+                    },
                     "ambiguity_threshold": {"type": "number", "description": "Max allowed difference between top-2 normalized scores for a cluster to be flagged as ambiguous (default: 0.10). Clusters with top-2 delta below this are flagged."},
                     "shared_marker_threshold": {"type": "number", "description": "Fraction of cell-type lists a gene must appear in to be considered a shared/non-discriminating marker (default: 0.5)."}
                 },
@@ -295,6 +338,9 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                             "Each entry must include: 'label' (final cell-type string), "
                             "'panglaodb_queried' (true/false), 'supporting_genes' (list of marker "
                             "genes that matched PanglaoDB), 'confidence' ('high'/'medium'/'low'). "
+                            "When reference labels were used, include 'reference_annotation_support' "
+                            "and 'reference_annotation_conflicts' so the final record preserves whether "
+                            "CellTypist/Scimilarity agreed with the DEG/PanglaoDB evidence. "
                             "Example: {\"0\": {\"label\": \"T cell\", \"panglaodb_queried\": true, "
                             "\"supporting_genes\": [\"CD3D\", \"CD3E\"], \"confidence\": \"high\"}}"
                         ),
@@ -304,7 +350,10 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                                 "label": {"type": "string"},
                                 "panglaodb_queried": {"type": "boolean"},
                                 "supporting_genes": {"type": "array", "items": {"type": "string"}},
-                                "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+                                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                                "reference_annotation_support": {"type": "object"},
+                                "reference_annotation_conflicts": {"type": "array", "items": {"type": "string"}},
+                                "reasoning": {"type": "string"}
                             },
                             "required": ["label", "panglaodb_queried"]
                         }
@@ -2971,6 +3020,333 @@ def process_tool_call(
             fetched = fetch_url_text(url, max_chars=max_chars)
             fetched["tool"] = "fetch_url"
             return json.dumps(fetched, indent=2), adata
+
+        elif tool_name == "run_cellbender":
+            import shutil
+            import subprocess
+
+            input_raw = str(tool_input.get("input_path", "")).strip()
+            if not input_raw:
+                return _error_result(
+                    tool="run_cellbender",
+                    message="input_path is required.",
+                    adata_obj=adata,
+                    recovery_options=["Provide the raw/unfiltered 10x h5 file path as input_path."],
+                )
+
+            input_path = Path(input_raw).expanduser()
+            if not input_path.exists():
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Input file does not exist: {input_path}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Check the path to the raw/unfiltered 10x h5 file.",
+                        "Use inspect_workspace or run_shell with ls -lh to locate the file.",
+                    ],
+                )
+            if not (input_path.is_file() or input_path.is_dir()):
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Input path is neither a file nor directory: {input_path}",
+                    adata_obj=adata,
+                    recovery_options=["Pass a raw/unfiltered input supported by CellBender, usually raw_feature_bc_matrix.h5."],
+                )
+
+            load_output = bool(tool_input.get("load_output", False))
+            force_replace_primary = bool(tool_input.get("force_replace_primary", False))
+            if load_output and adata is not None and not force_replace_primary:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=(
+                        "A primary dataset is already loaded. Refusing to replace it with CellBender output "
+                        "unless force_replace_primary=true."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Set load_output=false to run CellBender as preprocessing only.",
+                        "Save the current dataset first, then retry with force_replace_primary=true if you really want to switch primary data.",
+                    ],
+                )
+
+            executable = (
+                str(tool_input.get("cellbender_executable") or "").strip()
+                or os.environ.get("SCAGENT_CELLBENDER", "").strip()
+                or "cellbender"
+            )
+            resolved_executable = shutil.which(executable)
+            if not resolved_executable:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"CellBender executable not found: {executable}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Activate an environment where cellbender is installed before starting scagent.",
+                        "Set SCAGENT_CELLBENDER to the absolute CellBender executable path.",
+                        "Pass cellbender_executable with an absolute executable path.",
+                        "Install CellBender in the configured scagent environment if it is not installed.",
+                    ],
+                )
+
+            default_base = Path(run_manager.run_dir) if run_manager is not None else Path(".")
+            output_raw = str(tool_input.get("output_path") or "").strip()
+            if output_raw:
+                output_path = Path(output_raw).expanduser()
+                if not output_path.is_absolute() and run_manager is not None:
+                    output_path = default_base / output_path
+            else:
+                output_path = default_base / "cellbender" / f"{input_path.stem}_cellbender.h5"
+            if output_path.suffix.lower() != ".h5":
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"CellBender output_path must end in .h5: {output_path}",
+                    adata_obj=adata,
+                    recovery_options=["Choose an output_path ending in .h5."],
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if output_path.exists():
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Output path already exists: {output_path}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Choose a new output_path.",
+                        "Move or archive the existing output before rerunning CellBender.",
+                    ],
+                    extra={"output_path": str(output_path)},
+                )
+
+            extra_args = tool_input.get("extra_args") or []
+            if isinstance(extra_args, str):
+                return _error_result(
+                    tool="run_cellbender",
+                    message="extra_args must be an array of strings, not a single string.",
+                    adata_obj=adata,
+                    recovery_options=["Pass extra_args like [\"--low-count-threshold\", \"5\"]."],
+                )
+            if not isinstance(extra_args, list) or not all(isinstance(arg, str) for arg in extra_args):
+                return _error_result(
+                    tool="run_cellbender",
+                    message="extra_args must be an array of strings.",
+                    adata_obj=adata,
+                    recovery_options=["Remove non-string values from extra_args."],
+                )
+            reserved_extra = {"--input", "--output"}
+            if any(arg in reserved_extra for arg in extra_args):
+                return _error_result(
+                    tool="run_cellbender",
+                    message="extra_args must not include --input or --output; use input_path and output_path instead.",
+                    adata_obj=adata,
+                    recovery_options=["Remove --input/--output from extra_args."],
+                )
+
+            def _positive_int_arg(name: str) -> int | None:
+                value = tool_input.get(name)
+                if value is None:
+                    return None
+                ivalue = int(value)
+                if ivalue <= 0:
+                    raise ValueError(f"{name} must be positive")
+                return ivalue
+
+            try:
+                expected_cells = _positive_int_arg("expected_cells")
+                total_droplets = _positive_int_arg("total_droplets_included")
+                epochs = _positive_int_arg("epochs")
+                timeout = int(tool_input.get("timeout", 86400))
+                if timeout <= 0:
+                    raise ValueError("timeout must be positive")
+                fpr = tool_input.get("fpr")
+                if fpr is not None:
+                    fpr = float(fpr)
+                    if fpr < 0 or fpr > 1:
+                        raise ValueError("fpr must be between 0 and 1")
+            except Exception as e:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Invalid CellBender parameter: {e}",
+                    adata_obj=adata,
+                    recovery_options=["Use positive integers for count/epoch parameters and 0 <= fpr <= 1."],
+                )
+
+            argv = [
+                resolved_executable,
+                "remove-background",
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+            ]
+            if expected_cells is not None:
+                argv.extend(["--expected-cells", str(expected_cells)])
+            if total_droplets is not None:
+                argv.extend(["--total-droplets-included", str(total_droplets)])
+            if fpr is not None:
+                argv.extend(["--fpr", str(fpr)])
+            if epochs is not None:
+                argv.extend(["--epochs", str(epochs)])
+            if bool(tool_input.get("use_cuda", False)):
+                argv.append("--cuda")
+            argv.extend(extra_args)
+
+            workdir_raw = str(tool_input.get("workdir") or "").strip()
+            workdir = Path(workdir_raw).expanduser() if workdir_raw else output_path.parent
+            workdir.mkdir(parents=True, exist_ok=True)
+
+            stdout_log = output_path.with_suffix(output_path.suffix + ".stdout.log")
+            stderr_log = output_path.with_suffix(output_path.suffix + ".stderr.log")
+
+            def _tail(path: Path, max_chars: int = 4000) -> str:
+                if not path.exists():
+                    return ""
+                text = path.read_text(errors="replace")
+                return text[-max_chars:] if len(text) > max_chars else text
+
+            timed_out = False
+            try:
+                with stdout_log.open("w") as stdout_fh, stderr_log.open("w") as stderr_fh:
+                    proc = subprocess.run(
+                        argv,
+                        stdout=stdout_fh,
+                        stderr=stderr_fh,
+                        text=True,
+                        timeout=timeout,
+                        cwd=str(workdir),
+                    )
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                returncode = -1
+            except Exception as e:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"CellBender failed to start: {e}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Check that CellBender is executable in this environment.",
+                        "Check that workdir is writable.",
+                    ],
+                    extra={
+                        "command": " ".join(argv),
+                        "stdout_log": str(stdout_log),
+                        "stderr_log": str(stderr_log),
+                    },
+                )
+
+            output_exists = output_path.exists() and output_path.stat().st_size > 0
+            stdout_tail = _tail(stdout_log)
+            stderr_tail = _tail(stderr_log)
+            artifacts_created = []
+            output_artifact = _artifact_payload(
+                str(output_path),
+                role="cellbender_output",
+                metadata={"format": "10x_h5", "loaded_as_primary": False},
+            ) if output_exists else None
+            if output_artifact:
+                artifacts_created.append(output_artifact)
+            companion_candidates = [
+                (output_path.with_name(f"{output_path.stem}_filtered.h5"), "cellbender_filtered_output"),
+                (output_path.with_name(f"{output_path.stem}_report.html"), "cellbender_report"),
+                (output_path.with_suffix(".pdf"), "cellbender_report"),
+                (output_path.with_suffix(".log"), "cellbender_log"),
+                (output_path.with_name(f"{output_path.stem}_metrics.csv"), "cellbender_metrics"),
+                (output_path.with_name(f"{output_path.stem}_cell_barcodes.csv"), "cellbender_cell_barcodes"),
+                (output_path.with_name(f"{output_path.stem}_posterior.h5"), "cellbender_posterior"),
+                (workdir / "ckpt.tar.gz", "cellbender_checkpoint"),
+            ]
+            seen_artifact_paths = {str(output_path.resolve())} if output_exists else set()
+            for path, role in companion_candidates:
+                if path.exists() and str(path.resolve()) not in seen_artifact_paths:
+                    artifact = _artifact_payload(str(path), role=role)
+                    if artifact:
+                        artifacts_created.append(artifact)
+                        seen_artifact_paths.add(str(path.resolve()))
+            for log_path, stream_name in ((stdout_log, "stdout"), (stderr_log, "stderr")):
+                if log_path.exists():
+                    artifact = _artifact_payload(
+                        str(log_path),
+                        role="cellbender_log",
+                        metadata={"stream": stream_name},
+                    )
+                    if artifact:
+                        artifacts_created.append(artifact)
+
+            updated_adata = adata
+            loaded_as_primary = False
+            load_error = None
+            if returncode == 0 and output_exists and load_output:
+                try:
+                    updated_adata = load_data(str(output_path))
+                    loaded_as_primary = True
+                    if output_artifact:
+                        output_artifact["metadata"]["loaded_as_primary"] = True
+                except Exception as e:
+                    load_error = str(e)
+
+            ok = returncode == 0 and output_exists and load_error is None
+            status = "ok" if ok else "error"
+            if timed_out:
+                message = f"CellBender timed out after {timeout}s."
+            elif returncode != 0:
+                message = f"CellBender exited with return code {returncode}."
+            elif not output_exists:
+                message = "CellBender exited successfully but the expected output h5 was not created."
+            elif load_error:
+                message = f"CellBender output was created, but loading it failed: {load_error}"
+            else:
+                message = f"CellBender completed and wrote {output_path}."
+
+            result = {
+                "status": status,
+                "tool": "run_cellbender",
+                "message": message,
+                "input_path": str(input_path),
+                "output_path": str(output_path),
+                "stdout_log": str(stdout_log),
+                "stderr_log": str(stderr_log),
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "returncode": returncode,
+                "timed_out": timed_out,
+                "command": " ".join(argv),
+                "command_argv": argv,
+                "workdir": str(workdir),
+                "expected_cells": expected_cells,
+                "total_droplets_included": total_droplets,
+                "fpr": fpr,
+                "epochs": epochs,
+                "use_cuda": bool(tool_input.get("use_cuda", False)),
+                "load_output": load_output,
+                "loaded_as_primary": loaded_as_primary,
+                "state": make_state(updated_adata) if updated_adata is not None else {},
+            }
+
+            return _finalize_result(
+                result,
+                updated_adata,
+                dataset_changed=loaded_as_primary,
+                summary=message,
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed" if ok else "failed",
+                    message,
+                    [
+                        _check("cellbender_returncode_zero", returncode == 0, f"Return code: {returncode}"),
+                        _check("cellbender_output_exists", output_exists, f"Output path: {output_path}"),
+                        _check(
+                            "cellbender_output_loaded",
+                            (not load_output) or loaded_as_primary,
+                            "Output loaded as primary dataset." if loaded_as_primary else "Output was not loaded as primary dataset.",
+                        ),
+                    ],
+                    recovery_options=[
+                        "Inspect stderr_log for CellBender errors.",
+                        "Check GPU availability and retry with use_cuda=false if CUDA failed.",
+                        "Adjust expected_cells, total_droplets_included, fpr, or epochs based on the dataset.",
+                    ] if not ok else [],
+                ),
+            )
 
         elif tool_name == "run_shell":
             import subprocess
@@ -7203,6 +7579,28 @@ def process_tool_call(
             expression_threshold = float(tool_input.get("expression_threshold", 0.0))
             force_recompute = bool(tool_input.get("force_recompute_deg", False))
             deg_method = tool_input.get("deg_method", "wilcoxon")
+            supplied_reference_keys = tool_input.get("reference_annotation_keys")
+            standard_reference_keys = [
+                "celltypist_majority_voting",
+                "celltypist_predicted_labels",
+                "scimilarity_predictions_unconstrained",
+                "scimilarity_representative_prediction",
+            ]
+            if supplied_reference_keys is None:
+                reference_annotation_keys = [
+                    k for k in standard_reference_keys if k in adata.obs.columns
+                ]
+            else:
+                reference_annotation_keys = [
+                    str(k) for k in supplied_reference_keys
+                    if isinstance(k, str) and str(k).strip()
+                ]
+            valid_reference_keys = [
+                k for k in reference_annotation_keys if k in adata.obs.columns
+            ]
+            missing_reference_keys = [
+                k for k in reference_annotation_keys if k not in adata.obs.columns
+            ]
 
             cluster_series = adata.obs[cluster_key].astype(str)
             cluster_ids = sorted(cluster_series.unique(), key=lambda s: (len(s), s))
@@ -7288,6 +7686,7 @@ def process_tool_call(
             score_matrix: Dict[str, Dict[str, float]] = {}
             ambiguous_clusters: List[str] = []
             cluster_summaries: List[Dict[str, Any]] = []
+            reference_annotation_summary: Dict[str, List[Dict[str, Any]]] = {}
 
             X_layer = tool_input.get("deg_layer")
             X_source = adata.layers[X_layer] if X_layer and X_layer in adata.layers else adata.X
@@ -7320,6 +7719,44 @@ def process_tool_call(
                             frac = float(expressed[mask, :].mean())
                         score_matrix.setdefault(c, {})[label] = frac
 
+            if valid_reference_keys:
+                for c in cluster_ids:
+                    mask = (cluster_series == c).values
+                    per_cluster_reference: List[Dict[str, Any]] = []
+                    n_in = int(mask.sum())
+                    for key in valid_reference_keys:
+                        values = adata.obs.loc[mask, key].astype(str)
+                        values = values[
+                            ~values.str.lower().isin({"", "nan", "none", "unknown", "unassigned"})
+                        ]
+                        if values.empty or n_in == 0:
+                            per_cluster_reference.append({
+                                "annotation_key": key,
+                                "top_label": None,
+                                "top_fraction": 0.0,
+                                "top_count": 0,
+                                "top_labels": [],
+                            })
+                            continue
+                        counts = values.value_counts(dropna=True).head(5)
+                        top_label = str(counts.index[0])
+                        top_count = int(counts.iloc[0])
+                        per_cluster_reference.append({
+                            "annotation_key": key,
+                            "top_label": top_label,
+                            "top_fraction": round(float(top_count / n_in), 4),
+                            "top_count": top_count,
+                            "top_labels": [
+                                {
+                                    "label": str(label),
+                                    "count": int(count),
+                                    "fraction": round(float(count / n_in), 4),
+                                }
+                                for label, count in counts.items()
+                            ],
+                        })
+                    reference_annotation_summary[c] = per_cluster_reference
+
             for c in cluster_ids:
                 summary: Dict[str, Any] = {
                     "cluster_id": c,
@@ -7327,6 +7764,8 @@ def process_tool_call(
                     "top_degs": [d["gene"] for d in top_degs_per_cluster.get(c, [])][:n_deg_genes],
                     "top_degs_detail": top_degs_per_cluster.get(c, []),
                 }
+                if reference_annotation_summary.get(c):
+                    summary["reference_annotations"] = reference_annotation_summary[c]
                 if score_matrix.get(c):
                     ranked = sorted(score_matrix[c].items(), key=lambda kv: kv[1], reverse=True)
                     top_label, top_score = ranked[0]
@@ -7375,6 +7814,17 @@ def process_tool_call(
                                 "reason": f"competing label for ambiguous cluster {entry['cluster_id']}",
                             })
                             seen_queries.add(label)
+                for ref_entry in entry.get("reference_annotations", []):
+                    label = ref_entry.get("top_label")
+                    if label and label not in seen_queries:
+                        panglaodb_queries.append({
+                            "cell_type": label,
+                            "reason": (
+                                f"reference-derived candidate from {ref_entry.get('annotation_key')} "
+                                f"for cluster {entry['cluster_id']}"
+                            ),
+                        })
+                        seen_queries.add(label)
 
             proposal = {
                 "cluster_key": cluster_key,
@@ -7385,6 +7835,9 @@ def process_tool_call(
                 "shared_markers": shared_markers,
                 "ambiguous_clusters": ambiguous_clusters,
                 "label_marker_lists_used": {k: list(v) for k, v in label_marker_lists.items()},
+                "reference_annotation_keys": valid_reference_keys,
+                "missing_reference_annotation_keys": missing_reference_keys,
+                "reference_annotation_summary": reference_annotation_summary,
                 "scoring_method": "normalized_expression_fraction" if label_marker_lists else "deg_only",
                 "ambiguity_threshold": ambiguity_threshold,
                 "shared_marker_threshold": shared_marker_threshold,
@@ -7407,11 +7860,20 @@ def process_tool_call(
                 "ambiguous_clusters": ambiguous_clusters,
                 "shared_markers_flagged": shared_markers,
                 "scoring_method": proposal["scoring_method"],
+                "reference_annotation_keys": valid_reference_keys,
+                "missing_reference_annotation_keys": missing_reference_keys,
+                "reference_annotation_summary": reference_annotation_summary,
+                "reference_annotation_notice": (
+                    "No CellTypist/Scimilarity annotation columns were supplied or auto-detected. "
+                    "If a compatible reference model is available, run it before treating this proposal "
+                    "as the main source of candidate labels."
+                ) if not valid_reference_keys else None,
                 "clusters": cluster_summaries,
                 "panglaodb_queries_required": panglaodb_queries,
                 "next_steps": [
+                    "If no reference_annotation_keys are present and CellTypist or Scimilarity is compatible, run reference annotation before finalizing broad cell-type labels.",
                     "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate).",
-                    "Compare PanglaoDB markers against each cluster's top_degs to confirm or revise the proposed label.",
+                    "Compare PanglaoDB markers against each cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
                     "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
                     "Once every cluster has external evidence, call finalize_annotation with evidence_summary.",
                 ],
@@ -7558,6 +8020,13 @@ def process_tool_call(
                             f"Cluster {cid} was flagged ambiguous by prepare_annotation but evidence provides no competing_labels_considered."
                         )
                 checks["competing_labels_considered"] = competing or []
+                if "reference_annotation_support" in ev:
+                    checks["reference_annotation_support"] = ev.get("reference_annotation_support")
+                if "reference_annotation_conflicts" in ev:
+                    conflicts = ev.get("reference_annotation_conflicts")
+                    checks["reference_annotation_conflicts"] = conflicts if isinstance(conflicts, list) else [str(conflicts)]
+                if "reasoning" in ev:
+                    checks["reasoning"] = str(ev.get("reasoning"))
 
                 conf = ev.get("confidence")
                 if conf not in {"high", "medium", "low"}:

@@ -801,6 +801,8 @@ class AgentWorldState:
                 "ambiguous_clusters": ambiguous,
                 "shared_markers_flagged": result.get("shared_markers_flagged") or [],
                 "scoring_method": result.get("scoring_method"),
+                "reference_annotation_keys": result.get("reference_annotation_keys") or [],
+                "reference_annotation_notice": result.get("reference_annotation_notice"),
                 "panglaodb_queries_required": queries_required,
                 "reference_marker_queries": existing_queries,
                 "reference_marker_source": "PanglaoDB",
@@ -866,6 +868,21 @@ class AgentWorldState:
         ts = _utc_now_iso()
 
 
+
+        if tool_name == "run_cellbender":
+            return {
+                "tool": "run_cellbender",
+                "timestamp": ts,
+                "input_path": result.get("input_path"),
+                "output_path": result.get("output_path"),
+                "returncode": result.get("returncode"),
+                "use_cuda": result.get("use_cuda"),
+                "expected_cells": result.get("expected_cells"),
+                "total_droplets_included": result.get("total_droplets_included"),
+                "fpr": result.get("fpr"),
+                "epochs": result.get("epochs"),
+                "loaded_as_primary": result.get("loaded_as_primary"),
+            }
 
         if tool_name == "score_integration":
             return {
@@ -1071,6 +1088,8 @@ class AgentWorldState:
                 "ambiguous_clusters": result.get("ambiguous_clusters"),
                 "shared_markers_flagged": result.get("shared_markers_flagged"),
                 "scoring_method": result.get("scoring_method"),
+                "reference_annotation_keys": result.get("reference_annotation_keys"),
+                "reference_annotation_notice": result.get("reference_annotation_notice"),
                 "panglaodb_queries_required": result.get("panglaodb_queries_required"),
             }
 

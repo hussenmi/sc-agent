@@ -99,6 +99,9 @@ ${UV_CMD} pip install -e ".[all]" --quiet
 # =============================================================================
 export SCAGENT_HOME="${SCAGENT_DIR}"
 export SCIMILARITY_MODEL_PATH="/data1/peerd/ibrahih3/scimilarity/docs/notebooks/models/model_v1.1"
+if [ -x "/usersoftware/peerd/ibrahih3/envs/cellbender/bin/cellbender" ]; then
+    export SCAGENT_CELLBENDER="/usersoftware/peerd/ibrahih3/envs/cellbender/bin/cellbender"
+fi
 export PYTHONPATH="${SCAGENT_DIR}:${PYTHONPATH}"
 
 # =============================================================================
@@ -136,4 +139,7 @@ echo ""
 echo "Environment variables set:"
 echo "  SCAGENT_HOME=${SCAGENT_HOME}"
 echo "  SCIMILARITY_MODEL_PATH=${SCIMILARITY_MODEL_PATH}"
+if [ -n "${SCAGENT_CELLBENDER}" ]; then
+    echo "  SCAGENT_CELLBENDER=${SCAGENT_CELLBENDER}"
+fi
 echo ""
