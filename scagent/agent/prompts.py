@@ -159,7 +159,7 @@ If MT genes dominate the top list alongside low lib and low n_genes → treat as
 - The recommended action and evidence ("low library size and low detected genes relative to the global medians")
 - Cells removed / remaining count
 
-After confirmed removal: re-run the full embedding pipeline on cleaned data — `run_pca` → `run_neighbors` → `run_umap` → `run_clustering` — then run `run_cluster_qc` again. Always include `run_pca`; subsetting cells invalidates the existing PC space. Stop iterating when no clusters are flagged or all remaining clusters have plausible QC metrics.
+After confirmed removal: re-run the full embedding pipeline on cleaned data — `normalize_and_hvg` (use default `normalization_source='auto'`) → `run_pca` → `run_neighbors` → `run_umap` → `run_clustering` at resolution=1.5 — then run `run_cluster_qc` again. Always start with `normalize_and_hvg`: subsetting cells changes the variance landscape and the HVG selection must reflect the cleaned cell population. Ribosomal removal is safe to re-run — genes already removed will not be double-removed. Stop iterating when no clusters are flagged or all remaining clusters have plausible QC metrics.
 
 **Report each iteration**: "Iteration N: removed X cells (clusters Y, Z — reasons) — N_remaining remaining. Iteration N+1: no flagged clusters — stopping."
 
@@ -172,10 +172,14 @@ After confirmed removal: re-run the full embedding pipeline on cleaned data — 
 
 These are reusable defaults that work well across most datasets:
 - HVG: 4000 genes, seurat_v3 flavor (requires raw counts in layer)
-- PCA: 30 components, no scaling (run on log-normalized data directly)
+- PCA: 50 components, no scaling (run on log-normalized data directly). After `run_pca`, read `suggested_n_pcs` from the result (elbow + 5 buffer) and pass it explicitly as `n_pcs` to `run_neighbors`. State the chosen value: "Elbow at PC{N}, using {suggested_n_pcs} PCs for neighbors." If the scree plot shows a clearly different elbow, override `suggested_n_pcs` with your own judgment and explain why.
 - Neighbors: k=30
 - UMAP: min_dist=0.1
-- Leiden: resolution=1.5 for initial QC clustering (finer = better isolation of low-quality populations); flavor='igraph', n_iterations=2, directed=False
+- Leiden clustering resolutions by phase:
+  - **QC round 1** (first clustering before any removal): resolution=2.0 — maximum granularity to expose small low-quality populations
+  - **QC round 2+** (re-clustering after each confirmed removal): resolution=1.5 — still fine but slightly coarser once obvious junk is gone
+  - **Final annotation clustering** (after QC loop is complete): default resolution=1.0, but explore lower values (0.5–0.8) if clusters look over-split or higher values if biologically distinct populations are merging; state your reasoning when deviating from 1.0
+  - flavor='igraph', n_iterations=2, directed=False for all rounds
 
 ### Cell Type Annotation
 - CellTypist: CRITICAL - requires target_sum=10000 normalization (not standard 1e4)
@@ -226,7 +230,7 @@ The standard flow is:
 2. `run_clustering` — cluster the data
 3. `run_cluster_qc` — get per-cluster QC evidence, recommended actions, and proposed removals
 4. Present the table to the user with evidence, ask for confirmation
-5. Remove confirmed clusters via `run_code`, then re-run `run_pca` → `run_neighbors` → `run_umap` → `run_clustering`
+5. Remove confirmed clusters via `run_code`, then re-run `normalize_and_hvg` (default `normalization_source='auto'`) → `run_pca` → `run_neighbors` → `run_umap` → `run_clustering` at resolution=1.5 (QC round 2+)
 
 **For cluster removal via `run_code`**:
 ```python
@@ -353,6 +357,7 @@ The user's list tells you what to look for. The DEGs and PanglaoDB tell you what
 - Stopping after load to ask "what would you like to do?" — inspect the data and drive the analysis
 - Presenting numbered menu options after **every** tool call — narrate results, then present options only when a genuine decision point is reached
 - Running PCA on **scaled data** — run PCA on log-normalized data directly
+- **Skipping `normalize_and_hvg` when re-embedding after cluster removal** — subsetting cells changes the variance landscape; always re-run `normalize_and_hvg` (with `normalization_source='auto'`) before `run_pca` after confirmed cluster removal, even though normalization was already done earlier
 - Clustering or plotting after batch correction **before rerunning UMAP**
 - Using `sc.external.pp.harmony_integrate` — use `harmonypy.run_harmony` directly (the scanpy wrapper has a transpose bug)
 - Keeping ribosomal genes by inertia — by default `normalize_and_hvg` removes ribosomal genes from the analysis object before normalization/HVG unless the user/source explicitly says to keep them

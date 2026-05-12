@@ -985,6 +985,12 @@ def run_validated_deg(
     if not inplace:
         adata = adata.copy()
 
+    # Wilcoxon should always run on adata.X (log-normalized). If use_raw was not
+    # explicitly set and no layer was given, force use_raw=False so a pre-existing
+    # adata.raw (e.g. from a loaded h5ad) doesn't silently redirect to raw counts.
+    if method == "wilcoxon" and use_raw is None and layer is None:
+        use_raw = False
+
     # Run pre-validation
     report = validate_deg_input(
         adata,

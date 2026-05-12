@@ -48,7 +48,7 @@ class DimRedDefaults:
     """Dimensionality reduction defaults."""
 
     # PCA
-    n_pcs: int = 30
+    n_pcs: int = 50
 
     # Neighbors
     n_neighbors: int = 30

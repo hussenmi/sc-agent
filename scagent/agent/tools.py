@@ -1928,6 +1928,88 @@ def process_tool_call(
                 result["image_encode_error"] = str(enc_err)
         return result
 
+    def _generate_cluster_highlight_grid(adata_obj, color_by, output_path):
+        """
+        Grid of UMAP panels — one per cluster — each cluster highlighted in colour,
+        all other cells shown in light gray.  Returns the saved file path or None.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _mplt
+        import numpy as _np
+
+        if "X_umap" not in adata_obj.obsm:
+            return None
+        if color_by not in adata_obj.obs.columns:
+            return None
+
+        coords = adata_obj.obsm["X_umap"]
+        labels = adata_obj.obs[color_by].astype(str)
+
+        try:
+            unique_clusters = sorted(labels.unique(), key=lambda x: int(x))
+        except (ValueError, TypeError):
+            unique_clusters = sorted(labels.unique())
+
+        n_clusters = len(unique_clusters)
+        if n_clusters < 2 or n_clusters > 50:
+            return None
+
+        n_cols = min(5, n_clusters)
+        n_rows = int(_np.ceil(n_clusters / n_cols))
+
+        # Palette: tab20 → tab20b → tab20c, cycling every 20
+        _palettes = [_mplt.cm.tab20, _mplt.cm.tab20b, _mplt.cm.tab20c]
+        def _cluster_color(i):
+            return _palettes[(i // 20) % 3]((i % 20) / 20)
+
+        n_cells = adata_obj.n_obs
+        s_bg = max(0.4, min(4.0, 80_000 / n_cells))
+        s_fg = max(0.8, min(7.0, 120_000 / n_cells))
+
+        panel_w, panel_h = 2.6, 2.6
+        fig, axes = _mplt.subplots(
+            n_rows, n_cols,
+            figsize=(panel_w * n_cols, panel_h * n_rows),
+            squeeze=False,
+        )
+
+        for idx, cluster in enumerate(unique_clusters):
+            row, col = divmod(idx, n_cols)
+            ax = axes[row][col]
+
+            fg = (labels == cluster).values
+            bg = ~fg
+
+            if bg.any():
+                ax.scatter(
+                    coords[bg, 0], coords[bg, 1],
+                    c="#CCCCCC", s=s_bg, alpha=0.25,
+                    linewidths=0, rasterized=True,
+                )
+            ax.scatter(
+                coords[fg, 0], coords[fg, 1],
+                c=[_cluster_color(idx)], s=s_fg, alpha=0.9,
+                linewidths=0, rasterized=True,
+            )
+            ax.set_title(
+                f"Cluster {cluster}  ({int(fg.sum()):,})",
+                fontsize=8, pad=3,
+            )
+            ax.set_axis_off()
+
+        for idx in range(n_clusters, n_rows * n_cols):
+            row, col = divmod(idx, n_cols)
+            axes[row][col].set_visible(False)
+
+        fig.subplots_adjust(hspace=0.25, wspace=0.04)
+
+        base, ext = os.path.splitext(output_path)
+        grid_path = f"{base}_grid{ext}"
+        fig.savefig(grid_path, dpi=150, bbox_inches="tight", facecolor="white")
+        _mplt.close(fig)
+        return grid_path
+
     def _stringify_dataframe_columns(df):
         if df is None:
             return df
@@ -5269,7 +5351,7 @@ def process_tool_call(
         elif tool_name == "run_pca":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            n_comps = int(tool_input.get("n_comps") or tool_input.get("n_pcs") or 30)
+            n_comps = int(tool_input.get("n_comps") or tool_input.get("n_pcs") or 50)
             svd_solver = tool_input.get("svd_solver", "arpack")
             mask_var = tool_input.get("mask_var", "highly_variable")
 
@@ -5279,6 +5361,74 @@ def process_tool_call(
             if output_path:
                 write_h5ad_safe(adata, output_path)
 
+            # Elbow detection: kneedle algorithm (max perpendicular distance from diagonal)
+            variance_ratios = adata.uns["pca"]["variance_ratio"]
+            n_shown = len(variance_ratios)
+
+            def _find_pca_elbow(ratios):
+                n = len(ratios)
+                if n < 3:
+                    return n
+                x = np.arange(n, dtype=float)
+                y = np.array(ratios, dtype=float)
+                x_n = x / (n - 1)
+                y_range = float(y.max() - y.min())
+                y_n = (y - y.min()) / (y_range if y_range > 0 else 1.0)
+                dx = float(x_n[-1] - x_n[0])
+                dy = float(y_n[-1] - y_n[0])
+                denom = float(np.sqrt(dx**2 + dy**2))
+                if denom == 0:
+                    return n // 2
+                dist = np.abs(dy * x_n - dx * y_n + x_n[-1] * y_n[0] - y_n[-1] * x_n[0]) / denom
+                return int(np.argmax(dist)) + 1  # 1-indexed
+
+            elbow_pc = _find_pca_elbow(variance_ratios)
+            suggested_n_pcs = min(elbow_pc + 5, n_shown)
+
+            # Scree plot
+            scree_path = None
+            scree_b64 = None
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as _plt
+
+                _base = Path(run_manager.run_dir) if run_manager else Path(".")
+                scree_path = str(ensure_dir(_base / "figures") / "pca_variance_explained.png")
+
+                pcs = np.arange(1, n_shown + 1)
+                cumvar = np.cumsum(variance_ratios) * 100
+
+                fig, (ax1, ax2) = _plt.subplots(1, 2, figsize=(12, 4))
+
+                ax1.bar(pcs, variance_ratios * 100, color="steelblue", alpha=0.7, width=0.8)
+                ax1.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
+                            label=f"Elbow PC{elbow_pc}")
+                ax1.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
+                            label=f"Suggested n_pcs={suggested_n_pcs}")
+                ax1.set_xlabel("Principal Component")
+                ax1.set_ylabel("Variance Explained (%)")
+                ax1.set_title("Variance per PC")
+                ax1.legend(fontsize=9)
+
+                ax2.plot(pcs, cumvar, "o-", markersize=3, color="steelblue")
+                ax2.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
+                            label=f"Elbow PC{elbow_pc}")
+                ax2.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
+                            label=f"Suggested n_pcs={suggested_n_pcs}")
+                ax2.axhline(80, color="gray", linestyle=":", linewidth=1, label="80% threshold")
+                ax2.set_xlabel("Principal Component")
+                ax2.set_ylabel("Cumulative Variance (%)")
+                ax2.set_title("Cumulative Variance Explained")
+                ax2.legend(fontsize=9)
+
+                _plt.tight_layout()
+                _plt.savefig(scree_path, dpi=150, bbox_inches="tight")
+                _plt.close(fig)
+                scree_b64 = encode_image_base64(scree_path)
+            except Exception as _scree_err:
+                logger.warning("Scree plot generation failed: %s", _scree_err)
+
             result = {
                 "status": "ok",
                 "tool": "run_pca",
@@ -5287,7 +5437,11 @@ def process_tool_call(
                 "n_comps": n_comps,
                 "svd_solver": svd_solver,
                 "mask_var": mask_var,
-                "variance_explained": float(adata.uns["pca"]["variance_ratio"].sum()),
+                "variance_explained_total": float(variance_ratios.sum()),
+                "variance_ratio_per_pc": [round(float(v), 5) for v in variance_ratios],
+                "elbow_pc": elbow_pc,
+                "suggested_n_pcs": suggested_n_pcs,
+                "scree_plot": scree_path,
                 "side_effects": {
                     "pca_computed": True,
                     "neighbors_recomputed": False,
@@ -5297,11 +5451,15 @@ def process_tool_call(
                 "warnings": warnings,
                 "state": make_state(adata),
             }
+            if scree_b64:
+                result["image_base64"] = scree_b64
+                result["image_mime"] = "image/png"
+
             return _finalize_result(
                 result,
                 adata,
                 dataset_changed=True,
-                summary=f"Ran PCA only with n_comps={n_comps} and svd_solver={svd_solver}.",
+                summary=f"Ran PCA with n_comps={n_comps}; elbow at PC{elbow_pc}, suggested n_pcs={suggested_n_pcs} for run_neighbors.",
                 verification=_build_verification(
                     "passed",
                     "PCA was computed without downstream graph or embedding side effects.",
@@ -7212,6 +7370,30 @@ def process_tool_call(
                 role="figure",
                 metadata={"plot_type": plot_type, "color_by": color_by},
             )
+            artifacts = [artifact] if artifact is not None else []
+
+            # Auto-generate cluster highlight grid when coloring by a categorical column
+            # (covers leiden/louvain/pheno results; skips continuous gene expression colorings)
+            if (
+                plot_type == "umap"
+                and color_by is not None
+                and color_by in adata.obs.columns
+                and hasattr(adata.obs[color_by], "cat")
+            ):
+                try:
+                    grid_path = _generate_cluster_highlight_grid(adata, color_by, output_path)
+                    if grid_path and os.path.exists(grid_path):
+                        grid_artifact = _artifact_payload(
+                            grid_path,
+                            role="figure",
+                            metadata={"plot_type": "umap_cluster_grid", "color_by": color_by},
+                        )
+                        if grid_artifact:
+                            artifacts.append(grid_artifact)
+                        result["cluster_grid_path"] = grid_path
+                except Exception as _grid_err:
+                    logger.warning("Cluster highlight grid generation failed: %s", _grid_err)
+
             verification_checks = [
                 _check("figure_exists", os.path.exists(output_path), f"Figure exists at {output_path}."),
             ]
@@ -7228,7 +7410,7 @@ def process_tool_call(
                 adata,
                 dataset_changed=False,
                 summary=f"Generated a {plot_type} figure colored by '{color_by}'.",
-                artifacts_created=[artifact] if artifact is not None else [],
+                artifacts_created=artifacts,
                 verification=_build_verification(
                     "passed",
                     "Figure output was created and verified.",
