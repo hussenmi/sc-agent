@@ -13,7 +13,7 @@ import os
 os.environ.setdefault('TQDM_NCOLS', '60')
 os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import json
 import logging
 from pathlib import Path
@@ -22,9 +22,17 @@ import re
 logger = logging.getLogger(__name__)
 
 
-def get_tools() -> List[Dict[str, Any]]:
+def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
     """
     Get Claude API tool definitions for single-cell analysis.
+
+    Parameters
+    ----------
+    include_describe_image : bool
+        If True, also register the ``describe_image`` tool that routes a saved
+        figure through the vision sidecar. The agent should only enable this
+        when ``_use_sidecar_for_images()`` is True so the tool stays invisible
+        to multimodal-main runs.
 
     Returns
     -------
@@ -44,6 +52,35 @@ def get_tools() -> List[Dict[str, Any]]:
                     "context": {"type": "string", "description": "Optional biological context hint (e.g., 'PBMC healthy human')"}
                 },
                 "required": ["data_path"]
+            }
+        },
+        {
+            "name": "run_cellbender",
+            "description": (
+                "Run CellBender remove-background on a raw/unfiltered droplet matrix before standard scagent analysis. "
+                "Use this for ambient RNA/background removal when the user provides raw droplet data. "
+                "Do not run this on already filtered, normalized, or post-CellBender data. "
+                "The tool validates inputs, captures stdout/stderr logs, verifies the output h5, and only loads "
+                "the cleaned output as the primary dataset when load_output=true."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "input_path": {"type": "string", "description": "Path to the raw/unfiltered input for CellBender. Prefer raw_feature_bc_matrix.h5; CellBender also supports some raw matrix directories and other unfiltered formats."},
+                    "output_path": {"type": "string", "description": "Path for CellBender's cleaned output h5. Defaults to <run_dir>/cellbender/<input_stem>_cellbender.h5."},
+                    "expected_cells": {"type": "integer", "description": "Optional CellBender --expected-cells value. For CellBender v0.3+, omit this initially unless defaults fail or the user/source provides a reason."},
+                    "total_droplets_included": {"type": "integer", "description": "Optional CellBender --total-droplets-included value. For CellBender v0.3+, omit this initially unless defaults fail or UMI-curve review supports a manual value."},
+                    "fpr": {"type": "number", "description": "Optional CellBender --fpr value. Default is CellBender's own conservative setting; larger values remove more background but risk removing signal."},
+                    "epochs": {"type": "integer", "description": "Optional CellBender --epochs value."},
+                    "use_cuda": {"type": "boolean", "description": "If true, pass --cuda to CellBender. Only use when GPU availability has been checked."},
+                    "cellbender_executable": {"type": "string", "description": "Executable or absolute path. Defaults to SCAGENT_CELLBENDER, then 'cellbender' on PATH."},
+                    "extra_args": {"type": "array", "items": {"type": "string"}, "description": "Advanced extra command-line args for cellbender remove-background. Do not include --input or --output."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds. Default is 86400 (24 hours)."},
+                    "workdir": {"type": "string", "description": "Working directory for the CellBender subprocess. Defaults to the output directory."},
+                    "load_output": {"type": "boolean", "description": "If true, load the CellBender output h5 as the primary in-memory dataset after success. Default false."},
+                    "force_replace_primary": {"type": "boolean", "description": "Required with load_output=true when a primary dataset is already loaded."}
+                },
+                "required": ["input_path"]
             }
         },
         {
@@ -171,6 +208,9 @@ def get_tools() -> List[Dict[str, Any]]:
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"},
+                    "k": {"type": "integer", "description": "PhenoGraph nearest-neighbor k (default: 30; ignored for Leiden)"},
+                    "use_rep": {"type": "string", "description": "Representation for PhenoGraph clustering (default: X_pca; ignored for Leiden)"},
+                    "random_state": {"type": "integer", "description": "Random seed for clustering when supported (default: 0)"},
                     "cluster_key": {"type": "string", "description": "Optional explicit obs column to store this clustering result. If omitted, scagent will keep primary aliases like 'leiden' stable and store comparisons under deterministic keys like 'leiden_res_0_5'."},
                     "make_primary": {"type": "boolean", "description": "If true, promote this clustering to the default alias for the method (for example 'leiden') while preserving the explicit result key."}
                 },
@@ -186,6 +226,9 @@ def get_tools() -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolutions": {"type": "array", "items": {"type": "number"}, "description": "List of resolutions to compare"},
+                    "k": {"type": "integer", "description": "PhenoGraph nearest-neighbor k (default: 30; ignored for Leiden)"},
+                    "use_rep": {"type": "string", "description": "Representation for PhenoGraph clustering (default: X_pca; ignored for Leiden)"},
+                    "random_state": {"type": "integer", "description": "Random seed for clustering when supported (default: 0)"},
                     "generate_figures": {"type": "boolean", "description": "If true and UMAP is present, save one figure per clustering"},
                     "figure_dir": {"type": "string", "description": "Optional directory for generated comparison figures"},
                     "include_images": {"type": "boolean", "description": "If true, include image data for generated figures"},
@@ -224,6 +267,119 @@ def get_tools() -> List[Dict[str, Any]]:
                     "model_path": {"type": "string", "description": "Optional explicit Scimilarity model directory. Overrides organism-based default paths."}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "prepare_annotation",
+            "description": (
+                "Prepare a structured annotation proposal for all clusters: compute DEGs, score marker genes "
+                "against clusters using normalized expression fractions (not raw means), flag ambiguous clusters "
+                "where top-2 candidate labels are close, and identify shared markers that don't discriminate. "
+                "If CellTypist or Scimilarity columns are present, summarize their dominant cluster-level labels "
+                "as reference-derived candidate labels so DEG/PanglaoDB validation can adjudicate them. "
+                "Also stage reverse PanglaoDB marker lookups for a panel of top non-nuisance DEGs per cluster, "
+                "so plausible alternative labels can be discovered from observed markers instead of relying on "
+                "a single gene or hard-coded ambiguity lists. "
+                "Stores the proposal in adata.uns['annotation_proposal'] and returns per-cluster candidates "
+                "with competing labels and the specific PanglaoDB label and reverse-marker queries you must run next. "
+                "This is the validation/adjudication stage, not a replacement for reference-based annotation "
+                "when a compatible CellTypist or Scimilarity model is available. After this, query PanglaoDB "
+                "for each proposed label, reference-derived candidate label, competing label, and staged DEG "
+                "gene-symbol reverse lookup, then call finalize_annotation with the evidence."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cluster_key": {"type": "string", "description": "obs column with cluster labels (default: leiden)"},
+                    "marker_dict": {
+                        "type": "object",
+                        "description": (
+                            "Optional dict mapping cell-type label to list of marker gene names. "
+                            "If provided, scoring uses normalized expression fraction (fraction of cells "
+                            "expressing each marker > 0), averaged across all markers in the list. "
+                            "This is less biased than raw mean expression and length-normalized. "
+                            "Example: {\"T cell\": [\"CD3D\", \"CD3E\"], \"B cell\": [\"CD19\", \"MS4A1\"]}"
+                        ),
+                        "additionalProperties": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "n_deg_genes": {"type": "integer", "description": "Number of top DEGs to extract per cluster for PanglaoDB comparison (default: 20)"},
+                    "deg_key": {"type": "string", "description": "adata.uns key for existing DEG results (default: rank_genes_groups). If the key exists, DEGs are read from it; otherwise rank_genes_groups is run automatically."},
+                    "annotation_key": {"type": "string", "description": "Name of the obs column that finalize_annotation will write (default: cell_type). Stored in the proposal so finalize_annotation knows where to write."},
+                    "reference_annotation_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional obs columns containing reference-based candidate labels, such as "
+                            "celltypist_majority_voting, celltypist_predicted_labels, "
+                            "scimilarity_predictions_unconstrained, or scimilarity_representative_prediction. "
+                            "If omitted, prepare_annotation auto-detects those standard columns when present."
+                        )
+                    },
+                    "panglaodb_species": {"type": "string", "enum": ["Hs", "Mm"], "description": "Optional PanglaoDB species code to include in staged queries: Hs for human, Mm for mouse."},
+                    "reverse_lookup_n_genes_per_cluster": {"type": "integer", "description": "Number of top non-nuisance DEGs per cluster to stage for PanglaoDB gene_symbol reverse lookup (default: 10; use 0 to disable)."},
+                    "reverse_lookup_max_unique_genes": {"type": "integer", "description": "Maximum unique DEG gene_symbol reverse lookup queries to stage across all clusters (default: 120). Genes are selected round-robin across clusters so small/high-numbered clusters are represented."},
+                    "reverse_lookup_exclude_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Regex patterns for genes to exclude from reverse lookup as nuisance markers. Defaults exclude MT, ribosomal, MALAT1, and common hemoglobin genes; cell-cycle genes are not excluded by default."
+                    },
+                    "ambiguity_threshold": {"type": "number", "description": "Max allowed difference between top-2 normalized scores for a cluster to be flagged as ambiguous (default: 0.10). Clusters with top-2 delta below this are flagged."},
+                    "shared_marker_threshold": {"type": "number", "description": "Fraction of cell-type lists a gene must appear in to be considered a shared/non-discriminating marker (default: 0.5)."}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "finalize_annotation",
+            "description": (
+                "Write final cell-type annotation labels to adata.obs after PanglaoDB evidence has been "
+                "collected. Requires: (1) prepare_annotation was called first (proposal in adata.uns), "
+                "(2) evidence_summary maps every cluster to a label with PanglaoDB evidence. "
+                "Writes adata.obs[annotation_key] and records the full evidence in adata.uns['annotation_validation']. "
+                "This is step 2 of 2 — never call this before querying PanglaoDB for each proposed label "
+                "and each competing label from the prepare_annotation output."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "evidence_summary": {
+                        "type": "object",
+                        "description": (
+                            "Required. Dict mapping cluster_id (as string) to annotation evidence. "
+                            "Each entry must include: 'label' (final cell-type string), "
+                            "'panglaodb_queried' (true/false), 'supporting_genes' (list of marker "
+                            "genes that matched PanglaoDB), 'confidence' ('high'/'medium'/'low'). "
+                            "When reference labels were used, include 'reference_annotation_support' "
+                            "and 'reference_annotation_conflicts' so the final record preserves whether "
+                            "CellTypist/Scimilarity agreed with the DEG/PanglaoDB evidence. "
+                            "When reverse marker lookup was used, include 'reverse_marker_support' "
+                            "(candidate PanglaoDB labels and the DEG genes supporting each) and "
+                            "'panglaodb_label_used' if the final biological label had to be validated "
+                            "through a broader PanglaoDB vocabulary label. "
+                            "Example: {\"0\": {\"label\": \"T cell\", \"panglaodb_queried\": true, "
+                            "\"supporting_genes\": [\"CD3D\", \"CD3E\"], \"confidence\": \"high\"}}"
+                        ),
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "panglaodb_queried": {"type": "boolean"},
+                                "supporting_genes": {"type": "array", "items": {"type": "string"}},
+                                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                                "reference_annotation_support": {"type": "object"},
+                                "reference_annotation_conflicts": {"type": "array", "items": {"type": "string"}},
+                                "reverse_marker_support": {"type": "object"},
+                                "panglaodb_label_used": {"type": "string"},
+                                "reasoning": {"type": "string"}
+                            },
+                            "required": ["label", "panglaodb_queried"]
+                        }
+                    },
+                    "annotation_key": {"type": "string", "description": "obs column to write labels into (default: reads from adata.uns['annotation_proposal']['annotation_key'] or 'cell_type')"},
+                    "cluster_key": {"type": "string", "description": "obs column with cluster ids (default: reads from adata.uns['annotation_proposal']['cluster_key'] or 'leiden')"},
+                    "overwrite": {"type": "boolean", "description": "If true, overwrite an existing annotation column (default: false — raises an error if the column already exists)"}
+                },
+                "required": ["evidence_summary"]
             }
         },
         {
@@ -418,7 +574,7 @@ def get_tools() -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save PNG figure"},
-                    "plot_type": {"type": "string", "enum": ["umap", "violin", "dotplot", "heatmap"], "description": "Plot type"},
+                    "plot_type": {"type": "string", "enum": ["umap", "tsne", "violin", "dotplot", "heatmap"], "description": "Plot type. Use 'tsne' when the dataset has obsm['X_tsne'] but no UMAP (e.g. when reproducing a paper that uses t-SNE)."},
                     "color_by": {"type": "string", "description": "Column or gene to color by"},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"},
                     "include_image": {"type": "boolean", "description": "If true, include image data for model review (default: true)"}
@@ -996,16 +1152,49 @@ def get_tools() -> List[Dict[str, Any]]:
         },
     ]
 
-    return action_tools + meta_tools + inspection_tools
+    tools = action_tools + meta_tools + inspection_tools
+
+    if include_describe_image:
+        tools.append({
+            "name": "describe_image",
+            "description": (
+                "Get a structured textual description of a saved figure from the vision "
+                "sidecar model. Use this to (re-)inspect a figure or ask a specific "
+                "follow-up question about it. This is the only way you can examine a "
+                "figure — the main model you are is text-only. The sidecar returns "
+                "sections: WHAT_THIS_IS / KEY_OBSERVATIONS / NUMBERS_VISIBLE / "
+                "ANOMALIES / ACTIONABLE_FLAGS / OPEN_QUESTIONS."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "figure_path": {
+                        "type": "string",
+                        "description": "Absolute or run-relative path to the figure file (PNG/JPG).",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "Optional focused question for the sidecar, e.g. "
+                            "'do clusters 4 and 7 separate by batch?' or "
+                            "'is there a small island top-right of the UMAP?'"
+                        ),
+                    },
+                },
+                "required": ["figure_path"],
+            },
+        })
+
+    return tools
 
 
-def get_openai_tools() -> List[Dict[str, Any]]:
+def get_openai_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
     """
     Get OpenAI-format tool definitions.
 
     OpenAI uses a different schema format than Anthropic.
     """
-    anthropic_tools = get_tools()
+    anthropic_tools = get_tools(include_describe_image=include_describe_image)
     openai_tools = []
 
     for tool in anthropic_tools:
@@ -1320,6 +1509,12 @@ def process_tool_call(
             next_priority = "run_pca"
         elif not state.has_clusters:
             next_priority = "run_clustering"
+        elif (
+            world_state is not None
+            and isinstance(getattr(world_state, "data_summary", None), dict)
+            and (world_state.data_summary.get("cluster_qc", {}) or {}).get("status") == "needed"
+        ):
+            next_priority = "run_cluster_qc"
         else:
             next_priority = "annotation_or_deg"
 
@@ -1576,12 +1771,24 @@ def process_tool_call(
         resolution: float,
         cluster_key: str,
         make_primary: bool,
+        k: int | None = None,
+        use_rep: str | None = None,
+        random_state: int = 0,
     ):
         normalized_method = "phenograph" if str(method).lower() == "phenograph" else "leiden"
         if normalized_method == "leiden":
-            run_leiden(adata_obj, resolution=resolution, key_added=cluster_key)
+            run_leiden(adata_obj, resolution=resolution, random_state=random_state, key_added=cluster_key)
         else:
-            run_phenograph(adata_obj, resolution=resolution, key_added=cluster_key)
+            phenograph_kwargs = {
+                "resolution": resolution,
+                "key_added": cluster_key,
+                "random_state": random_state,
+            }
+            if k is not None:
+                phenograph_kwargs["k"] = int(k)
+            if use_rep is not None:
+                phenograph_kwargs["use_rep"] = use_rep
+            run_phenograph(adata_obj, **phenograph_kwargs)
 
         register_clustering(
             adata_obj,
@@ -1643,7 +1850,14 @@ def process_tool_call(
             if color_by in ("", None):
                 color_by = None
             elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
-                raise ValueError(f"'{color_by}' is not available for UMAP coloring.")
+                raise ValueError(f"'{color_by}' is not available for {plot_type.upper()} coloring.")
+        elif plot_type == "tsne":
+            if "X_tsne" not in adata_obj.obsm:
+                raise ValueError("t-SNE embedding not found in obsm['X_tsne']. Compute it via sc.tl.tsne or run_code first.")
+            if color_by in ("", None):
+                color_by = None
+            elif color_by not in adata_obj.obs.columns and color_by not in adata_obj.var_names:
+                raise ValueError(f"'{color_by}' is not available for {plot_type.upper()} coloring.")
 
         # For large datasets, rasterized scatter is orders of magnitude faster than
         # vector rendering (the matplotlib default).  vector_friendly=False tells
@@ -1666,6 +1880,14 @@ def process_tool_call(
                 sc.pl.umap(adata_obj, **kwargs)
             else:
                 sc.pl.umap(adata_obj, color=color_by, **kwargs)
+        elif plot_type == "tsne":
+            kwargs = dict(ax=ax, show=False)
+            if dot_size is not None:
+                kwargs["size"] = dot_size
+            if color_by is None:
+                sc.pl.tsne(adata_obj, **kwargs)
+            else:
+                sc.pl.tsne(adata_obj, color=color_by, **kwargs)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -1705,6 +1927,88 @@ def process_tool_call(
                 )
                 result["image_encode_error"] = str(enc_err)
         return result
+
+    def _generate_cluster_highlight_grid(adata_obj, color_by, output_path):
+        """
+        Grid of UMAP panels — one per cluster — each cluster highlighted in colour,
+        all other cells shown in light gray.  Returns the saved file path or None.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _mplt
+        import numpy as _np
+
+        if "X_umap" not in adata_obj.obsm:
+            return None
+        if color_by not in adata_obj.obs.columns:
+            return None
+
+        coords = adata_obj.obsm["X_umap"]
+        labels = adata_obj.obs[color_by].astype(str)
+
+        try:
+            unique_clusters = sorted(labels.unique(), key=lambda x: int(x))
+        except (ValueError, TypeError):
+            unique_clusters = sorted(labels.unique())
+
+        n_clusters = len(unique_clusters)
+        if n_clusters < 2 or n_clusters > 50:
+            return None
+
+        n_cols = min(5, n_clusters)
+        n_rows = int(_np.ceil(n_clusters / n_cols))
+
+        # Palette: tab20 → tab20b → tab20c, cycling every 20
+        _palettes = [_mplt.cm.tab20, _mplt.cm.tab20b, _mplt.cm.tab20c]
+        def _cluster_color(i):
+            return _palettes[(i // 20) % 3]((i % 20) / 20)
+
+        n_cells = adata_obj.n_obs
+        s_bg = max(0.4, min(4.0, 80_000 / n_cells))
+        s_fg = max(0.8, min(7.0, 120_000 / n_cells))
+
+        panel_w, panel_h = 2.6, 2.6
+        fig, axes = _mplt.subplots(
+            n_rows, n_cols,
+            figsize=(panel_w * n_cols, panel_h * n_rows),
+            squeeze=False,
+        )
+
+        for idx, cluster in enumerate(unique_clusters):
+            row, col = divmod(idx, n_cols)
+            ax = axes[row][col]
+
+            fg = (labels == cluster).values
+            bg = ~fg
+
+            if bg.any():
+                ax.scatter(
+                    coords[bg, 0], coords[bg, 1],
+                    c="#CCCCCC", s=s_bg, alpha=0.25,
+                    linewidths=0, rasterized=True,
+                )
+            ax.scatter(
+                coords[fg, 0], coords[fg, 1],
+                c=[_cluster_color(idx)], s=s_fg, alpha=0.9,
+                linewidths=0, rasterized=True,
+            )
+            ax.set_title(
+                f"Cluster {cluster}  ({int(fg.sum()):,})",
+                fontsize=8, pad=3,
+            )
+            ax.set_axis_off()
+
+        for idx in range(n_clusters, n_rows * n_cols):
+            row, col = divmod(idx, n_cols)
+            axes[row][col].set_visible(False)
+
+        fig.subplots_adjust(hspace=0.25, wspace=0.04)
+
+        base, ext = os.path.splitext(output_path)
+        grid_path = f"{base}_grid{ext}"
+        fig.savefig(grid_path, dpi=150, bbox_inches="tight", facecolor="white")
+        _mplt.close(fig)
+        return grid_path
 
     def _stringify_dataframe_columns(df):
         if df is None:
@@ -2531,6 +2835,31 @@ def process_tool_call(
                         ],
                     )
 
+            # Soft warning: direct obs annotation assignment without the prepare/finalize workflow
+            _anno_assign = re.search(
+                r'\badata\.obs\s*\[\s*[\'"][^\'"]+[\'"]\s*\]\s*='
+                r'(?!.*\.astype|.*\.map\(|.*int|.*float|.*bool|.*isin)',
+                code,
+                flags=re.DOTALL,
+            )
+            if _anno_assign and adata is not None:
+                _proposal_exists = bool((adata.uns.get('annotation_proposal') or {}) if hasattr(adata, 'uns') else False)
+                _validated = bool((adata.uns.get('annotation_validation') or {}).get('panglaodb_validated') if hasattr(adata, 'uns') else False)
+                if not _validated:
+                    preflight_checks.append({
+                        "name": "direct_annotation_assignment",
+                        "status": "warning",
+                        "details": (
+                            "Direct obs column assignment detected. If this is a cell-type annotation, "
+                            "use prepare_annotation → PanglaoDB queries → finalize_annotation instead "
+                            "of assigning labels directly in run_code. "
+                            + ("prepare_annotation has been called; proceed to PanglaoDB queries then finalize_annotation."
+                               if _proposal_exists else
+                               "prepare_annotation has NOT been called yet — call it first to get DEGs, "
+                               "scoring, and the list of PanglaoDB queries needed before finalizing labels.")
+                        ),
+                    })
+
             # Helper function for safe directory creation
             from pathlib import Path as _Path
             def ensure_dir(path):
@@ -2790,6 +3119,333 @@ def process_tool_call(
             fetched = fetch_url_text(url, max_chars=max_chars)
             fetched["tool"] = "fetch_url"
             return json.dumps(fetched, indent=2), adata
+
+        elif tool_name == "run_cellbender":
+            import shutil
+            import subprocess
+
+            input_raw = str(tool_input.get("input_path", "")).strip()
+            if not input_raw:
+                return _error_result(
+                    tool="run_cellbender",
+                    message="input_path is required.",
+                    adata_obj=adata,
+                    recovery_options=["Provide the raw/unfiltered 10x h5 file path as input_path."],
+                )
+
+            input_path = Path(input_raw).expanduser()
+            if not input_path.exists():
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Input file does not exist: {input_path}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Check the path to the raw/unfiltered 10x h5 file.",
+                        "Use inspect_workspace or run_shell with ls -lh to locate the file.",
+                    ],
+                )
+            if not (input_path.is_file() or input_path.is_dir()):
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Input path is neither a file nor directory: {input_path}",
+                    adata_obj=adata,
+                    recovery_options=["Pass a raw/unfiltered input supported by CellBender, usually raw_feature_bc_matrix.h5."],
+                )
+
+            load_output = bool(tool_input.get("load_output", False))
+            force_replace_primary = bool(tool_input.get("force_replace_primary", False))
+            if load_output and adata is not None and not force_replace_primary:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=(
+                        "A primary dataset is already loaded. Refusing to replace it with CellBender output "
+                        "unless force_replace_primary=true."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Set load_output=false to run CellBender as preprocessing only.",
+                        "Save the current dataset first, then retry with force_replace_primary=true if you really want to switch primary data.",
+                    ],
+                )
+
+            executable = (
+                str(tool_input.get("cellbender_executable") or "").strip()
+                or os.environ.get("SCAGENT_CELLBENDER", "").strip()
+                or "cellbender"
+            )
+            resolved_executable = shutil.which(executable)
+            if not resolved_executable:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"CellBender executable not found: {executable}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Activate an environment where cellbender is installed before starting scagent.",
+                        "Set SCAGENT_CELLBENDER to the absolute CellBender executable path.",
+                        "Pass cellbender_executable with an absolute executable path.",
+                        "Install CellBender in the configured scagent environment if it is not installed.",
+                    ],
+                )
+
+            default_base = Path(run_manager.run_dir) if run_manager is not None else Path(".")
+            output_raw = str(tool_input.get("output_path") or "").strip()
+            if output_raw:
+                output_path = Path(output_raw).expanduser()
+                if not output_path.is_absolute() and run_manager is not None:
+                    output_path = default_base / output_path
+            else:
+                output_path = default_base / "cellbender" / f"{input_path.stem}_cellbender.h5"
+            if output_path.suffix.lower() != ".h5":
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"CellBender output_path must end in .h5: {output_path}",
+                    adata_obj=adata,
+                    recovery_options=["Choose an output_path ending in .h5."],
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if output_path.exists():
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Output path already exists: {output_path}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Choose a new output_path.",
+                        "Move or archive the existing output before rerunning CellBender.",
+                    ],
+                    extra={"output_path": str(output_path)},
+                )
+
+            extra_args = tool_input.get("extra_args") or []
+            if isinstance(extra_args, str):
+                return _error_result(
+                    tool="run_cellbender",
+                    message="extra_args must be an array of strings, not a single string.",
+                    adata_obj=adata,
+                    recovery_options=["Pass extra_args like [\"--low-count-threshold\", \"5\"]."],
+                )
+            if not isinstance(extra_args, list) or not all(isinstance(arg, str) for arg in extra_args):
+                return _error_result(
+                    tool="run_cellbender",
+                    message="extra_args must be an array of strings.",
+                    adata_obj=adata,
+                    recovery_options=["Remove non-string values from extra_args."],
+                )
+            reserved_extra = {"--input", "--output"}
+            if any(arg in reserved_extra for arg in extra_args):
+                return _error_result(
+                    tool="run_cellbender",
+                    message="extra_args must not include --input or --output; use input_path and output_path instead.",
+                    adata_obj=adata,
+                    recovery_options=["Remove --input/--output from extra_args."],
+                )
+
+            def _positive_int_arg(name: str) -> int | None:
+                value = tool_input.get(name)
+                if value is None:
+                    return None
+                ivalue = int(value)
+                if ivalue <= 0:
+                    raise ValueError(f"{name} must be positive")
+                return ivalue
+
+            try:
+                expected_cells = _positive_int_arg("expected_cells")
+                total_droplets = _positive_int_arg("total_droplets_included")
+                epochs = _positive_int_arg("epochs")
+                timeout = int(tool_input.get("timeout", 86400))
+                if timeout <= 0:
+                    raise ValueError("timeout must be positive")
+                fpr = tool_input.get("fpr")
+                if fpr is not None:
+                    fpr = float(fpr)
+                    if fpr < 0 or fpr > 1:
+                        raise ValueError("fpr must be between 0 and 1")
+            except Exception as e:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"Invalid CellBender parameter: {e}",
+                    adata_obj=adata,
+                    recovery_options=["Use positive integers for count/epoch parameters and 0 <= fpr <= 1."],
+                )
+
+            argv = [
+                resolved_executable,
+                "remove-background",
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+            ]
+            if expected_cells is not None:
+                argv.extend(["--expected-cells", str(expected_cells)])
+            if total_droplets is not None:
+                argv.extend(["--total-droplets-included", str(total_droplets)])
+            if fpr is not None:
+                argv.extend(["--fpr", str(fpr)])
+            if epochs is not None:
+                argv.extend(["--epochs", str(epochs)])
+            if bool(tool_input.get("use_cuda", False)):
+                argv.append("--cuda")
+            argv.extend(extra_args)
+
+            workdir_raw = str(tool_input.get("workdir") or "").strip()
+            workdir = Path(workdir_raw).expanduser() if workdir_raw else output_path.parent
+            workdir.mkdir(parents=True, exist_ok=True)
+
+            stdout_log = output_path.with_suffix(output_path.suffix + ".stdout.log")
+            stderr_log = output_path.with_suffix(output_path.suffix + ".stderr.log")
+
+            def _tail(path: Path, max_chars: int = 4000) -> str:
+                if not path.exists():
+                    return ""
+                text = path.read_text(errors="replace")
+                return text[-max_chars:] if len(text) > max_chars else text
+
+            timed_out = False
+            try:
+                with stdout_log.open("w") as stdout_fh, stderr_log.open("w") as stderr_fh:
+                    proc = subprocess.run(
+                        argv,
+                        stdout=stdout_fh,
+                        stderr=stderr_fh,
+                        text=True,
+                        timeout=timeout,
+                        cwd=str(workdir),
+                    )
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                returncode = -1
+            except Exception as e:
+                return _error_result(
+                    tool="run_cellbender",
+                    message=f"CellBender failed to start: {e}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Check that CellBender is executable in this environment.",
+                        "Check that workdir is writable.",
+                    ],
+                    extra={
+                        "command": " ".join(argv),
+                        "stdout_log": str(stdout_log),
+                        "stderr_log": str(stderr_log),
+                    },
+                )
+
+            output_exists = output_path.exists() and output_path.stat().st_size > 0
+            stdout_tail = _tail(stdout_log)
+            stderr_tail = _tail(stderr_log)
+            artifacts_created = []
+            output_artifact = _artifact_payload(
+                str(output_path),
+                role="cellbender_output",
+                metadata={"format": "10x_h5", "loaded_as_primary": False},
+            ) if output_exists else None
+            if output_artifact:
+                artifacts_created.append(output_artifact)
+            companion_candidates = [
+                (output_path.with_name(f"{output_path.stem}_filtered.h5"), "cellbender_filtered_output"),
+                (output_path.with_name(f"{output_path.stem}_report.html"), "cellbender_report"),
+                (output_path.with_suffix(".pdf"), "cellbender_report"),
+                (output_path.with_suffix(".log"), "cellbender_log"),
+                (output_path.with_name(f"{output_path.stem}_metrics.csv"), "cellbender_metrics"),
+                (output_path.with_name(f"{output_path.stem}_cell_barcodes.csv"), "cellbender_cell_barcodes"),
+                (output_path.with_name(f"{output_path.stem}_posterior.h5"), "cellbender_posterior"),
+                (workdir / "ckpt.tar.gz", "cellbender_checkpoint"),
+            ]
+            seen_artifact_paths = {str(output_path.resolve())} if output_exists else set()
+            for path, role in companion_candidates:
+                if path.exists() and str(path.resolve()) not in seen_artifact_paths:
+                    artifact = _artifact_payload(str(path), role=role)
+                    if artifact:
+                        artifacts_created.append(artifact)
+                        seen_artifact_paths.add(str(path.resolve()))
+            for log_path, stream_name in ((stdout_log, "stdout"), (stderr_log, "stderr")):
+                if log_path.exists():
+                    artifact = _artifact_payload(
+                        str(log_path),
+                        role="cellbender_log",
+                        metadata={"stream": stream_name},
+                    )
+                    if artifact:
+                        artifacts_created.append(artifact)
+
+            updated_adata = adata
+            loaded_as_primary = False
+            load_error = None
+            if returncode == 0 and output_exists and load_output:
+                try:
+                    updated_adata = load_data(str(output_path))
+                    loaded_as_primary = True
+                    if output_artifact:
+                        output_artifact["metadata"]["loaded_as_primary"] = True
+                except Exception as e:
+                    load_error = str(e)
+
+            ok = returncode == 0 and output_exists and load_error is None
+            status = "ok" if ok else "error"
+            if timed_out:
+                message = f"CellBender timed out after {timeout}s."
+            elif returncode != 0:
+                message = f"CellBender exited with return code {returncode}."
+            elif not output_exists:
+                message = "CellBender exited successfully but the expected output h5 was not created."
+            elif load_error:
+                message = f"CellBender output was created, but loading it failed: {load_error}"
+            else:
+                message = f"CellBender completed and wrote {output_path}."
+
+            result = {
+                "status": status,
+                "tool": "run_cellbender",
+                "message": message,
+                "input_path": str(input_path),
+                "output_path": str(output_path),
+                "stdout_log": str(stdout_log),
+                "stderr_log": str(stderr_log),
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "returncode": returncode,
+                "timed_out": timed_out,
+                "command": " ".join(argv),
+                "command_argv": argv,
+                "workdir": str(workdir),
+                "expected_cells": expected_cells,
+                "total_droplets_included": total_droplets,
+                "fpr": fpr,
+                "epochs": epochs,
+                "use_cuda": bool(tool_input.get("use_cuda", False)),
+                "load_output": load_output,
+                "loaded_as_primary": loaded_as_primary,
+                "state": make_state(updated_adata) if updated_adata is not None else {},
+            }
+
+            return _finalize_result(
+                result,
+                updated_adata,
+                dataset_changed=loaded_as_primary,
+                summary=message,
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed" if ok else "failed",
+                    message,
+                    [
+                        _check("cellbender_returncode_zero", returncode == 0, f"Return code: {returncode}"),
+                        _check("cellbender_output_exists", output_exists, f"Output path: {output_path}"),
+                        _check(
+                            "cellbender_output_loaded",
+                            (not load_output) or loaded_as_primary,
+                            "Output loaded as primary dataset." if loaded_as_primary else "Output was not loaded as primary dataset.",
+                        ),
+                    ],
+                    recovery_options=[
+                        "Inspect stderr_log for CellBender errors.",
+                        "Check GPU availability and retry with use_cuda=false if CUDA failed.",
+                        "Adjust expected_cells, total_droplets_included, fpr, or epochs based on the dataset.",
+                    ] if not ok else [],
+                ),
+            )
 
         elif tool_name == "run_shell":
             import subprocess
@@ -4695,7 +5351,7 @@ def process_tool_call(
         elif tool_name == "run_pca":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            n_comps = int(tool_input.get("n_comps") or tool_input.get("n_pcs") or 30)
+            n_comps = int(tool_input.get("n_comps") or tool_input.get("n_pcs") or 50)
             svd_solver = tool_input.get("svd_solver", "arpack")
             mask_var = tool_input.get("mask_var", "highly_variable")
 
@@ -4705,6 +5361,74 @@ def process_tool_call(
             if output_path:
                 write_h5ad_safe(adata, output_path)
 
+            # Elbow detection: kneedle algorithm (max perpendicular distance from diagonal)
+            variance_ratios = adata.uns["pca"]["variance_ratio"]
+            n_shown = len(variance_ratios)
+
+            def _find_pca_elbow(ratios):
+                n = len(ratios)
+                if n < 3:
+                    return n
+                x = np.arange(n, dtype=float)
+                y = np.array(ratios, dtype=float)
+                x_n = x / (n - 1)
+                y_range = float(y.max() - y.min())
+                y_n = (y - y.min()) / (y_range if y_range > 0 else 1.0)
+                dx = float(x_n[-1] - x_n[0])
+                dy = float(y_n[-1] - y_n[0])
+                denom = float(np.sqrt(dx**2 + dy**2))
+                if denom == 0:
+                    return n // 2
+                dist = np.abs(dy * x_n - dx * y_n + x_n[-1] * y_n[0] - y_n[-1] * x_n[0]) / denom
+                return int(np.argmax(dist)) + 1  # 1-indexed
+
+            elbow_pc = _find_pca_elbow(variance_ratios)
+            suggested_n_pcs = min(elbow_pc + 5, n_shown)
+
+            # Scree plot
+            scree_path = None
+            scree_b64 = None
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as _plt
+
+                _base = Path(run_manager.run_dir) if run_manager else Path(".")
+                scree_path = str(ensure_dir(_base / "figures") / "pca_variance_explained.png")
+
+                pcs = np.arange(1, n_shown + 1)
+                cumvar = np.cumsum(variance_ratios) * 100
+
+                fig, (ax1, ax2) = _plt.subplots(1, 2, figsize=(12, 4))
+
+                ax1.bar(pcs, variance_ratios * 100, color="steelblue", alpha=0.7, width=0.8)
+                ax1.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
+                            label=f"Elbow PC{elbow_pc}")
+                ax1.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
+                            label=f"Suggested n_pcs={suggested_n_pcs}")
+                ax1.set_xlabel("Principal Component")
+                ax1.set_ylabel("Variance Explained (%)")
+                ax1.set_title("Variance per PC")
+                ax1.legend(fontsize=9)
+
+                ax2.plot(pcs, cumvar, "o-", markersize=3, color="steelblue")
+                ax2.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
+                            label=f"Elbow PC{elbow_pc}")
+                ax2.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
+                            label=f"Suggested n_pcs={suggested_n_pcs}")
+                ax2.axhline(80, color="gray", linestyle=":", linewidth=1, label="80% threshold")
+                ax2.set_xlabel("Principal Component")
+                ax2.set_ylabel("Cumulative Variance (%)")
+                ax2.set_title("Cumulative Variance Explained")
+                ax2.legend(fontsize=9)
+
+                _plt.tight_layout()
+                _plt.savefig(scree_path, dpi=150, bbox_inches="tight")
+                _plt.close(fig)
+                scree_b64 = encode_image_base64(scree_path)
+            except Exception as _scree_err:
+                logger.warning("Scree plot generation failed: %s", _scree_err)
+
             result = {
                 "status": "ok",
                 "tool": "run_pca",
@@ -4713,7 +5437,11 @@ def process_tool_call(
                 "n_comps": n_comps,
                 "svd_solver": svd_solver,
                 "mask_var": mask_var,
-                "variance_explained": float(adata.uns["pca"]["variance_ratio"].sum()),
+                "variance_explained_total": float(variance_ratios.sum()),
+                "variance_ratio_per_pc": [round(float(v), 5) for v in variance_ratios],
+                "elbow_pc": elbow_pc,
+                "suggested_n_pcs": suggested_n_pcs,
+                "scree_plot": scree_path,
                 "side_effects": {
                     "pca_computed": True,
                     "neighbors_recomputed": False,
@@ -4723,11 +5451,15 @@ def process_tool_call(
                 "warnings": warnings,
                 "state": make_state(adata),
             }
+            if scree_b64:
+                result["image_base64"] = scree_b64
+                result["image_mime"] = "image/png"
+
             return _finalize_result(
                 result,
                 adata,
                 dataset_changed=True,
-                summary=f"Ran PCA only with n_comps={n_comps} and svd_solver={svd_solver}.",
+                summary=f"Ran PCA with n_comps={n_comps}; elbow at PC{elbow_pc}, suggested n_pcs={suggested_n_pcs} for run_neighbors.",
                 verification=_build_verification(
                     "passed",
                     "PCA was computed without downstream graph or embedding side effects.",
@@ -4897,6 +5629,9 @@ def process_tool_call(
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
             method = tool_input.get("method", "leiden")
             resolution = float(tool_input.get("resolution", 1.0))
+            k = tool_input.get("k")
+            use_rep = tool_input.get("use_rep")
+            random_state = int(tool_input.get("random_state", 0))
             requested_cluster_key = tool_input.get("cluster_key")
             cluster_key, default_make_primary = _resolve_clustering_output_key(
                 adata,
@@ -4919,6 +5654,9 @@ def process_tool_call(
                 resolution=resolution,
                 cluster_key=cluster_key,
                 make_primary=bool(make_primary),
+                k=k,
+                use_rep=use_rep,
+                random_state=random_state,
             )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_clustering")
@@ -4944,6 +5682,11 @@ def process_tool_call(
                 "primary_alias_available": result_payload["primary_alias_available"],
                 "primary_alias_created": result_payload["primary_alias_created"],
                 "make_primary": bool(make_primary),
+                "parameters": {
+                    "k": int(k) if k is not None else None,
+                    "use_rep": use_rep,
+                    "random_state": random_state,
+                },
                 "n_clusters": result_payload["n_clusters"],
                 "cluster_sizes": result_payload["cluster_sizes"],
                 "available_clusterings": result_payload["clusterings"],
@@ -5000,6 +5743,9 @@ def process_tool_call(
             resolutions = [float(value) for value in tool_input.get("resolutions", [])]
             if not resolutions:
                 raise ValueError("compare_clusterings requires at least one resolution.")
+            k = tool_input.get("k")
+            use_rep = tool_input.get("use_rep")
+            random_state = int(tool_input.get("random_state", 0))
 
             compare_results = []
             figure_dir = tool_input.get("figure_dir")
@@ -5019,12 +5765,20 @@ def process_tool_call(
                     resolution=resolution,
                     cluster_key=cluster_key,
                     make_primary=False,
+                    k=k,
+                    use_rep=use_rep,
+                    random_state=random_state,
                 )
                 compare_entry = {
                     "resolution": result_payload["resolution"],
                     "cluster_key": result_payload["cluster_key"],
                     "n_clusters": result_payload["n_clusters"],
                     "cluster_sizes": result_payload["cluster_sizes"],
+                    "parameters": {
+                        "k": int(k) if k is not None else None,
+                        "use_rep": use_rep,
+                        "random_state": random_state,
+                    },
                 }
 
                 if generate_figures and "X_umap" in adata.obsm:
@@ -6570,27 +7324,35 @@ def process_tool_call(
             color_by = tool_input.get("color_by")
             genes = tool_input.get("genes", [])
             include_image = tool_input.get("include_image", True)
-            if plot_type == "umap" and "X_umap" not in adata.obsm:
+            _embedding_key = {"umap": "X_umap", "tsne": "X_tsne"}.get(plot_type)
+            if _embedding_key is not None and _embedding_key not in adata.obsm:
                 return _smart_unavailable_result(
                     tool="generate_figure",
-                    message="UMAP cannot be rendered because the embedding is not available on the current in-memory dataset.",
+                    message=(
+                        f"{plot_type.upper()} cannot be rendered because the "
+                        f"embedding (obsm['{_embedding_key}']) is not available "
+                        "on the current in-memory dataset."
+                    ),
                     adata_obj=adata,
                     missing_prerequisites=["embedding"],
-                    recovery_options=[
-                        "Run PCA, neighbors, and UMAP first.",
-                        "If you only need a summary of current state, inspect the session instead of plotting.",
-                    ],
+                    recovery_options=(
+                        ["Run PCA, neighbors, and UMAP first.",
+                         "If you only need a summary of current state, inspect the session instead of plotting."]
+                        if plot_type == "umap" else
+                        [f"Compute t-SNE first (e.g. sc.tl.tsne(adata) via run_code) so obsm['{_embedding_key}'] is populated.",
+                         "If a UMAP exists instead, switch plot_type to 'umap'."]
+                    ),
                     extra={"plot_type": plot_type, "color_by": color_by},
                 )
-            if plot_type == "umap" and color_by not in (None, "") and color_by not in adata.obs.columns and color_by not in adata.var_names:
+            if plot_type in ("umap", "tsne") and color_by not in (None, "") and color_by not in adata.obs.columns and color_by not in adata.var_names:
                 return _smart_unavailable_result(
                     tool="generate_figure",
-                    message=f"UMAP coloring key '{color_by}' is not available on the current in-memory dataset.",
+                    message=f"{plot_type.upper()} coloring key '{color_by}' is not available on the current in-memory dataset.",
                     adata_obj=adata,
                     missing_prerequisites=["valid_color_key"],
                     recovery_options=[
                         "Use one of the available obs columns or genes for coloring.",
-                        "Render a plain UMAP without coloring.",
+                        f"Render a plain {plot_type.upper()} without coloring.",
                     ],
                     extra={"plot_type": plot_type, "requested_color_by": color_by},
                 )
@@ -6608,10 +7370,34 @@ def process_tool_call(
                 role="figure",
                 metadata={"plot_type": plot_type, "color_by": color_by},
             )
+            artifacts = [artifact] if artifact is not None else []
+
+            # Auto-generate cluster highlight grid when coloring by a categorical column
+            # (covers leiden/louvain/pheno results; skips continuous gene expression colorings)
+            if (
+                plot_type == "umap"
+                and color_by is not None
+                and color_by in adata.obs.columns
+                and hasattr(adata.obs[color_by], "cat")
+            ):
+                try:
+                    grid_path = _generate_cluster_highlight_grid(adata, color_by, output_path)
+                    if grid_path and os.path.exists(grid_path):
+                        grid_artifact = _artifact_payload(
+                            grid_path,
+                            role="figure",
+                            metadata={"plot_type": "umap_cluster_grid", "color_by": color_by},
+                        )
+                        if grid_artifact:
+                            artifacts.append(grid_artifact)
+                        result["cluster_grid_path"] = grid_path
+                except Exception as _grid_err:
+                    logger.warning("Cluster highlight grid generation failed: %s", _grid_err)
+
             verification_checks = [
                 _check("figure_exists", os.path.exists(output_path), f"Figure exists at {output_path}."),
             ]
-            if plot_type == "umap":
+            if plot_type in ("umap", "tsne") and color_by not in (None, ""):
                 verification_checks.append(
                     _check(
                         "color_key_valid",
@@ -6624,7 +7410,7 @@ def process_tool_call(
                 adata,
                 dataset_changed=False,
                 summary=f"Generated a {plot_type} figure colored by '{color_by}'.",
-                artifacts_created=[artifact] if artifact is not None else [],
+                artifacts_created=artifacts,
                 verification=_build_verification(
                     "passed",
                     "Figure output was created and verified.",
@@ -6954,6 +7740,770 @@ def process_tool_call(
                 dataset_changed=False,
                 summary=f"Cluster QC: {len(proposed_removal)} clusters proposed for removal ({cells_proposed} cells, {result['pct_proposed']}%), {len(ambiguous)} ambiguous.",
                 artifacts_created=artifacts,
+            )
+
+        elif tool_name == "prepare_annotation":
+            import re as _re
+            import scanpy as sc
+            import scipy.sparse as sp
+            import numpy as _np
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return _error_result(
+                    tool="prepare_annotation",
+                    message="No data in memory. Load a dataset first.",
+                    adata_obj=adata,
+                    recovery_options=["Run load_data with the path to your h5ad."],
+                )
+
+            cluster_key = tool_input.get("cluster_key", "leiden")
+            if cluster_key not in adata.obs.columns:
+                return _smart_unavailable_result(
+                    tool="prepare_annotation",
+                    message=f"Cluster column '{cluster_key}' not found in adata.obs.",
+                    adata_obj=adata,
+                    missing_prerequisites=["clustering"],
+                    recovery_options=[
+                        "Run run_clustering first to produce a cluster column.",
+                        f"Pass an existing cluster column via cluster_key. Available columns: {list(adata.obs.columns)[:30]}",
+                    ],
+                )
+
+            annotation_key = tool_input.get("annotation_key", "cell_type")
+            marker_dict = tool_input.get("marker_dict") or {}
+            n_deg_genes = int(tool_input.get("n_deg_genes", 20))
+            deg_key = tool_input.get("deg_key", "rank_genes_groups")
+            ambiguity_threshold = float(tool_input.get("ambiguity_threshold", 0.10))
+            shared_marker_threshold = float(tool_input.get("shared_marker_threshold", 0.5))
+            expression_threshold = float(tool_input.get("expression_threshold", 0.0))
+            force_recompute = bool(tool_input.get("force_recompute_deg", False))
+            deg_method = tool_input.get("deg_method", "wilcoxon")
+            panglaodb_species = tool_input.get("panglaodb_species")
+            reverse_lookup_n_genes = max(
+                0, int(tool_input.get("reverse_lookup_n_genes_per_cluster", 10))
+            )
+            reverse_lookup_max_unique = max(
+                0, int(tool_input.get("reverse_lookup_max_unique_genes", 120))
+            )
+            default_reverse_exclude_patterns = [
+                r"^MT-",
+                r"^mt-",
+                r"^RPL",
+                r"^RPS",
+                r"^MRPL",
+                r"^MRPS",
+                r"^Rpl",
+                r"^Rps",
+                r"^Mrpl",
+                r"^Mrps",
+                r"^MALAT1$",
+                r"^Malat1$",
+                r"^HB[ABDEGMQZ]",
+                r"^Hb[ab]",
+                r"^RP\d",
+                r"^AC\d",
+                r"^AL\d",
+                r"^AP\d",
+                r"^LINC\d",
+                r"\.\d+$",
+            ]
+            supplied_reverse_exclude = tool_input.get("reverse_lookup_exclude_patterns")
+            reverse_exclude_patterns = (
+                [str(p) for p in supplied_reverse_exclude]
+                if isinstance(supplied_reverse_exclude, list)
+                else default_reverse_exclude_patterns
+            )
+            try:
+                reverse_exclude_regexes = [
+                    _re.compile(p) for p in reverse_exclude_patterns if str(p).strip()
+                ]
+            except Exception:
+                reverse_exclude_regexes = [
+                    _re.compile(p) for p in default_reverse_exclude_patterns
+                ]
+
+            def _reverse_exclude_reason(gene: str) -> Optional[str]:
+                for rx in reverse_exclude_regexes:
+                    try:
+                        if rx.search(gene):
+                            return rx.pattern
+                    except Exception:
+                        continue
+                return None
+
+            supplied_reference_keys = tool_input.get("reference_annotation_keys")
+            standard_reference_keys = [
+                "celltypist_majority_voting",
+                "celltypist_predicted_labels",
+                "scimilarity_predictions_unconstrained",
+                "scimilarity_representative_prediction",
+            ]
+            if supplied_reference_keys is None:
+                reference_annotation_keys = [
+                    k for k in standard_reference_keys if k in adata.obs.columns
+                ]
+            else:
+                reference_annotation_keys = [
+                    str(k) for k in supplied_reference_keys
+                    if isinstance(k, str) and str(k).strip()
+                ]
+            valid_reference_keys = [
+                k for k in reference_annotation_keys if k in adata.obs.columns
+            ]
+            missing_reference_keys = [
+                k for k in reference_annotation_keys if k not in adata.obs.columns
+            ]
+
+            cluster_series = adata.obs[cluster_key].astype(str)
+            cluster_ids = sorted(cluster_series.unique(), key=lambda s: (len(s), s))
+            cluster_sizes = {c: int((cluster_series == c).sum()) for c in cluster_ids}
+
+            need_recompute = force_recompute or (deg_key not in adata.uns)
+            if not need_recompute:
+                cached = adata.uns.get(deg_key, {})
+                cached_groupby = None
+                params = cached.get("params") if isinstance(cached, dict) else None
+                if isinstance(params, dict):
+                    cached_groupby = params.get("groupby")
+                if cached_groupby != cluster_key:
+                    need_recompute = True
+
+            if need_recompute:
+                sc.tl.rank_genes_groups(
+                    adata,
+                    groupby=cluster_key,
+                    method=deg_method,
+                    key_added=deg_key,
+                    use_raw=False,
+                    n_genes=max(n_deg_genes, 50),
+                )
+
+            rgg = adata.uns.get(deg_key, {})
+            names = rgg.get("names") if isinstance(rgg, dict) else None
+            scores = rgg.get("scores") if isinstance(rgg, dict) else None
+            pvals_adj = rgg.get("pvals_adj") if isinstance(rgg, dict) else None
+            logfcs = rgg.get("logfoldchanges") if isinstance(rgg, dict) else None
+
+            top_degs_per_cluster: Dict[str, List[Dict[str, Any]]] = {}
+            if names is not None and hasattr(names, "dtype") and names.dtype.names:
+                rec_groups = list(names.dtype.names)
+                for g in rec_groups:
+                    entries = []
+                    n_take = min(n_deg_genes, len(names[g]))
+                    for i in range(n_take):
+                        try:
+                            gene = str(names[g][i])
+                        except Exception:
+                            continue
+                        entry = {"gene": gene}
+                        if scores is not None:
+                            try:
+                                entry["score"] = float(scores[g][i])
+                            except Exception:
+                                pass
+                        if logfcs is not None:
+                            try:
+                                entry["logfc"] = float(logfcs[g][i])
+                            except Exception:
+                                pass
+                        if pvals_adj is not None:
+                            try:
+                                entry["pval_adj"] = float(pvals_adj[g][i])
+                            except Exception:
+                                pass
+                        entries.append(entry)
+                    top_degs_per_cluster[str(g)] = entries
+            elif isinstance(names, dict):
+                for g, gene_values in names.items():
+                    entries = []
+                    try:
+                        genes_iter = list(gene_values)
+                    except Exception:
+                        genes_iter = []
+                    n_take = min(n_deg_genes, len(genes_iter))
+                    for i in range(n_take):
+                        try:
+                            gene = str(genes_iter[i])
+                        except Exception:
+                            continue
+                        entry = {"gene": gene}
+                        if isinstance(scores, dict) and g in scores:
+                            try:
+                                entry["score"] = float(list(scores[g])[i])
+                            except Exception:
+                                pass
+                        if isinstance(logfcs, dict) and g in logfcs:
+                            try:
+                                entry["logfc"] = float(list(logfcs[g])[i])
+                            except Exception:
+                                pass
+                        if isinstance(pvals_adj, dict) and g in pvals_adj:
+                            try:
+                                entry["pval_adj"] = float(list(pvals_adj[g])[i])
+                            except Exception:
+                                pass
+                        entries.append(entry)
+                    top_degs_per_cluster[str(g)] = entries
+
+            shared_markers: List[str] = []
+            label_marker_lists: Dict[str, List[str]] = {}
+            if marker_dict:
+                var_set = set(adata.var_names.astype(str))
+                for label, genes in marker_dict.items():
+                    if not isinstance(genes, list):
+                        continue
+                    present = [str(g) for g in genes if str(g) in var_set]
+                    label_marker_lists[str(label)] = present
+
+                if shared_marker_threshold > 0 and label_marker_lists:
+                    gene_label_count: Dict[str, int] = {}
+                    for genes in label_marker_lists.values():
+                        for g in set(genes):
+                            gene_label_count[g] = gene_label_count.get(g, 0) + 1
+                    n_labels = len(label_marker_lists)
+                    threshold_count = max(2, int(round(shared_marker_threshold * n_labels)))
+                    shared_markers = sorted(
+                        g for g, c in gene_label_count.items() if c >= threshold_count
+                    )
+
+            score_matrix: Dict[str, Dict[str, float]] = {}
+            ambiguous_clusters: List[str] = []
+            cluster_summaries: List[Dict[str, Any]] = []
+            reference_annotation_summary: Dict[str, List[Dict[str, Any]]] = {}
+            reverse_lookup_by_cluster: Dict[str, List[str]] = {}
+            reverse_lookup_excluded_by_cluster: Dict[str, List[Dict[str, str]]] = {}
+
+            X_layer = tool_input.get("deg_layer")
+            X_source = adata.layers[X_layer] if X_layer and X_layer in adata.layers else adata.X
+
+            if label_marker_lists:
+                gene_to_idx = {str(g): i for i, g in enumerate(adata.var_names)}
+                cluster_masks = {c: (cluster_series == c).values for c in cluster_ids}
+                for label, genes in label_marker_lists.items():
+                    discriminating = [g for g in genes if g not in shared_markers] or genes
+                    idxs = [gene_to_idx[g] for g in discriminating if g in gene_to_idx]
+                    if not idxs:
+                        for c in cluster_ids:
+                            score_matrix.setdefault(c, {})[label] = 0.0
+                        continue
+                    sub = X_source[:, idxs]
+                    if sp.issparse(sub):
+                        expressed = (sub > expression_threshold).astype("float32")
+                    else:
+                        expressed = (_np.asarray(sub) > expression_threshold).astype("float32")
+                    for c in cluster_ids:
+                        mask = cluster_masks[c]
+                        n_in = int(mask.sum())
+                        if n_in == 0:
+                            score_matrix.setdefault(c, {})[label] = 0.0
+                            continue
+                        if sp.issparse(expressed):
+                            sub_expr = expressed[mask, :]
+                            frac = float(sub_expr.sum() / (n_in * len(idxs)))
+                        else:
+                            frac = float(expressed[mask, :].mean())
+                        score_matrix.setdefault(c, {})[label] = frac
+
+            if reverse_lookup_n_genes > 0:
+                for c in cluster_ids:
+                    selected: List[str] = []
+                    excluded: List[Dict[str, str]] = []
+                    seen_cluster_genes: set = set()
+                    for entry in top_degs_per_cluster.get(c, []):
+                        gene = str(entry.get("gene") or "").strip()
+                        if not gene or gene in seen_cluster_genes:
+                            continue
+                        seen_cluster_genes.add(gene)
+                        reason = _reverse_exclude_reason(gene)
+                        if reason:
+                            excluded.append({"gene": gene, "reason": f"matched exclude pattern {reason}"})
+                            continue
+                        selected.append(gene)
+                        if len(selected) >= reverse_lookup_n_genes:
+                            break
+                    reverse_lookup_by_cluster[c] = selected
+                    reverse_lookup_excluded_by_cluster[c] = excluded[:20]
+
+            if valid_reference_keys:
+                for c in cluster_ids:
+                    mask = (cluster_series == c).values
+                    per_cluster_reference: List[Dict[str, Any]] = []
+                    n_in = int(mask.sum())
+                    for key in valid_reference_keys:
+                        values = adata.obs.loc[mask, key].astype(str)
+                        values = values[
+                            ~values.str.lower().isin({"", "nan", "none", "unknown", "unassigned"})
+                        ]
+                        if values.empty or n_in == 0:
+                            per_cluster_reference.append({
+                                "annotation_key": key,
+                                "top_label": None,
+                                "top_fraction": 0.0,
+                                "top_count": 0,
+                                "top_labels": [],
+                            })
+                            continue
+                        counts = values.value_counts(dropna=True).head(5)
+                        top_label = str(counts.index[0])
+                        top_count = int(counts.iloc[0])
+                        per_cluster_reference.append({
+                            "annotation_key": key,
+                            "top_label": top_label,
+                            "top_fraction": round(float(top_count / n_in), 4),
+                            "top_count": top_count,
+                            "top_labels": [
+                                {
+                                    "label": str(label),
+                                    "count": int(count),
+                                    "fraction": round(float(count / n_in), 4),
+                                }
+                                for label, count in counts.items()
+                            ],
+                        })
+                    reference_annotation_summary[c] = per_cluster_reference
+
+            for c in cluster_ids:
+                summary: Dict[str, Any] = {
+                    "cluster_id": c,
+                    "n_cells": cluster_sizes[c],
+                    "top_degs": [d["gene"] for d in top_degs_per_cluster.get(c, [])][:n_deg_genes],
+                    "top_degs_detail": top_degs_per_cluster.get(c, []),
+                    "reverse_lookup_genes": reverse_lookup_by_cluster.get(c, []),
+                    "reverse_lookup_excluded_genes": reverse_lookup_excluded_by_cluster.get(c, []),
+                }
+                if reference_annotation_summary.get(c):
+                    summary["reference_annotations"] = reference_annotation_summary[c]
+                if score_matrix.get(c):
+                    ranked = sorted(score_matrix[c].items(), key=lambda kv: kv[1], reverse=True)
+                    top_label, top_score = ranked[0]
+                    runner_up = ranked[1] if len(ranked) > 1 else (None, 0.0)
+                    delta = float(top_score - runner_up[1])
+                    is_ambiguous = delta < ambiguity_threshold and top_score > 0
+                    summary.update({
+                        "proposed_label": top_label,
+                        "proposed_score": round(top_score, 4),
+                        "competing_labels": [
+                            {"label": lbl, "score": round(s, 4), "delta_from_top": round(top_score - s, 4)}
+                            for lbl, s in ranked[1:4] if s > 0
+                        ],
+                        "is_ambiguous": is_ambiguous,
+                        "ambiguity_delta": round(delta, 4),
+                    })
+                    if is_ambiguous:
+                        ambiguous_clusters.append(c)
+                else:
+                    summary.update({
+                        "proposed_label": None,
+                        "proposed_score": None,
+                        "competing_labels": [],
+                        "is_ambiguous": True,
+                        "ambiguity_delta": None,
+                    })
+                    ambiguous_clusters.append(c)
+                cluster_summaries.append(summary)
+
+            panglaodb_queries: List[Dict[str, Any]] = []
+            seen_queries: set = set()
+            for entry in cluster_summaries:
+                proposed = entry.get("proposed_label")
+                if proposed and proposed not in seen_queries:
+                    panglaodb_queries.append({
+                        "cell_type": proposed,
+                        "reason": f"proposed label for cluster {entry['cluster_id']}",
+                    })
+                    seen_queries.add(proposed)
+                if entry.get("is_ambiguous"):
+                    for comp in entry.get("competing_labels", []):
+                        label = comp.get("label")
+                        if label and label not in seen_queries:
+                            panglaodb_queries.append({
+                                "cell_type": label,
+                                "reason": f"competing label for ambiguous cluster {entry['cluster_id']}",
+                            })
+                            seen_queries.add(label)
+                for ref_entry in entry.get("reference_annotations", []):
+                    label = ref_entry.get("top_label")
+                    if label and label not in seen_queries:
+                        panglaodb_queries.append({
+                            "cell_type": label,
+                            "reason": (
+                                f"reference-derived candidate from {ref_entry.get('annotation_key')} "
+                                f"for cluster {entry['cluster_id']}"
+                            ),
+                        })
+                        seen_queries.add(label)
+
+            panglaodb_reverse_queries: List[Dict[str, Any]] = []
+            reverse_gene_to_clusters: Dict[str, List[str]] = {}
+            for c, genes in reverse_lookup_by_cluster.items():
+                for g in genes:
+                    reverse_gene_to_clusters.setdefault(g, []).append(c)
+            selected_reverse_genes: List[str] = []
+            seen_reverse_genes: set = set()
+            max_depth = max((len(v) for v in reverse_lookup_by_cluster.values()), default=0)
+            for rank in range(max_depth):
+                for c in cluster_ids:
+                    genes = reverse_lookup_by_cluster.get(c, [])
+                    if rank >= len(genes):
+                        continue
+                    gene = genes[rank]
+                    if gene in seen_reverse_genes:
+                        continue
+                    selected_reverse_genes.append(gene)
+                    seen_reverse_genes.add(gene)
+                    if len(selected_reverse_genes) >= reverse_lookup_max_unique:
+                        break
+                if len(selected_reverse_genes) >= reverse_lookup_max_unique:
+                    break
+            for gene in selected_reverse_genes:
+                query: Dict[str, Any] = {
+                    "gene_symbol": gene,
+                    "reason": (
+                        "reverse marker lookup from top cluster DEGs; aggregate returned "
+                        "cell types across multiple genes before choosing candidate labels"
+                    ),
+                    "clusters": reverse_gene_to_clusters.get(gene, []),
+                }
+                if panglaodb_species in {"Hs", "Mm"}:
+                    query["species"] = panglaodb_species
+                panglaodb_reverse_queries.append(query)
+
+            proposal = {
+                "cluster_key": cluster_key,
+                "annotation_key": annotation_key,
+                "n_clusters": len(cluster_ids),
+                "cluster_ids": cluster_ids,
+                "clusters": cluster_summaries,
+                "shared_markers": shared_markers,
+                "ambiguous_clusters": ambiguous_clusters,
+                "label_marker_lists_used": {k: list(v) for k, v in label_marker_lists.items()},
+                "reference_annotation_keys": valid_reference_keys,
+                "missing_reference_annotation_keys": missing_reference_keys,
+                "reference_annotation_summary": reference_annotation_summary,
+                "reverse_lookup_n_genes_per_cluster": reverse_lookup_n_genes,
+                "reverse_lookup_max_unique_genes": reverse_lookup_max_unique,
+                "reverse_lookup_exclude_patterns": reverse_exclude_patterns,
+                "reverse_lookup_by_cluster": reverse_lookup_by_cluster,
+                "reverse_lookup_excluded_by_cluster": reverse_lookup_excluded_by_cluster,
+                "scoring_method": "normalized_expression_fraction" if label_marker_lists else "deg_only",
+                "ambiguity_threshold": ambiguity_threshold,
+                "shared_marker_threshold": shared_marker_threshold,
+                "panglaodb_queries_required": panglaodb_queries,
+                "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
+                "panglaodb_species": panglaodb_species,
+                "deg_key": deg_key,
+                "deg_method": deg_method,
+            }
+            try:
+                adata.uns["annotation_proposal"] = proposal
+            except Exception:
+                pass
+
+            result = {
+                "status": "ok",
+                "tool": "prepare_annotation",
+                "cluster_key": cluster_key,
+                "annotation_key": annotation_key,
+                "n_clusters": len(cluster_ids),
+                "n_ambiguous": len(ambiguous_clusters),
+                "ambiguous_clusters": ambiguous_clusters,
+                "shared_markers_flagged": shared_markers,
+                "scoring_method": proposal["scoring_method"],
+                "reference_annotation_keys": valid_reference_keys,
+                "missing_reference_annotation_keys": missing_reference_keys,
+                "reference_annotation_summary": reference_annotation_summary,
+                "reference_annotation_notice": (
+                    "No CellTypist/Scimilarity annotation columns were supplied or auto-detected. "
+                    "If a compatible reference model is available, run it before treating this proposal "
+                    "as the main source of candidate labels."
+                ) if not valid_reference_keys else None,
+                "clusters": cluster_summaries,
+                "panglaodb_queries_required": panglaodb_queries,
+                "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
+                "reverse_lookup_n_genes_per_cluster": reverse_lookup_n_genes,
+                "reverse_lookup_max_unique_genes": reverse_lookup_max_unique,
+                "reverse_lookup_exclude_patterns": reverse_exclude_patterns,
+                "panglaodb_species": panglaodb_species,
+                "next_steps": [
+                    "If no reference_annotation_keys are present and CellTypist or Scimilarity is compatible, run reference annotation before finalizing broad cell-type labels.",
+                    "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate).",
+                    "For each entry in panglaodb_reverse_marker_queries_required, call bc_get_panglaodb_marker_genes with gene_symbol and species; aggregate returned cell_type values per cluster across multiple genes.",
+                    "Do not infer alternatives from a single top gene. Treat reverse-lookup labels as candidates only when supported by multiple DEG genes, then query those cell_type labels directly.",
+                    "Compare PanglaoDB markers against each cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
+                    "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
+                    "Once every cluster has external evidence, call finalize_annotation with evidence_summary.",
+                ],
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result, adata,
+                dataset_changed=False,
+                summary=(
+                    f"Annotation proposal staged for {len(cluster_ids)} clusters "
+                    f"({len(ambiguous_clusters)} ambiguous, {len(shared_markers)} shared markers flagged). "
+                    f"Now query PanglaoDB for {len(panglaodb_queries)} candidate labels "
+                    f"and {len(panglaodb_reverse_queries)} reverse marker genes."
+                ),
+                verification=_build_verification(
+                    "passed",
+                    "Annotation proposal written to adata.uns['annotation_proposal'].",
+                    [
+                        _check(
+                            "proposal_stored",
+                            "annotation_proposal" in adata.uns,
+                            "annotation_proposal present on adata.uns.",
+                        ),
+                        _check(
+                            "degs_available",
+                            bool(top_degs_per_cluster),
+                            f"Top DEGs extracted for {len(top_degs_per_cluster)} clusters.",
+                        ),
+                    ],
+                ),
+            )
+
+        elif tool_name == "finalize_annotation":
+            import pandas as _pd
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message="No data in memory.",
+                    adata_obj=adata,
+                    recovery_options=["Load data first."],
+                )
+
+            proposal = adata.uns.get("annotation_proposal")
+            if not isinstance(proposal, dict) or not proposal.get("cluster_ids"):
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        "No annotation_proposal found on adata.uns. finalize_annotation requires "
+                        "prepare_annotation to be run first."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Call prepare_annotation first to produce DEGs and a proposal.",
+                        "Then query PanglaoDB for each candidate label and call finalize_annotation with evidence.",
+                    ],
+                )
+
+            evidence = tool_input.get("evidence_summary")
+            if not isinstance(evidence, dict) or not evidence:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message="evidence_summary is required and must map every cluster to a label with evidence.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Pass evidence_summary={cluster_id: {label, panglaodb_queried, supporting_genes, confidence}} for every cluster.",
+                    ],
+                )
+
+            cluster_key = tool_input.get("cluster_key") or proposal.get("cluster_key", "leiden")
+            annotation_key = tool_input.get("annotation_key") or proposal.get("annotation_key", "cell_type")
+            overwrite = bool(tool_input.get("overwrite", False))
+            allow_partial = bool(tool_input.get("allow_partial", False))
+
+            if cluster_key not in adata.obs.columns:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=f"Cluster column '{cluster_key}' missing from adata.obs.",
+                    adata_obj=adata,
+                    recovery_options=["Re-run prepare_annotation with the correct cluster_key."],
+                )
+            if annotation_key in adata.obs.columns and not overwrite:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        f"Column '{annotation_key}' already exists on adata.obs. "
+                        "Pass overwrite=true to replace it, or use a different annotation_key."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        f"Retry with overwrite=true if you intend to replace '{annotation_key}'.",
+                        "Pick a new annotation_key that does not collide with an existing column.",
+                    ],
+                )
+
+            proposal_clusters = [str(c) for c in proposal.get("cluster_ids", [])]
+            evidence_str = {str(k): v for k, v in evidence.items()}
+            missing_clusters = [c for c in proposal_clusters if c not in evidence_str]
+            unknown_clusters = [c for c in evidence_str.keys() if c not in proposal_clusters]
+
+            ambiguous_set = set(str(c) for c in proposal.get("ambiguous_clusters", []))
+            validation_failures: List[str] = []
+            per_cluster_validation: Dict[str, Dict[str, Any]] = {}
+
+            if missing_clusters and not allow_partial:
+                validation_failures.append(
+                    f"Missing evidence for {len(missing_clusters)} clusters: {missing_clusters[:10]}"
+                )
+            if unknown_clusters:
+                validation_failures.append(
+                    f"evidence_summary references {len(unknown_clusters)} clusters not in the proposal: {unknown_clusters[:10]}"
+                )
+
+            any_panglaodb = False
+            for cid, ev in evidence_str.items():
+                if not isinstance(ev, dict):
+                    validation_failures.append(f"Cluster {cid}: evidence is not an object.")
+                    continue
+                checks: Dict[str, Any] = {"cluster_id": cid}
+                label = ev.get("label")
+                if not isinstance(label, str) or not label.strip():
+                    validation_failures.append(f"Cluster {cid}: missing or empty 'label'.")
+                    checks["label_ok"] = False
+                else:
+                    checks["label"] = label
+                    checks["label_ok"] = True
+
+                pq = bool(ev.get("panglaodb_queried", False))
+                checks["panglaodb_queried"] = pq
+                if pq:
+                    any_panglaodb = True
+
+                supporting = ev.get("supporting_genes") or []
+                checks["n_supporting_genes"] = len(supporting) if isinstance(supporting, list) else 0
+                if isinstance(supporting, list) and len(supporting) == 0:
+                    validation_failures.append(
+                        f"Cluster {cid}: supporting_genes is empty — every label must cite at least one cluster DEG that matched a PanglaoDB marker."
+                    )
+
+                competing = ev.get("competing_labels_considered")
+                if cid in ambiguous_set:
+                    if not isinstance(competing, list) or len(competing) == 0:
+                        validation_failures.append(
+                            f"Cluster {cid} was flagged ambiguous by prepare_annotation but evidence provides no competing_labels_considered."
+                        )
+                checks["competing_labels_considered"] = competing or []
+                if "reference_annotation_support" in ev:
+                    checks["reference_annotation_support"] = ev.get("reference_annotation_support")
+                if "reference_annotation_conflicts" in ev:
+                    conflicts = ev.get("reference_annotation_conflicts")
+                    checks["reference_annotation_conflicts"] = conflicts if isinstance(conflicts, list) else [str(conflicts)]
+                if "reverse_marker_support" in ev:
+                    checks["reverse_marker_support"] = ev.get("reverse_marker_support")
+                if "panglaodb_label_used" in ev:
+                    checks["panglaodb_label_used"] = str(ev.get("panglaodb_label_used"))
+                if "reasoning" in ev:
+                    checks["reasoning"] = str(ev.get("reasoning"))
+
+                conf = ev.get("confidence")
+                if conf not in {"high", "medium", "low"}:
+                    validation_failures.append(f"Cluster {cid}: confidence must be 'high', 'medium', or 'low'.")
+                checks["confidence"] = conf
+
+                per_cluster_validation[cid] = checks
+
+            if not any_panglaodb:
+                validation_failures.append(
+                    "No cluster has panglaodb_queried=true. At least one PanglaoDB query must back the labels — "
+                    "this tool refuses to write annotations without external marker validation."
+                )
+
+            if validation_failures:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message="Evidence validation failed: " + "; ".join(validation_failures[:6]),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Query PanglaoDB for each proposed label and competing label.",
+                        "Fill supporting_genes with the cluster DEGs that match PanglaoDB markers.",
+                        "For ambiguous clusters, list the alternative labels you considered in competing_labels_considered.",
+                        "Resubmit finalize_annotation with the corrected evidence_summary.",
+                    ],
+                    extra={
+                        "validation_failures": validation_failures,
+                        "per_cluster_validation": per_cluster_validation,
+                    },
+                )
+
+            cluster_to_label: Dict[str, str] = {}
+            for cid in proposal_clusters:
+                ev = evidence_str.get(cid)
+                if isinstance(ev, dict) and isinstance(ev.get("label"), str):
+                    cluster_to_label[cid] = ev["label"]
+                elif allow_partial:
+                    cluster_to_label[cid] = "Unassigned"
+
+            try:
+                series = adata.obs[cluster_key].astype(str).map(cluster_to_label)
+                if not allow_partial and series.isna().any():
+                    return _error_result(
+                        tool="finalize_annotation",
+                        message="Mapping produced NaNs — some cluster ids in obs were not in the evidence.",
+                        adata_obj=adata,
+                        recovery_options=["Re-run prepare_annotation; verify the cluster_key matches."],
+                    )
+                series = series.fillna("Unassigned")
+                adata.obs[annotation_key] = _pd.Categorical(series.values)
+            except Exception as e:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=f"Failed to write annotation column: {e}",
+                    adata_obj=adata,
+                    recovery_options=["Inspect cluster_key dtype and evidence_summary keys; ensure they're strings."],
+                )
+
+            label_counts: Dict[str, int] = {}
+            for v in adata.obs[annotation_key].astype(str).values:
+                label_counts[v] = label_counts.get(v, 0) + 1
+
+            validation_payload = {
+                "annotation_key": annotation_key,
+                "cluster_key": cluster_key,
+                "panglaodb_validated": True,
+                "n_clusters_validated": len([c for c in per_cluster_validation.values() if c.get("panglaodb_queried")]),
+                "per_cluster_evidence": per_cluster_validation,
+                "label_counts": label_counts,
+                "finalized": True,
+            }
+            try:
+                adata.uns["annotation_validation"] = validation_payload
+            except Exception:
+                pass
+
+            result = {
+                "status": "ok",
+                "tool": "finalize_annotation",
+                "annotation_key": annotation_key,
+                "cluster_key": cluster_key,
+                "n_clusters_labeled": len(cluster_to_label),
+                "label_counts": label_counts,
+                "cell_type_breakdown": label_counts,
+                "annotation_validation": validation_payload,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result, adata,
+                dataset_changed=True,
+                summary=(
+                    f"Wrote final annotation '{annotation_key}' for {len(cluster_to_label)} clusters "
+                    f"({len(label_counts)} unique labels, all PanglaoDB-validated)."
+                ),
+                verification=_build_verification(
+                    "passed",
+                    "Annotation finalized with external marker evidence.",
+                    [
+                        _check(
+                            "annotation_column_written",
+                            annotation_key in adata.obs.columns,
+                            f"adata.obs['{annotation_key}'] present.",
+                        ),
+                        _check(
+                            "validation_recorded",
+                            "annotation_validation" in adata.uns,
+                            "adata.uns['annotation_validation'] recorded.",
+                        ),
+                        _check(
+                            "panglaodb_evidence_present",
+                            any_panglaodb,
+                            "At least one cluster has PanglaoDB-backed evidence.",
+                        ),
+                    ],
+                ),
             )
 
         else:

@@ -69,6 +69,9 @@ pbmc_auto/
 logs/
 .claude/
 treg_project/
+andrew_data/
+tests/
+cellbender_test/
 
 # macOS metadata files
 ._*
@@ -80,3 +83,4 @@ scagent/agent/prompts_backup.py
 *.png
 claude_local.sh
 sc-agent-490721-01596696572f.json
+*.bin

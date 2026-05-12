@@ -23,6 +23,7 @@ from .run_manager import RunManager, create_run
 from .decision_policy import (
     decision_for_clustering_selection,
 )
+from .vision_sidecar import VisionSidecar
 from .world_state import AgentWorldState, artifact_id_from_path
 
 logger = logging.getLogger(__name__)
@@ -77,10 +78,11 @@ load_data
   → run_cluster_qc            [narrate full table + evidence]
   → PAUSE: present removal proposal, wait for confirmation
   → [loop: normalize_and_hvg → run_pca → run_neighbors → run_umap → run_clustering → run_cluster_qc → until clean]
-  → run_celltypist
-  → run_code for DEGs
-  → bc_get_panglaodb_marker_genes per label (MCP)
-  → correct labels, final UMAP
+  → run_celltypist and/or run_scimilarity when organism/model compatibility allows
+  → prepare_annotation with reference annotation keys
+  → bc_get_panglaodb_marker_genes per candidate and plausible competitor (MCP)
+  → finalize_annotation with DEG, reference-label, and PanglaoDB evidence
+  → final UMAP
 ```
 
 **Each `→` is a tool call in the same response turn. The only places you stop and wait are: cluster removal confirmation, user domain knowledge, or surprising results.**
@@ -141,6 +143,7 @@ AUTO_RECOVERY_ATTEMPTS = 2
 
 ACTION_TOOL_NAMES = {
     "load_data",
+    "run_cellbender",
     "run_qc",
     "normalize_and_hvg",
     "run_pca",
@@ -150,6 +153,8 @@ ACTION_TOOL_NAMES = {
     "compare_clusterings",
     "run_celltypist",
     "run_scimilarity",
+    "prepare_annotation",
+    "finalize_annotation",
     "run_batch_correction",
     "score_integration",
     "benchmark_integration",
@@ -184,6 +189,7 @@ INSPECTION_TOOL_NAMES = {
     "fetch_url",
     "web_search",
     "research_findings",
+    "describe_image",
 }
 
 # Load .env file if present
@@ -287,6 +293,12 @@ class SCAgent:
         self.world_state = AgentWorldState()
         self.biological_context: Optional[Dict[str, Any]] = None
         self._pending_images: List[Dict[str, str]] = []  # For vision support (list of figure dicts)
+        # Vision sidecar — used only when the main model is text-only AND
+        # SCAGENT_VISION_MODEL is configured. None otherwise.
+        self._vision_sidecar: Optional[VisionSidecar] = VisionSidecar.from_env()
+        # Tracks the most recent producing-tool image_context per figure path so
+        # describe_image can re-use plot_type / color_by / cluster_key on followups.
+        self._figure_context_index: Dict[str, Dict[str, Any]] = {}
         self._next_llm_status_message: Optional[str] = None
         self._conversation_history: List[Dict[str, Any]] = []  # For interactive mode
         self._active_request: str = ""
@@ -454,7 +466,7 @@ class SCAgent:
 
         self.client = Anthropic(api_key=api_key)
         self.model = model or "claude-sonnet-4-20250514"
-        self.tools = get_tools()
+        self.tools = get_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = 200_000  # all Claude models support 200K
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
@@ -479,7 +491,7 @@ class SCAgent:
         else:
             self.client = OpenAI(api_key=api_key)
         self.model = model or "gpt-4o"
-        self.tools = get_openai_tools()
+        self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = self._resolve_context_limit()
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
@@ -488,7 +500,7 @@ class SCAgent:
         codex_model = model or os.environ.get("SCAGENT_CODEX_MODEL")
         self.client = CodexCLIClient(model=codex_model, cwd=os.getcwd())
         self.model = codex_model or "codex-default"
-        self.tools = get_openai_tools()
+        self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
     def _init_gemini(self, api_key: Optional[str], model: Optional[str]):
@@ -517,7 +529,7 @@ class SCAgent:
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
         self.model = model or "gemini-3.1-flash"
-        self.tools = get_openai_tools()
+        self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = self._resolve_context_limit()
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
@@ -566,7 +578,7 @@ class SCAgent:
 
         m = model or "gemini-3.1-flash"
         self.model = m if m.startswith("google/") else f"google/{m}"
-        self.tools = get_openai_tools()
+        self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = int(os.environ.get("SCAGENT_CONTEXT_LIMIT", "1000000"))
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
 
@@ -823,10 +835,13 @@ class SCAgent:
     def _is_gemma_model(self) -> bool:
         return "gemma" in (self.model or "").lower()
 
+    def _is_gemini_model(self) -> bool:
+        return self.provider == "gemini" or "gemini" in (self.model or "").lower()
+
     def _is_thinking_model(self) -> bool:
         """Return True for models that have controllable thinking/reasoning modes."""
         m = (self.model or "").lower()
-        return "gemma" in m or "qwen" in m or "deepseek" in m
+        return "gemma" in m or "qwen" in m or "deepseek" in m or "gemini" in m
 
     def _thinking_extra(self) -> dict:
         """Return extra kwargs to control thinking mode and reasoning effort.
@@ -834,6 +849,10 @@ class SCAgent:
         DeepSeek API (cloud): thinking ON by default.
           SCAGENT_THINKING=0  → disable thinking entirely.
           SCAGENT_THINKING_EFFORT=high|max  → reasoning depth (default: high).
+
+        Gemini (cloud): thinking OFF by default.
+          SCAGENT_THINKING=1  → enable via thinking_config.
+          SCAGENT_THINKING_BUDGET=N  → token budget (default: 8000).
 
         vLLM local models (Qwen/Gemma): thinking OFF by default (server default).
           SCAGENT_THINKING=1  → enable via chat_template_kwargs.
@@ -850,6 +869,11 @@ class SCAgent:
             if effort in ("high", "max"):
                 kwargs["reasoning_effort"] = effort
             return kwargs
+        if "gemini" in m:
+            if os.environ.get("SCAGENT_THINKING", "0") == "1":
+                budget = int(os.environ.get("SCAGENT_THINKING_BUDGET", "8000"))
+                return {"extra_body": {"thinking_config": {"thinking_budget": budget, "include_thoughts": True}}}
+            return {}
         # vLLM local models (Qwen/Gemma)
         if os.environ.get("SCAGENT_THINKING", "0") == "1":
             return {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
@@ -924,11 +948,93 @@ class SCAgent:
         }
 
     def _supports_vision(self) -> bool:
-        """Return False for models whose API doesn't accept image_url content (e.g. DeepSeek v4)."""
+        """Return False for models whose API doesn't accept image_url content (e.g. DeepSeek v4).
+
+        Honors SCAGENT_FORCE_TEXT_VISION=1 as a testing override so the sidecar
+        path can be exercised against a multimodal main model.
+        """
+        if os.environ.get("SCAGENT_FORCE_TEXT_VISION", "").lower() in ("1", "true", "yes"):
+            return False
         m = (self.model or "").lower()
         if "deepseek" in m:
             return False
         return True
+
+    def _use_sidecar_for_images(self) -> bool:
+        """True iff main model is text-only AND a vision sidecar is configured."""
+        return (not self._supports_vision()) and self._vision_sidecar is not None
+
+    def _build_sidecar_text_message(self, images: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Run the vision sidecar over pending figures and wrap its output as a user message.
+
+        On sidecar error, falls back to the path-only placeholder used today.
+        Emits a run_manager event per call for auditing.
+        """
+        sidecar = self._vision_sidecar
+        paths = ", ".join(img.get("path", "?") for img in images)
+        if sidecar is None:
+            return {"role": "user", "content": f"Figure(s) saved at {paths}."}
+
+        # Attach any cached image_context for each image so the sidecar can use
+        # plot_type / color_by / cluster_key when describing.
+        enriched: List[Dict[str, Any]] = []
+        for img in images:
+            ctx = self._figure_context_index.get(img.get("path") or "", {})
+            enriched.append({**img, "image_context": ctx})
+
+        try:
+            world_state = self.world_state.snapshot()
+        except Exception:
+            world_state = None
+
+        result = sidecar.describe(
+            enriched,
+            world_state=world_state,
+            comparative=(len(enriched) > 1),
+        )
+        if self.run_manager:
+            try:
+                self.run_manager.append_event(
+                    "vision_sidecar_call",
+                    {
+                        "model": result.get("model"),
+                        "n_images": result.get("n_images"),
+                        "latency_ms": result.get("latency_ms"),
+                        "cache_hits": result.get("cache_hits"),
+                        "status": result.get("status"),
+                        "paths": [img.get("path") for img in images],
+                    },
+                )
+                self.run_manager.append_log(
+                    f"vision_sidecar status={result.get('status')} "
+                    f"model={result.get('model')} n_images={result.get('n_images')} "
+                    f"latency_ms={result.get('latency_ms')} "
+                    f"cache_hits={result.get('cache_hits')} "
+                    + (f"error={result.get('error')!r} " if result.get('status') != 'ok' else "")
+                    + f"paths={[img.get('path') for img in images]}"
+                )
+            except Exception:
+                pass
+
+        if result.get("status") != "ok" or not result.get("text"):
+            return {
+                "role": "user",
+                "content": (
+                    f"Figure(s) saved at {paths}. Vision sidecar unavailable "
+                    f"({result.get('error', 'unknown error')})."
+                ),
+            }
+
+        header = (
+            f"[Figure described by vision sidecar — model={result.get('model')}; "
+            "main model is text-only]\n"
+            f"Path(s): {paths}\n\n"
+        )
+        footer = (
+            "\n\nIf you need to look again or ask a focused question about any of "
+            "these figures, call describe_image(figure_path=..., question=\"...\")."
+        )
+        return {"role": "user", "content": header + result["text"] + footer}
 
     def _build_image_message(self, images: List[Dict[str, str]], provider: str) -> Dict[str, Any]:
         """Build a user message containing one or more figures with a role-aware prompt."""
@@ -1092,6 +1198,11 @@ class SCAgent:
         if selected_action == "run_clustering":
             clustering_input = dict(action_inputs.get("run_clustering", {}))
             run_step("run_clustering", clustering_input)
+            return {"selected_action": selected_action, "steps": steps}
+
+        if selected_action == "run_cluster_qc":
+            cluster_qc_input = dict(action_inputs.get("run_cluster_qc", {}))
+            run_step("run_cluster_qc", cluster_qc_input)
             return {"selected_action": selected_action, "steps": steps}
 
         if selected_action == "render_plain_umap":
@@ -1401,22 +1512,44 @@ class SCAgent:
                 cluster_key = result_data.get("cluster_key", "clustering")
                 n_clusters = result_data.get("n_clusters", "?")
                 summary = f"Clustering produced {n_clusters} clusters in '{cluster_key}'."
-                options, option_actions = self._checkpoint_options([
-                    ("Proceed to cell type annotation", "run_annotation"),
-                    ("Compare alternative clustering resolutions before annotating", "compare_clusterings"),
-                    ("Run marker analysis or cluster-size review before annotating", "review_cluster_markers"),
-                    ("Something else", "custom"),
-                ])
+                processing = self.world_state.data_summary.get("processing", {}) if self.world_state else {}
+                qc_ready = bool(processing.get("has_qc_metrics"))
+                cluster_qc_needed = qc_ready
+                if cluster_qc_needed:
+                    options, option_actions = self._checkpoint_options([
+                        ("Run cluster-level QC before annotation", "run_cluster_qc"),
+                        ("Compare alternative clustering resolutions before QC", "compare_clusterings"),
+                        ("Proceed without cluster-level QC for this clustering", "run_annotation"),
+                        ("Something else", "custom"),
+                    ])
+                    default_action_input = {
+                        "run_cluster_qc": {
+                            "cluster_key": result_data.get("primary_cluster_key") or cluster_key,
+                        }
+                    }
+                    question = "Clustering is complete. Should I run cluster-level QC before continuing?"
+                    recommendation = options[0]
+                else:
+                    options, option_actions = self._checkpoint_options([
+                        ("Proceed to cell type annotation", "run_annotation"),
+                        ("Compare alternative clustering resolutions before annotating", "compare_clusterings"),
+                        ("Run marker analysis or cluster-size review before annotating", "review_cluster_markers"),
+                        ("Something else", "custom"),
+                    ])
+                    default_action_input = {}
+                    question = "Clustering is complete. What should I do next?"
+                    recommendation = options[0]
                 checkpoint = {
                     "kind": "clustering",
-                    "question": "Clustering is complete. What should I do next?",
+                    "question": question,
                     "options": options,
                     "default": options[0],
                     "decision_key": "clustering_next_step",
                     "summary": summary,
-                    "recommendation": options[0],
+                    "recommendation": recommendation,
                     "option_actions": option_actions,
                     "action_inputs": {
+                        **default_action_input,
                         "run_annotation": {
                             "majority_voting": True,
                             "cluster_key": result_data.get("primary_cluster_key") or result_data.get("cluster_key", "leiden"),
@@ -1692,8 +1825,34 @@ class SCAgent:
                 "then call the appropriate tool. Do not include this sentence inside the "
                 "thinking block — write it as plain response text after the closing tag."
             )
+        if self._is_gemini_model():
+            # Gemini via OpenAI-compatible API often returns tool calls with no text content.
+            # Instruct it to narrate before each tool call so users see reasoning steps.
+            prompt += (
+                "\n\n## Narration Requirement\n"
+                "Before each tool call, always write one brief sentence describing what you "
+                "are about to do (e.g. 'I'll load the data to inspect its structure.'). "
+                "Write this as plain text content in the same response as the tool call."
+            )
         if self.smart_autonomous:
             prompt += _SMART_AUTONOMOUS_PROMPT
+        if self._use_sidecar_for_images():
+            sidecar_model = self._vision_sidecar.model if self._vision_sidecar else "(unconfigured)"
+            prompt += (
+                "\n\n## Figure Handling (text-only main model + vision sidecar active)\n"
+                "- You cannot see figures directly. A separate vision model "
+                f"(`{sidecar_model}`) describes any figure produced by a tool. The "
+                "description is injected into the conversation as a user message with "
+                "sections WHAT_THIS_IS / KEY_OBSERVATIONS / NUMBERS_VISIBLE / ANOMALIES "
+                "/ ACTIONABLE_FLAGS / OPEN_QUESTIONS. Treat that description as your "
+                "view of the figure.\n"
+                "- To re-inspect a figure or ask a focused question (e.g. 'do clusters "
+                "4 and 7 separate by batch?'), call `describe_image(figure_path=..., "
+                "question=\"...\")`.\n"
+                "- Do not claim you 'see' the figure — you have a faithful textual "
+                "description. If a description is missing a detail you need, request "
+                "it via `describe_image`."
+            )
         return f"{prompt}\n\n## Runtime Interaction State\n{self._runtime_guidance()}"
 
     def _current_capabilities(self) -> Dict[str, Any]:
@@ -1703,12 +1862,60 @@ class SCAgent:
         text = (value or "").strip().lower()
         return text in {"y", "yes", "1", "ok", "okay", "sure", "continue", "do it", "run it", "compute it"}
 
+    def _checkpoint_action_from_user_response(
+        self,
+        checkpoint: Dict[str, Any],
+        value: str,
+    ) -> Optional[str]:
+        """Resolve common natural replies to a pending checkpoint action."""
+        text = " ".join((value or "").strip().lower().split())
+        text = text.strip(" .,!?:;")
+        option_actions = checkpoint.get("option_actions") or []
+        options = checkpoint.get("options") or []
+
+        numbered_match = re.match(r"^(?:option|choice|number|#)?\s*([1-9][0-9]*)\b", text)
+        if text.isdigit() or numbered_match:
+            number = numbered_match.group(1) if numbered_match else text
+            index = int(number) - 1
+            if 0 <= index < len(option_actions):
+                return option_actions[index]
+
+        ordinal_index = {
+            "first": 0,
+            "1st": 0,
+            "one": 0,
+            "second": 1,
+            "2nd": 1,
+            "two": 1,
+            "third": 2,
+            "3rd": 2,
+            "three": 2,
+            "fourth": 3,
+            "4th": 3,
+            "four": 3,
+        }
+        for ordinal, index in ordinal_index.items():
+            if re.match(rf"^(?:(?:option|choice|number)\s+)?{ordinal}\b", text):
+                if 0 <= index < len(option_actions):
+                    return option_actions[index]
+
+        request_words = {w for w in re.findall(r"[a-z0-9]+", text) if len(w) > 2}
+        for option, action in zip(options, option_actions):
+            option_text = " ".join(str(option).strip().lower().split()).strip(" .,!?:;")
+            if text and text == option_text:
+                return action
+            option_words = {w for w in re.findall(r"[a-z0-9]+", option_text) if len(w) > 2}
+            if option_words and len(option_words & request_words) >= min(3, len(option_words)):
+                return action
+        return None
+
     def _is_strict_cleanup_yes(self, value: str) -> bool:
         text = " ".join((value or "").strip().lower().split())
         text = text.strip(" .,!?:;")
         if text in {
             "y",
             "yes",
+            "1",
             "ok",
             "okay",
             "sure",
@@ -1849,7 +2056,8 @@ class SCAgent:
         if checkpoint.get("kind") != "cluster_qc_cleanup":
             return False
         proposal = checkpoint.get("proposal") or {}
-        if self._is_strict_cleanup_yes(request):
+        selected_action = self._checkpoint_action_from_user_response(checkpoint, request)
+        if selected_action == "remove_proposed_clusters":
             mentioned = self._mentioned_cluster_labels(request)
             proposed = {str(label) for label in proposal.get("proposed_removal", [])}
             if mentioned and mentioned != proposed:
@@ -1867,7 +2075,7 @@ class SCAgent:
             )
             self._clear_pending_checkpoint(request)
             return True
-        if self._is_cleanup_no(request):
+        if selected_action == "keep_proposed_clusters":
             self.world_state.resolve_decision(
                 "cluster_qc_cleanup",
                 "keep_proposed_clusters",
@@ -1900,6 +2108,15 @@ class SCAgent:
                     "proposal": proposal,
                     "reason": auto_reason,
                 }
+            return {
+                "source": "user_confirmation",
+                "proposal": proposal,
+                "reason": (
+                    "A cluster cleanup checkpoint is pending. The model interpreted the "
+                    "latest user reply in that context; destructive-code preflight must "
+                    "verify the exact proposed clusters and cell count before execution."
+                ),
+            }
         if self._looks_like_direct_cleanup_request(self._active_request):
             return {
                 "source": "direct_user_request",
@@ -2573,7 +2790,8 @@ class SCAgent:
         # authorization. Otherwise the LLM's response options take precedence.
         if self._pending_checkpoint:
             if not self._authorize_pending_cleanup_from_user(request):
-                self._clear_pending_checkpoint("superseded by new response")
+                if self._pending_checkpoint.get("kind") != "cluster_qc_cleanup":
+                    self._clear_pending_checkpoint("superseded by new response")
 
         # Build initial message
         user_message = request
@@ -2803,14 +3021,18 @@ class SCAgent:
                     })
 
                     if self._pending_images:
-                        paths = ", ".join(img["path"] for img in self._pending_images)
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"Figure(s) generated at {paths}. The Codex CLI bridge does not "
-                                "support inline image bytes; call review_figure if visual review is needed."
-                            ),
-                        })
+                        if self._vision_sidecar is not None:
+                            messages.append(self._build_sidecar_text_message(self._pending_images))
+                            self._next_llm_status_message = "Reading figure description..."
+                        else:
+                            paths = ", ".join(img["path"] for img in self._pending_images)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"Figure(s) generated at {paths}. The Codex CLI bridge does not "
+                                    "support inline image bytes; call review_figure if visual review is needed."
+                                ),
+                            })
                         self._pending_images = []
                     continue
 
@@ -2947,8 +3169,18 @@ class SCAgent:
 
                     # If there are pending figures, inject them as a vision user message
                     if self._pending_images:
-                        messages.append(self._build_image_message(self._pending_images, "anthropic"))
-                        self._next_llm_status_message = "Analyzing figure..."
+                        if self._supports_vision():
+                            messages.append(self._build_image_message(self._pending_images, "anthropic"))
+                            self._next_llm_status_message = "Analyzing figure..."
+                        elif self._vision_sidecar is not None:
+                            messages.append(self._build_sidecar_text_message(self._pending_images))
+                            self._next_llm_status_message = "Reading figure description..."
+                        else:
+                            paths = ", ".join(img["path"] for img in self._pending_images)
+                            messages.append({
+                                "role": "user",
+                                "content": f"Figure(s) saved at {paths}.",
+                            })
                         self._pending_images = []
 
                 elif response.stop_reason == "end_turn":
@@ -3084,6 +3316,7 @@ class SCAgent:
                 "api.openai.com",
                 "api.anthropic.com",
                 "api.groq.com",
+                "api.deepseek.com",
                 "generativelanguage.googleapis.com",
                 "aiplatform.googleapis.com",
             )
@@ -3116,25 +3349,34 @@ class SCAgent:
             return limit
 
         # --- Priority 4: cloud model name dict ---
+        def _known(limit: int, source: str) -> int:
+            logger.info(f"Context limit from known model table ({source}): {limit:,} tokens")
+            self._print(f"[dim]Context limit from known model table: {limit:,} tokens[/dim]")
+            return limit
+
         # Claude: Opus 4.6/4.7, Sonnet 4.6, and Mythos are 1M; Haiku 4.5 and older are 200K
         if "claude" in model:
             if any(m in model for m in ("opus-4-6", "opus-4-7", "sonnet-4-6", "mythos")):
-                return 1_000_000
-            return 200_000
+                return _known(1_000_000, self.model)
+            return _known(200_000, self.model)
         # GPT-5.x: mini variants (gpt-5-mini, gpt-5.4-mini) are 400K; all others are 1M
         if "gpt-5" in model:
             if "mini" in model:
-                return 400_000
-            return 1_000_000
+                return _known(400_000, self.model)
+            return _known(1_000_000, self.model)
         if "gpt-4o" in model:
-            return 128_000
+            return _known(128_000, self.model)
         if "gpt-4-turbo" in model:
-            return 128_000
+            return _known(128_000, self.model)
         if "llama" in model or "mixtral" in model or "gemma" in model:
-            return 128_000
+            return _known(128_000, self.model)
         # Gemini 3.x and 2.5: Pro, Flash, and Flash-Lite all support 1M context
         if "gemini" in model:
-            return 1_048_576
+            return _known(1_048_576, self.model)
+        # DeepSeek v4: pro/flash both support 1M context, 384K max output.
+        # Legacy aliases (deepseek-chat / deepseek-reasoner) point at v4-flash.
+        if "deepseek" in model:
+            return _known(1_000_000, self.model)
 
         # --- Priority 5: generic Qwen fallback ---
         if "qwen" in model:
@@ -3780,9 +4022,15 @@ class SCAgent:
                     # Add assistant message with tool calls
                     messages.append(message)
 
-                    # Print any reasoning/text content from the agent
-                    if message.content:
-                        self._print_thinking(message.content)
+                    # Print any reasoning/text content from the agent.
+                    # reasoning_content is a non-standard field used by Gemini and DeepSeek
+                    # via their OpenAI-compatible APIs to expose thinking tokens.
+                    _reasoning = (
+                        (getattr(message, "model_extra", None) or {}).get("reasoning_content")
+                        or message.content
+                    )
+                    if _reasoning:
+                        self._print_thinking(_reasoning)
 
                     # Process each tool call
                     for tool_call in message.tool_calls:
@@ -3800,6 +4048,9 @@ class SCAgent:
                         if self._supports_vision():
                             messages.append(self._build_image_message(self._pending_images, "openai"))
                             self._next_llm_status_message = "Analyzing figure..."
+                        elif self._vision_sidecar is not None:
+                            messages.append(self._build_sidecar_text_message(self._pending_images))
+                            self._next_llm_status_message = "Reading figure description..."
                         else:
                             paths = ", ".join(img["path"] for img in self._pending_images)
                             messages.append({"role": "user", "content": f"Figure(s) saved at {paths}."})
@@ -3899,6 +4150,7 @@ class SCAgent:
 
     _TOOL_LABELS = {
         "load_data":            "Loading dataset",
+        "run_cellbender":       "Running CellBender",
         "run_qc":               "Running QC",
         "score_integration":    "Scoring integration quality",
         "benchmark_integration": "Benchmarking integration (scib-metrics)",
@@ -3910,6 +4162,8 @@ class SCAgent:
         "compare_clusterings":  "Comparing clusterings",
         "run_celltypist":       "Cell type annotation",
         "run_scimilarity":      "Scimilarity annotation",
+        "prepare_annotation":   "Preparing annotation proposal",
+        "finalize_annotation":  "Finalizing annotation",
         "run_batch_correction": "Batch correction",
         "run_deg":              "Differential expression",
         "run_pseudobulk_deg":  "Pseudobulk DEG (DESeq2)",
@@ -3930,6 +4184,50 @@ class SCAgent:
         "review_artifact":      "Reviewing artifact",
         "read_file":            "Reading file",
         "pause_and_ask":        "Pausing for guidance",
+        "describe_image":       "Describing figure (vision sidecar)",
+    }
+
+    _MCP_TOOL_LABELS = {
+        # biocontext marker and annotation validation
+        "bc_get_panglaodb_marker_genes": "Querying PanglaoDB markers",
+        "bc_get_panglaodb_options": "Loading PanglaoDB options",
+        "bc_get_cell_ontology_terms": "Searching Cell Ontology",
+        "bc_search_ontology_terms": "Searching ontology terms",
+        "bc_get_term_details": "Loading ontology term details",
+        "bc_get_term_hierarchical_children": "Loading ontology hierarchy",
+        "bc_get_available_ontologies": "Loading ontology list",
+        # biocontext gene, protein, and pathway evidence
+        "bc_get_human_protein_atlas_info": "Querying Human Protein Atlas",
+        "bc_get_go_terms_by_gene": "Querying GO terms",
+        "bc_get_reactome_info_by_identifier": "Querying Reactome",
+        "bc_get_string_id": "Mapping STRING identifier",
+        "bc_get_string_interactions": "Querying STRING interactions",
+        "bc_get_string_network_image": "Generating STRING network",
+        "bc_get_string_similarity_scores": "Querying STRING similarity",
+        "bc_get_ensembl_id_from_gene_symbol": "Mapping Ensembl gene ID",
+        "bc_get_kegg_id_by_gene_symbol": "Mapping KEGG gene ID",
+        "bc_query_kegg": "Querying KEGG",
+        "bc_get_uniprot_id_by_protein_symbol": "Mapping UniProt protein ID",
+        "bc_get_uniprot_protein_info": "Querying UniProt",
+        "bc_get_alphafold_info_by_protein_symbol": "Querying AlphaFold",
+        "bc_get_protein_domains": "Querying protein domains",
+        "bc_get_interpro_entry": "Querying InterPro entry",
+        "bc_search_interpro_entries": "Searching InterPro",
+        # literature MCPs
+        "search_abstracts": "Searching PubMed abstracts",
+        "bc_get_europepmc_articles": "Searching Europe PMC",
+        "bc_get_europepmc_fulltext": "Fetching Europe PMC full text",
+        "bc_get_biorxiv_preprint_details": "Fetching bioRxiv preprint",
+        "bc_get_recent_biorxiv_preprints": "Searching bioRxiv preprints",
+        "bc_search_google_scholar_publications": "Searching Google Scholar",
+        # translational/drug/trial MCPs
+        "bc_query_open_targets_graphql": "Querying Open Targets",
+        "bc_get_open_targets_query_examples": "Loading Open Targets examples",
+        "bc_get_open_targets_graphql_schema": "Loading Open Targets schema",
+        "bc_search_drugs_fda": "Searching FDA drugs",
+        "bc_get_drug_label_info": "Fetching FDA drug label",
+        "bc_search_studies": "Searching clinical trials",
+        "bc_get_study_details": "Fetching clinical trial details",
     }
 
     # Tools that should leave persistent start/done lines in the terminal. This
@@ -3937,6 +4235,7 @@ class SCAgent:
     # actions so the user can see the pipeline history after each step finishes.
     _STREAMING_TOOLS = {
         "load_data",
+        "run_cellbender",
         "normalize_and_hvg",
         "run_pca",
         "run_neighbors",
@@ -3944,6 +4243,7 @@ class SCAgent:
         "compare_clusterings",
         "run_celltypist",
         "run_scimilarity",
+        "prepare_annotation",     # runs rank_genes_groups, can be slow
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
         "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets
@@ -3959,7 +4259,38 @@ class SCAgent:
         "run_cluster_qc",
         "generate_figure",
         "run_code",               # unknown — user code may print progress
+        "run_shell",              # external system checks/commands should be visible in terminal history
     }
+
+    def _display_label_for_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
+        """Return a concise terminal label for native and MCP tools."""
+        if tool_name == "run_code":
+            return self._TOOL_LABELS.get(tool_name, tool_input.get("description", "Running code"))
+
+        if tool_name in self._TOOL_LABELS:
+            return self._TOOL_LABELS[tool_name]
+        if tool_name in self._MCP_TOOL_LABELS:
+            return self._MCP_TOOL_LABELS[tool_name]
+
+        if self._mcp_client and self._mcp_client.has_tool(tool_name):
+            if tool_name.startswith("bc_get_"):
+                stem = tool_name.removeprefix("bc_get_")
+                return "Querying " + stem.replace("_", " ").title()
+            if tool_name.startswith("bc_search_"):
+                stem = tool_name.removeprefix("bc_search_")
+                return "Searching " + stem.replace("_", " ").title()
+            if tool_name.startswith("bc_query_"):
+                stem = tool_name.removeprefix("bc_query_")
+                return "Querying " + stem.replace("_", " ").title()
+            return "Using MCP tool " + tool_name.replace("_", " ")
+
+        return tool_name.replace("_", " ").title()
+
+    def _should_print_persistent_tool_progress(self, tool_name: str) -> bool:
+        """Whether verbose mode should leave durable start/done lines."""
+        if tool_name in self._STREAMING_TOOLS:
+            return True
+        return bool(self._mcp_client and self._mcp_client.has_tool(tool_name))
 
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Execute a tool and return JSON result."""
@@ -4003,6 +4334,15 @@ class SCAgent:
 
             run_root = self.run_manager.run_dir
 
+            def _inside_run_root(p: Path) -> bool:
+                """True if path is the run dir or one of its descendants."""
+                try:
+                    p_resolved = p.resolve() if p.is_absolute() else (run_root / p).resolve()
+                    p_resolved.relative_to(run_root.resolve())
+                    return True
+                except (ValueError, OSError):
+                    return False
+
             if tool_name in figure_tools:
                 requested = tool_input.get("output_path")
                 if not requested:
@@ -4017,22 +4357,59 @@ class SCAgent:
                             _sanitize_name(requested_path.stem),
                             ext=requested_path.suffix.lstrip(".") or "png",
                         )
+                    elif not _inside_run_root(requested_path):
+                        # Absolute path outside the run dir — agent invented a custom
+                        # location. Re-route under the run dir for consistency.
+                        rerouted = self.run_manager.get_figure_path(
+                            _sanitize_name(requested_path.stem),
+                            ext=requested_path.suffix.lstrip(".") or "png",
+                        )
+                        logger.info(
+                            "Rerouting generate_figure output_path from %s to %s "
+                            "(outside run dir).", requested, rerouted,
+                        )
+                        tool_input["output_path"] = rerouted
 
-            if tool_name == "run_qc" and not tool_input.get("figure_dir"):
-                tool_input["figure_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
+            if tool_name == "run_qc":
+                requested_dir = tool_input.get("figure_dir")
+                run_figures_dir = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
+                if not requested_dir:
+                    tool_input["figure_dir"] = run_figures_dir
+                elif not _inside_run_root(Path(requested_dir)):
+                    logger.info(
+                        "Rerouting run_qc figure_dir from %s to %s (outside run dir).",
+                        requested_dir, run_figures_dir,
+                    )
+                    tool_input["figure_dir"] = run_figures_dir
 
-            if tool_name == "compare_clusterings" and tool_input.get("generate_figures") and not tool_input.get("figure_dir"):
-                tool_input["figure_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
+            if tool_name == "compare_clusterings" and tool_input.get("generate_figures"):
+                requested_dir = tool_input.get("figure_dir")
+                run_figures_dir = str(self.run_manager._ensure(self.run_manager.dirs["figures"]))
+                if not requested_dir:
+                    tool_input["figure_dir"] = run_figures_dir
+                elif not _inside_run_root(Path(requested_dir)):
+                    logger.info(
+                        "Rerouting compare_clusterings figure_dir from %s to %s (outside run dir).",
+                        requested_dir, run_figures_dir,
+                    )
+                    tool_input["figure_dir"] = run_figures_dir
 
             if tool_name == "run_gsea":
                 requested_dir = tool_input.get("output_dir")
+                gsea_dir = str(self.run_manager._ensure(self.run_manager.dirs["gsea"]))
                 if not requested_dir:
-                    tool_input["output_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["gsea"]))
+                    tool_input["output_dir"] = gsea_dir
                 else:
                     requested_path = Path(requested_dir)
                     if not requested_path.is_absolute():
                         if requested_path == Path(".") or requested_path.name == run_root.name:
-                            tool_input["output_dir"] = str(self.run_manager._ensure(self.run_manager.dirs["gsea"]))
+                            tool_input["output_dir"] = gsea_dir
+                    elif not _inside_run_root(requested_path):
+                        logger.info(
+                            "Rerouting run_gsea output_dir from %s to %s (outside run dir).",
+                            requested_dir, gsea_dir,
+                        )
+                        tool_input["output_dir"] = gsea_dir
 
             # When save_checkpoints is False, NEVER save intermediate h5ad files
             # Only save when save_checkpoints is True OR when it's save_data tool
@@ -4074,6 +4451,8 @@ class SCAgent:
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
             result_json = self._handle_install_package(tool_input)
+        elif tool_name == "describe_image":
+            result_json = self._handle_describe_image(tool_input)
         else:
             # For run_code, inject the output_dir before dispatch
             if tool_name == "run_code" and self.run_manager:
@@ -4091,10 +4470,7 @@ class SCAgent:
             annotation_validation_block = self._annotation_validation_guard(tool_name, tool_input)
 
             # Build the display label
-            if tool_name == "run_code":
-                label = self._TOOL_LABELS.get(tool_name, tool_input.get('description', 'Running code'))
-            else:
-                label = self._TOOL_LABELS.get(tool_name, tool_name.replace('_', ' ').title())
+            label = self._display_label_for_tool(tool_name, tool_input)
 
             def _dispatch():
                 """Call process_tool_call (native tools) or MCP client (external tools)."""
@@ -4140,10 +4516,11 @@ class SCAgent:
                         pass
                 return _rj, _ad
 
-            if self.verbose and tool_name in self._STREAMING_TOOLS:
+            if self.verbose and self._should_print_persistent_tool_progress(tool_name):
                 # Streaming tools produce their own tqdm/progress output. Using
                 # Rich's Live (console.status) fights with tqdm and blanks the
-                # terminal. Print a start line and let the tool's output flow.
+                # terminal. MCP calls should also leave a durable audit trail in
+                # the live terminal because they are external evidence queries.
                 console.print(f"[cyan]▶[/cyan] {label}...")
                 result_json, self.adata = _dispatch()
                 console.print(f"[green]✓[/green] {label} done")
@@ -4168,17 +4545,26 @@ class SCAgent:
             # If there's an image directly embedded in the result, queue it
             if "image_base64" in result_data:
                 image_context = result_data.get("image_context", {})
+                figure_path = (
+                    result_data.get("output_path")
+                    or result_data.get("figure_path")
+                    or image_context.get("output_path")
+                    or "figure.png"
+                )
                 self._pending_images.append({
                     "base64": result_data["image_base64"],
                     "mime": result_data.get("image_mime", "image/png"),
-                    "path": (
-                        result_data.get("output_path")
-                        or result_data.get("figure_path")
-                        or image_context.get("output_path")
-                        or "figure.png"
-                    ),
+                    "path": figure_path,
                     "role": "figure",
                 })
+                # Remember context for sidecar describe_image follow-ups.
+                ctx_for_index = dict(image_context)
+                ctx_for_index.setdefault("plot_type", result_data.get("plot_type"))
+                ctx_for_index.setdefault("color_by", result_data.get("color_by"))
+                ctx_for_index.setdefault("producing_tool", tool_name)
+                self._figure_context_index[figure_path] = {
+                    k: v for k, v in ctx_for_index.items() if v is not None
+                }
                 # Remove base64 from JSON to keep response small
                 del result_data["image_base64"]
                 if "image_mime" in result_data:
@@ -4203,6 +4589,10 @@ class SCAgent:
                         "role": artifact.get("role", "figure"),
                     })
                     already_loaded.add(path)
+                    self._figure_context_index.setdefault(path, {
+                        "role": artifact.get("role", "figure"),
+                        "producing_tool": tool_name,
+                    })
                 except Exception as enc_err:
                     logger.warning("Failed to encode figure %s for vision: %s", path, enc_err)
 
@@ -4279,8 +4669,14 @@ class SCAgent:
             if status == "ok":
                 if tool_name == "run_code" and tool_input.get("cleanup_authorization"):
                     self._active_cleanup_authorization = None
+                    cleanup_executed = any(
+                        check.get("name") == "destructive_cluster_removal"
+                        and check.get("status") == "passed"
+                        for check in result_data.get("preflight_checks", []) or []
+                    )
                     if (
-                        self._pending_checkpoint
+                        cleanup_executed
+                        and self._pending_checkpoint
                         and self._pending_checkpoint.get("kind") == "cluster_qc_cleanup"
                     ):
                         self._clear_pending_checkpoint("cleanup executed")
@@ -4918,6 +5314,21 @@ class SCAgent:
 
     def _handle_pause_and_ask(self, tool_input: Dict[str, Any]) -> str:
         """Handle pause_and_ask tool — create a pending checkpoint from LLM-initiated pause."""
+        if (self._pending_checkpoint or {}).get("kind") == "cluster_qc_cleanup":
+            checkpoint = self._pending_checkpoint or {}
+            return json.dumps({
+                "status": "ok",
+                "tool": "pause_and_ask",
+                "paused": True,
+                "question": checkpoint.get("question", tool_input.get("question", "")),
+                "context": checkpoint.get("summary", tool_input.get("context", "")),
+                "options": checkpoint.get("options", tool_input.get("options", [])),
+                "message": (
+                    "Analysis paused at the existing cluster cleanup checkpoint. "
+                    "Present the question in your response and end your turn."
+                ),
+            }, indent=2)
+
         question = tool_input.get("question", "")
         context = tool_input.get("context", "")
         options = tool_input.get("options") or []
@@ -4971,6 +5382,125 @@ class SCAgent:
         except Exception as exc:
             logger.warning("Auto-checkpoint save failed for %s: %s", label, exc)
             return None
+
+    def _handle_describe_image(self, tool_input: Dict[str, Any]) -> str:
+        """Run a saved figure through the vision sidecar and return text-only output.
+
+        The agent only exposes this tool when ``_use_sidecar_for_images()`` is True,
+        but we still defensively handle the case where the sidecar is missing.
+        """
+        figure_path = (tool_input.get("figure_path") or "").strip()
+        question = tool_input.get("question") or ""
+
+        if not figure_path:
+            return json.dumps({
+                "status": "error",
+                "tool": "describe_image",
+                "message": "figure_path is required.",
+            }, indent=2)
+
+        sidecar = self._vision_sidecar
+        if sidecar is None:
+            return json.dumps({
+                "status": "unavailable",
+                "tool": "describe_image",
+                "message": (
+                    "SCAGENT_VISION_MODEL is not configured; describe_image cannot run. "
+                    "If the main model is multimodal, use review_figure instead."
+                ),
+            }, indent=2)
+
+        abs_path = os.path.abspath(figure_path)
+        if not os.path.exists(abs_path):
+            return json.dumps({
+                "status": "error",
+                "tool": "describe_image",
+                "figure_path": abs_path,
+                "message": f"Figure not found: {abs_path}",
+            }, indent=2)
+
+        # Reuse base64 from _pending_images when it matches; otherwise read from disk.
+        b64 = None
+        mime = None
+        for pending in self._pending_images:
+            if os.path.abspath(pending.get("path", "")) == abs_path:
+                b64 = pending.get("base64")
+                mime = pending.get("mime")
+                break
+        if b64 is None:
+            try:
+                b64 = encode_image_base64(abs_path)
+                mime = get_image_mime_type(abs_path)
+            except Exception as exc:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "describe_image",
+                    "figure_path": abs_path,
+                    "message": f"Failed to read figure: {exc}",
+                }, indent=2)
+
+        ctx = self._figure_context_index.get(abs_path) or self._figure_context_index.get(figure_path) or {}
+        img_payload = [{
+            "base64": b64,
+            "mime": mime or "image/png",
+            "path": abs_path,
+            "role": "figure",
+            "image_context": ctx,
+        }]
+
+        try:
+            world_state = self.world_state.snapshot()
+        except Exception:
+            world_state = None
+
+        result = sidecar.describe(
+            img_payload,
+            world_state=world_state,
+            question=question or None,
+            comparative=False,
+        )
+        if self.run_manager:
+            try:
+                self.run_manager.append_event(
+                    "vision_sidecar_call",
+                    {
+                        "model": result.get("model"),
+                        "n_images": 1,
+                        "latency_ms": result.get("latency_ms"),
+                        "cache_hits": result.get("cache_hits"),
+                        "status": result.get("status"),
+                        "paths": [abs_path],
+                        "via_tool": "describe_image",
+                    },
+                )
+                self.run_manager.append_log(
+                    f"vision_sidecar via=describe_image status={result.get('status')} "
+                    f"model={result.get('model')} latency_ms={result.get('latency_ms')} "
+                    f"cache_hit={bool(result.get('cache_hits'))} "
+                    f"question={(question or '')[:80]!r} path={abs_path}"
+                )
+            except Exception:
+                pass
+
+        if result.get("status") != "ok":
+            return json.dumps({
+                "status": "error",
+                "tool": "describe_image",
+                "figure_path": abs_path,
+                "model": result.get("model"),
+                "message": result.get("error", "vision sidecar failed"),
+            }, indent=2)
+
+        return json.dumps({
+            "status": "ok",
+            "tool": "describe_image",
+            "figure_path": abs_path,
+            "model": result.get("model"),
+            "question": question or None,
+            "description": result.get("text", ""),
+            "cache_hit": bool(result.get("cache_hits")),
+            "latency_ms": result.get("latency_ms"),
+        }, indent=2)
 
     def _handle_install_package(self, tool_input: Dict[str, Any]) -> str:
         """Handle install_package tool - requires user approval."""

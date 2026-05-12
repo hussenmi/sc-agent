@@ -14,10 +14,14 @@
 #   THINKING=1   Enable model reasoning/thinking mode (slower TTFT)
 #   SPEC=0       Disable speculative decoding
 #   SPEC=1       Force-enable for models that have a configured method
+#   LONG_CTX=1   Extend context to ~1M tokens via YaRN (Qwen3.6 only).
+#                Actual window is capped by KV budget — 2×H100 FP8 ≈ 450K,
+#                4×H100 FP8 ≈ 1M. Degrades short-context quality slightly.
 #
 # Examples:
-#   bash start_vllm.sh Qwen/Qwen3.6-27B-FP8 8000 2     # FP8 — H100 only
-#   bash start_vllm.sh Qwen/Qwen3.6-27B 8000 2         # BF16 — required on A100
+#   bash start_vllm.sh Qwen/Qwen3.6-27B-FP8 8000 2                          # FP8 — H100 only
+#   LONG_CTX=1 bash start_vllm.sh Qwen/Qwen3.6-27B-FP8 8000 4              # FP8 + YaRN 1M
+#   bash start_vllm.sh Qwen/Qwen3.6-27B 8000 2                              # BF16 — required on A100
 #   bash start_vllm.sh meta-llama/Llama-3.3-70B-Instruct 8000 4
 #
 # Download a model first with:  bash download_model.sh <model_id>
@@ -27,6 +31,7 @@ PORT=${2:-8000}
 GPUS=${3:-"auto"}
 THINKING=${THINKING:-0}
 SPEC=${SPEC:-"auto"}
+LONG_CTX=${LONG_CTX:-1}
 
 HF_DIR="/data1/peerd/ibrahih3/hf"
 SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_gemma4.sif"}
@@ -162,9 +167,23 @@ case "$HW_CLASS" in
   ampere)
     # BF16 throughput is the best path on Ampere. FP8 KV cache roughly doubles
     # effective KV memory, recovering most of what BF16 weights cost vs FP8.
-    EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
-    VLLM_USE_DEEP_GEMM=0
-    echo "Config:   BF16 weights + FP8 KV cache"
+    # Use E5M2 explicitly: bare "fp8" defaults to E4M3 (fp8e4nv) which Triton
+    # cannot compile on cc=8.0. Qwen incidentally avoids the Triton path; Gemma 4
+    # fuses FP8 casts into its RMS-norm kernel and crashes there. E5M2 is the
+    # format A100 actually supports natively and works for most models.
+    #
+    # Gemma 4 is the exception: vLLM's attention module hard-asserts kv_cache_dtype
+    # in {"fp8","fp8_e4m3"} for the Gemma 4 path, rejecting E5M2 outright. So on
+    # A100 + Gemma 4 we have no working FP8 KV option (E4M3 fails Triton, E5M2
+    # fails vLLM's assert) and must fall back to BF16 KV cache.
+    if [[ "$PARSER" == "gemma4" ]]; then
+      VLLM_USE_DEEP_GEMM=0
+      echo "Config:   BF16 weights + BF16 KV cache (Gemma 4 on A100 — FP8 KV not supported)"
+    else
+      EXTRA_FLAGS+=("--kv-cache-dtype" "fp8_e5m2")
+      VLLM_USE_DEEP_GEMM=0
+      echo "Config:   BF16 weights + FP8 KV cache (E5M2)"
+    fi
     ;;
   hopper_no_nvswitch)
     # H100 PCIe and NVL both lack NVSwitch (NVL pairs use an NVLink bridge at best;
@@ -232,6 +251,29 @@ elif [[ "$THINKING" == "1" ]]; then
   echo "Speculative: disabled (THINKING=1)"
 elif [[ "$SPEC" == "0" ]]; then
   echo "Speculative: disabled (SPEC=0)"
+fi
+
+# ── Long context: YaRN extension to ~1M tokens (Qwen3.6 only) ────────────────
+# Native cap is 262K. YaRN factor=4.0 enables up to 1,010,000 tokens but the
+# actual window is capped by the KV budget below — you need enough GPUs:
+#   2×H100 80GB FP8 model ≈ 452K   |   4×H100 80GB FP8 model ≈ 1M
+# Short-context quality degrades slightly at factor 4.0.
+LONG_CTX_SUPPORTED=0
+if [[ "$LONG_CTX" == "1" ]]; then
+  case "$MODEL" in
+    Qwen/Qwen3.6-27B|Qwen/Qwen3.6-27B-FP8)
+      LONG_CTX_SUPPORTED=1
+      ctx_k=1010
+      EXTRA_FLAGS+=("--hf-overrides" '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}')
+      echo "Long ctx:  YaRN factor=4.0 → up to 1010K (actual limited by KV budget)"
+      ;;
+    *)
+      echo "Long ctx:  LONG_CTX=1 requested but not configured for $MODEL — using default ${ctx_k}K"
+      ;;
+  esac
+fi
+if [[ "$LONG_CTX_SUPPORTED" == "1" ]]; then
+  export SINGULARITYENV_VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 fi
 
 # ── Context window: KV budget → tokens, capped at model native max ────────────
