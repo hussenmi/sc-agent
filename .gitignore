@@ -72,6 +72,8 @@ treg_project/
 andrew_data/
 tests/
 cellbender_test/
+results/
+article_figures/
 
 # macOS metadata files
 ._*
@@ -84,3 +86,5 @@ scagent/agent/prompts_backup.py
 claude_local.sh
 sc-agent-490721-01596696572f.json
 *.bin
+openai_client.py
+agent_demo.py

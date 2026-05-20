@@ -464,10 +464,18 @@ class AgentWorldState:
                 "cluster_key": cluster_key,
                 "fresh": True,
                 "checked_at": record.get("checked_at"),
+                "metric_flagged_clusters": record.get("metric_flagged_clusters", record.get("proposed_removal", [])),
+                "cells_in_metric_flagged_clusters": record.get("cells_in_metric_flagged_clusters", record.get("cells_in_proposed_removal")),
+                "pct_metric_flagged": record.get("pct_metric_flagged", record.get("pct_proposed")),
                 "proposed_removal": record.get("proposed_removal", []),
                 "ambiguous": record.get("ambiguous", []),
                 "cells_in_proposed_removal": record.get("cells_in_proposed_removal"),
                 "pct_proposed": record.get("pct_proposed"),
+                "structure_clusters_analyzed": record.get("structure_clusters_analyzed", []),
+                "synthesized_removal": record.get("synthesized_removal", []),
+                "cells_in_synthesized_removal": record.get("cells_in_synthesized_removal"),
+                "rescued_clusters": record.get("rescued_clusters", []),
+                "conflicting": record.get("conflicting", []),
                 "reason": "cluster QC is fresh for the active clustering and current cell set",
             }
 
@@ -725,12 +733,60 @@ class AgentWorldState:
                     "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                     "n_clusters": n_clusters,
                     "checked_at": _utc_now_iso(),
+                    "metric_flagged_clusters": [
+                        str(c) for c in result.get("metric_flagged_clusters", result.get("proposed_removal", [])) or []
+                    ],
+                    "cells_in_metric_flagged_clusters": result.get(
+                        "cells_in_metric_flagged_clusters",
+                        result.get("cells_in_proposed_removal"),
+                    ),
+                    "pct_metric_flagged": result.get("pct_metric_flagged", result.get("pct_proposed")),
                     "proposed_removal": [str(c) for c in result.get("proposed_removal", []) or []],
                     "ambiguous": [str(c) for c in result.get("ambiguous", []) or []],
                     "cells_in_proposed_removal": result.get("cells_in_proposed_removal"),
                     "pct_proposed": result.get("pct_proposed"),
                     "thresholds_used": result.get("thresholds_used", {}),
+                    "cluster_decisions": result.get("cluster_decisions", {}),
+                    "cluster_table": result.get("cluster_table", []),
                 }
+                self.data_summary["cluster_qc"] = self._cluster_qc_summary(
+                    adata,
+                    self.data_summary.get("cluster_key"),
+                    self.data_summary.get("processing", {}),
+                )
+
+        if tool_name == "run_cluster_structure_qc" and result.get("status") in {"ok", "success"} and adata is not None:
+            cluster_key = result.get("cluster_key")
+            if cluster_key:
+                key = str(cluster_key)
+                record = self.cluster_qc_registry.setdefault(
+                    key,
+                    {
+                        "cluster_key": key,
+                        "cell_set": self._cell_set_fingerprint(adata),
+                        "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
+                    },
+                )
+                record["structure_checked_at"] = _utc_now_iso()
+                record["structure_evidence"] = result.get("structure_evidence_by_cluster", {})
+                record["structure_clusters_analyzed"] = [
+                    str(c) for c in result.get("clusters_analyzed", []) or []
+                ]
+                record["synthesized_removal"] = [
+                    str(c) for c in result.get("synthesized_removal", []) or []
+                ]
+                record["cells_in_synthesized_removal"] = result.get("cells_in_synthesized_removal")
+                record["pct_synthesized_removal"] = result.get("pct_synthesized_removal")
+                record["rescued_clusters"] = [
+                    str(c) for c in result.get("rescued_clusters", []) or []
+                ]
+                record["confirmed_junk"] = [
+                    str(c) for c in result.get("confirmed_junk", []) or []
+                ]
+                record["conflicting"] = [
+                    str(c) for c in result.get("conflicting", []) or []
+                ]
+                record["structure_thresholds_used"] = result.get("thresholds_used", {})
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
                     self.data_summary.get("cluster_key"),
@@ -746,19 +802,48 @@ class AgentWorldState:
         if tool_name in {"run_celltypist", "run_scimilarity"}:
             breakdown = result.get("cell_type_breakdown") or {}
             expected_labels = sorted(str(label) for label in breakdown.keys())
-            self.annotation_validation = {
-                "required": True,
-                "status": "pending_reference_marker_validation",
-                "annotation_tool": tool_name,
+            existing = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
+            candidate_sources = dict(existing.get("candidate_sources") or {})
+            candidate_sources[tool_name] = {
                 "annotation_key": result.get("annotation_key"),
                 "organism": (
                     result.get("requested_organism")
                     or result.get("selected_organism")
                     or result.get("model_organism")
                 ),
-                "expected_annotation_labels": expected_labels,
+                "n_labels": len(expected_labels),
+                "expected_labels": expected_labels,
+            }
+            reference_keys = [
+                str(source.get("annotation_key"))
+                for source in candidate_sources.values()
+                if source.get("annotation_key")
+            ]
+            union_labels = sorted({
+                str(label)
+                for source in candidate_sources.values()
+                for label in source.get("expected_labels", [])
+            })
+            existing_queries = (
+                list(existing.get("reference_marker_queries", []))
+                if isinstance(existing.get("reference_marker_queries"), list) else []
+            )
+            self.annotation_validation = {
+                "required": True,
+                "status": "pending_annotation_consensus",
+                "annotation_tool": "multi_source_consensus",
+                "annotation_key": result.get("annotation_key"),
+                "organism": (
+                    result.get("requested_organism")
+                    or result.get("selected_organism")
+                    or result.get("model_organism")
+                    or existing.get("organism")
+                ),
+                "candidate_sources": candidate_sources,
+                "reference_annotation_keys": reference_keys,
+                "expected_annotation_labels": union_labels,
                 "reference_marker_source": "PanglaoDB or comparable external marker source",
-                "reference_marker_queries": [],
+                "reference_marker_queries": existing_queries,
                 "validation_mode": "adjudicate_best_supported_label_not_confirmation",
                 "competing_label_policy": (
                     "For ambiguous clusters, query and compare plausible alternative "
@@ -766,12 +851,13 @@ class AgentWorldState:
                     "automated label."
                 ),
                 "deg_required": True,
-                "deg_completed": False,
+                "deg_completed": bool(existing.get("deg_completed", False)),
+                "finalized": False,
                 "instruction": (
-                    "Run DEG by cluster, query PanglaoDB or a comparable external marker "
-                    "source for proposed and plausible competing labels, compare "
-                    "reference markers against cluster DEGs, and choose the "
-                    "best-supported label before final reporting."
+                    "Run both CellTypist and Scimilarity when compatible, run DEG by cluster, "
+                    "call prepare_annotation with all reference annotation keys, query PanglaoDB "
+                    "for proposed and competing labels plus reverse marker genes, use literature/web "
+                    "sources for unresolved ambiguous labels, stage evidence, then finalize_annotation."
                 ),
             }
             return
@@ -783,13 +869,14 @@ class AgentWorldState:
             return
 
         if tool_name == "prepare_annotation":
+            existing_validation = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
             cluster_summaries = result.get("clusters") or []
             ambiguous = result.get("ambiguous_clusters") or []
             queries_required = result.get("panglaodb_queries_required") or []
             reverse_queries_required = result.get("panglaodb_reverse_marker_queries_required") or []
             existing_queries = (
-                list(self.annotation_validation.get("reference_marker_queries", []))
-                if isinstance(self.annotation_validation, dict) else []
+                list(existing_validation.get("reference_marker_queries", []))
+                if isinstance(existing_validation, dict) else []
             )
             self.annotation_validation = {
                 "required": True,
@@ -803,7 +890,10 @@ class AgentWorldState:
                 "shared_markers_flagged": result.get("shared_markers_flagged") or [],
                 "scoring_method": result.get("scoring_method"),
                 "reference_annotation_keys": result.get("reference_annotation_keys") or [],
+                "reference_source_coverage": result.get("reference_source_coverage") or {},
+                "missing_reference_sources": result.get("missing_reference_sources") or [],
                 "reference_annotation_notice": result.get("reference_annotation_notice"),
+                "candidate_sources": existing_validation.get("candidate_sources") or {},
                 "panglaodb_queries_required": queries_required,
                 "panglaodb_reverse_marker_queries_required": reverse_queries_required,
                 "reference_marker_queries": existing_queries,
@@ -820,11 +910,35 @@ class AgentWorldState:
             }
             return
 
+        if tool_name == "stage_annotation_evidence":
+            coverage = result.get("coverage") or {}
+            if not isinstance(self.annotation_validation, dict):
+                self.annotation_validation = {}
+            self.annotation_validation.update({
+                "required": True,
+                "status": (
+                    "evidence_staged_ready_to_finalize"
+                    if coverage.get("n_missing") == 0
+                    else "evidence_partially_staged_pending_more_clusters"
+                ),
+                "annotation_tool": "manual_marker_workflow",
+                "n_evidence_staged": result.get("n_entries_staged_total"),
+                "n_evidence_covered": coverage.get("n_covered"),
+                "n_evidence_missing": coverage.get("n_missing"),
+                "missing_evidence_clusters": coverage.get("missing_clusters") or [],
+                "instruction": (
+                    "Continue staging cluster evidence until coverage is complete, then call "
+                    "finalize_annotation; evidence_summary can be omitted when staged evidence covers all clusters."
+                ),
+            })
+            return
+
         if tool_name == "finalize_annotation":
             payload = result.get("annotation_validation") or {}
+            existing_validation = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
             existing_queries = (
-                list(self.annotation_validation.get("reference_marker_queries", []))
-                if isinstance(self.annotation_validation, dict) else []
+                list(existing_validation.get("reference_marker_queries", []))
+                if isinstance(existing_validation, dict) else []
             )
             self.annotation_validation = {
                 "required": True,
@@ -838,6 +952,10 @@ class AgentWorldState:
                 "finalized": True,
                 "reference_marker_queries": existing_queries,
                 "reference_marker_source": "PanglaoDB",
+                "reference_annotation_keys": payload.get("reference_annotation_keys") or [],
+                "reference_source_coverage": payload.get("reference_source_coverage") or {},
+                "missing_reference_sources": payload.get("missing_reference_sources") or [],
+                "candidate_sources": existing_validation.get("candidate_sources") or {},
                 "per_cluster_evidence": payload.get("per_cluster_evidence", {}),
             }
             return
@@ -860,7 +978,8 @@ class AgentWorldState:
                     "reference_marker_source": "PanglaoDB",
                 }
             self.annotation_validation["reference_marker_queries"] = existing[-50:]
-            self.annotation_validation["status"] = "reference_markers_queried_pending_synthesis"
+            if not self.annotation_validation.get("finalized"):
+                self.annotation_validation["status"] = "reference_markers_queried_pending_synthesis"
             self.annotation_validation["reference_marker_source"] = "PanglaoDB"
 
     @staticmethod
@@ -1093,11 +1212,26 @@ class AgentWorldState:
                 "shared_markers_flagged": result.get("shared_markers_flagged"),
                 "scoring_method": result.get("scoring_method"),
                 "reference_annotation_keys": result.get("reference_annotation_keys"),
+                "reference_source_coverage": result.get("reference_source_coverage"),
+                "missing_reference_sources": result.get("missing_reference_sources"),
                 "reference_annotation_notice": result.get("reference_annotation_notice"),
                 "panglaodb_queries_required": result.get("panglaodb_queries_required"),
                 "panglaodb_reverse_marker_queries_required": result.get("panglaodb_reverse_marker_queries_required"),
                 "reverse_lookup_n_genes_per_cluster": result.get("reverse_lookup_n_genes_per_cluster"),
                 "reverse_lookup_max_unique_genes": result.get("reverse_lookup_max_unique_genes"),
+            }
+
+        if tool_name == "stage_annotation_evidence":
+            coverage = result.get("coverage") or {}
+            return {
+                "tool": "stage_annotation_evidence",
+                "timestamp": ts,
+                "n_entries_received": result.get("n_entries_received"),
+                "n_entries_staged_total": result.get("n_entries_staged_total"),
+                "n_covered": coverage.get("n_covered"),
+                "n_missing": coverage.get("n_missing"),
+                "missing_clusters": coverage.get("missing_clusters"),
+                "role": "manual_annotation_evidence_staging",
             }
 
         if tool_name == "finalize_annotation":
@@ -1209,11 +1343,33 @@ class AgentWorldState:
                 "timestamp": ts,
                 "cluster_key": result.get("cluster_key"),
                 "n_clusters": result.get("n_clusters"),
+                "metric_flagged_clusters": result.get("metric_flagged_clusters", result.get("proposed_removal", [])),
+                "cells_in_metric_flagged_clusters": result.get(
+                    "cells_in_metric_flagged_clusters",
+                    result.get("cells_in_proposed_removal"),
+                ),
+                "pct_metric_flagged": result.get("pct_metric_flagged", result.get("pct_proposed")),
                 "proposed_removal": result.get("proposed_removal", []),
                 "ambiguous": result.get("ambiguous", []),
                 "cells_proposed": result.get("cells_in_proposed_removal"),
                 "pct_proposed": result.get("pct_proposed"),
                 "checkpoint_path": result.get("checkpoint_path"),
+            }
+
+        if tool_name == "run_cluster_structure_qc":
+            return {
+                "tool": "run_cluster_structure_qc",
+                "timestamp": ts,
+                "cluster_key": result.get("cluster_key"),
+                "clusters_analyzed": result.get("clusters_analyzed", []),
+                "synthesized_removal": result.get("synthesized_removal", []),
+                "cells_in_synthesized_removal": result.get("cells_in_synthesized_removal"),
+                "confirmed_junk": result.get("confirmed_junk", []),
+                "structured_ambiguous": result.get("structured_ambiguous", []),
+                "unstructured_ambiguous": result.get("unstructured_ambiguous", []),
+                "rescued_clusters": result.get("rescued_clusters", []),
+                "conflicting": result.get("conflicting", []),
+                "structure_qc_json": result.get("structure_qc_json"),
             }
 
         return None
