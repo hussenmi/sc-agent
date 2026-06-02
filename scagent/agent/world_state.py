@@ -347,6 +347,57 @@ class AgentWorldState:
             "run_code_note": "run_code is ALWAYS available for custom plots, filtering, or any valid analysis",
         }
 
+    def _batch_strategy_summary(self, state, processing: Dict[str, Any]) -> Dict[str, Any]:
+        """Summarize whether a multi-partition dataset has an explicit batch plan."""
+        batch_key = self.get_confirmed_value("batch_key") or state.batch_key
+        n_batches = int(state.n_batches or 0)
+
+        if not batch_key or n_batches < 2:
+            return {
+                "status": "not_applicable",
+                "batch_key": batch_key,
+                "n_batches": n_batches,
+                "reason": "No multi-group sample/batch/donor partition was detected.",
+            }
+
+        if state.batch_correction_applied:
+            return {
+                "status": "corrected",
+                "batch_key": batch_key,
+                "n_batches": n_batches,
+                "method": state.batch_correction_method or "unknown",
+                "reason": "A batch-corrected representation or graph is present.",
+            }
+
+        if processing.get("has_neighbors") or processing.get("has_umap") or processing.get("has_clusters"):
+            status = "needs_review"
+            next_action = "Score or inspect batch mixing, then rerun batch correction if sample structure remains."
+            reason = (
+                "A multi-group batch key is present, but neighbors/UMAP/clustering already exist "
+                "without a recorded correction strategy."
+            )
+        elif processing.get("has_pca"):
+            status = "needs_decision"
+            next_action = "Run score_integration on X_pca and/or run_batch_correction before neighbors/UMAP/clustering."
+            reason = "A multi-group batch key is present after PCA; choose and record a batch strategy before graph construction."
+        elif processing.get("is_normalized") or processing.get("has_hvg"):
+            status = "pending_pca"
+            next_action = "Run PCA, then assess batch mixing or run batch correction before graph construction."
+            reason = "A multi-group batch key is present and will matter once PCA is available."
+        else:
+            status = "pending_preprocessing"
+            next_action = "Carry the batch key through QC/normalization and revisit before neighbors/UMAP/clustering."
+            reason = "A multi-group batch key is present early in the workflow."
+
+        return {
+            "status": status,
+            "batch_key": batch_key,
+            "n_batches": n_batches,
+            "method": None,
+            "reason": reason,
+            "next_action": next_action,
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "created_at": self.created_at,
@@ -554,6 +605,7 @@ class AgentWorldState:
             "recommended_batch_key": state.batch_key,
             "n_batches": state.n_batches,
             "batch_correction_applied": state.batch_correction_applied,
+            "batch_correction_method": state.batch_correction_method,
             "cluster_key": state.cluster_key,
             "n_clusters": state.n_clusters,
             "cell_type_key": state.cell_type_key,
@@ -561,6 +613,7 @@ class AgentWorldState:
             "obs_columns_detail": obs_columns_detail(adata.obs, adata.n_obs),
             "biological_context": biological_context,
         }
+        self.data_summary["batch_strategy"] = self._batch_strategy_summary(state, processing)
         self.data_summary["cluster_qc"] = self._cluster_qc_summary(
             adata,
             state.cluster_key,
@@ -768,6 +821,12 @@ class AgentWorldState:
                     },
                 )
                 record["structure_checked_at"] = _utc_now_iso()
+                record["structure_qc_run_id"] = result.get("structure_qc_run_id")
+                record["structure_qc_pass"] = result.get("structure_qc_pass")
+                record["structure_figure_dir"] = result.get("figure_dir")
+                record["structure_heatmap_paths"] = result.get("heatmap_paths", [])
+                record["structure_qc_json"] = result.get("structure_qc_json")
+                record["structure_qc_markdown"] = result.get("structure_qc_markdown")
                 record["structure_evidence"] = result.get("structure_evidence_by_cluster", {})
                 record["structure_clusters_analyzed"] = [
                     str(c) for c in result.get("clusters_analyzed", []) or []
@@ -787,6 +846,21 @@ class AgentWorldState:
                     str(c) for c in result.get("conflicting", []) or []
                 ]
                 record["structure_thresholds_used"] = result.get("thresholds_used", {})
+                record.setdefault("structure_history", []).append(
+                    {
+                        "structure_qc_run_id": result.get("structure_qc_run_id"),
+                        "structure_qc_pass": result.get("structure_qc_pass"),
+                        "checked_at": record["structure_checked_at"],
+                        "clusters_analyzed": record["structure_clusters_analyzed"],
+                        "synthesized_removal": record["synthesized_removal"],
+                        "cells_in_synthesized_removal": record["cells_in_synthesized_removal"],
+                        "pct_synthesized_removal": record["pct_synthesized_removal"],
+                        "figure_dir": record["structure_figure_dir"],
+                        "heatmap_paths": record["structure_heatmap_paths"],
+                        "structure_qc_json": record["structure_qc_json"],
+                        "structure_qc_markdown": record["structure_qc_markdown"],
+                    }
+                )
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
                     self.data_summary.get("cluster_key"),
@@ -796,6 +870,40 @@ class AgentWorldState:
     def _update_annotation_validation(self, tool_name: str, result: Dict[str, Any]) -> None:
         """Track whether automated annotation has external marker validation."""
         status = result.get("status")
+        if tool_name in {"run_celltypist", "run_scimilarity"} and status not in {"ok", "success"}:
+            source_name = tool_name.removeprefix("run_")
+            existing = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
+            unavailable = dict(existing.get("reference_source_unavailable") or {})
+            reason = (
+                result.get("unavailable_reason")
+                or result.get("missing_reason")
+                or result.get("message")
+                or str(status or "unknown")
+            )
+            unavailable[source_name] = {
+                "tool": tool_name,
+                "status": status,
+                "reason": reason,
+                "message": result.get("message"),
+                "model": result.get("model") or result.get("celltypist_model"),
+                "model_path": result.get("model_path"),
+                "requested_organism": result.get("requested_organism"),
+                "model_organism": result.get("model_organism"),
+                "selected_organism": result.get("selected_organism"),
+                "timestamp": _utc_now_iso(),
+            }
+            self.annotation_validation = {
+                **existing,
+                "required": True,
+                "status": existing.get("status") or "reference_source_unavailable",
+                "reference_source_unavailable": unavailable,
+                "instruction": existing.get("instruction") or (
+                    "Run compatible CellTypist and Scimilarity sources when possible. "
+                    "If a source cannot run, keep its concrete unavailable reason and "
+                    "continue with remaining sources plus DEG/external marker adjudication."
+                ),
+            }
+            return
         if status not in {"ok", "success"}:
             return
 
@@ -804,6 +912,8 @@ class AgentWorldState:
             expected_labels = sorted(str(label) for label in breakdown.keys())
             existing = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
             candidate_sources = dict(existing.get("candidate_sources") or {})
+            unavailable = dict(existing.get("reference_source_unavailable") or {})
+            unavailable.pop(tool_name.removeprefix("run_"), None)
             candidate_sources[tool_name] = {
                 "annotation_key": result.get("annotation_key"),
                 "organism": (
@@ -840,6 +950,7 @@ class AgentWorldState:
                     or existing.get("organism")
                 ),
                 "candidate_sources": candidate_sources,
+                "reference_source_unavailable": unavailable,
                 "reference_annotation_keys": reference_keys,
                 "expected_annotation_labels": union_labels,
                 "reference_marker_source": "PanglaoDB or comparable external marker source",
@@ -892,6 +1003,7 @@ class AgentWorldState:
                 "reference_annotation_keys": result.get("reference_annotation_keys") or [],
                 "reference_source_coverage": result.get("reference_source_coverage") or {},
                 "missing_reference_sources": result.get("missing_reference_sources") or [],
+                "reference_source_unavailable": existing_validation.get("reference_source_unavailable") or {},
                 "reference_annotation_notice": result.get("reference_annotation_notice"),
                 "candidate_sources": existing_validation.get("candidate_sources") or {},
                 "panglaodb_queries_required": queries_required,
@@ -955,6 +1067,7 @@ class AgentWorldState:
                 "reference_annotation_keys": payload.get("reference_annotation_keys") or [],
                 "reference_source_coverage": payload.get("reference_source_coverage") or {},
                 "missing_reference_sources": payload.get("missing_reference_sources") or [],
+                "reference_source_unavailable": payload.get("reference_source_unavailable") or existing_validation.get("reference_source_unavailable") or {},
                 "candidate_sources": existing_validation.get("candidate_sources") or {},
                 "per_cluster_evidence": payload.get("per_cluster_evidence", {}),
             }
@@ -966,6 +1079,15 @@ class AgentWorldState:
                 "source": "PanglaoDB",
                 "species": query.get("species") or result.get("species"),
                 "cell_type": query.get("cell_type") or result.get("cell_type"),
+                # Persist gene_symbol so reverse-marker queries are auditable.
+                # Without this, finalize_annotation cannot verify "reverse_marker_support"
+                # evidence against the actual PanglaoDB call history.
+                "gene_symbol": (
+                    query.get("gene_symbol")
+                    or query.get("gene")
+                    or result.get("gene_symbol")
+                    or result.get("gene")
+                ),
                 "min_sensitivity": query.get("min_sensitivity") or result.get("min_sensitivity"),
                 "queried_at": _utc_now_iso(),
             }
@@ -1188,12 +1310,17 @@ class AgentWorldState:
             return {
                 "tool": tool_name,
                 "timestamp": ts,
+                "status": result.get("status"),
                 "model": result.get("model") or result.get("celltypist_model"),
                 "model_path": result.get("model_path"),
+                "model_cached": result.get("model_cached"),
+                "model_cache_path": result.get("model_cache_path"),
                 "requested_organism": result.get("requested_organism"),
                 "selected_organism": result.get("selected_organism"),
                 "model_organism": result.get("model_organism"),
                 "model_organism_source": result.get("model_organism_source"),
+                "unavailable_reason": result.get("unavailable_reason"),
+                "message": result.get("message"),
                 "allow_cross_species": result.get("allow_cross_species"),
                 "majority_voting": result.get("majority_voting"),
                 "n_cell_types": result.get("n_cell_types") or result.get("n_types"),
@@ -1369,7 +1496,12 @@ class AgentWorldState:
                 "unstructured_ambiguous": result.get("unstructured_ambiguous", []),
                 "rescued_clusters": result.get("rescued_clusters", []),
                 "conflicting": result.get("conflicting", []),
+                "structure_qc_run_id": result.get("structure_qc_run_id"),
+                "structure_qc_pass": result.get("structure_qc_pass"),
+                "figure_dir": result.get("figure_dir"),
+                "heatmap_paths": result.get("heatmap_paths", []),
                 "structure_qc_json": result.get("structure_qc_json"),
+                "structure_qc_markdown": result.get("structure_qc_markdown"),
             }
 
         return None

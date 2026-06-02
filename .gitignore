@@ -74,6 +74,7 @@ tests/
 cellbender_test/
 results/
 article_figures/
+two_replicates/
 
 # macOS metadata files
 ._*

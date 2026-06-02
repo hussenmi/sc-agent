@@ -177,6 +177,8 @@ ACTION_TOOL_NAMES = {
 INSPECTION_TOOL_NAMES = {
     "inspect_data",
     "inspect_session",
+    "list_celltypist_models",
+    "check_celltypist_model",
     "list_artifacts",
     "get_cluster_sizes",
     "get_top_markers",
@@ -2553,6 +2555,15 @@ class SCAgent:
                     "min_sensitivity": tool_input.get("min_sensitivity"),
                 },
             )
+            if isinstance(result_data.get("markers"), list) and len(result_data["markers"]) == 0:
+                result_data["no_markers_found"] = True
+                result_data["next_step"] = (
+                    "No PanglaoDB entries matched this cell_type string. "
+                    "Call bc_get_panglaodb_options once (if not already called this session) "
+                    "to retrieve the valid vocabulary, pick the closest matching term, "
+                    "retry bc_get_panglaodb_marker_genes with that term, and record the "
+                    "substitution in panglaodb_label_used on the evidence entry."
+                )
 
         if "state_delta" not in result_data:
             before_stage = before_snapshot.get("analysis_stage", "uninitialized")
@@ -4374,6 +4385,8 @@ class SCAgent:
         "run_umap":             "Computing UMAP",
         "run_clustering":       "Clustering",
         "compare_clusterings":  "Comparing clusterings",
+        "list_celltypist_models": "Listing CellTypist models",
+        "check_celltypist_model": "Checking CellTypist model",
         "run_celltypist":       "Cell type annotation",
         "run_scimilarity":      "Scimilarity annotation",
         "prepare_annotation":   "Preparing annotation proposal",

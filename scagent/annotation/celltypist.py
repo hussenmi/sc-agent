@@ -121,6 +121,120 @@ def available_celltypist_models_for_organism(organism: str, *, force_update: boo
     return matches
 
 
+def _celltypist_model_cache_path(model: str) -> Optional[Path]:
+    """Return the expected local CellTypist cache path for a named model."""
+    basename = _model_basename(model)
+    if not basename or str(model).startswith(("/", "./")):
+        return None
+    try:
+        from celltypist import models
+    except ImportError:
+        return None
+    models_path = getattr(models, "models_path", None)
+    if not models_path:
+        return None
+    return Path(models_path) / basename
+
+
+def celltypist_model_records(
+    *,
+    organism: Optional[str] = None,
+    query: Optional[str] = None,
+    force_update: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return CellTypist model catalog records with inferred organism/cache state."""
+    catalog = celltypist_models_description(force_update=force_update)
+    target = str(organism or "").strip().lower()
+    query_text = str(query or "").strip().lower()
+    records: List[Dict[str, Any]] = []
+
+    for _, row in catalog.iterrows():
+        model = str(row.get("model") or "")
+        description = str(row.get("description") or "")
+        info = infer_celltypist_model_organism(model, force_update=False, catalog=catalog)
+        inferred = info.get("organism") or "unknown"
+        if target in {"human", "mouse"} and inferred != target:
+            continue
+        haystack = f"{model} {description}".lower()
+        if query_text and query_text not in haystack:
+            continue
+        cache_path = _celltypist_model_cache_path(model)
+        records.append({
+            "model": model,
+            "description": description,
+            "inferred_organism": inferred,
+            "organism_source": info.get("source"),
+            "organism_reason": info.get("reason"),
+            "cached": bool(cache_path and cache_path.exists()),
+            "cache_path": str(cache_path) if cache_path else None,
+        })
+    return records
+
+
+def check_celltypist_model(
+    model: str = CELLTYPIST_DEFAULTS.model,
+    *,
+    organism: Optional[str] = None,
+    query: Optional[str] = None,
+    force_update: bool = False,
+) -> Dict[str, Any]:
+    """Check whether a CellTypist model is suitable and suggest alternatives."""
+    requested_organism = str(organism or "").strip().lower()
+    if requested_organism not in {"human", "mouse"}:
+        requested_organism = ""
+    model_info = infer_celltypist_model_organism(model, force_update=force_update)
+    model_organism = model_info.get("organism") or "unknown"
+    cache_path = None
+    cached = False
+    explicit_path_exists = None
+    if str(model or "").startswith(("/", "./")):
+        explicit_path = Path(model)
+        explicit_path_exists = explicit_path.exists()
+        cache_path = str(explicit_path)
+        cached = bool(explicit_path_exists)
+    else:
+        cached_path = _celltypist_model_cache_path(model)
+        cache_path = str(cached_path) if cached_path else None
+        cached = bool(cached_path and cached_path.exists())
+
+    species_match = (
+        not requested_organism
+        or model_organism not in {"human", "mouse"}
+        or requested_organism == model_organism
+    )
+    compatible = bool(species_match and (explicit_path_exists is not False))
+    reasons: List[str] = []
+    if not requested_organism:
+        reasons.append("Dataset organism was not provided, so species compatibility is unresolved.")
+    if requested_organism and model_organism in {"human", "mouse"} and requested_organism != model_organism:
+        reasons.append(
+            f"Requested organism is {requested_organism}, but model appears to be {model_organism}."
+        )
+    if explicit_path_exists is False:
+        reasons.append(f"Explicit CellTypist model path does not exist: {model}")
+    if model_organism == "unknown":
+        reasons.append("Could not infer model organism from the CellTypist catalog or model name.")
+
+    recommendation_target = requested_organism if requested_organism in {"human", "mouse"} else None
+    recommended = (
+        celltypist_model_records(organism=recommendation_target, query=query, force_update=force_update)
+        if recommendation_target else []
+    )
+    return {
+        "model": model,
+        "model_info": model_info,
+        "requested_organism": requested_organism or None,
+        "model_organism": model_organism,
+        "species_match": species_match,
+        "compatible": compatible,
+        "cached": cached,
+        "cache_path": cache_path,
+        "download_required": bool(not cached and not str(model or "").startswith(("/", "./"))),
+        "reasons": reasons,
+        "recommended_models": recommended[:20],
+    }
+
+
 def prepare_for_celltypist(
     adata: AnnData,
     raw_layer: Optional[str] = None,
@@ -326,12 +440,26 @@ def run_celltypist(
             "but that column is not present in adata.obs."
         )
 
-    # Download model if needed
-    if not (model.startswith('/') or model.startswith('./')):
-        try:
-            models.download_models(model=model)
-        except Exception as e:
-            logger.warning(f"Could not download model: {e}")
+    # Download model if needed. Treat download failures as structured
+    # unavailability instead of continuing and failing later with a vague
+    # CellTypist loader error.
+    if model.startswith('/') or model.startswith('./'):
+        if not Path(model).exists():
+            raise RuntimeError(f"CellTypist model path does not exist: {model}")
+    else:
+        cached_path = _celltypist_model_cache_path(model)
+        if not (cached_path and cached_path.exists()):
+            try:
+                models.download_models(model=model)
+            except Exception as e:
+                raise RuntimeError(
+                    f"CellTypist model download failed for '{model}': {e}"
+                ) from e
+            cached_path = _celltypist_model_cache_path(model)
+            if cached_path and not cached_path.exists():
+                raise RuntimeError(
+                    f"CellTypist model download finished but '{model}' is still not available locally."
+                )
 
     # Prepare data with correct normalization
     adata_ct = prepare_for_celltypist(adata, raw_layer=raw_layer)
@@ -379,6 +507,14 @@ def run_celltypist(
     n_celltypes = adata_preds.obs['predicted_labels'].nunique()
     logger.info(f"CellTypist complete: {n_celltypes} cell types annotated")
 
+    if model.startswith(("/", "./")):
+        model_cache_path = model
+        model_cached = Path(model).exists()
+    else:
+        cached_model_path = _celltypist_model_cache_path(model)
+        model_cache_path = str(cached_model_path) if cached_model_path else None
+        model_cached = bool(cached_model_path and cached_model_path.exists())
+
     adata.uns["celltypist"] = {
         "model": model,
         "model_name": _model_basename(model),
@@ -386,6 +522,8 @@ def run_celltypist(
         "model_organism": model_organism,
         "model_organism_source": model_info.get("source"),
         "model_description": model_info.get("description"),
+        "model_cached": model_cached,
+        "model_cache_path": model_cache_path,
         "allow_cross_species": bool(allow_cross_species),
         "majority_voting": bool(majority_voting),
         "over_clustering": over_clustering if majority_voting else None,
