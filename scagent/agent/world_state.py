@@ -966,9 +966,9 @@ class AgentWorldState:
                 "finalized": False,
                 "instruction": (
                     "Run both CellTypist and Scimilarity when compatible, run DEG by cluster, "
-                    "call prepare_annotation with all reference annotation keys, query PanglaoDB "
-                    "for proposed and competing labels plus reverse marker genes, use literature/web "
-                    "sources for unresolved ambiguous labels, stage evidence, then finalize_annotation."
+                    "call prepare_annotation with all reference annotation keys, query PanglaoDB only "
+                    "for clusters requiring external adjudication, use literature/web sources for "
+                    "unresolved ambiguous labels, stage evidence, then finalize_annotation."
                 ),
             }
             return
@@ -985,13 +985,19 @@ class AgentWorldState:
             ambiguous = result.get("ambiguous_clusters") or []
             queries_required = result.get("panglaodb_queries_required") or []
             reverse_queries_required = result.get("panglaodb_reverse_marker_queries_required") or []
+            required_clusters = [str(c) for c in (result.get("panglaodb_required_clusters") or [])]
+            optional_clusters = [str(c) for c in (result.get("panglaodb_optional_clusters") or [])]
             existing_queries = (
                 list(existing_validation.get("reference_marker_queries", []))
                 if isinstance(existing_validation, dict) else []
             )
             self.annotation_validation = {
                 "required": True,
-                "status": "proposal_staged_pending_panglaodb",
+                "status": (
+                    "proposal_staged_pending_external_adjudication"
+                    if required_clusters
+                    else "proposal_staged_reference_deg_sufficient"
+                ),
                 "annotation_tool": "manual_marker_workflow",
                 "annotation_key": result.get("annotation_key"),
                 "cluster_key": result.get("cluster_key"),
@@ -1008,16 +1014,24 @@ class AgentWorldState:
                 "candidate_sources": existing_validation.get("candidate_sources") or {},
                 "panglaodb_queries_required": queries_required,
                 "panglaodb_reverse_marker_queries_required": reverse_queries_required,
+                "panglaodb_required_clusters": required_clusters,
+                "panglaodb_optional_clusters": optional_clusters,
                 "reference_marker_queries": existing_queries,
                 "reference_marker_source": "PanglaoDB",
                 "deg_required": True,
                 "deg_completed": True,
                 "finalized": False,
                 "instruction": (
-                    "Query PanglaoDB for every entry in panglaodb_queries_required and "
-                    "panglaodb_reverse_marker_queries_required, aggregate reverse gene-symbol "
-                    "hits across multiple DEGs, compare markers against each cluster's top_degs, "
-                    "then call finalize_annotation."
+                    (
+                        "Query PanglaoDB only for clusters in panglaodb_required_clusters using "
+                        "panglaodb_queries_required and panglaodb_reverse_marker_queries_required, "
+                        "aggregate reverse gene-symbol hits across multiple DEGs, compare markers "
+                        "against each required cluster's top_degs, then stage/finalize annotation."
+                    )
+                    if required_clusters else
+                    "No cluster was flagged for upfront PanglaoDB adjudication. Stage evidence from "
+                    "reference labels plus submitted DEG support; query PanglaoDB reactively only if "
+                    "stage_annotation_evidence/finalize_annotation reports a cluster still requires it."
                 ),
             }
             return
@@ -1061,6 +1075,9 @@ class AgentWorldState:
                 "n_clusters_validated": payload.get("n_clusters_validated"),
                 "label_counts": result.get("label_counts") or {},
                 "panglaodb_validated": True,
+                "external_validation_policy": payload.get("external_validation_policy"),
+                "validation_strategy": payload.get("validation_strategy"),
+                "panglaodb_required_clusters": payload.get("panglaodb_required_clusters") or [],
                 "finalized": True,
                 "reference_marker_queries": existing_queries,
                 "reference_marker_source": "PanglaoDB",

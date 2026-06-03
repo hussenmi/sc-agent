@@ -81,8 +81,8 @@ load_data
   → [loop: normalize_and_hvg → run_pca → run_neighbors → run_umap → run_clustering → run_cluster_qc → run_cluster_structure_qc → until clean]
   → run_celltypist and/or run_scimilarity when organism/model compatibility allows
   → prepare_annotation with reference annotation keys
-  → bc_get_panglaodb_marker_genes per candidate and plausible competitor (MCP)
-  → finalize_annotation with DEG, reference-label, and PanglaoDB evidence
+  → bc_get_panglaodb_marker_genes only for clusters flagged as requiring external adjudication
+  → finalize_annotation with DEG + reference-label evidence, plus PanglaoDB evidence where required
   → final UMAP
 ```
 
@@ -170,6 +170,8 @@ ACTION_TOOL_NAMES = {
     "run_cluster_qc",
     "run_cluster_structure_qc",
     "run_code",
+    "write_report",
+    "write_json",
     "run_shell",
     "install_package",
 }
@@ -948,8 +950,8 @@ class SCAgent:
                 "Run both run_celltypist and run_scimilarity when compatible; if one cannot run, record the concrete reason.",
                 "Run run_deg by the primary cluster key if marker DEGs are not already available.",
                 "Call prepare_annotation with CellTypist and Scimilarity columns as reference_annotation_keys.",
-                "Query PanglaoDB for proposed labels, plausible competitors, and reverse marker lookup genes.",
-                "Use search_papers/web_search or another external source for ambiguous labels not resolved by PanglaoDB.",
+                "Query PanglaoDB only for clusters flagged as requiring external adjudication, including plausible competitors and staged reverse marker lookup genes.",
+                "Use search_papers/web_search as supporting context for ambiguous labels, but PanglaoDB remains the structured external adjudicator in v1.",
                 "Stage per-cluster evidence with stage_annotation_evidence, then call finalize_annotation.",
             ],
         }
@@ -1303,6 +1305,8 @@ class SCAgent:
         "review_artifact",
         "run_cluster_structure_qc",  # Refines an existing cleanup checkpoint.
         "generate_figure",  # Visualization doesn't change state
+        "write_report",  # Writing a report doesn't change state
+        "write_json",  # Writing a JSON file doesn't change state
         "save_data",  # Saving is always ok
         "read_file",
         "search_papers",
@@ -2278,6 +2282,37 @@ class SCAgent:
             request_text=extra_text or self._active_request,
         )
 
+    def _complete_run(self, final_result: str) -> None:
+        """Finalize a turn: guarantee a comprehensive analysis report exists, then
+        append the findings-log entry (full prompt + tool counts + report link).
+
+        A deterministic ``analysis_record.md`` is always written from stored
+        session state via ``_assemble_analysis_record`` so a full report exists
+        even when the model did not call ``write_report``. When the model did
+        call it, that narrative report layers on top of the same record.
+        """
+        if not self.run_manager:
+            return
+        report_path: Optional[str] = None
+        try:
+            from .tools import _assemble_analysis_record
+            record = _assemble_analysis_record(self.world_state, self.adata)
+            if record:
+                header = f"# Comprehensive Analysis Record — {self.run_manager.run_id}\n\n"
+                req = (self._active_request or "").strip()
+                if req:
+                    header += f"**Original request:**\n\n{req}\n\n---\n\n"
+                report_path = self.run_manager.write_text_report(
+                    "analysis_record", header + record, ext="md"
+                )
+        except Exception:
+            report_path = None
+        self.run_manager.complete(
+            summary=final_result,
+            request=self._active_request,
+            report_path=report_path,
+        )
+
     def _record_world_state_snapshot(self) -> None:
         """Persist a compact world-state snapshot into the run ledger."""
         if self.run_manager:
@@ -2786,7 +2821,7 @@ class SCAgent:
                     "last_action": self.world_state.last_action,
                 },
             )
-            self.run_manager.complete(summary=final_result, request=self._active_request)
+            self._complete_run(final_result)
 
         self._print("\n" + "-" * 50)
         self._print(final_result)
@@ -2826,7 +2861,7 @@ class SCAgent:
                     "last_action": self.world_state.last_action,
                 },
             )
-            self.run_manager.complete(summary=final_result, request=self._active_request)
+            self._complete_run(final_result)
 
         self._print("\n" + "-" * 50)
         self._print(final_result)
@@ -3186,7 +3221,7 @@ class SCAgent:
                         continue
                     self._conversation_history = messages
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
 
@@ -3341,7 +3376,7 @@ class SCAgent:
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -4334,7 +4369,7 @@ class SCAgent:
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -4347,7 +4382,7 @@ class SCAgent:
                     self._print(final_result)
                     self._conversation_history = messages
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
 
@@ -4403,6 +4438,8 @@ class SCAgent:
         "run_cluster_qc":       "Cluster QC assessment",
         "run_cluster_structure_qc": "Analyzing cluster structure",
         "run_code":             "Running code",
+        "write_report":         "Writing report",
+        "write_json":           "Writing JSON file",
         "run_shell":            "Running shell command",
         "install_package":      "Installing package",
         "generate_figure":      "Generating figure",

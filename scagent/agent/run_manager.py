@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field, asdict
+from collections import OrderedDict
 import getpass
 
 
@@ -313,12 +314,22 @@ class RunManager:
 
         self._save_manifest()
 
-    def append_findings(self, request: str, summary: str, tools_used: List[str]) -> str:
+    def append_findings(
+        self,
+        request: str,
+        summary: str,
+        tools_used: List[str],
+        report_path: Optional[str] = None,
+    ) -> str:
         """Append one turn's findings to the running findings log (conversation.md).
 
         This is called automatically at the end of every completed turn so the
         file grows into a readable research journal.  It is separate from
         summary.md which is only written when the user explicitly requests it.
+
+        Records the user's request in full (never truncated), a deduplicated
+        tool-usage count, the turn summary, and a link to the comprehensive
+        analysis report when one was produced.
         """
         findings_path = self._ensure(self.dirs["reports"]) / "conversation.md"
         is_new = not findings_path.exists()
@@ -330,25 +341,46 @@ class RunManager:
                 f.write("---\n\n")
 
             ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-            f.write(f"## {ts} — {request[:80]}\n\n")
+            f.write(f"## {ts}\n\n")
+
+            # The user's original request, in full — never truncated.
+            if request and request.strip():
+                f.write("**Request:**\n\n")
+                f.write(f"{request.strip()}\n\n")
 
             meaningful_tools = [t for t in tools_used if t not in ("follow_up", "inspect_run_state")]
             if meaningful_tools:
-                f.write(f"**Tools:** {', '.join(meaningful_tools)}\n\n")
+                # Deduplicate while preserving first-seen order, with counts.
+                counts: "OrderedDict[str, int]" = OrderedDict()
+                for t in meaningful_tools:
+                    counts[t] = counts.get(t, 0) + 1
+                tools_str = ", ".join(
+                    f"{t} ×{n}" if n > 1 else t for t, n in counts.items()
+                )
+                f.write(f"**Tools used:** {tools_str}\n\n")
 
             if summary:
                 f.write(f"{summary}\n\n")
+
+            if report_path:
+                # Link relative to the run directory so it stays portable.
+                try:
+                    rel = os.path.relpath(report_path, self.run_dir)
+                except Exception:
+                    rel = report_path
+                f.write(f"**Comprehensive report:** `{rel}`\n\n")
 
             f.write("---\n\n")
 
         return str(findings_path)
 
-    def complete(self, summary: str = "", request: str = ""):
+    def complete(self, summary: str = "", request: str = "", report_path: Optional[str] = None):
         """Mark run as completed, append to findings log, save manifest.
 
         Does NOT write summary.md — that is a curated document the user
         requests explicitly (e.g. 'give me a summary of what we've done').
         The findings log (conversation.md) is the auto-maintained research journal.
+        ``report_path`` links the turn entry to the comprehensive analysis report.
         """
         self.manifest.status = "completed"
         self._save_manifest()
@@ -360,7 +392,7 @@ class RunManager:
 
         turn_request = request or self.manifest.request or ""
         if summary and turn_request:
-            self.append_findings(turn_request, summary, recent_tools)
+            self.append_findings(turn_request, summary, recent_tools, report_path=report_path)
 
         return str(self.dirs["reports"] / "conversation.md")
 
