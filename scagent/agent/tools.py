@@ -753,6 +753,103 @@ def _save_deg_table_csv(adata: Any, key: str, run_manager: Any = None, *, groupb
     return path, int(len(df))
 
 
+def _natural_cluster_sort(values: List[str]) -> List[str]:
+    """Sort cluster ids numerically when possible, else lexicographically."""
+    def _key(c: str):
+        s = str(c)
+        return (0, int(s)) if s.isdigit() else (1, s)
+    return sorted({str(v) for v in values}, key=_key)
+
+
+def _plot_cluster_qc_metrics(adata: Any, cluster_key: str, out_path: Any,
+                             flagged_clusters: Any = None) -> Optional[str]:
+    """Per-cluster QC metric box plots — one panel per metric, clusters on the
+    x-axis, flagged clusters highlighted in red.
+
+    Deliberately ONE compact multi-panel figure per QC iteration (not one file
+    per cluster) so the figures directory does not explode. Returns the saved
+    path, or ``None`` if it could not be produced.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    if adata is None or cluster_key not in getattr(adata, "obs", {}):
+        return None
+    metric_specs = [
+        ("total_counts", "Library size (counts)", True),
+        ("n_genes_by_counts", "Genes per cell", True),
+        ("pct_counts_mt", "% mitochondrial", False),
+        ("pct_counts_ribo", "% ribosomal", False),
+        ("doublet_score", "Doublet score", False),
+    ]
+    metrics = [m for m in metric_specs if m[0] in adata.obs.columns]
+    if not metrics:
+        return None
+    obs = adata.obs
+    labels = obs[cluster_key].astype(str)
+    cats = _natural_cluster_sort(labels.unique())
+    if not cats:
+        return None
+    flagged = {str(c) for c in (flagged_clusters or [])}
+
+    n = len(metrics)
+    # Wider per-cluster spacing + larger fonts so cluster index labels stay
+    # legible after a vision model downsamples the image.
+    width = max(10.0, len(cats) * 0.6)
+    fig, axes = plt.subplots(n, 1, figsize=(width, 3.0 * n), squeeze=False)
+    tick_fs = 11 if len(cats) <= 30 else 9
+    for ax, (metric, ylabel, logscale) in zip(axes[:, 0], metrics):
+        data = [obs.loc[labels == c, metric].dropna().values for c in cats]
+        bp = ax.boxplot(data, showfliers=False, patch_artist=True)
+        for i, c in enumerate(cats):
+            box = bp["boxes"][i]
+            box.set_facecolor("#d62728" if c in flagged else "#7fb3d5")
+            box.set_alpha(0.85)
+        # Set tick labels manually — version-proof across matplotlib's
+        # labels/tick_labels kwarg change in 3.9. Flagged clusters get bold
+        # red labels so their indices pop even at a glance / when downsampled.
+        ax.set_xticks(range(1, len(cats) + 1))
+        ax.set_xticklabels(cats, rotation=90, fontsize=tick_fs)
+        for lbl, c in zip(ax.get_xticklabels(), cats):
+            if c in flagged:
+                lbl.set_color("#b22222")
+                lbl.set_fontweight("bold")
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.tick_params(axis="y", labelsize=10)
+        if logscale:
+            try:
+                ax.set_yscale("log")
+            except Exception:
+                pass
+        ax.grid(axis="y", alpha=0.25)
+    title = f"Per-cluster QC metrics — {cluster_key}"
+    if flagged:
+        title += "   (red = metric-flagged)"
+    axes[0, 0].set_title(title, fontsize=14)
+    # Spell out the flagged cluster IDs in large text so the key information is
+    # readable regardless of how aggressively the image is downscaled.
+    if flagged:
+        flagged_sorted = _natural_cluster_sort(flagged)
+        fig.text(
+            0.5, 0.002,
+            "Metric-flagged clusters: " + ", ".join(flagged_sorted),
+            ha="center", va="bottom", fontsize=12, color="#b22222", fontweight="bold",
+        )
+    fig.tight_layout(rect=(0, 0.02, 1, 1) if flagged else None)
+    try:
+        out_path = str(out_path)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    except Exception:
+        plt.close(fig)
+        return None
+    plt.close(fig)
+    return out_path
+
+
 def _resolve_run_path(raw: Any, run_manager: Any = None, must_exist: bool = True) -> Optional[Path]:
     """Resolve a path argument forgivingly across tools.
 
@@ -1408,8 +1505,11 @@ def _validate_annotation_evidence(
             and panglao_compatible
             and not reverse_hit
         )
+        # Defer the compatibility failure: whether it is a real error or a
+        # harmless over-claim depends on panglaodb_required, computed below.
+        _panglao_incompatible_msg = None
         if panglao_label_text and final_label_text and not panglao_compatible and not reverse_hit:
-            validation_failures.append(
+            _panglao_incompatible_msg = (
                 f"Cluster {cid}: panglaodb_label_used={panglao_label_text!r} is not biologically compatible "
                 f"with final label {final_label_text!r}. Use a compatible PanglaoDB label, exact label query, "
                 "or reverse marker support."
@@ -1489,8 +1589,10 @@ def _validate_annotation_evidence(
             panglaodb_required_reasons.append("cross_lineage_or_reference_consensus_override")
         if n_reference_source_groups == 1 and not final_matches_single_reference:
             panglaodb_required_reasons.append("single_reference_label_divergence")
-        if raw_conf == "low":
-            panglaodb_required_reasons.append("self_asserted_low_confidence")
+        # NOTE: a self-asserted 'low' confidence is a confidence CAP, not a
+        # PanglaoDB trigger. A cluster that is QC-damaged (e.g. dying cells) but
+        # has a clear reference+DEG identity should finalize at low confidence
+        # without being forced into an external query PanglaoDB cannot satisfy.
 
         if not panglaodb_required_reasons:
             if (
@@ -1523,6 +1625,29 @@ def _validate_annotation_evidence(
         checks["panglaodb_required"] = panglaodb_required
         checks["validation_tier"] = validation_tier
         checks["panglaodb_required_reasons"] = panglaodb_required_reasons
+
+        # Resolve a deferred PanglaoDB-compatibility issue now that we know
+        # whether the cluster actually needs external adjudication. On a cluster
+        # that is NOT panglaodb_required (reference+DEG sufficient), a
+        # wrong/over-claimed panglaodb_label_used is harmless noise — normalize
+        # it to panglaodb_queried=false rather than hard-failing. This prevents
+        # over-claims (e.g. 'dendritic cells' pasted onto a T-cell cluster) from
+        # cascading into a blocked finalize.
+        if _panglao_incompatible_msg:
+            if not panglaodb_required and apply_auto_fixes and pq:
+                ev = dict(ev)
+                ev["panglaodb_queried"] = False
+                ev.pop("panglaodb_label_used", None)
+                evidence_str[cid] = ev
+                pq = False
+                checks["panglaodb_queried"] = False
+                auto_fixes.append(
+                    f"Cluster {cid}: dropped an unsupported PanglaoDB claim "
+                    f"(panglaodb_label_used={panglao_label_text!r} is not compatible with {final_label_text!r}); "
+                    "the cluster is reference+DEG sufficient, so set panglaodb_queried=false."
+                )
+            else:
+                validation_failures.append(_panglao_incompatible_msg)
 
         if panglaodb_required:
             panglaodb_required_clusters.append(cid)
@@ -2131,8 +2256,11 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "that are ambiguous, DEG-only, or reference-discordant, so plausible alternative labels can "
                 "be discovered without flooding context. "
                 "Stores the proposal in adata.uns['annotation_proposal'] and returns per-cluster candidates "
-                "with competing labels, validation_tier, panglaodb_required, and the specific PanglaoDB label "
-                "and reverse-marker queries to run next for required clusters. "
+                "with competing labels, validation_tier, panglaodb_required, the specific PanglaoDB label "
+                "and reverse-marker queries to run next for required clusters, and — critically — each "
+                "cluster's DEGs pre-classified into `discriminating_degs`, `broad_context_degs`, and "
+                "`nuisance_degs`, plus `suggested_supporting_genes` (the discriminating DEGs to cite as "
+                "supporting_genes so evidence passes validation on the first try). "
                 "This is the validation/adjudication stage, not a replacement for reference-based annotation "
                 "when a compatible CellTypist or Scimilarity model is available. After this, query PanglaoDB "
                 "only for panglaodb_required_clusters, then call finalize_annotation with reference, DEG, "
@@ -2726,7 +2854,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells; it nominates proposed-removal and ambiguous clusters for structure QC adjudication. Call this after first clustering to identify low-quality, low-complexity, doublet-enriched, or ambiguous clusters before annotation.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells; it nominates proposed-removal and ambiguous clusters for structure QC adjudication. Call this after first clustering to identify low-quality, low-complexity, doublet-enriched, or ambiguous clusters before annotation. Also saves a per-cluster QC box-plot figure (one compact multi-panel figure per iteration, metric-flagged clusters highlighted) to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png and returns its path in `qc_metrics_figure` — cite it in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -5901,16 +6029,33 @@ def process_tool_call(
                 safe_name = safe_name[:-5]
             data = tool_input.get("data")
             if isinstance(data, str):
-                # Tolerate a stringified payload by parsing it back to structured data.
+                # Tolerate a stringified payload by parsing it back to structured
+                # data. Try strict JSON first, then a couple of forgiving repairs
+                # (Python-dict-style single quotes / True/False/None via
+                # ast.literal_eval, and trailing-comma cleanup) so a model that
+                # stringifies its evidence doesn't dead-end.
+                parsed = None
+                raw = data.strip()
                 try:
-                    data = json.loads(data)
+                    parsed = json.loads(raw)
                 except Exception:
+                    try:
+                        import ast as _ast
+                        parsed = _ast.literal_eval(raw)
+                    except Exception:
+                        try:
+                            _cleaned = re.sub(r",(\s*[}\]])", r"\1", raw)
+                            parsed = json.loads(_cleaned)
+                        except Exception:
+                            parsed = None
+                if parsed is None:
                     return json.dumps({
                         "status": "error",
                         "tool": "write_json",
-                        "message": "`data` must be a JSON object or array, not a string. Pass the structured data directly.",
-                        "recovery_options": ["Call write_json with data={...} as a real object, not a quoted JSON string."],
+                        "message": "`data` must be a JSON object or array, not a string. Pass the structured data directly (data={...}), not a quoted/serialized blob.",
+                        "recovery_options": ["Call write_json with data as a real object: data={\"0\": {...}, \"1\": {...}}."],
                     }, indent=2), adata
+                data = parsed
             if not isinstance(data, (dict, list)):
                 return json.dumps({
                     "status": "error",
@@ -10502,6 +10647,54 @@ def process_tool_call(
                 checkpoint_path = tool_input.get("checkpoint_path") or cp_default
                 write_h5ad_safe(adata, checkpoint_path)
 
+            # Per-cluster QC metric box plots for this iteration. One compact
+            # multi-panel figure per call, organized under
+            # figures/cluster_qc/<cluster_key>/ alongside structure-QC figures,
+            # with a pass number so re-runs on the same key don't overwrite.
+            qc_metrics_figure = None
+            try:
+                safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
+                if run_manager is not None:
+                    qc_fig_dir = Path(run_manager.run_dir) / "figures" / "cluster_qc" / safe_key
+                else:
+                    qc_fig_dir = Path("figures") / "cluster_qc" / safe_key
+                qc_fig_dir.mkdir(parents=True, exist_ok=True)
+                # Pass number tracks the actual CLUSTERING, not the number of
+                # run_cluster_qc calls. A fingerprint of the cluster labels keys
+                # a small index file, so a redundant re-run on the same
+                # clustering overwrites the same pass figure (idempotent), and
+                # only a genuinely new clustering gets a new pass number.
+                import hashlib as _hashlib
+                import json as _json
+                _labels = adata.obs[cluster_key].astype(str).tolist()
+                _fp = _hashlib.md5(("|".join(_labels)).encode()).hexdigest()[:12]
+                _idx_path = qc_fig_dir / ".qc_metric_passes.json"
+                try:
+                    _idx = _json.loads(_idx_path.read_text()) if _idx_path.exists() else {}
+                    if not isinstance(_idx, dict):
+                        _idx = {}
+                except Exception:
+                    _idx = {}
+                if _fp in _idx:
+                    pass_n = int(_idx[_fp])
+                else:
+                    pass_n = max([int(v) for v in _idx.values()], default=0) + 1
+                    _idx[_fp] = pass_n
+                    try:
+                        _idx_path.write_text(_json.dumps(_idx))
+                    except Exception:
+                        pass
+                qc_metrics_figure = _plot_cluster_qc_metrics(
+                    adata,
+                    cluster_key,
+                    qc_fig_dir / f"qc_metrics_by_cluster_pass_{pass_n:03d}.png",
+                    flagged_clusters=proposed_removal,
+                )
+                if qc_metrics_figure and run_manager is not None:
+                    run_manager.add_output(qc_metrics_figure)
+            except Exception:
+                qc_metrics_figure = None
+
             cluster_table = cluster_qc.reset_index().rename(columns={cluster_key: "cluster"})
             cluster_table["cluster"] = cluster_table["cluster"].astype(str)
             cluster_table["recommended_action"] = cluster_table["cluster"].map(
@@ -10542,6 +10735,7 @@ def process_tool_call(
                 "pct_proposed": round(cells_proposed / cells_total * 100, 1),
                 "cells_remaining_if_removed": cells_total - cells_proposed,
                 "checkpoint_path": checkpoint_path,
+                "qc_metrics_figure": qc_metrics_figure,
                 "thresholds_used": {
                     "mt_threshold": mt_threshold,
                     "doublet_threshold": doublet_threshold,
@@ -10553,6 +10747,12 @@ def process_tool_call(
             artifacts = []
             if checkpoint_path:
                 artifacts.append(_artifact_payload(checkpoint_path, role="checkpoint", metadata={"stage": "pre_cluster_qc_cleanup"}))
+            if qc_metrics_figure:
+                artifacts.append(_artifact_payload(
+                    qc_metrics_figure,
+                    role="figure",
+                    metadata={"kind": "per_cluster_qc_metrics", "cluster_key": cluster_key},
+                ))
             return _finalize_result(
                 result, adata,
                 dataset_changed=False,
@@ -11962,11 +12162,32 @@ def process_tool_call(
                     "cluster_id": c,
                     "n_cells": cluster_sizes[c],
                     "top_degs": [d["gene"] for d in top_degs_per_cluster.get(c, [])][:n_deg_genes],
-                    "top_degs_detail": top_degs_per_cluster.get(c, []),
+                    # top_degs_detail (per-gene score/logfc/pval) intentionally omitted —
+                    # it is never read downstream and the full ranking is in the DEG CSV.
                     "reverse_lookup_genes": reverse_lookup_by_cluster.get(c, []),
                     "reverse_lookup_excluded_genes": reverse_lookup_excluded_by_cluster.get(c, []),
                     "qc_annotation_caveats": _cluster_annotation_qc_caveats(c),
                 }
+                # Pre-classify this cluster's top DEGs so the agent can cite
+                # discriminating markers on the first try instead of guessing.
+                # Uses the SAME functions the evidence validator applies, so
+                # genes in `suggested_supporting_genes` are guaranteed to pass
+                # the non-nuisance + discriminating checks.
+                _disc, _broad, _nuis = [], [], []
+                for _d in top_degs_per_cluster.get(c, []):
+                    _g = _d.get("gene")
+                    if not _g:
+                        continue
+                    if _annotation_nuisance_reason(_g):
+                        _nuis.append(_g)
+                    elif _annotation_broad_support_reason(_g):
+                        _broad.append(_g)
+                    else:
+                        _disc.append(_g)
+                summary["discriminating_degs"] = _disc
+                summary["broad_context_degs"] = _broad
+                summary["nuisance_degs"] = _nuis
+                summary["suggested_supporting_genes"] = _disc[:6]
                 if reference_annotation_summary.get(c):
                     summary["reference_annotations"] = reference_annotation_summary[c]
                 if score_matrix.get(c):
@@ -12230,6 +12451,40 @@ def process_tool_call(
                 if payload:
                     prepare_artifacts.append(payload)
 
+            # Build a SLIM per-cluster view for the tool result. The full
+            # cluster_summaries (top_degs_detail, full broad/nuisance/discriminating
+            # lists, per-key reference_annotations, reverse-lookup genes) stay in
+            # adata.uns['annotation_proposal'] — they are not needed in the model's
+            # context and were the dominant driver of EMERGENCY context compactions.
+            # The result keeps only what the model must act on per cluster.
+            def _slim_cluster_view(s: Dict[str, Any]) -> Dict[str, Any]:
+                v = {
+                    "cluster_id": s.get("cluster_id"),
+                    "n_cells": s.get("n_cells"),
+                    "proposed_label": s.get("proposed_label"),
+                    "is_ambiguous": s.get("is_ambiguous"),
+                    "validation_tier": s.get("validation_tier"),
+                    "panglaodb_required": s.get("panglaodb_required"),
+                    "suggested_supporting_genes": s.get("suggested_supporting_genes"),
+                    "top_degs": (s.get("top_degs") or [])[:8],
+                }
+                rc = s.get("reference_consensus") or {}
+                if rc:
+                    v["reference_consensus"] = {
+                        "has_consensus": rc.get("has_consensus"),
+                        "label": rc.get("label"),
+                        "sources": rc.get("sources"),
+                    }
+                if s.get("is_ambiguous") and s.get("competing_labels"):
+                    v["competing_labels"] = s.get("competing_labels")
+                if s.get("panglaodb_required") and s.get("panglaodb_required_reasons"):
+                    v["panglaodb_required_reasons"] = s.get("panglaodb_required_reasons")
+                if s.get("qc_annotation_caveats"):
+                    v["qc_annotation_caveats"] = s.get("qc_annotation_caveats")
+                return v
+
+            clusters_result_view = [_slim_cluster_view(s) for s in cluster_summaries]
+
             result = {
                 "status": "ok",
                 "tool": "prepare_annotation",
@@ -12240,15 +12495,15 @@ def process_tool_call(
                 "n_clusters": len(cluster_ids),
                 "n_ambiguous": len(ambiguous_clusters),
                 "ambiguous_clusters": ambiguous_clusters,
-                "shared_markers_flagged": shared_markers,
+                "shared_markers_flagged": shared_markers[:30],
                 "scoring_method": proposal["scoring_method"],
                 "reference_annotation_keys": valid_reference_keys,
                 "missing_reference_annotation_keys": missing_reference_keys,
                 "reference_source_coverage": reference_source_coverage,
                 "missing_reference_sources": missing_reference_sources,
-                "reference_annotation_summary": reference_annotation_summary,
                 "reference_annotation_notice": reference_annotation_notice,
-                "clusters": cluster_summaries,
+                "clusters": clusters_result_view,
+                "full_proposal_in": "adata.uns['annotation_proposal'] (full per-cluster DEGs/reference detail; the DEG table is also at deg_table_csv)",
                 "panglaodb_queries_required": panglaodb_queries,
                 "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
                 "panglaodb_required_clusters": panglaodb_required_clusters,
@@ -12262,6 +12517,8 @@ def process_tool_call(
                 "n_stale_evidence_entries_cleared": n_evidence_cleared,
                 "prior_evidence_fingerprint": prior_fp,
                 "next_steps": [
+                    "Set each cluster's supporting_genes from its `suggested_supporting_genes` (these are the discriminating DEGs — already non-nuisance and non-broad, so they pass validation on the first try). Add cluster-specific markers from `discriminating_degs` if needed.",
+                    "Do NOT cite genes from `broad_context_degs` (MHC-II like HLA-DRA/CD74, housekeeping, generic myeloid) or `nuisance_degs` (MT/ribosomal/hemoglobin/MALAT1) as the supporting evidence — the validator rejects them as non-discriminating, which is the #1 cause of re-staging loops.",
                     "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in staged evidence.",
                     "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate); these are limited to clusters needing external adjudication.",
                     "For each entry in panglaodb_reverse_marker_queries_required, call bc_get_panglaodb_marker_genes with gene_symbol and species; aggregate returned cell_type values per required cluster across multiple genes.",
@@ -12269,8 +12526,7 @@ def process_tool_call(
                     "For panglaodb_optional_clusters, synthesize labels from CellTypist/Scimilarity agreement and submitted DEG support; PanglaoDB can remain false unless validation later flags that cluster.",
                     "Compare PanglaoDB markers against each required cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
                     "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
-                    "Stage each cluster with label, supporting_genes, PanglaoDB evidence, CellTypist/Scimilarity agreement or conflict, competing labels considered, and explicit reasoning. For more than five clusters, use evidence_path instead of large inline JSON.",
-                    "Before writing labels, call finalize_annotation with validate_only=true; only call it without validate_only after evidence validation passes.",
+                    "Stage ALL clusters in ONE stage_annotation_evidence call (pass evidence_summary as a structured object; for >~25 clusters use write_json then evidence_path). Read result.validation, fix only the flagged clusters, and re-stage. Call finalize_annotation only after stage reports validation.status='ok' for every cluster — do not call finalize speculatively while clusters are still failing.",
                 ],
                 "state": make_state(adata),
             }
@@ -12497,10 +12753,21 @@ def process_tool_call(
             full_coverage = n_covered_with_evidence == n_proposal and n_proposal > 0
             has_blocking_issues = bool(stage_failures)
             validation_status = "ok" if not has_blocking_issues else "issues"
+            # Unambiguous gate for the model: only finalize when every proposal
+            # cluster is covered AND no cluster has a blocking validation issue.
+            ready_to_finalize = full_coverage and not has_blocking_issues
+            clusters_failing = sorted({
+                m.group(1)
+                for f in stage_failures
+                for m in [re.match(r"Cluster (\S+?):", str(f))]
+                if m
+            })
 
             result = {
                 "status": "ok",
                 "tool": "stage_annotation_evidence",
+                "ready_to_finalize": ready_to_finalize,
+                "clusters_failing": clusters_failing,
                 "n_entries_received": len(normalized_incoming),
                 "n_entries_staged_total": len(staged),
                 "evidence_source": evidence_source,
@@ -12757,13 +13024,13 @@ def process_tool_call(
                     message="Evidence validation failed: " + _format_validation_failures_per_cluster(validation_failures),
                     adata_obj=adata,
                     recovery_options=[
+                        "Do NOT retry finalize_annotation directly. Correct the flagged clusters via stage_annotation_evidence and wait until it reports ready_to_finalize=true (clusters_failing empty), then call finalize once.",
+                        "Set supporting_genes from the cluster's suggested_supporting_genes / discriminating_degs in the prepare_annotation proposal — these are guaranteed non-nuisance, non-broad, and present in the DEGs.",
+                        "Do not cite broad_context_degs (MHC-II like HLA-DRA/CD74, housekeeping, generic myeloid) or nuisance_degs (MT/ribosomal/hemoglobin/MALAT1) as the supporting evidence.",
                         "Query PanglaoDB only for clusters whose validation_tier is needs_external_adjudication.",
-                        "Fill supporting_genes with submitted marker genes that overlap the cluster DEGs.",
-                        "Use non-nuisance marker genes; MT/ribosomal/hemoglobin/MALAT1 genes cannot be sole label support.",
                         "Include source_synthesis and lower confidence for QC/structure-review clusters.",
                         "For ambiguous clusters, list the alternative labels you considered in competing_labels_considered.",
                         "Run missing CellTypist/Scimilarity sources; Scimilarity needs a prior tool-recorded blocker if it truly cannot run.",
-                        "Resubmit finalize_annotation with the corrected evidence_summary.",
                     ],
                     extra={
                         "validation_failures": validation_failures,
