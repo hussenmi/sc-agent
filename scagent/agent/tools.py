@@ -1577,41 +1577,90 @@ def _validate_annotation_evidence(
 
         n_submitted_deg_support = len(discriminating_matched_degs)
         raw_conf = ev.get("confidence")
+
+        # --- Cytopus (local) adjudication ---------------------------------
+        # Does the final label best match this cluster's DEGs among candidates,
+        # using the curated local Cytopus KnowledgeBase? This is the PRIMARY
+        # external marker check alongside reference consensus + DEGs. PanglaoDB
+        # is consulted ONLY when neither reference consensus nor Cytopus can
+        # resolve the cluster — i.e. genuinely ambiguous.
+        cluster_top_deg_genes: List[str] = []
+        for _d in (proposal_entry.get("top_degs") or []):
+            _g = _d.get("gene") if isinstance(_d, dict) else _d
+            if isinstance(_g, str) and _g.strip():
+                cluster_top_deg_genes.append(_g.strip())
+        competing_for_cytopus: List[str] = []
+        for _comp in (proposal_entry.get("competing_labels") or []):
+            _cl = _comp.get("label") if isinstance(_comp, dict) else _comp
+            if isinstance(_cl, str) and _cl.strip():
+                competing_for_cytopus.append(_cl.strip())
+        _ev_comp = ev.get("competing_labels_considered")
+        if isinstance(_ev_comp, list):
+            competing_for_cytopus.extend([str(c) for c in _ev_comp if str(c).strip()])
+
+        cytopus_adj: Dict[str, Any] = {"available": False}
+        try:
+            from ..annotation import cytopus_markers as _cyto
+            cytopus_adj = _cyto.adjudicate(
+                final_label_text, competing_for_cytopus, cluster_top_deg_genes, min_margin=1
+            )
+        except Exception:
+            cytopus_adj = {"available": False}
+        cytopus_available = bool(cytopus_adj.get("available"))
+        cytopus_confirms = bool(cytopus_available and cytopus_adj.get("candidate_is_best"))
+        cytopus_thin_margin = bool(cytopus_confirms and (cytopus_adj.get("margin") or 0) < 2)
+        if cytopus_available:
+            checks["cytopus_adjudication"] = {
+                "candidate_covered": cytopus_adj.get("candidate_covered"),
+                "candidate_is_best": cytopus_adj.get("candidate_is_best"),
+                "best_label": cytopus_adj.get("best_label"),
+                "best_overlap": cytopus_adj.get("best_overlap"),
+                "margin": cytopus_adj.get("margin"),
+            }
+
+        # A cross-lineage override of a TWO-SOURCE reference consensus keeps the
+        # high bar (handled later) — Cytopus alone cannot rescue it.
+        crosses_two_source_consensus = bool(
+            reference_consensus.get("has_consensus") and not final_matches_reference_consensus
+        )
+
         panglaodb_required_reasons: List[str] = []
         validation_tier = "needs_external_adjudication"
-        if cid in ambiguous_set:
-            panglaodb_required_reasons.append("flagged_ambiguous")
-        if n_reference_source_groups == 0:
-            panglaodb_required_reasons.append("deg_only_no_reference_source")
-        if n_reference_source_groups >= 2 and not reference_consensus.get("has_consensus"):
-            panglaodb_required_reasons.append("reference_sources_disagree")
-        if reference_consensus.get("has_consensus") and not final_matches_reference_consensus:
-            panglaodb_required_reasons.append("cross_lineage_or_reference_consensus_override")
-        if n_reference_source_groups == 1 and not final_matches_single_reference:
-            panglaodb_required_reasons.append("single_reference_label_divergence")
-        # NOTE: a self-asserted 'low' confidence is a confidence CAP, not a
-        # PanglaoDB trigger. A cluster that is QC-damaged (e.g. dying cells) but
-        # has a clear reference+DEG identity should finalize at low confidence
-        # without being forced into an external query PanglaoDB cannot satisfy.
 
-        if not panglaodb_required_reasons:
-            if (
-                reference_consensus.get("has_consensus")
-                and final_matches_reference_consensus
-                and n_submitted_deg_support >= 2
-            ):
-                validation_tier = "reference_consensus_plus_deg"
-            elif (
-                n_reference_source_groups == 1
-                and final_matches_single_reference
-                and n_submitted_deg_support >= 3
-            ):
-                validation_tier = "reference_partial_plus_deg"
-            else:
-                needed = 2 if reference_consensus.get("has_consensus") else 3
-                panglaodb_required_reasons.append(
-                    f"insufficient_submitted_deg_support_{n_submitted_deg_support}_of_{needed}"
-                )
+        if (
+            reference_consensus.get("has_consensus")
+            and final_matches_reference_consensus
+            and n_submitted_deg_support >= 2
+        ):
+            validation_tier = "reference_consensus_plus_deg"
+        elif (
+            n_reference_source_groups == 1
+            and final_matches_single_reference
+            and n_submitted_deg_support >= 3
+        ):
+            validation_tier = "reference_partial_plus_deg"
+        elif cytopus_confirms and n_submitted_deg_support >= 1 and not crosses_two_source_consensus:
+            # Local Cytopus markers best-match the cluster DEGs for this label —
+            # sufficient without PanglaoDB. (Thin margins cap confidence below.)
+            validation_tier = "cytopus_plus_deg"
+        else:
+            # Genuinely unresolved by reference + Cytopus + DEGs → PanglaoDB.
+            if cid in ambiguous_set:
+                panglaodb_required_reasons.append("flagged_ambiguous")
+            if n_reference_source_groups == 0:
+                panglaodb_required_reasons.append("deg_only_no_reference_source")
+            if n_reference_source_groups >= 2 and not reference_consensus.get("has_consensus"):
+                panglaodb_required_reasons.append("reference_sources_disagree")
+            if crosses_two_source_consensus:
+                panglaodb_required_reasons.append("cross_lineage_or_reference_consensus_override")
+            if cytopus_available and not cytopus_adj.get("candidate_covered"):
+                panglaodb_required_reasons.append("cytopus_uncovered_label")
+            elif cytopus_available and not cytopus_confirms:
+                panglaodb_required_reasons.append("cytopus_label_not_best_match")
+            if n_submitted_deg_support < 1:
+                panglaodb_required_reasons.append("no_discriminating_deg_support")
+            if not panglaodb_required_reasons:
+                panglaodb_required_reasons.append("unresolved_by_reference_cytopus_deg")
 
         panglaodb_required = bool(validation_tier == "needs_external_adjudication")
         panglaodb_has_call_history_support = bool(label_in_history or reverse_hit)
@@ -1663,7 +1712,7 @@ def _validate_annotation_evidence(
                     "Either query PanglaoDB for this label or record the gene_symbol reverse query that supports it."
                 )
 
-        if validation_tier in {"reference_consensus_plus_deg", "reference_partial_plus_deg"}:
+        if validation_tier in {"reference_consensus_plus_deg", "reference_partial_plus_deg", "cytopus_plus_deg"}:
             panglaodb_support_level = validation_tier
             checks["panglaodb_support_level"] = panglaodb_support_level
 
@@ -1765,6 +1814,16 @@ def _validate_annotation_evidence(
                     f"Cluster {cid}: auto-lowered confidence high → medium because only one reference source "
                     f"supported the label and submitted DEG support was {n_submitted_deg_support}; use at least "
                     "four discriminating submitted DEG markers for high confidence without PanglaoDB."
+                )
+            elif panglaodb_support_level == "cytopus_plus_deg" and cytopus_thin_margin:
+                ev = dict(ev)
+                ev["confidence"] = "medium"
+                evidence_str[cid] = ev
+                conf = "medium"
+                auto_fixes.append(
+                    f"Cluster {cid}: auto-lowered confidence high → medium because the Cytopus marker "
+                    f"adjudication margin over the runner-up label was thin "
+                    f"(margin {cytopus_adj.get('margin')}); the local winner is trusted but the evidence is not strong."
                 )
             elif fine_label_without_direct_external:
                 ev = dict(ev)
@@ -12236,13 +12295,55 @@ def process_tool_call(
                         ambiguous_clusters.append(c)
                 ref_consensus = _reference_consensus_from_entries(summary.get("reference_annotations") or [])
                 source_groups = ref_consensus.get("source_groups") or []
+
+                # Cytopus (local) prediction: does the proposed label best-match
+                # this cluster's DEGs? Cytopus + DEGs + reference are primary;
+                # PanglaoDB is staged ONLY for clusters none of them can resolve.
+                cyto_pred: Dict[str, Any] = {"available": False}
+                proposed_lbl = summary.get("proposed_label")
+                if proposed_lbl:
+                    try:
+                        from ..annotation import cytopus_markers as _cyto
+                        _comp = [
+                            (cc.get("label") if isinstance(cc, dict) else cc)
+                            for cc in (summary.get("competing_labels") or [])
+                        ]
+                        cyto_pred = _cyto.adjudicate(
+                            proposed_lbl,
+                            [str(x) for x in _comp if x],
+                            summary.get("top_degs") or [],
+                            min_margin=1,
+                        )
+                    except Exception:
+                        cyto_pred = {"available": False}
+                cyto_confirms = bool(cyto_pred.get("available") and cyto_pred.get("candidate_is_best"))
+                # Prepare is a prediction (validator is authoritative): if Cytopus
+                # has a CONFIDENT local call for this cluster's DEGs (clear best +
+                # margin), treat the cluster as locally resolvable and don't pre-stage
+                # PanglaoDB, even if the (murky) proposed_label didn't match. If the
+                # agent's final label diverges, the validator re-flags it.
+                cyto_confident = bool(
+                    cyto_pred.get("available")
+                    and (cyto_pred.get("best_overlap") or 0) >= 2
+                    and (cyto_pred.get("margin") or 0) >= 1
+                )
+                cyto_resolves = cyto_confirms or cyto_confident
+                ref_two_source = bool(ref_consensus.get("has_consensus"))
+
                 required_reasons: List[str] = []
-                if not source_groups:
-                    required_reasons.append("deg_only_no_reference_source")
-                if summary.get("is_ambiguous"):
-                    required_reasons.append("flagged_ambiguous")
-                if len(source_groups) >= 2 and not ref_consensus.get("has_consensus"):
-                    required_reasons.append("reference_sources_disagree")
+                if not (ref_two_source or cyto_resolves):
+                    if summary.get("is_ambiguous"):
+                        required_reasons.append("flagged_ambiguous")
+                    if not source_groups:
+                        required_reasons.append("deg_only_no_reference_source")
+                    if len(source_groups) >= 2 and not ref_consensus.get("has_consensus"):
+                        required_reasons.append("reference_sources_disagree")
+                    if cyto_pred.get("available") and (cyto_pred.get("best_overlap") or 0) == 0:
+                        required_reasons.append("cytopus_no_marker_overlap")
+                    elif cyto_pred.get("available"):
+                        required_reasons.append("cytopus_inconclusive")
+                    if not required_reasons:
+                        required_reasons.append("unresolved_by_reference_cytopus_deg")
                 panglaodb_required = bool(required_reasons)
                 summary["reference_source_groups"] = source_groups
                 summary["reference_consensus"] = {
@@ -12252,14 +12353,22 @@ def process_tool_call(
                     "labels": ref_consensus.get("labels", []),
                     "score": ref_consensus.get("score"),
                 }
+                if cyto_pred.get("available"):
+                    summary["cytopus_adjudication"] = {
+                        "candidate_covered": cyto_pred.get("candidate_covered"),
+                        "candidate_is_best": cyto_pred.get("candidate_is_best"),
+                        "best_label": cyto_pred.get("best_label"),
+                        "best_overlap": cyto_pred.get("best_overlap"),
+                        "margin": cyto_pred.get("margin"),
+                    }
                 summary["panglaodb_required"] = panglaodb_required
                 summary["validation_tier"] = (
                     "needs_external_adjudication"
                     if panglaodb_required
                     else (
                         "reference_consensus_plus_deg"
-                        if ref_consensus.get("has_consensus")
-                        else "reference_partial_plus_deg"
+                        if ref_two_source
+                        else ("cytopus_plus_deg" if cyto_resolves else "reference_partial_plus_deg")
                     )
                 )
                 summary["panglaodb_required_reasons"] = required_reasons
@@ -12474,6 +12583,13 @@ def process_tool_call(
                         "has_consensus": rc.get("has_consensus"),
                         "label": rc.get("label"),
                         "sources": rc.get("sources"),
+                    }
+                ca = s.get("cytopus_adjudication") or {}
+                if ca:
+                    v["cytopus_adjudication"] = {
+                        "candidate_is_best": ca.get("candidate_is_best"),
+                        "best_label": ca.get("best_label"),
+                        "margin": ca.get("margin"),
                     }
                 if s.get("is_ambiguous") and s.get("competing_labels"):
                     v["competing_labels"] = s.get("competing_labels")

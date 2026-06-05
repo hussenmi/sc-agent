@@ -36,6 +36,7 @@ dependencies = [
     "bbknn>=1.5",  # Batch correction via graph k-NN; used in batch/bbknn.py
     "mygene>=3.2",  # Gene symbol <-> Ensembl ID conversion via mygene.info
     "adjustText>=1.0",  # Non-overlapping labels for scatter/volcano/UMAP plots
+    "cytopus>=1.3",  # Local curated immune cell-type gene sets; primary marker adjudicator (annotation/cytopus_markers.py)
 ]
 
 [project.optional-dependencies]
