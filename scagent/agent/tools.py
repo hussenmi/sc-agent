@@ -426,6 +426,35 @@ def _reference_consensus_from_entries(
     }
 
 
+def _loads_tolerant(text: str) -> Optional[Any]:
+    """Parse a (possibly imperfect) serialized object back to structured data.
+
+    Tries, in order: strict JSON, Python-literal eval (single quotes / True /
+    False / None), and a trailing-comma cleanup. Returns the parsed object or
+    None if every attempt fails (e.g. genuinely truncated payloads). Used so a
+    model that stringifies its evidence — to write_json, stage_annotation_evidence,
+    or an evidence file — doesn't dead-end on minor formatting quirks.
+    """
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    try:
+        import ast as _ast
+        return _ast.literal_eval(raw)
+    except Exception:
+        pass
+    try:
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", raw))
+    except Exception:
+        return None
+
+
 def _report_fmt(value: Any, limit: Optional[int] = None) -> str:
     """One-line rendering of a value for markdown tables.
 
@@ -1664,10 +1693,27 @@ def _validate_annotation_evidence(
 
         panglaodb_required = bool(validation_tier == "needs_external_adjudication")
         panglaodb_has_call_history_support = bool(label_in_history or reverse_hit)
-        if panglaodb_required and pq and (
-            panglaodb_has_call_history_support
-            or not (queried_celltypes_normalized or queried_gene_symbols_normalized)
+        if panglaodb_required and panglaodb_has_call_history_support:
+            # A compatible label was actually queried this session (it is in the
+            # PanglaoDB call history) — external adjudication genuinely happened.
+            # Accept it even if the agent forgot to set panglaodb_queried=true,
+            # rather than looping finalize on the missing flag.
+            if not pq and apply_auto_fixes:
+                ev = dict(ev)
+                ev["panglaodb_queried"] = True
+                evidence_str[cid] = ev
+                pq = True
+                checks["panglaodb_queried"] = True
+                auto_fixes.append(
+                    f"Cluster {cid}: set panglaodb_queried=true — a compatible label was queried in "
+                    "PanglaoDB this session (present in the call history), so external adjudication did occur."
+                )
+            validation_tier = "external_adjudicated"
+            panglaodb_required = False
+        elif panglaodb_required and pq and not (
+            queried_celltypes_normalized or queried_gene_symbols_normalized
         ):
+            # PanglaoDB/MCP unavailable this session: accept the agent's attested query.
             validation_tier = "external_adjudicated"
             panglaodb_required = False
         checks["n_submitted_discriminating_deg_support"] = n_submitted_deg_support
@@ -6088,25 +6134,9 @@ def process_tool_call(
                 safe_name = safe_name[:-5]
             data = tool_input.get("data")
             if isinstance(data, str):
-                # Tolerate a stringified payload by parsing it back to structured
-                # data. Try strict JSON first, then a couple of forgiving repairs
-                # (Python-dict-style single quotes / True/False/None via
-                # ast.literal_eval, and trailing-comma cleanup) so a model that
-                # stringifies its evidence doesn't dead-end.
-                parsed = None
-                raw = data.strip()
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    try:
-                        import ast as _ast
-                        parsed = _ast.literal_eval(raw)
-                    except Exception:
-                        try:
-                            _cleaned = re.sub(r",(\s*[}\]])", r"\1", raw)
-                            parsed = json.loads(_cleaned)
-                        except Exception:
-                            parsed = None
+                # Tolerate a stringified payload (json / python-literal / trailing
+                # commas). Genuinely truncated blobs still fail -> clear error.
+                parsed = _loads_tolerant(data)
                 if parsed is None:
                     return json.dumps({
                         "status": "error",
@@ -12744,27 +12774,28 @@ def process_tool_call(
                             "Use register_artifact(path) inside run_code to surface the absolute path in the previous tool result.",
                         ],
                     )
-                try:
-                    incoming = json.loads(resolved_path.read_text())
-                    evidence_source = f"file:{resolved_path}"
-                except Exception as exc:
+                parsed_file = _loads_tolerant(resolved_path.read_text())
+                if parsed_file is None:
                     return _error_result(
                         tool="stage_annotation_evidence",
-                        message=f"Could not parse evidence_path as JSON: {type(exc).__name__}: {exc}",
+                        message=f"Could not parse evidence_path as JSON: {resolved_path}",
                         adata_obj=adata,
                         recovery_options=["Ensure the file contains a JSON object keyed by cluster id."],
                     )
+                incoming = parsed_file
+                evidence_source = f"file:{resolved_path}"
             elif isinstance(incoming, str):
-                try:
-                    incoming = json.loads(incoming)
+                parsed_inline = _loads_tolerant(incoming)
+                if parsed_inline is not None:
+                    incoming = parsed_inline
                     evidence_source = "json_string"
-                except Exception as exc:
+                else:
                     incoming_len = len(incoming)
-                    likely_truncated = incoming_len > 6000 and type(exc).__name__ == "JSONDecodeError"
+                    likely_truncated = incoming_len > 6000
                     return _error_result(
                         tool="stage_annotation_evidence",
                         message=(
-                            f"Could not parse evidence_summary JSON string: {type(exc).__name__}: {exc}. "
+                            "Could not parse evidence_summary as JSON/structured data. "
                             + (
                                 "The inline evidence payload is large and likely truncated; write evidence to a JSON file and pass evidence_path instead."
                                 if likely_truncated
@@ -13281,12 +13312,27 @@ def process_tool_call(
             for v in adata.obs[annotation_key].astype(str).values:
                 label_counts[v] = label_counts.get(v, 0) + 1
 
+            # Provenance rollup: how each cluster was adjudicated. Cytopus (local)
+            # + reference + DEGs are primary; PanglaoDB is the rare fallback.
+            validation_tier_breakdown: Dict[str, int] = {}
+            for _c in per_cluster_validation.values():
+                _t = _c.get("validation_tier") or "unknown"
+                validation_tier_breakdown[_t] = validation_tier_breakdown.get(_t, 0) + 1
+            n_panglaodb_adjudicated = len([
+                c for c in per_cluster_validation.values() if c.get("panglaodb_queried")
+            ])
+            n_cytopus_adjudicated = validation_tier_breakdown.get("cytopus_plus_deg", 0)
+
             validation_payload = {
                 "annotation_key": annotation_key,
                 "cluster_key": cluster_key,
                 "panglaodb_validated": True,
-                "external_validation_policy": "conditional_panglaodb_adjudication",
-                "validation_strategy": "reference_and_submitted_deg_primary_panglaodb_for_required_clusters",
+                "external_validation_policy": "cytopus_local_primary_panglaodb_fallback",
+                "validation_strategy": "reference_consensus_and_local_cytopus_and_submitted_deg_primary;panglaodb_only_for_ambiguous",
+                "marker_adjudication_sources": ["cytopus_local", "reference_consensus", "submitted_deg", "panglaodb_fallback"],
+                "validation_tier_breakdown": validation_tier_breakdown,
+                "n_cytopus_adjudicated": n_cytopus_adjudicated,
+                "n_panglaodb_adjudicated": n_panglaodb_adjudicated,
                 "panglaodb_required_clusters": panglaodb_required_clusters,
                 "used_staged_evidence": used_staged_evidence,
                 "auto_fixes": auto_fixes,
@@ -13298,7 +13344,7 @@ def process_tool_call(
                 "reference_source_unavailable_manual": manual_unavailable_sources,
                 "unexplained_missing_reference_sources": unexplained_missing_sources,
                 "scimilarity_availability": scimilarity_availability,
-                "n_clusters_validated": len([c for c in per_cluster_validation.values() if c.get("panglaodb_queried")]),
+                "n_clusters_validated": len(per_cluster_validation),
                 "per_cluster_evidence": per_cluster_validation,
                 "label_counts": label_counts,
                 "finalized": True,

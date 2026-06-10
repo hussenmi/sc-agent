@@ -128,8 +128,13 @@ def normalize_label(value: Any) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _load_kb():
+    import contextlib
+    import io
     import cytopus as cp  # noqa: import guarded by caller via available()
-    return cp.KnowledgeBase()
+    # cp.KnowledgeBase() prints a banner ("KnowledgeBase object containing ...")
+    # to stdout on init; silence it so it does not leak into the agent terminal.
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        return cp.KnowledgeBase()
 
 
 @functools.lru_cache(maxsize=1)

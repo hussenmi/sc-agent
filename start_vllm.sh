@@ -119,10 +119,15 @@ case "$GPU_CC" in
     HW_CLASS="ampere"                  # A100
     ;;
   9.0)
-    if [[ "$GPU_NAME" == *"SXM"* || "$GPU_NAME" == *"HBM3"* ]]; then
-      HW_CLASS="hopper_nvswitch"       # H100 SXM
+    # Probe for NVSwitch directly rather than guessing from the SKU name. The name
+    # string is an unreliable proxy: H100 SXM reports "...SXM..." but H200 SXM
+    # reports a bare "NVIDIA H200" with no SXM/HBM3 marker — so a name match
+    # misclassifies a full-NVSwitch HGX board as no-NVSwitch. The kernel exposes
+    # one entry per NVSwitch chip here when the fabric is physically present.
+    if ls /proc/driver/nvidia-nvswitch/devices/* >/dev/null 2>&1; then
+      HW_CLASS="hopper_nvswitch"       # H100/H200 SXM (HGX baseboard w/ NVSwitch)
     else
-      HW_CLASS="hopper_no_nvswitch"    # H100 PCIe / H100 NVL
+      HW_CLASS="hopper_no_nvswitch"    # H100/H200 PCIe / NVL
     fi
     ;;
   *)
