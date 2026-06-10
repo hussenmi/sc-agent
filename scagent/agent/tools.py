@@ -3213,7 +3213,25 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "options": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of discrete choices if applicable. Omit for open-ended questions."
+                        "minItems": 2,
+                        "maxItems": 5,
+                        "description": "Two to five concise user-facing choices. Omit for an open-ended question."
+                    },
+                    "option_actions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Stable machine-readable action id for each option, in the same order. "
+                            "Use short snake_case values."
+                        )
+                    },
+                    "decision_key": {
+                        "type": "string",
+                        "description": "Stable snake_case key identifying this decision."
+                    },
+                    "allow_custom": {
+                        "type": "boolean",
+                        "description": "Whether the selector should offer a custom free-text response. Defaults to true."
                     }
                 },
                 "required": ["question", "context"]
@@ -4984,19 +5002,7 @@ def process_tool_call(
 
     try:
         # ===== META TOOLS =====
-        if tool_name == "ask_user":
-            # This is handled specially by the agent loop - just return the question
-            return json.dumps({
-                "status": "needs_input",
-                "tool": "ask_user",
-                "question": tool_input["question"],
-                "options": tool_input.get("options", []),
-                "option_actions": tool_input.get("option_actions", []),
-                "default": tool_input.get("default", ""),
-                "decision_key": tool_input.get("decision_key", ""),
-            }, indent=2), adata
-
-        elif tool_name == "run_code":
+        if tool_name == "run_code":
             # Execute custom Python code on adata
             import scanpy as sc
             import pandas as pd
@@ -7708,7 +7714,7 @@ def process_tool_call(
                         "QC filtering was not applied. Review the thresholds, parameters, and removal "
                         "counts, then confirm before I remove cells or genes."
                     ),
-                    "required_next_action": "ask_user",
+                    "required_next_action": "resolve_pending_decision",
                     "before": {"n_cells": n_before, "n_genes": g_before},
                     "after": {"n_cells": n_before, "n_genes": g_before},
                     "recommendation": recommendation,

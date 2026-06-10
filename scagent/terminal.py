@@ -2,8 +2,276 @@
 
 from __future__ import annotations
 
+import re
+import sys
+from dataclasses import asdict, dataclass
+from typing import Callable, Sequence
+
 _READLINE_CONFIGURED = False
 _PROMPT_SESSION = None
+
+
+@dataclass(frozen=True)
+class DecisionChoice:
+    """A user-facing decision label paired with a stable machine action."""
+
+    label: str
+    action: str
+
+
+@dataclass(frozen=True)
+class DecisionSelection:
+    """Normalized result from either the selector or text fallback."""
+
+    action: str
+    label: str
+    index: int | None
+    value: str
+    raw_response: str
+    input_mode: str
+    custom: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+_ORDINALS = {
+    "first": 1,
+    "1st": 1,
+    "one": 1,
+    "second": 2,
+    "2nd": 2,
+    "two": 2,
+    "third": 3,
+    "3rd": 3,
+    "three": 3,
+    "fourth": 4,
+    "4th": 4,
+    "four": 4,
+    "fifth": 5,
+    "5th": 5,
+    "five": 5,
+}
+
+
+def resolve_decision_response(
+    response: str,
+    choices: Sequence[DecisionChoice],
+    *,
+    default_index: int | None = None,
+    allow_custom: bool = True,
+    input_mode: str = "text",
+) -> DecisionSelection:
+    """Resolve a text reply against choices without making the model infer it."""
+
+    raw = response or ""
+    normalized = raw.strip()
+    lowered = normalized.casefold()
+    selected_index: int | None = None
+
+    if not normalized and default_index is not None and 0 <= default_index < len(choices):
+        selected_index = default_index
+    else:
+        number_match = re.fullmatch(r"(?:option|choice)?\s*#?\s*(\d+)", lowered)
+        if number_match:
+            selected_index = int(number_match.group(1)) - 1
+        elif lowered in _ORDINALS:
+            selected_index = _ORDINALS[lowered] - 1
+        else:
+            for index, choice in enumerate(choices):
+                if lowered in {choice.action.casefold(), choice.label.casefold()}:
+                    selected_index = index
+                    break
+
+    if selected_index is not None and 0 <= selected_index < len(choices):
+        choice = choices[selected_index]
+        custom = choice.action == "custom"
+        return DecisionSelection(
+            action=choice.action,
+            label=choice.label,
+            index=selected_index,
+            value=normalized or choice.label,
+            raw_response=raw,
+            input_mode=input_mode,
+            custom=custom,
+        )
+
+    if allow_custom:
+        return DecisionSelection(
+            action="custom",
+            label="Custom response",
+            index=None,
+            value=normalized,
+            raw_response=raw,
+            input_mode=input_mode,
+            custom=True,
+        )
+
+    return DecisionSelection(
+        action="",
+        label="",
+        index=None,
+        value=normalized,
+        raw_response=raw,
+        input_mode=input_mode,
+        custom=False,
+    )
+
+
+def _run_selector_app(
+    question: str,
+    choices: Sequence[DecisionChoice],
+    *,
+    default_index: int = 0,
+) -> int:
+    """Render an arrow-key selector and return its zero-based choice index."""
+
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.formatted_text import FormattedText
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.containers import Window
+
+    selected = [min(max(default_index, 0), len(choices) - 1)]
+
+    def content() -> FormattedText:
+        fragments = [("class:question", f"{question}\n\n")]
+        for index, choice in enumerate(choices):
+            pointer = "❯" if index == selected[0] else " "
+            style = "class:selected" if index == selected[0] else ""
+            fragments.append((style, f" {pointer} {choice.label}\n"))
+        fragments.append(("class:hint", "\n Use ↑/↓ and Enter."))
+        return FormattedText(fragments)
+
+    bindings = KeyBindings()
+
+    @bindings.add("up")
+    @bindings.add("k")
+    def _up(event):
+        selected[0] = (selected[0] - 1) % len(choices)
+
+    @bindings.add("down")
+    @bindings.add("j")
+    def _down(event):
+        selected[0] = (selected[0] + 1) % len(choices)
+
+    @bindings.add("home")
+    def _home(event):
+        selected[0] = 0
+
+    @bindings.add("end")
+    def _end(event):
+        selected[0] = len(choices) - 1
+
+    @bindings.add("enter")
+    def _accept(event):
+        event.app.exit(result=selected[0])
+
+    @bindings.add("c-c")
+    @bindings.add("escape")
+    def _cancel(event):
+        event.app.exit(exception=KeyboardInterrupt)
+
+    app = Application(
+        layout=Layout(Window(FormattedTextControl(content), always_hide_cursor=True)),
+        key_bindings=bindings,
+        full_screen=False,
+        erase_when_done=False,
+    )
+    return app.run()
+
+
+def prompt_for_decision(
+    question: str,
+    choices: Sequence[DecisionChoice],
+    *,
+    default_index: int | None = 0,
+    allow_custom: bool = True,
+    force_text_fallback: bool = False,
+    input_reader: Callable[[str], str] | None = None,
+) -> DecisionSelection:
+    """Ask a discrete question using a selector, with a numbered text fallback."""
+
+    input_reader = input_reader or read_user_input
+    normalized_choices = list(choices)
+    if not normalized_choices:
+        response = input_reader(f"{question}\n> ")
+        return DecisionSelection(
+            action="custom",
+            label="Custom response",
+            index=None,
+            value=response,
+            raw_response=response,
+            input_mode="text",
+            custom=True,
+        )
+
+    custom_index = next(
+        (index for index, choice in enumerate(normalized_choices) if choice.action == "custom"),
+        None,
+    )
+    if allow_custom and custom_index is None:
+        custom_index = len(normalized_choices)
+        normalized_choices.append(DecisionChoice("Enter a custom response", "custom"))
+
+    use_selector = (
+        not force_text_fallback
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+    if use_selector:
+        selected_index = _run_selector_app(
+            question,
+            normalized_choices,
+            default_index=default_index or 0,
+        )
+        choice = normalized_choices[selected_index]
+        if choice.action == "custom":
+            response = input_reader("Your response: ")
+            return DecisionSelection(
+                action="custom",
+                label=choice.label,
+                index=selected_index,
+                value=response,
+                raw_response=response,
+                input_mode="selector",
+                custom=True,
+            )
+        return DecisionSelection(
+            action=choice.action,
+            label=choice.label,
+            index=selected_index,
+            value=choice.label,
+            raw_response=choice.label,
+            input_mode="selector",
+            custom=False,
+        )
+
+    print(question)
+    for index, choice in enumerate(normalized_choices, 1):
+        suffix = " [default]" if default_index == index - 1 else ""
+        print(f"  {index}. {choice.label}{suffix}")
+    response = input_reader("> ")
+    selection = resolve_decision_response(
+        response,
+        normalized_choices,
+        default_index=default_index,
+        allow_custom=allow_custom,
+        input_mode="text",
+    )
+    if selection.action == "custom" and selection.index == custom_index:
+        custom_response = input_reader("Your response: ")
+        return DecisionSelection(
+            action="custom",
+            label=selection.label,
+            index=selection.index,
+            value=custom_response,
+            raw_response=custom_response,
+            input_mode="text",
+            custom=True,
+        )
+    return selection
 
 
 def _configure_readline() -> None:

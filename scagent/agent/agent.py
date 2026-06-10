@@ -45,6 +45,10 @@ You are running in smart autonomous mode. **Drive the analysis forward without p
 
 **Do NOT present numbered options at the end of every turn.** After completing a phase, give a brief status summary (what you found, what's next) and continue unless there's a real reason to stop. Options menus are for decisions, not routine narration.
 
+When a real decision is needed, explain the evidence and call `pause_and_ask`
+with concise labels and stable action identifiers. The runtime renders the
+interactive selector; do not duplicate its numbered menu in prose.
+
 **Proceed without pausing for:** standard preprocessing (normalization, HVG, PCA, neighbors, UMAP), algorithm parameter choices with established best practices, reversible steps you can re-run with different settings.
 
 ### When to use `pause_and_ask`
@@ -398,9 +402,10 @@ class SCAgent:
 
     def close(self) -> None:
         """Shut down MCP connections and any other resources. Safe to call multiple times."""
-        if self._mcp_client is not None:
+        mcp_client = getattr(self, "_mcp_client", None)
+        if mcp_client is not None:
             try:
-                self._mcp_client.stop()
+                mcp_client.stop()
             except Exception:
                 pass
             self._mcp_client = None
@@ -1110,9 +1115,36 @@ class SCAgent:
         return deduped[:5]
 
     def _set_pending_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        checkpoint = dict(checkpoint)
+        options = [str(option) for option in checkpoint.get("options", []) or []]
+        actions = [str(action) for action in checkpoint.get("option_actions", []) or []]
+        if len(actions) != len(options):
+            actions = self._stable_option_actions(options)
+        checkpoint["options"] = options
+        checkpoint["option_actions"] = actions
+        checkpoint.setdefault("decision_key", checkpoint.get("kind", "pending_decision"))
+        checkpoint.setdefault("allow_custom", True)
         self._pending_checkpoint = checkpoint
         if self.run_manager:
             self.run_manager.append_event("checkpoint_pending", checkpoint)
+
+    @property
+    def has_pending_decision(self) -> bool:
+        return self._pending_checkpoint is not None
+
+    @staticmethod
+    def _stable_option_actions(options: List[str]) -> List[str]:
+        """Generate deterministic action ids when a caller supplied labels only."""
+        actions: List[str] = []
+        seen: Dict[str, int] = {}
+        for index, option in enumerate(options, 1):
+            slug = re.sub(r"[^a-z0-9]+", "_", option.lower()).strip("_")
+            slug = slug[:64] or f"option_{index}"
+            seen[slug] = seen.get(slug, 0) + 1
+            if seen[slug] > 1:
+                slug = f"{slug}_{seen[slug]}"
+            actions.append(slug)
+        return actions
 
     def _checkpoint_options(
         self,
@@ -1122,13 +1154,110 @@ class SCAgent:
         actions = [action for _, action in entries]
         return options, actions
 
-    def _clear_pending_checkpoint(self, user_response: Optional[str] = None) -> None:
+    def _clear_pending_checkpoint(self, user_response: Any = None) -> None:
         if self._pending_checkpoint and self.run_manager:
             payload = dict(self._pending_checkpoint)
             if user_response is not None:
                 payload["user_response"] = user_response
             self.run_manager.append_event("checkpoint_resolved", payload)
         self._pending_checkpoint = None
+
+    def prompt_pending_decision(self, *, force_text_fallback: bool = False):
+        """Render the current checkpoint and return a normalized selection."""
+        if not self._pending_checkpoint:
+            return None
+        from ..terminal import DecisionChoice, prompt_for_decision
+
+        checkpoint = self._pending_checkpoint
+        options = checkpoint.get("options", []) or []
+        actions = checkpoint.get("option_actions", []) or []
+        choices = [
+            DecisionChoice(label=label, action=actions[index])
+            for index, label in enumerate(options)
+        ]
+        default = checkpoint.get("default")
+        default_index = options.index(default) if default in options else 0
+        context = str(checkpoint.get("context") or checkpoint.get("summary") or "").strip()
+        question = str(checkpoint.get("question") or "How should I proceed?").strip()
+        if context:
+            question = f"{context}\n\n{question}"
+        return prompt_for_decision(
+            question,
+            choices,
+            default_index=default_index,
+            allow_custom=bool(checkpoint.get("allow_custom", True)),
+            force_text_fallback=force_text_fallback,
+        )
+
+    def resolve_pending_decision_text(self, response: str):
+        """Resolve a plain-text reply against the newest pending decision."""
+        if not self._pending_checkpoint:
+            return None
+        from ..terminal import DecisionChoice, resolve_decision_response
+
+        checkpoint = self._pending_checkpoint
+        options = checkpoint.get("options", []) or []
+        actions = checkpoint.get("option_actions", []) or []
+        choices = [
+            DecisionChoice(label=label, action=actions[index])
+            for index, label in enumerate(options)
+        ]
+        default = checkpoint.get("default")
+        default_index = options.index(default) if default in options else None
+        return resolve_decision_response(
+            response,
+            choices,
+            default_index=default_index,
+            allow_custom=bool(checkpoint.get("allow_custom", True)),
+        )
+
+    def resolve_pending_decision(self, selection) -> Dict[str, Any]:
+        """Commit a normalized selection and return the payload given to the model."""
+        if not self._pending_checkpoint:
+            raise RuntimeError("No pending decision to resolve.")
+        checkpoint = dict(self._pending_checkpoint)
+        selected_action = selection.action
+        selected_value = selection.value
+
+        if checkpoint.get("kind") == "cluster_qc_cleanup":
+            self._authorize_pending_cleanup_from_user(selected_action)
+
+        decision_key = checkpoint.get("decision_key", checkpoint.get("kind", "pending_decision"))
+        self.world_state.resolve_decision(
+            decision_key,
+            selected_action or selected_value,
+            source="user",
+            message=selected_value,
+        )
+        payload = {
+            "decision_key": decision_key,
+            "checkpoint_kind": checkpoint.get("kind"),
+            "question": checkpoint.get("question", ""),
+            "selected_action": selected_action,
+            "selected_label": selection.label,
+            "selected_index": selection.index,
+            "selected_value": selected_value,
+            "raw_response": selection.raw_response,
+            "input_mode": selection.input_mode,
+            "custom": selection.custom,
+            "action_input": (checkpoint.get("action_inputs") or {}).get(selected_action),
+            "context": checkpoint.get("context") or checkpoint.get("summary") or "",
+        }
+        if checkpoint.get("proposal") is not None:
+            payload["proposal"] = checkpoint["proposal"]
+        if self._pending_checkpoint is not None:
+            self._clear_pending_checkpoint(payload)
+        return payload
+
+    def structured_decision_request(self, selection) -> str:
+        """Turn a selector result into an unambiguous model-facing user message."""
+        payload = self.resolve_pending_decision(selection)
+        return (
+            "[Structured user decision]\n"
+            f"{json.dumps(payload, indent=2, default=str)}\n\n"
+            "Treat selected_action as authoritative. Carry out that choice, using "
+            "selected_value as the user's text only when custom is true."
+        )
 
     def _run_nested_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
         result_json = self._execute_tool(tool_name, tool_input)
@@ -1336,7 +1465,7 @@ class SCAgent:
                     "state-changing step."
                 ),
                 "pending_checkpoint": checkpoint,
-                "required_next_action": "ask_user",
+                "required_next_action": "resolve_pending_decision",
             },
             indent=2,
         )
@@ -1870,10 +1999,6 @@ class SCAgent:
     def _current_capabilities(self) -> Dict[str, Any]:
         return (self.world_state.data_summary or {}).get("capabilities", {})
 
-    def _is_yes_response(self, value: str) -> bool:
-        text = (value or "").strip().lower()
-        return text in {"y", "yes", "1", "ok", "okay", "sure", "continue", "do it", "run it", "compute it"}
-
     def _checkpoint_action_from_user_response(
         self,
         checkpoint: Dict[str, Any],
@@ -1884,6 +2009,10 @@ class SCAgent:
         text = text.strip(" .,!?:;")
         option_actions = checkpoint.get("option_actions") or []
         options = checkpoint.get("options") or []
+
+        for action in option_actions:
+            if text == str(action).strip().lower():
+                return action
 
         numbered_match = re.match(r"^(?:option|choice|number|#)?\s*([1-9][0-9]*)\b", text)
         if text.isdigit() or numbered_match:
@@ -2254,25 +2383,6 @@ class SCAgent:
                 "reason": "The latest user request directly requested cell or cluster removal.",
             }
         return None
-
-    def _run_reconciled_action(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a tool and return parsed result. Used for checkpoint option handling."""
-        result_json = self._execute_tool(tool_name, tool_input)
-        try:
-            return json.loads(result_json)
-        except json.JSONDecodeError:
-            return {"status": "error", "tool": tool_name, "message": "Invalid JSON result"}
-
-    def _format_reconciled_response(self, intro: str, steps: List[Dict[str, Any]], final_result: Optional[Dict[str, Any]] = None) -> str:
-        """Format a response from executed steps. Used for checkpoint option handling."""
-        lines = [intro]
-        for step in steps:
-            summary = step.get("summary") or step.get("message") or ""
-            if summary:
-                lines.append(f"  {summary}")
-        if final_result and final_result.get("output_path"):
-            lines.append(f"Output: {final_result['output_path']}")
-        return "\n".join(lines)
 
     def _sync_world_state(self, extra_text: Optional[str] = None) -> None:
         """Refresh the unified world state from the active AnnData and request context."""
@@ -2653,26 +2763,6 @@ class SCAgent:
             result_data["decisions_raised"] = existing_decisions
         else:
             result_data["decisions_raised"] = self._generic_decisions_from_result(tool_name, tool_input, result_data)
-        if (
-            tool_name == "ask_user"
-            and result_data.get("decision_key")
-            and result_data.get("user_response")
-            and result_data.get("user_response") not in {"proceed", "no response"}
-        ):
-            self.world_state.resolve_decision(
-                result_data["decision_key"],
-                result_data["user_response"],
-                source="user",
-                message=result_data.get("question", ""),
-            )
-            result_data["decisions_raised"] = [
-                decision
-                for decision in self.world_state.resolved_decisions[-1:]
-            ]
-            result_data["decisions_raised"] = [
-                decision.to_dict() if hasattr(decision, "to_dict") else decision
-                for decision in result_data["decisions_raised"]
-            ]
         result_data["verification"] = self._generic_verification(tool_name, tool_input, result_data)
         return result_data
 
@@ -2773,16 +2863,24 @@ class SCAgent:
             for i, s in enumerate(suggestions, 1):
                 console.print(f"  {i}. {s}")
 
-        console.print("\n[bold]What would you like to do?[/bold]")
-        console.print("  • Type a new instruction")
-        console.print("  • Press Enter to let the agent try to recover")
-        console.print("  • Type 'quit' to stop")
-
         try:
-            from ..terminal import read_user_input
+            from ..terminal import DecisionChoice, prompt_for_decision
 
-            response = read_user_input("\n> ")
-            return response if response else "try to recover from the error"
+            selection = prompt_for_decision(
+                "What would you like to do?",
+                [
+                    DecisionChoice("Try automatic recovery again", "retry"),
+                    DecisionChoice("Enter a new instruction", "custom"),
+                    DecisionChoice("Stop this analysis", "stop"),
+                ],
+                default_index=0,
+                allow_custom=False,
+            )
+            if selection.action == "retry":
+                return "try to recover from the error"
+            if selection.action == "stop":
+                return "quit"
+            return selection.value
         except (EOFError, KeyboardInterrupt):
             return "quit"
 
@@ -2955,13 +3053,14 @@ class SCAgent:
             )
             self.run_manager.append_event("follow_up_request", {"request": request})
 
-        # Clear any stale checkpoint - the LLM's response options take precedence
-        # First translate explicit user confirmation into a one-shot cleanup
-        # authorization. Otherwise the LLM's response options take precedence.
+        # Resolve text-only clients against the newest pending checkpoint before
+        # the request enters the provider conversation.
         if self._pending_checkpoint:
-            if not self._authorize_pending_cleanup_from_user(request):
-                if self._pending_checkpoint.get("kind") != "cluster_qc_cleanup":
-                    self._clear_pending_checkpoint("superseded by new response")
+            selection = self.resolve_pending_decision_text(request)
+            if selection is not None:
+                request = self.structured_decision_request(selection)
+                self._active_request = request
+                self.world_state.set_active_request(request)
 
         # Build initial message
         user_message = request
@@ -2997,10 +3096,6 @@ class SCAgent:
         specs: List[Dict[str, Any]] = []
         for tool in self.tools:
             function = tool.get("function", {})
-            if function.get("name") == "ask_user":
-                # In CLI mode, user questions should be normal final responses.
-                # The next interactive turn will capture the user's choice.
-                continue
             specs.append({
                 "name": function.get("name"),
                 "description": function.get("description", ""),
@@ -3041,11 +3136,10 @@ class SCAgent:
             "- For final responses, set tool_name and tool_input_json to null. For tool calls, set "
             "content to null.\n\n"
             "When a tool result or runtime state says checkpoint_required or pending_checkpoint, "
-            "do not call an ask-user tool. Return kind='final' with a clear, conversational summary "
-            "of what just happened and 2-4 numbered next-step options. Do not mention internal "
-            "checkpoint fields such as default, recommendation, option_actions, or decision_key. "
-            "Do not say 'You selected option N' unless that is the actual scientific result; just "
-            "carry out the selected action or ask what to do next.\n\n"
+            "return kind='final' with a clear explanation of the evidence and why a decision is "
+            "needed. The runtime renders the options as an interactive selector, so do not "
+            "duplicate them as a numbered menu. When the next request contains a Structured "
+            "user decision, treat selected_action as authoritative.\n\n"
             "## Current Request, History, Runtime State, and Tools\n"
             f"{json.dumps(payload, indent=2, default=str)}"
         )
@@ -3220,7 +3314,7 @@ class SCAgent:
                     if should_continue:
                         continue
                     self._conversation_history = messages
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
@@ -3375,7 +3469,7 @@ class SCAgent:
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
@@ -4368,7 +4462,7 @@ class SCAgent:
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
@@ -4381,7 +4475,7 @@ class SCAgent:
                     messages.append({"role": "assistant", "content": final_result})
                     self._print(final_result)
                     self._conversation_history = messages
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
@@ -4571,7 +4665,7 @@ class SCAgent:
 
         # Only block truly pipeline-progressing tools when checkpoint pending
         # Allow flexible tools (run_code, inspection, visualization) to proceed
-        if self._pending_checkpoint and self._is_action_tool(tool_name) and tool_name != "ask_user":
+        if self._pending_checkpoint and self._is_action_tool(tool_name):
             if tool_name not in self.CHECKPOINT_EXEMPT_TOOLS:
                 return self._blocked_by_checkpoint_result(tool_name)
             # For exempt tools, we'll include checkpoint context in the result later
@@ -4703,18 +4797,7 @@ class SCAgent:
             if hint:
                 self.world_state.add_context_hint(str(hint))
 
-        # ask_user is no longer in the tool list — the agent uses a turn-based
-        # model and presents options in its final text response instead.
-        # This branch is a safety net in case an older serialized conversation
-        # replays the tool; treat it as a no-op so the turn continues cleanly.
-        if tool_name == "ask_user":
-            result_json = json.dumps({
-                "status": "ok",
-                "tool": "ask_user",
-                "message": "ask_user is no longer used — present options in your final response text.",
-                "user_response": "proceed",
-            }, indent=2)
-        elif tool_name == "pause_and_ask":
+        if tool_name == "pause_and_ask":
             result_json = self._handle_pause_and_ask(tool_input)
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
@@ -4949,13 +5032,6 @@ class SCAgent:
                 checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
             if checkpoint is None:
                 checkpoint = self._build_recovery_checkpoint(tool_name, tool_input, result_data)
-            if tool_name == "ask_user":
-                prior_checkpoint = self._pending_checkpoint
-                selected_action = result_data.get("selected_action")
-                self._clear_pending_checkpoint(result_data.get("user_response"))
-                auto_execution = self._execute_checkpoint_action(selected_action, prior_checkpoint or {}) if prior_checkpoint else None
-                if auto_execution is not None:
-                    result_data["auto_execution"] = auto_execution
             if checkpoint is not None:
                 result_data["checkpoint_required"] = True
                 result_data["checkpoint"] = checkpoint
@@ -5017,11 +5093,6 @@ class SCAgent:
                                 "kind": "umap",
                                 "color_by": comparison.get("cluster_key"),
                             })
-                elif tool_name == "ask_user":
-                    self._interaction_state["asked_questions"].append({
-                        "question": result_data.get("question", ""),
-                        "options": result_data.get("options", []),
-                    })
                 # Show key results inline
                 details = []
                 if "after" in result_data:
@@ -5034,8 +5105,6 @@ class SCAgent:
                     details.append(f"{result_data['shape']['n_cells']} cells")
                 if details:
                     self._print(f"    → {', '.join(details)}")
-            elif status == "needs_input":
-                pass  # Handled by ask_user
             elif status == "error":
                 err_msg = result_data.get('message') or result_data.get('error', '')
                 err_short = err_msg[:120] + ("…" if len(err_msg) > 120 else "")
@@ -5530,106 +5599,6 @@ class SCAgent:
             "gsea_evidence_json": json_path,
         }
 
-    def _handle_ask_user(self, tool_input: Dict[str, Any]) -> str:
-        """Handle ask_user tool - prompt user for input."""
-        if self._pending_checkpoint:
-            checkpoint = self._pending_checkpoint
-            # Prefer the canonical checkpoint text over model-invented wording.
-            tool_input = {
-                **tool_input,
-                "question": checkpoint.get("question", tool_input.get("question", "")),
-                "options": checkpoint.get("options", tool_input.get("options", [])),
-                "option_actions": checkpoint.get("option_actions", tool_input.get("option_actions", [])),
-                "default": checkpoint.get("default", tool_input.get("default", "")),
-                "decision_key": checkpoint.get("decision_key", tool_input.get("decision_key", "")),
-                "summary": checkpoint.get("summary", tool_input.get("summary", "")),
-            }
-
-        question = tool_input["question"]
-        options = tool_input.get("options", [])
-        option_actions = tool_input.get("option_actions", [])
-        default = tool_input.get("default", "")
-        decision_key = tool_input.get("decision_key", "")
-        summary = tool_input.get("summary", "")
-
-        if self.collaborative and not sys.stdin.isatty():
-            return json.dumps({
-                "status": "error",
-                "tool": "ask_user",
-                "question": question,
-                "options": options,
-                "option_actions": option_actions,
-                "default": default,
-                "decision_key": decision_key,
-                "message": "Collaborative checkpoints require an interactive terminal.",
-            }, indent=2)
-        if not self.collaborative:
-            response = default or "proceed"
-            return json.dumps({
-                "status": "ok",
-                "tool": "ask_user",
-                "question": question,
-                "options": options,
-                "option_actions": option_actions,
-                "default": default,
-                "decision_key": decision_key,
-                "user_response": response,
-                "auto_selected": True,
-            }, indent=2)
-
-        print()
-        if summary:
-            print(summary)
-            print()
-        print(question)
-        if options and not re.search(r"(^|\n)\s*1\.\s", question):
-            for idx, option in enumerate(options, 1):
-                print(f"{idx}. {option}")
-        if default:
-            print("Press Enter to use the suggested option.")
-
-        # Get user input
-        try:
-            from ..terminal import read_user_input
-
-            response = read_user_input("> ")
-            if not response and default:
-                response = default
-        except (EOFError, KeyboardInterrupt):
-            response = default or "no response"
-
-        raw_response = response
-        selected_option = None
-        selected_action = None
-        selected_index = None
-        if options and response.isdigit():
-            option_index = int(response) - 1
-            if 0 <= option_index < len(options):
-                selected_option = options[option_index]
-                selected_index = option_index
-                if option_index < len(option_actions):
-                    selected_action = option_actions[option_index]
-                response = selected_option
-        elif response in options:
-            selected_index = options.index(response)
-            if selected_index < len(option_actions):
-                selected_action = option_actions[selected_index]
-
-        return json.dumps({
-            "status": "ok",
-            "tool": "ask_user",
-            "question": question,
-            "options": options,
-            "option_actions": option_actions,
-            "default": default,
-            "decision_key": decision_key,
-            "user_response": response,
-            "raw_user_response": raw_response,
-            "selected_option": selected_option,
-            "selected_action": selected_action,
-            "selected_index": selected_index,
-        }, indent=2)
-
     def _handle_pause_and_ask(self, tool_input: Dict[str, Any]) -> str:
         """Handle pause_and_ask tool — create a pending checkpoint from LLM-initiated pause."""
         if (self._pending_checkpoint or {}).get("kind") == "cluster_qc_cleanup":
@@ -5641,9 +5610,11 @@ class SCAgent:
                 "question": checkpoint.get("question", tool_input.get("question", "")),
                 "context": checkpoint.get("summary", tool_input.get("context", "")),
                 "options": checkpoint.get("options", tool_input.get("options", [])),
+                "option_actions": checkpoint.get("option_actions", []),
+                "decision_key": checkpoint.get("decision_key", ""),
                 "message": (
                     "Analysis paused at the existing cluster cleanup checkpoint. "
-                    "Present the question in your response and end your turn."
+                    "Explain why input is needed and end the turn; the runtime renders the choices."
                 ),
             }, indent=2)
 
@@ -5669,7 +5640,9 @@ class SCAgent:
                     "If the user explicitly asks for stricter cleanup, run a new structure-aware proposal instead of inventing a keep-mask removal.",
                 ],
             }, indent=2)
-        option_actions = ["custom"] * len(options)
+        option_actions = tool_input.get("option_actions") or self._stable_option_actions(options)
+        if len(option_actions) != len(options):
+            option_actions = self._stable_option_actions(options)
 
         checkpoint = {
             "kind": "llm_pause",
@@ -5678,7 +5651,8 @@ class SCAgent:
             "options": options,
             "option_actions": option_actions,
             "summary": context,
-            "decision_key": "llm_pause",
+            "decision_key": tool_input.get("decision_key") or "llm_pause",
+            "allow_custom": bool(tool_input.get("allow_custom", True)),
             "artifacts": [],
         }
         self._set_pending_checkpoint(checkpoint)
@@ -5689,7 +5663,12 @@ class SCAgent:
             "question": question,
             "context": context,
             "options": options,
-            "message": "Analysis paused. Present the question in your response and end your turn.",
+            "option_actions": option_actions,
+            "decision_key": checkpoint["decision_key"],
+            "message": (
+                "Analysis paused. Explain why input is needed and end the turn; "
+                "the runtime renders the choices."
+            ),
         }, indent=2)
 
     def _maybe_auto_checkpoint(self, tool_name: str, tool_input: Dict[str, Any]) -> Optional[str]:
@@ -5847,7 +5826,6 @@ class SCAgent:
         package = tool_input["package"]
         reason = tool_input["reason"]
 
-        # Ask for approval
         print(f"\n{'='*50}")
         print(f"PACKAGE INSTALL REQUEST")
         print(f"Package: {package}")
@@ -5855,13 +5833,22 @@ class SCAgent:
         print('='*50)
 
         try:
-            from ..terminal import read_user_input
+            from ..terminal import DecisionChoice, prompt_for_decision
 
-            response = read_user_input("Approve? [y/N]: ").lower()
+            selection = prompt_for_decision(
+                "Approve this package installation?",
+                [
+                    DecisionChoice("Do not install", "deny"),
+                    DecisionChoice(f"Install {package}", "approve"),
+                ],
+                default_index=0,
+                allow_custom=False,
+            )
+            approved = selection.action == "approve"
         except (EOFError, KeyboardInterrupt):
-            response = "n"
+            approved = False
 
-        if response in ("y", "yes"):
+        if approved:
             # Try uv first (faster, works with uv-managed venvs), fall back to pip
             python_path = sys.executable
             install_commands = [

@@ -70,7 +70,9 @@ logs/
 .claude/
 treg_project/
 andrew_data/
-tests/
+# Keep the large local test workspace ignored, but track focused regression tests.
+tests/*
+!tests/decision_interaction_test.py
 cellbender_test/
 results/
 article_figures/

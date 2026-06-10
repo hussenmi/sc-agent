@@ -283,23 +283,49 @@ def _maybe_save_on_exit(agent, console) -> None:
     if agent.adata is None:
         return
     from pathlib import Path
-    from scagent.terminal import read_user_input
+    from scagent.terminal import DecisionChoice, prompt_for_decision
+
     run_dir = agent.run_manager.run_dir if agent.run_manager else Path(agent.output_dir)
     default_path = str(run_dir / "final_result.h5ad")
     try:
-        console.print(f"\n[yellow]You have data in memory. Save before exiting?[/yellow] [dim](Enter path, or press Enter for default: {default_path}, or n to skip)[/dim]")
-        response = read_user_input("> ").strip()
+        selection = prompt_for_decision(
+            f"You have data in memory. Save before exiting?\nDefault: {default_path}",
+            [
+                DecisionChoice("Save to the default path", "save_default"),
+                DecisionChoice("Save to another path", "custom"),
+                DecisionChoice("Exit without saving", "skip"),
+            ],
+            default_index=0,
+            allow_custom=False,
+        )
     except (EOFError, KeyboardInterrupt):
         return
-    if response.lower() in ("n", "no", "skip"):
+    if selection.action == "skip":
         return
-    save_path = response if response and response.lower() not in ("y", "yes") else default_path
+    save_path = selection.value if selection.action == "custom" else default_path
     try:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         agent.adata.write_h5ad(save_path)
         console.print(f"[green]Saved to {save_path}[/green]")
     except Exception as e:
         console.print(f"[red]Save failed: {e}[/red]")
+
+
+def _analyze_with_decisions(agent, **analyze_kwargs):
+    """Run a turn and immediately resolve any structured checkpoints."""
+    result = agent.analyze(**analyze_kwargs)
+    max_iterations = analyze_kwargs.get("max_iterations", 75)
+    while agent.has_pending_decision:
+        selection = agent.prompt_pending_decision()
+        if selection is None:
+            break
+        result = agent.analyze(
+            request=agent.structured_decision_request(selection),
+            data_path=None,
+            max_iterations=max_iterations,
+            continue_conversation=True,
+        )
+    return result
 
 
 def run_start(args):
@@ -359,7 +385,8 @@ def run_start(args):
     if args.data:
         console.print()
         try:
-            agent.analyze(
+            _analyze_with_decisions(
+                agent,
                 request="Load and inspect this data. Describe what you find — shape, processing state, metadata, and biology.",
                 data_path=args.data,
                 run_name=run_name,
@@ -388,7 +415,8 @@ def run_start(args):
             break
 
         try:
-            agent.analyze(
+            _analyze_with_decisions(
+                agent,
                 request=user_input,
                 data_path=None,
                 run_name=run_name,
@@ -449,7 +477,8 @@ def run_analyze(args):
 
     # First analysis
     try:
-        result = agent.analyze(
+        result = _analyze_with_decisions(
+            agent,
             request=request,
             data_path=args.data,
             run_name=args.name,
@@ -481,7 +510,8 @@ def run_analyze(args):
 
                 # Continue analysis with the same agent (preserves state and conversation)
                 try:
-                    result = agent.analyze(
+                    result = _analyze_with_decisions(
+                        agent,
                         request=user_input,
                         data_path=None,  # Use existing loaded data
                         max_iterations=args.max_iterations,

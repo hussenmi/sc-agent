@@ -216,7 +216,7 @@ class AgentWorldState:
 
         if adata is not None:
             # Always available
-            available_actions.extend(["run_code", "inspect_data", "save_data", "ask_user"])
+            available_actions.extend(["run_code", "inspect_data", "save_data", "pause_and_ask"])
 
             # QC
             if not processing.get("has_qc_metrics"):
