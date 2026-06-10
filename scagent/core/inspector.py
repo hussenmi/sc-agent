@@ -1486,12 +1486,18 @@ def inspect_data(adata: AnnData) -> DataState:
     if state.batch_key:
         state.n_batches = int(adata.obs[state.batch_key].nunique(dropna=True))
 
-    if "X_scanorama" in adata.obsm:
+    if adata.uns.get("bbknn_batch_key") is not None:
+        state.batch_correction_applied = True
+        state.batch_correction_method = "bbknn"
+    elif "X_scanorama" in adata.obsm:
         state.batch_correction_applied = True
         state.batch_correction_method = "scanorama"
     elif "X_pca_harmony" in adata.obsm:
         state.batch_correction_applied = True
         state.batch_correction_method = "harmony"
+    elif "X_scVI" in adata.obsm:
+        state.batch_correction_applied = True
+        state.batch_correction_method = "scvi"
 
     return state
 
@@ -1547,12 +1553,16 @@ def recommend_next_steps(state: DataState, goal: str) -> List[str]:
         if not state.has_hvg:
             steps.append("select_hvg")
 
-        if goal == "batch_correct" or (state.n_batches > 1 and not state.batch_correction_applied):
-            if goal == "batch_correct":
-                steps.append("run_batch_correction")
-
         if not state.has_pca:
             steps.append("run_pca")
+
+        if state.n_batches > 1 and not state.batch_correction_applied:
+            if goal == "batch_correct":
+                steps.append("run_batch_correction")
+            else:
+                steps.append("assess_batch_strategy")
+                if state.has_pca:
+                    steps.append("run_batch_correction_if_needed")
 
         if not state.has_neighbors:
             steps.append("compute_neighbors")

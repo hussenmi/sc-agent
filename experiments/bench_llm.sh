@@ -23,11 +23,11 @@
 # Use absolute hostnames (not "localhost") so this works whether run interactively
 # or via sbatch — sbatch lands the job on an arbitrary compute node.
 ENDPOINTS=(
-  "http://iscb009:8000/v1,Qwen3.6-27B,iscb009-A100-BF16"
-  "http://isch003:8000/v1,Qwen3.6-27B,isch003-H100-FP8"
+  "http://iscb007:8000/v1,Qwen3.6-27B,iscb007-A100-BF16"
+  "http://iscg002:8000/v1,Qwen3.6-27B,iscg002-H100-FP8"
 )
 
-REPEATS=2          # times to run each prompt (medians/p90 across all)
+REPEATS=4          # times to run each prompt (medians/p90 across all)
 MAX_TOKENS=300     # generation length cap per request
 NO_WARMUP=0        # set to 1 to skip the warmup pass (faster but first request is cold)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ NO_WARMUP=0        # set to 1 to skip the warmup pass (faster but first request 
 # Hardcoded project root because $0 doesn't point here under sbatch (SLURM copies
 # the submitted script to /var/spool/slurmd/<job>/).
 PROJECT_ROOT="/data1/peerd/ibrahih3/cs_agent"
-BENCH_PY="$PROJECT_ROOT/bench_llm.py"
+BENCH_PY="$PROJECT_ROOT/experiments/bench_llm.py"
 LOG_DIR="$PROJECT_ROOT/logs"
 PYTHON=${PYTHON:-python3}
 
@@ -59,13 +59,8 @@ echo "Running: $PYTHON $BENCH_PY ${ARGS[*]}"
 # When launched via sbatch, SLURM redirects stdout/stderr to the --output file
 # above. When launched interactively, no redirection happens — so tee here for
 # interactive runs only, to avoid duplicating the log file under sbatch.
-if [[ -n "$SLURM_JOB_ID" ]]; then
-  echo ""
-  exec "$PYTHON" "$BENCH_PY" "${ARGS[@]}"
-else
-  TS=$(date +%Y%m%d_%H%M%S)
-  LOG_FILE="$LOG_DIR/bench_llm_$(hostname -s)_${TS}.log"
-  echo "Logging to: $LOG_FILE"
-  echo ""
-  "$PYTHON" "$BENCH_PY" "${ARGS[@]}" 2>&1 | tee "$LOG_FILE"
-fi
+TS=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="$LOG_DIR/bench_llm_$(hostname -s)_${TS}.log"
+echo "Logging to: $LOG_FILE"
+echo ""
+"$PYTHON" "$BENCH_PY" "${ARGS[@]}" 2>&1 | tee "$LOG_FILE"

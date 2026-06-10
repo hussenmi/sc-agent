@@ -14,12 +14,2091 @@ os.environ.setdefault('TQDM_NCOLS', '60')
 os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
 from typing import List, Dict, Any, Optional
+import hashlib
 import json
 import logging
 from pathlib import Path
 import re
 
 logger = logging.getLogger(__name__)
+
+
+def _make_annotation_proposal_fingerprint(
+    cluster_key: str,
+    cluster_ids,
+    deg_key: str,
+    annotation_key: str,
+    n_obs: int,
+    adata=None,
+) -> str:
+    """Stable fingerprint of the inputs that define an annotation proposal.
+
+    When ``adata`` is provided, the fingerprint also includes a hash of the
+    live per-cell ``(obs_name, cluster_label)`` pairs so it changes when
+    cluster membership shifts — even if cluster ids, cluster count, and
+    ``n_obs`` stay the same. This is what makes "same labels, swapped
+    members" detectable downstream in ``finalize_annotation``.
+
+    When ``adata`` is omitted, the fingerprint covers only the proposal's
+    static descriptors; that variant is intended for parity checks of the
+    stored proposal payload, not as a live-state guarantee.
+    """
+    try:
+        ids_norm = sorted(str(c) for c in (cluster_ids or []))
+    except Exception:
+        ids_norm = []
+    digest = hashlib.sha1()
+    digest.update(
+        json.dumps(
+            {
+                "cluster_key": str(cluster_key or ""),
+                "annotation_key": str(annotation_key or ""),
+                "deg_key": str(deg_key or ""),
+                "n_obs": int(n_obs or 0),
+                "cluster_ids": ids_norm,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    if adata is not None and cluster_key and cluster_key in adata.obs.columns:
+        try:
+            cluster_series = adata.obs[cluster_key].astype(str)
+            obs_names_iter = adata.obs_names.astype(str)
+            membership = hashlib.sha1()
+            for name, label in zip(obs_names_iter, cluster_series.values):
+                membership.update(str(name).encode("utf-8", errors="replace"))
+                membership.update(b"\t")
+                membership.update(str(label).encode("utf-8", errors="replace"))
+                membership.update(b"\n")
+            digest.update(b"|membership=")
+            digest.update(membership.hexdigest().encode("utf-8"))
+        except Exception:
+            digest.update(b"|membership=unavailable")
+    return digest.hexdigest()[:16]
+
+DEFAULT_STRUCTURE_EXCLUDE_PATTERNS = [
+    r"^MT-",
+    r"^mt-",
+    r"^RPL",
+    r"^RPS",
+    r"^MRPL",
+    r"^MRPS",
+    r"^Rpl",
+    r"^Rps",
+    r"^Mrpl",
+    r"^Mrps",
+    r"^MALAT1$",
+    r"^Malat1$",
+    r"^HB[ABDEGMQZ]",
+    r"^Hb[ab]",
+    r"^RP\d",
+    r"^AC\d",
+    r"^AL\d",
+    r"^AP\d",
+    r"^LINC\d",
+    r"\.\d+$",
+]
+
+ANNOTATION_NUISANCE_GENE_PATTERNS = [
+    r"^MT-",
+    r"^mt-",
+    r"^RPL",
+    r"^RPS",
+    r"^MRPL",
+    r"^MRPS",
+    r"^Rpl",
+    r"^Rps",
+    r"^Mrpl",
+    r"^Mrps",
+    r"^MALAT1$",
+    r"^Malat1$",
+    r"^HB[ABDEGMQZ]",
+    r"^Hb[ab]",
+    r"^RP\d",
+    r"^AC\d",
+    r"^AL\d",
+    r"^AP\d",
+    r"^LINC\d",
+    r"\.\d+$",
+]
+
+ANNOTATION_BROAD_SUPPORT_GENE_PATTERNS = [
+    # Broad immune / antigen-presentation genes. Useful context, but not
+    # enough by themselves to overturn a lineage call.
+    r"^PTPRC$",
+    r"^CD52$",
+    r"^CORO1A$",
+    r"^B2M$",
+    r"^CD74$",
+    r"^HLA-",
+    r"^H2-",
+    # Housekeeping, cytoskeleton, and high-abundance structural genes.
+    r"^ACT[ABG]",
+    r"^GAPDH$",
+    r"^TUB[AB]",
+    r"^UBB$",
+    r"^UBC$",
+    r"^EEF",
+    r"^RAN$",
+    # Stress / heat-shock / immediate-early programs.
+    r"^HSP",
+    r"^HSPA",
+    r"^HSPB",
+    r"^HSPD",
+    r"^HSPH",
+    r"^DNAJ",
+    r"^FOS",
+    r"^JUN",
+    r"^EGR",
+    r"^DUSP",
+    r"^IER",
+    # Interferon and generic inflammatory response genes.
+    r"^IFIT",
+    r"^IFITM",
+    r"^ISG",
+    r"^IFI",
+    r"^MX[12]$",
+    r"^OAS",
+    r"^RSAD2$",
+    r"^S100A[89]$",
+    # Broad myeloid/innate context. These support a family but are not
+    # discriminating enough for cross-family overrides alone.
+    r"^LYZ$",
+    r"^LST1$",
+    r"^TYROBP$",
+    r"^FCER1G$",
+    r"^AIF1$",
+    r"^LGALS3$",
+    r"^CST3$",
+    r"^CTSB$",
+    r"^CTSL$",
+    r"^FTL$",
+    r"^FTH1$",
+]
+
+
+def _annotation_nuisance_reason(gene: Any) -> Optional[str]:
+    """Return the nuisance-pattern reason for a gene, if it is non-specific."""
+    text = str(gene or "").strip()
+    if not text:
+        return "empty_gene"
+    for pattern in ANNOTATION_NUISANCE_GENE_PATTERNS:
+        try:
+            if re.search(pattern, text):
+                return pattern
+        except Exception:
+            continue
+    return None
+
+
+def _annotation_broad_support_reason(gene: Any) -> Optional[str]:
+    """Return why a gene is broad/non-discriminating annotation support.
+
+    These are not treated as garbage: many are biologically meaningful. The
+    point is narrower — they should not be the only evidence for fine labels
+    or for overriding a CellTypist/Scimilarity reference consensus.
+    """
+    text = str(gene or "").strip()
+    if not text:
+        return "empty_gene"
+    for pattern in ANNOTATION_BROAD_SUPPORT_GENE_PATTERNS:
+        try:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                return pattern
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_annotation_label(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _singular_annotation_label(value: Any) -> str:
+    tokens = re.findall(r"[a-z0-9]+", _normalize_annotation_label(value))
+
+    def _singular_token(token: str) -> str:
+        if token == "cells":
+            return "cell"
+        if len(token) > 4 and token.endswith("ies"):
+            return token[:-3] + "y"
+        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            return token[:-1]
+        return token
+
+    return " ".join(_singular_token(token) for token in tokens)
+
+
+def _annotation_label_tokens(value: Any) -> List[str]:
+    return re.findall(r"[a-z0-9]+", _singular_annotation_label(value))
+
+
+def _substantive_annotation_label_tokens(value: Any) -> List[str]:
+    generic = {
+        "cell", "cells", "positive", "negative", "pos", "neg",
+        "human", "mouse", "derived", "like", "and", "or", "of", "the",
+    }
+    return [token for token in _annotation_label_tokens(value) if token not in generic]
+
+
+def _annotation_label_aliases(value: Any) -> set:
+    raw_text = str(value or "").strip()
+    text = _normalize_annotation_label(value)
+    singular = _singular_annotation_label(text)
+    aliases = {text, singular} if text else set()
+    if not text:
+        return aliases
+    compact = re.sub(r"[^a-z0-9]+", "", singular)
+    if compact:
+        aliases.add(compact)
+    tokens = _annotation_label_tokens(text)
+    substantive = _substantive_annotation_label_tokens(text)
+    if len(tokens) >= 2:
+        aliases.add("".join(token[0] for token in tokens if token))
+    if len(substantive) >= 2:
+        aliases.add("".join(token[0] for token in substantive if token))
+    if len(substantive) == 1 and len(substantive[0]) <= 4:
+        aliases.add(substantive[0])
+    raw_compact = re.sub(r"[^A-Za-z0-9]+", "", raw_text)
+    if raw_compact and len(raw_compact) <= 5 and raw_compact.lower() == compact:
+        aliases.add(raw_compact.lower())
+    return {a for a in aliases if a}
+
+
+def _annotation_labels_exact_or_alias(value_a: Any, value_b: Any) -> bool:
+    def _split(value: Any) -> List[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return re.split(r"\s*(?:/|\||;|\bor\b)\s*", value)
+        return [value]
+
+    for candidate_a in _split(value_a):
+        aliases_a = _annotation_label_aliases(candidate_a)
+        if not aliases_a:
+            continue
+        for candidate_b in _split(value_b):
+            aliases_b = _annotation_label_aliases(candidate_b)
+            if aliases_b and aliases_a.intersection(aliases_b):
+                return True
+    return False
+
+
+def _annotation_label_family(value: Any) -> Optional[str]:
+    text = _normalize_annotation_label(value)
+    if not text:
+        return None
+    if "platelet" in text or "megakary" in text:
+        return "platelet"
+    if "plasma" in text:
+        return "plasma"
+    if "monocyte" in text or "macrophage" in text:
+        return "monocyte"
+    if "plasmacytoid dendritic" in text or text == "pdc" or " pdc" in f" {text}":
+        return "pdc"
+    if "dendritic" in text or text in {"dc", "cdc", "cdc1", "cdc2"} or " cdc" in f" {text}":
+        return "dendritic"
+    if "natural killer" in text or " nk" in f" {text}" or text.startswith("nk"):
+        return "nk"
+    if "b cell" in text or text.startswith("b ") or " b " in f" {text} ":
+        return "b"
+    if "t cell" in text or text.startswith("t ") or " t " in f" {text} " or "mait" in text or "treg" in text:
+        return "t"
+    if "neutrophil" in text or "granulocyte" in text or "promyelocyte" in text or "myelocyte" in text:
+        return "granulocyte"
+    if "mast" in text or "basophil" in text:
+        return "mast_basophil"
+    if "eryth" in text or "red blood" in text:
+        return "erythroid"
+    if "epithelial" in text or "ciliated" in text or "club cell" in text:
+        return "epithelial"
+    if "endothelial" in text:
+        return "endothelial"
+    if "fibroblast" in text or "stromal" in text or "smooth muscle" in text:
+        return "stromal"
+    if "hsc" in text or "mpp" in text or "progenitor" in text or "stem" in text:
+        return "progenitor"
+    return None
+
+
+def _annotation_labels_biologically_compatible(a: Any, b: Any) -> bool:
+    a_norm = _normalize_annotation_label(a)
+    b_norm = _normalize_annotation_label(b)
+    if not a_norm or not b_norm:
+        return False
+    if _annotation_labels_exact_or_alias(a_norm, b_norm):
+        return True
+    a_singular = re.sub(r"\bcells\b", "cell", a_norm)
+    b_singular = re.sub(r"\bcells\b", "cell", b_norm)
+    if a_singular in b_singular or b_singular in a_singular:
+        return True
+    a_family = _annotation_label_family(a_norm)
+    b_family = _annotation_label_family(b_norm)
+    return bool(a_family and a_family == b_family)
+
+
+def _annotation_reference_source_group(annotation_key: Any) -> str:
+    key = str(annotation_key or "").lower()
+    if "celltypist" in key:
+        return "celltypist"
+    if "scimilarity" in key:
+        return "scimilarity"
+    return str(annotation_key or "other")
+
+
+def _reference_consensus_from_entries(
+    reference_annotations: Any,
+    min_fraction: float = 0.35,
+) -> Dict[str, Any]:
+    entries = reference_annotations or []
+    usable: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("top_label")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        try:
+            frac = float(entry.get("top_fraction") or 0.0)
+        except Exception:
+            frac = 0.0
+        if frac < min_fraction:
+            continue
+        source = _annotation_reference_source_group(entry.get("annotation_key"))
+        usable.append({
+            "source": source,
+            "annotation_key": entry.get("annotation_key"),
+            "label": label.strip(),
+            "fraction": round(frac, 4),
+            "family": _annotation_label_family(label),
+        })
+
+    groups: List[Dict[str, Any]] = []
+    for item in usable:
+        placed = False
+        for group in groups:
+            if _annotation_labels_biologically_compatible(item["label"], group["label"]):
+                group["members"].append(item)
+                if item["fraction"] > group.get("score", 0.0):
+                    group["label"] = item["label"]
+                    group["score"] = item["fraction"]
+                    group["family"] = item.get("family")
+                placed = True
+                break
+        if not placed:
+            groups.append({
+                "label": item["label"],
+                "family": item.get("family"),
+                "score": item["fraction"],
+                "members": [item],
+            })
+
+    for group in groups:
+        sources = sorted({m["source"] for m in group["members"] if m.get("source")})
+        group["sources"] = sources
+        group["n_sources"] = len(sources)
+        group["labels"] = sorted({m["label"] for m in group["members"] if m.get("label")})
+
+    consensus = sorted(
+        [g for g in groups if g.get("n_sources", 0) >= 2],
+        key=lambda g: (g.get("n_sources", 0), g.get("score", 0.0)),
+        reverse=True,
+    )
+    if not consensus:
+        return {
+            "has_consensus": False,
+            "reference_groups": groups,
+            "usable_references": usable,
+            "source_groups": sorted({u["source"] for u in usable if u.get("source")}),
+        }
+
+    best = consensus[0]
+    return {
+        "has_consensus": True,
+        "label": best.get("label"),
+        "family": best.get("family"),
+        "sources": best.get("sources", []),
+        "labels": best.get("labels", []),
+        "score": best.get("score"),
+        "reference_groups": groups,
+        "usable_references": usable,
+        "source_groups": sorted({u["source"] for u in usable if u.get("source")}),
+    }
+
+
+def _loads_tolerant(text: str) -> Optional[Any]:
+    """Parse a (possibly imperfect) serialized object back to structured data.
+
+    Tries, in order: strict JSON, Python-literal eval (single quotes / True /
+    False / None), and a trailing-comma cleanup. Returns the parsed object or
+    None if every attempt fails (e.g. genuinely truncated payloads). Used so a
+    model that stringifies its evidence — to write_json, stage_annotation_evidence,
+    or an evidence file — doesn't dead-end on minor formatting quirks.
+    """
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    try:
+        import ast as _ast
+        return _ast.literal_eval(raw)
+    except Exception:
+        pass
+    try:
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", raw))
+    except Exception:
+        return None
+
+
+def _report_fmt(value: Any, limit: Optional[int] = None) -> str:
+    """One-line rendering of a value for markdown tables.
+
+    Renders the value in full — reports must never truncate or show ellipses.
+    The ``limit`` parameter is accepted for backward compatibility but ignored;
+    newlines are flattened and pipes escaped so the value stays on one table row.
+    """
+    if value is None:
+        return "NA"
+    if isinstance(value, dict):
+        parts = [f"{k}: {v}" for k, v in value.items() if v not in (None, "", [], {})]
+        text = "; ".join(parts) if parts else "none"
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+        text = ", ".join(str(v) for v in items) if items else "none"
+    else:
+        text = str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str:
+    """Build a comprehensive, deterministic markdown record of every decision the
+    agent made this session — QC thresholds and what was removed/kept and why,
+    normalization/HVG choices, clustering, batch correction, and full per-cluster
+    annotation evidence with reasoning.
+
+    Pulls from the durable stores so nothing depends on the model remembering:
+      - ``world_state.step_log`` (chronological tool params + outcomes)
+      - ``world_state.cluster_qc_registry`` (per-cluster QC decisions + reasons)
+      - ``world_state.data_summary`` (current dataset/processing overview)
+      - ``adata.uns['annotation_validation']`` (per-cluster annotation evidence)
+
+    Returns markdown (empty string if there is nothing to report).
+    """
+    lines: List[str] = []
+    step_log: List[Dict[str, Any]] = []
+    cluster_qc_registry: Dict[str, Any] = {}
+    data_summary: Dict[str, Any] = {}
+    if world_state is not None:
+        raw_steps = getattr(world_state, "step_log", None)
+        if isinstance(raw_steps, list):
+            step_log = [s for s in raw_steps if isinstance(s, dict)]
+        raw_reg = getattr(world_state, "cluster_qc_registry", None)
+        if isinstance(raw_reg, dict):
+            cluster_qc_registry = raw_reg
+        raw_ds = getattr(world_state, "data_summary", None)
+        if isinstance(raw_ds, dict):
+            data_summary = raw_ds
+
+    annotation_validation: Dict[str, Any] = {}
+    if adata is not None and hasattr(adata, "uns"):
+        av = adata.uns.get("annotation_validation")
+        if isinstance(av, dict):
+            annotation_validation = av
+
+    def _steps_for(tool: str) -> List[Dict[str, Any]]:
+        return [s for s in step_log if s.get("tool") == tool]
+
+    # --- Dataset overview ---
+    if data_summary:
+        shape = data_summary.get("shape") or {}
+        proc = data_summary.get("processing") or {}
+        lines.append("## Dataset Overview")
+        lines.append("")
+        if shape:
+            lines.append(
+                f"- Current shape: **{shape.get('n_cells', 'NA')} cells × "
+                f"{shape.get('n_genes', 'NA')} genes**"
+            )
+        if data_summary.get("data_type"):
+            lines.append(f"- Data type: **{data_summary.get('data_type')}**")
+        if data_summary.get("n_batches"):
+            lines.append(
+                f"- Batches: **{data_summary.get('n_batches')}** "
+                f"(key: {_report_fmt(data_summary.get('batch_key'))})"
+            )
+        if proc:
+            done = [k.replace("has_", "").replace("is_", "") for k, v in proc.items() if v]
+            if done:
+                lines.append(f"- Completed processing: {_report_fmt(done)}")
+        lines.append("")
+
+    # --- Pipeline (chronological) ---
+    if step_log:
+        lines.append("## Analysis Pipeline (chronological)")
+        lines.append("")
+        lines.append("| # | Step | Key parameters / outcome |")
+        lines.append("|---|---|---|")
+        for i, s in enumerate(step_log, 1):
+            tool = s.get("tool", "?")
+            detail_keys = [k for k in s.keys() if k not in {"tool", "timestamp"}]
+            detail = {k: s[k] for k in detail_keys[:6]}
+            lines.append(f"| {i} | {tool} | {_report_fmt(detail, limit=300)} |")
+        lines.append("")
+
+    # --- Quality control ---
+    qc_steps = _steps_for("run_qc")
+    if qc_steps or cluster_qc_registry:
+        lines.append("## Quality Control")
+        lines.append("")
+    for s in qc_steps:
+        lines.append("### Initial QC (run_qc)")
+        lines.append("")
+        lines.append(
+            f"- Cells: **{s.get('cells_before', 'NA')} → {s.get('cells_after', 'NA')}** "
+            f"({s.get('cells_removed', 0)} removed)"
+        )
+        lines.append(
+            f"- Genes: **{s.get('genes_before', 'NA')} → {s.get('genes_after', 'NA')}** "
+            f"({s.get('genes_removed', 0)} removed)"
+        )
+        thresholds = {
+            "mt_threshold": s.get("mt_threshold"),
+            "min_genes": s.get("min_genes"),
+            "max_genes": s.get("max_genes"),
+            "min_counts": s.get("min_counts"),
+            "min_cells_per_gene": s.get("min_cells_per_gene"),
+        }
+        lines.append(f"- Thresholds applied: {_report_fmt(thresholds)}")
+        lines.append(
+            f"- Doublet detection: {_report_fmt(s.get('doublet_detection'))} "
+            f"(rate: {_report_fmt(s.get('doublet_rate'))})"
+        )
+        lines.append(f"- Median %MT: {_report_fmt(s.get('median_pct_mt'))}")
+        lines.append("")
+
+    for cluster_key, rec in cluster_qc_registry.items():
+        if not isinstance(rec, dict):
+            continue
+        lines.append(f"### Cluster-level QC — `{cluster_key}`")
+        lines.append("")
+        if rec.get("thresholds_used"):
+            lines.append(f"- Thresholds: {_report_fmt(rec.get('thresholds_used'))}")
+        proposed = rec.get("proposed_removal") or []
+        ambiguous = rec.get("ambiguous") or []
+        synthesized = rec.get("synthesized_removal") or []
+        rescued = rec.get("rescued_clusters") or []
+        confirmed = rec.get("confirmed_junk") or []
+        conflicting = rec.get("conflicting") or []
+        lines.append(f"- Metric-flagged / proposed for removal: {_report_fmt(proposed)}")
+        if ambiguous:
+            lines.append(f"- Ambiguous (needed structure review): {_report_fmt(ambiguous)}")
+        if synthesized or rescued or confirmed or conflicting:
+            lines.append(
+                f"- Structure QC → removed: {_report_fmt(synthesized)}; "
+                f"rescued (kept): {_report_fmt(rescued)}; "
+                f"confirmed junk: {_report_fmt(confirmed)}; "
+                f"conflicting: {_report_fmt(conflicting)}"
+            )
+        decisions = rec.get("cluster_decisions") or {}
+        if isinstance(decisions, dict) and decisions:
+            lines.append("")
+            lines.append("| Cluster | Action | Severity | Reasons |")
+            lines.append("|---|---|---|---|")
+            for cid, dec in decisions.items():
+                if not isinstance(dec, dict):
+                    continue
+                lines.append(
+                    f"| {cid} | {_report_fmt(dec.get('recommended_action'))} | "
+                    f"{_report_fmt(dec.get('severity'))} | "
+                    f"{_report_fmt(dec.get('reasons'))} |"
+                )
+        lines.append("")
+
+    # --- Normalization & feature selection ---
+    for s in _steps_for("normalize_and_hvg"):
+        lines.append("## Normalization & Feature Selection")
+        lines.append("")
+        lines.append(
+            f"- Source: {_report_fmt(s.get('resolved_source') or s.get('normalization_source'))}"
+            + (f" (reset from raw: {s.get('reset_reason')})" if s.get("reset_from_raw_counts") else "")
+        )
+        lines.append(
+            f"- target_sum: {_report_fmt(s.get('target_sum'))}, "
+            f"log1p: {_report_fmt(s.get('log_transform'))}"
+        )
+        lines.append(
+            f"- HVGs selected: **{_report_fmt(s.get('n_hvg_selected'))}** "
+            f"(flavor: {_report_fmt(s.get('hvg_flavor'))})"
+        )
+        removals = s.get("feature_removals") or {}
+        ribo = removals.get("ribosomal_genes") if isinstance(removals, dict) else None
+        if isinstance(ribo, dict):
+            lines.append(
+                f"- Ribosomal genes removed: {ribo.get('enabled')} "
+                f"(n={ribo.get('n_removed', 0)})"
+            )
+        lines.append("")
+
+    # --- Clustering ---
+    clust_steps = _steps_for("run_clustering")
+    if clust_steps:
+        lines.append("## Clustering")
+        lines.append("")
+        for s in clust_steps:
+            lines.append(
+                f"- {_report_fmt(s.get('method'))} @ resolution "
+                f"{_report_fmt(s.get('resolution'))} → **{_report_fmt(s.get('n_clusters'))} clusters** "
+                f"(key: {_report_fmt(s.get('cluster_key'))})"
+            )
+        lines.append("")
+
+    # --- Batch correction ---
+    bc_steps = _steps_for("run_batch_correction")
+    if bc_steps:
+        lines.append("## Batch Correction")
+        lines.append("")
+        for s in bc_steps:
+            lines.append(
+                f"- Method: **{_report_fmt(s.get('method'))}** on `{_report_fmt(s.get('batch_key'))}` "
+                f"({_report_fmt(s.get('n_batches'))} batches); "
+                f"embedding: {_report_fmt(s.get('corrected_embedding'))}"
+            )
+        lines.append("")
+
+    # --- Differential expression tables ---
+    deg_csv_paths = {}
+    if adata is not None and hasattr(adata, "uns"):
+        raw_paths = adata.uns.get("deg_csv_paths")
+        if isinstance(raw_paths, dict):
+            deg_csv_paths = raw_paths
+    if deg_csv_paths:
+        lines.append("## Differential Expression Tables")
+        lines.append("")
+        for key, path in deg_csv_paths.items():
+            lines.append(f"- `{key}` → {_report_fmt(path)}")
+        lines.append("")
+
+    # --- Annotation ---
+    if annotation_validation:
+        lines.append("## Cell-Type Annotation")
+        lines.append("")
+        if annotation_validation.get("external_validation_policy"):
+            lines.append(
+                f"- External validation policy: **{annotation_validation.get('external_validation_policy')}**"
+            )
+        if annotation_validation.get("panglaodb_required_clusters") is not None:
+            lines.append(
+                f"- Clusters that required PanglaoDB adjudication: "
+                f"{_report_fmt(annotation_validation.get('panglaodb_required_clusters'))}"
+            )
+        label_counts = annotation_validation.get("label_counts") or {}
+        if label_counts:
+            lines.append(f"- Label counts: {_report_fmt(label_counts, limit=400)}")
+        per_cluster = annotation_validation.get("per_cluster_evidence") or {}
+        if isinstance(per_cluster, dict) and per_cluster:
+            lines.append("")
+            lines.append(
+                "| Cluster | Label | Confidence | Tier | Supporting genes | "
+                "PanglaoDB | Competing | Reasoning |"
+            )
+            lines.append("|---|---|---|---|---|---|---|---|")
+            for cid, ev in per_cluster.items():
+                if not isinstance(ev, dict):
+                    continue
+                pdb = (
+                    f"{ev.get('panglaodb_label_used') or '—'} "
+                    f"({'queried' if ev.get('panglaodb_queried') else 'not queried'})"
+                )
+                lines.append(
+                    f"| {cid} | {_report_fmt(ev.get('label'))} | "
+                    f"{_report_fmt(ev.get('confidence'))} | "
+                    f"{_report_fmt(ev.get('validation_tier'))} | "
+                    f"{_report_fmt(ev.get('supporting_genes'))} | "
+                    f"{_report_fmt(pdb)} | "
+                    f"{_report_fmt(ev.get('competing_labels_considered'))} | "
+                    f"{_report_fmt(ev.get('reasoning'), limit=300)} |"
+                )
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _save_deg_table_csv(adata: Any, key: str, run_manager: Any = None, *, groupby: Optional[str] = None):
+    """Write the full ``rank_genes_groups`` result in ``adata.uns[key]`` to a tidy CSV.
+
+    Produces a long-format table (one row per cluster×gene) with renamed,
+    ordered columns so it is readable by the user in a spreadsheet and
+    re-readable by the agent later. Sorted by cluster, then by score/log2FC.
+
+    Returns ``(csv_path, n_rows)``; ``(None, 0)`` if nothing could be written.
+    """
+    if run_manager is None or adata is None:
+        return None, 0
+    try:
+        import scanpy as sc
+        df = sc.get.rank_genes_groups_df(adata, group=None, key=key)
+    except Exception:
+        return None, 0
+    if df is None or len(df) == 0:
+        return None, 0
+    rename = {
+        "group": "cluster",
+        "names": "gene",
+        "logfoldchanges": "log2fc",
+        "pvals": "pval",
+        "pvals_adj": "pval_adj",
+        "scores": "score",
+        "pct_nz_group": "pct_in_group",
+        "pct_nz_reference": "pct_in_reference",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    preferred = ["cluster", "gene", "log2fc", "pval_adj", "pval", "score",
+                 "pct_in_group", "pct_in_reference"]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    df = df[cols]
+    if "cluster" in df.columns:
+        sort_cols, ascending = ["cluster"], [True]
+        if "score" in df.columns:
+            sort_cols.append("score"); ascending.append(False)
+        elif "log2fc" in df.columns:
+            sort_cols.append("log2fc"); ascending.append(False)
+        try:
+            df = df.sort_values(sort_cols, ascending=ascending, kind="stable")
+        except Exception:
+            pass
+    name = f"deg_{groupby}_{key}" if groupby else f"deg_{key}"
+    name = re.sub(r"\s+", "_", name)
+    try:
+        path = run_manager.get_report_path(name, ext="csv")
+        df.to_csv(path, index=False)
+        run_manager.add_output(path)
+    except Exception:
+        return None, 0
+    return path, int(len(df))
+
+
+def _natural_cluster_sort(values: List[str]) -> List[str]:
+    """Sort cluster ids numerically when possible, else lexicographically."""
+    def _key(c: str):
+        s = str(c)
+        return (0, int(s)) if s.isdigit() else (1, s)
+    return sorted({str(v) for v in values}, key=_key)
+
+
+def _plot_cluster_qc_metrics(adata: Any, cluster_key: str, out_path: Any,
+                             flagged_clusters: Any = None) -> Optional[str]:
+    """Per-cluster QC metric box plots — one panel per metric, clusters on the
+    x-axis, flagged clusters highlighted in red.
+
+    Deliberately ONE compact multi-panel figure per QC iteration (not one file
+    per cluster) so the figures directory does not explode. Returns the saved
+    path, or ``None`` if it could not be produced.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    if adata is None or cluster_key not in getattr(adata, "obs", {}):
+        return None
+    metric_specs = [
+        ("total_counts", "Library size (counts)", True),
+        ("n_genes_by_counts", "Genes per cell", True),
+        ("pct_counts_mt", "% mitochondrial", False),
+        ("pct_counts_ribo", "% ribosomal", False),
+        ("doublet_score", "Doublet score", False),
+    ]
+    metrics = [m for m in metric_specs if m[0] in adata.obs.columns]
+    if not metrics:
+        return None
+    obs = adata.obs
+    labels = obs[cluster_key].astype(str)
+    cats = _natural_cluster_sort(labels.unique())
+    if not cats:
+        return None
+    flagged = {str(c) for c in (flagged_clusters or [])}
+
+    n = len(metrics)
+    # Wider per-cluster spacing + larger fonts so cluster index labels stay
+    # legible after a vision model downsamples the image.
+    width = max(10.0, len(cats) * 0.6)
+    fig, axes = plt.subplots(n, 1, figsize=(width, 3.0 * n), squeeze=False)
+    tick_fs = 11 if len(cats) <= 30 else 9
+    for ax, (metric, ylabel, logscale) in zip(axes[:, 0], metrics):
+        data = [obs.loc[labels == c, metric].dropna().values for c in cats]
+        bp = ax.boxplot(data, showfliers=False, patch_artist=True)
+        for i, c in enumerate(cats):
+            box = bp["boxes"][i]
+            box.set_facecolor("#d62728" if c in flagged else "#7fb3d5")
+            box.set_alpha(0.85)
+        # Set tick labels manually — version-proof across matplotlib's
+        # labels/tick_labels kwarg change in 3.9. Flagged clusters get bold
+        # red labels so their indices pop even at a glance / when downsampled.
+        ax.set_xticks(range(1, len(cats) + 1))
+        ax.set_xticklabels(cats, rotation=90, fontsize=tick_fs)
+        for lbl, c in zip(ax.get_xticklabels(), cats):
+            if c in flagged:
+                lbl.set_color("#b22222")
+                lbl.set_fontweight("bold")
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.tick_params(axis="y", labelsize=10)
+        if logscale:
+            try:
+                ax.set_yscale("log")
+            except Exception:
+                pass
+        ax.grid(axis="y", alpha=0.25)
+    title = f"Per-cluster QC metrics — {cluster_key}"
+    if flagged:
+        title += "   (red = metric-flagged)"
+    axes[0, 0].set_title(title, fontsize=14)
+    # Spell out the flagged cluster IDs in large text so the key information is
+    # readable regardless of how aggressively the image is downscaled.
+    if flagged:
+        flagged_sorted = _natural_cluster_sort(flagged)
+        fig.text(
+            0.5, 0.002,
+            "Metric-flagged clusters: " + ", ".join(flagged_sorted),
+            ha="center", va="bottom", fontsize=12, color="#b22222", fontweight="bold",
+        )
+    fig.tight_layout(rect=(0, 0.02, 1, 1) if flagged else None)
+    try:
+        out_path = str(out_path)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    except Exception:
+        plt.close(fig)
+        return None
+    plt.close(fig)
+    return out_path
+
+
+def _resolve_run_path(raw: Any, run_manager: Any = None, must_exist: bool = True) -> Optional[Path]:
+    """Resolve a path argument forgivingly across tools.
+
+    - Absolute paths are returned as-is.
+    - Relative paths and bare basenames are tried against (in order):
+      ``run_manager.run_dir / raw``, ``Path.cwd() / raw``, ``raw``.
+    - With ``must_exist=True`` (default, used for reads): returns the first
+      existing candidate, or ``None`` if no candidate exists.
+    - With ``must_exist=False`` (used for writes): returns the run_dir-anchored
+      path (or cwd-anchored if run_manager is None), creating no files.
+    """
+    if raw is None:
+        return None
+    try:
+        raw_path = Path(str(raw)).expanduser()
+    except Exception:
+        return None
+    if raw_path.is_absolute():
+        if must_exist and not raw_path.exists():
+            return None
+        return raw_path
+    candidates: List[Path] = []
+    run_dir: Optional[Path] = None
+    if run_manager is not None:
+        try:
+            run_dir = Path(run_manager.run_dir)
+            candidates.append(run_dir / raw_path)
+        except Exception:
+            run_dir = None
+    candidates.append(Path.cwd() / raw_path)
+    candidates.append(raw_path)
+    if must_exist:
+        for c in candidates:
+            try:
+                if c.exists():
+                    return c
+            except Exception:
+                continue
+        return None
+    # write path: prefer run_dir anchor when available
+    if run_dir is not None:
+        return run_dir / raw_path
+    return Path.cwd() / raw_path
+
+
+def _format_validation_failures_per_cluster(failures: List[str]) -> str:
+    """Group cluster-prefixed failures by cluster id so the model sees all
+    issues at once instead of a 6-item truncation. ``failures`` items that
+    start with ``"Cluster <id>:"`` are grouped; others go to a ``(global)``
+    bucket. The output keeps the original message bodies (post-prefix).
+    """
+    if not failures:
+        return ""
+    per_cluster: Dict[str, List[str]] = {}
+    globals_: List[str] = []
+    cluster_prefix = re.compile(r"^Cluster\s+([^:]+):\s*(.*)$", re.DOTALL)
+    for f in failures:
+        if not isinstance(f, str):
+            continue
+        m = cluster_prefix.match(f)
+        if m:
+            cid = m.group(1).strip()
+            body = m.group(2).strip()
+            per_cluster.setdefault(cid, []).append(body)
+        else:
+            globals_.append(f.strip())
+    n_clusters = len(per_cluster)
+    n_issues = sum(len(v) for v in per_cluster.values()) + len(globals_)
+    header = f"{n_issues} issues across {n_clusters} cluster(s)"
+    lines: List[str] = [header]
+    def _sort_key(cid: str):
+        try:
+            return (0, int(cid))
+        except Exception:
+            return (1, cid)
+    for cid in sorted(per_cluster.keys(), key=_sort_key):
+        bodies = per_cluster[cid]
+        lines.append(f"Cluster {cid}: " + "; ".join(bodies))
+    for g in globals_:
+        lines.append(f"(global): {g}")
+    return " | ".join(lines)
+
+
+def _validate_annotation_evidence(
+    *,
+    adata: Any,
+    proposal: Dict[str, Any],
+    evidence: Dict[str, Any],
+    world_state: Any,
+    tool_input_unavailable_sources: Any = None,
+    allow_partial: bool = False,
+    apply_auto_fixes: bool = True,
+) -> Dict[str, Any]:
+    """Validate annotation evidence against a prepare_annotation proposal.
+
+    Centralised so both ``stage_annotation_evidence`` (preview) and
+    ``finalize_annotation`` (commit) run identical checks. Returns a report
+    dict; never raises. When ``apply_auto_fixes`` is true, deterministic rule
+    violations (e.g., ``confidence=high`` paired with broad-lineage-only
+    PanglaoDB support) are silently corrected on the returned ``evidence_str``
+    and an entry is appended to ``auto_fixes``.
+
+    Returns
+    -------
+    dict with keys:
+      - ``validation_failures`` (List[str])
+      - ``per_cluster_validation`` (Dict[str, Dict[str, Any]])
+      - ``auto_fixes`` (List[str])
+      - ``evidence_str`` (Dict[str, Any]) — possibly mutated
+      - ``missing_clusters``, ``unknown_clusters`` (List[str])
+      - ``missing_reference_sources``, ``unexplained_missing_sources`` (List[str])
+      - ``tool_recorded_unavailable_sources``, ``manual_unavailable_sources``,
+        ``unavailable_reference_sources`` (Dict[str, Any])
+      - ``scimilarity_availability`` (Optional[Dict[str, Any]])
+      - ``any_panglaodb`` (bool)
+      - ``panglaodb_required_clusters`` (List[str])
+      - ``ambiguous_set`` (set), ``reference_keys`` (List[str])
+      - ``proposal_clusters``, ``proposal_cluster_entries``
+    """
+    proposal = proposal or {}
+    proposal_clusters = [str(c) for c in proposal.get("cluster_ids", [])]
+    evidence_str = {str(k): v for k, v in (evidence or {}).items()}
+    missing_clusters = [c for c in proposal_clusters if c not in evidence_str]
+    unknown_clusters = [c for c in evidence_str.keys() if c not in proposal_clusters]
+
+    ambiguous_set = set(str(c) for c in proposal.get("ambiguous_clusters", []))
+    reference_keys = [
+        str(k) for k in (proposal.get("reference_annotation_keys") or [])
+        if str(k).strip()
+    ]
+    proposal_cluster_entries = {
+        str(entry.get("cluster_id")): entry
+        for entry in proposal.get("clusters", [])
+        if isinstance(entry, dict) and entry.get("cluster_id") is not None
+    }
+
+    def _normalize_label(value: Any) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    def _singular_label(value: Any) -> str:
+        tokens = re.findall(r"[a-z0-9]+", _normalize_label(value))
+
+        def _singular_token(token: str) -> str:
+            if token == "cells":
+                return "cell"
+            if len(token) > 4 and token.endswith("ies"):
+                return token[:-3] + "y"
+            if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+                return token[:-1]
+            return token
+
+        return " ".join(_singular_token(token) for token in tokens)
+
+    def _label_tokens(value: Any) -> List[str]:
+        return re.findall(r"[a-z0-9]+", _singular_label(value))
+
+    def _substantive_label_tokens(value: Any) -> List[str]:
+        generic = {
+            "cell", "cells", "positive", "negative", "pos", "neg",
+            "human", "mouse", "derived", "like", "and", "or", "of", "the",
+        }
+        return [token for token in _label_tokens(value) if token not in generic]
+
+    def _label_acronyms(value: Any) -> set:
+        tokens = _label_tokens(value)
+        substantive = _substantive_label_tokens(value)
+        acronyms = set()
+        if len(tokens) >= 2:
+            acronyms.add("".join(token[0] for token in tokens if token))
+        if len(substantive) >= 2:
+            acronyms.add("".join(token[0] for token in substantive if token))
+        return {a for a in acronyms if len(a) >= 2}
+
+    def _label_aliases(value: Any) -> set:
+        raw_text = str(value or "").strip()
+        text = _normalize_label(value)
+        singular = _singular_label(text)
+        aliases = {text, singular} if text else set()
+        if not text:
+            return aliases
+        compact = re.sub(r"[^a-z0-9]+", "", singular)
+        if compact:
+            aliases.add(compact)
+        aliases.update(_label_acronyms(text))
+        substantive = _substantive_label_tokens(text)
+        if len(substantive) == 1 and len(substantive[0]) <= 4:
+            aliases.add(substantive[0])
+        raw_compact = re.sub(r"[^A-Za-z0-9]+", "", raw_text)
+        if raw_compact and len(raw_compact) <= 5 and raw_compact.lower() == compact:
+            aliases.add(raw_compact.lower())
+        return {a for a in aliases if a}
+
+    def _split_label_candidates(value: Any) -> List[str]:
+        if isinstance(value, list):
+            values = value
+        elif isinstance(value, str):
+            values = re.split(r"\s*(?:/|\||;|\bor\b)\s*", value)
+        else:
+            values = []
+        labels: List[str] = []
+        for raw in values:
+            label = str(raw or "").strip()
+            if label and label not in labels:
+                labels.append(label)
+        return labels
+
+    def _labels_exact_or_alias(value_a: Any, value_b: Any) -> bool:
+        candidates_a = _split_label_candidates(value_a) or [value_a]
+        candidates_b = _split_label_candidates(value_b) or [value_b]
+        for candidate_a in candidates_a:
+            aliases_a = _label_aliases(candidate_a)
+            if not aliases_a:
+                continue
+            for candidate_b in candidates_b:
+                aliases_b = _label_aliases(candidate_b)
+                if aliases_b and aliases_a.intersection(aliases_b):
+                    return True
+        return False
+
+    def _label_family_for_annotation(value: Any) -> Optional[str]:
+        text = _normalize_label(value)
+        if not text:
+            return None
+        if "platelet" in text or "megakary" in text:
+            return "platelet"
+        if "plasma" in text:
+            return "plasma"
+        if "monocyte" in text or "macrophage" in text:
+            return "monocyte"
+        if "plasmacytoid dendritic" in text or text == "pdc" or " pdc" in f" {text}":
+            return "pdc"
+        if "dendritic" in text or text in {"dc", "cdc", "cdc1", "cdc2"} or " cdc" in f" {text}":
+            return "dendritic"
+        if "natural killer" in text or " nk" in f" {text}" or text.startswith("nk"):
+            return "nk"
+        if "b cell" in text or text.startswith("b ") or " b " in f" {text} ":
+            return "b"
+        if "t cell" in text or text.startswith("t ") or " t " in f" {text} " or "mait" in text or "treg" in text:
+            return "t"
+        if "neutrophil" in text:
+            return "neutrophil"
+        if "mast" in text or "basophil" in text:
+            return "mast_basophil"
+        if "eryth" in text or "red blood" in text:
+            return "erythroid"
+        if "epithelial" in text or "ciliated" in text or "club cell" in text:
+            return "epithelial"
+        if "endothelial" in text:
+            return "endothelial"
+        if "fibroblast" in text or "stromal" in text or "smooth muscle" in text:
+            return "stromal"
+        if "hsc" in text or "mpp" in text or "progenitor" in text or "stem" in text:
+            return "progenitor"
+        return None
+
+    def _labels_biologically_compatible(a: Any, b: Any) -> bool:
+        a_norm = _normalize_label(a)
+        b_norm = _normalize_label(b)
+        if not a_norm or not b_norm:
+            return False
+        if _labels_exact_or_alias(a_norm, b_norm):
+            return True
+        a_singular = re.sub(r"\bcells\b", "cell", a_norm)
+        b_singular = re.sub(r"\bcells\b", "cell", b_norm)
+        if a_singular in b_singular or b_singular in a_singular:
+            return True
+        a_family = _label_family_for_annotation(a_norm)
+        b_family = _label_family_for_annotation(b_norm)
+        return bool(a_family and a_family == b_family)
+
+    def _reference_source_group(annotation_key: Any) -> str:
+        return _annotation_reference_source_group(annotation_key)
+
+    def _reference_consensus_for_cluster(
+        proposal_entry: Dict[str, Any],
+        min_fraction: float = 0.35,
+    ) -> Dict[str, Any]:
+        return _reference_consensus_from_entries(
+            proposal_entry.get("reference_annotations") or [],
+            min_fraction=min_fraction,
+        )
+
+    def _list_labels_from_evidence(value: Any) -> List[str]:
+        labels: List[str] = []
+        if isinstance(value, list):
+            iterable = value
+        elif isinstance(value, dict):
+            iterable = value.values()
+        elif isinstance(value, str):
+            iterable = [value]
+        else:
+            iterable = []
+        for item in iterable:
+            if isinstance(item, dict):
+                raw = item.get("label") or item.get("cell_type") or item.get("candidate") or item.get("top_label")
+            else:
+                raw = item
+            if isinstance(raw, str) and raw.strip():
+                labels.append(raw.strip())
+        return labels
+
+    def _confidence_rank(value: Any) -> int:
+        return {"low": 0, "medium": 1, "high": 2}.get(str(value or ""), -1)
+
+    def _confidence_exceeds(value: Any, cap: str) -> bool:
+        return _confidence_rank(value) > _confidence_rank(cap)
+
+    def _reason_code(reason: Any) -> str:
+        if isinstance(reason, dict):
+            value = reason.get("reason") or reason.get("unavailable_reason") or reason.get("status")
+        else:
+            value = reason
+        return str(value or "").strip().lower()
+
+    def _scimilarity_availability() -> Dict[str, Any]:
+        info: Dict[str, Any] = {
+            "source": "scimilarity",
+            "available": False,
+            "package_available": False,
+            "model_available": False,
+            "model_paths_checked": [],
+            "available_model_paths": [],
+        }
+        try:
+            import importlib.util
+            if importlib.util.find_spec("scimilarity") is None:
+                info["reason"] = "package_missing"
+                return info
+            info["package_available"] = True
+        except Exception as e:
+            info["reason"] = "package_check_failed"
+            info["message"] = str(e)
+            return info
+        try:
+            from ..annotation.scimilarity import (
+                DEFAULT_MODEL_PATH as _SCI_DEFAULT_MODEL_PATH,
+                _MODEL_PATH_HUMAN as _SCI_MODEL_PATH_HUMAN,
+                _MODEL_PATH_MOUSE as _SCI_MODEL_PATH_MOUSE,
+            )
+            candidate_paths = [
+                os.environ.get("SCIMILARITY_MODEL_PATH"),
+                os.environ.get("SCIMILARITY_MODEL_PATH_MOUSE"),
+                _SCI_MODEL_PATH_HUMAN,
+                _SCI_MODEL_PATH_MOUSE,
+                _SCI_DEFAULT_MODEL_PATH,
+            ]
+        except Exception as e:
+            info["reason"] = "model_path_lookup_failed"
+            info["message"] = str(e)
+            candidate_paths = [
+                os.environ.get("SCIMILARITY_MODEL_PATH"),
+                os.environ.get("SCIMILARITY_MODEL_PATH_MOUSE"),
+            ]
+        seen_paths = set()
+        for candidate in candidate_paths:
+            if not candidate:
+                continue
+            path_text = str(candidate)
+            if path_text in seen_paths:
+                continue
+            seen_paths.add(path_text)
+            exists = Path(path_text).exists()
+            info["model_paths_checked"].append({"path": path_text, "exists": bool(exists)})
+            if exists:
+                info["available_model_paths"].append(path_text)
+        info["model_available"] = bool(info["available_model_paths"])
+        info["available"] = bool(info["package_available"] and info["model_available"])
+        if not info["available"] and "reason" not in info:
+            info["reason"] = "model_path_missing" if info["package_available"] else "package_missing"
+        return info
+
+    # Resolve unavailable-reference-source reasons from world state + caller.
+    tool_recorded_unavailable_sources: Dict[str, Any] = {}
+    if world_state is not None:
+        annotation_val = getattr(world_state, "annotation_validation", None)
+        if isinstance(annotation_val, dict):
+            for source, reason in (annotation_val.get("reference_source_unavailable") or {}).items():
+                if source:
+                    tool_recorded_unavailable_sources[str(source).lower()] = reason
+
+    manual_unavailable_sources: Dict[str, Any] = {}
+    if isinstance(tool_input_unavailable_sources, dict):
+        for source, reason in tool_input_unavailable_sources.items():
+            if source:
+                manual_unavailable_sources[str(source).lower()] = reason
+
+    unavailable_reference_sources = dict(tool_recorded_unavailable_sources)
+    for source, reason in manual_unavailable_sources.items():
+        if source != "scimilarity":
+            unavailable_reference_sources[source] = reason
+
+    missing_reference_sources = [
+        str(source).lower()
+        for source in (proposal.get("missing_reference_sources") or [])
+        if str(source).strip()
+    ]
+    unexplained_missing_sources = [
+        source for source in missing_reference_sources
+        if source != "scimilarity" and source not in unavailable_reference_sources
+    ]
+
+    scimilarity_availability: Optional[Dict[str, Any]] = None
+    scimilarity_tool_unavailable = tool_recorded_unavailable_sources.get("scimilarity")
+    scimilarity_manual_unavailable = manual_unavailable_sources.get("scimilarity")
+    if "scimilarity" in missing_reference_sources:
+        scimilarity_availability = _scimilarity_availability()
+
+    # Pull PanglaoDB query log from world_state.
+    queried_celltypes_normalized: set = set()
+    queried_celltypes_raw: List[str] = []
+    queried_gene_symbols_normalized: set = set()
+    if world_state is not None:
+        annotation_val = getattr(world_state, "annotation_validation", None)
+        if isinstance(annotation_val, dict):
+            for entry in annotation_val.get("reference_marker_queries", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                ct = entry.get("cell_type")
+                if isinstance(ct, str) and ct.strip():
+                    queried_celltypes_raw.append(ct.strip())
+                    queried_celltypes_normalized.add(_normalize_label(ct))
+                gene = entry.get("gene_symbol") or entry.get("gene")
+                if isinstance(gene, str) and gene.strip():
+                    queried_gene_symbols_normalized.add(gene.strip().upper())
+
+    def _queried_label_candidates(labels: List[str]) -> List[str]:
+        candidates: List[str] = []
+        queried_aliases = {
+            alias
+            for queried in queried_celltypes_normalized
+            for alias in _label_aliases(queried)
+        }
+        for label_value in labels:
+            aliases = _label_aliases(label_value)
+            if aliases.intersection(queried_aliases):
+                candidates.append(label_value)
+        return candidates
+
+    # Per-cluster DEG gene sets from the proposal.
+    cluster_deg_genes: Dict[str, set] = {}
+    for cid, entry in proposal_cluster_entries.items():
+        genes = set()
+        for deg in (entry.get("top_degs") or []):
+            if isinstance(deg, dict):
+                gene = deg.get("gene")
+            else:
+                gene = deg
+            if isinstance(gene, str) and gene.strip():
+                genes.add(gene.strip().upper())
+        cluster_deg_genes[str(cid)] = genes
+
+    validation_failures: List[str] = []
+    per_cluster_validation: Dict[str, Dict[str, Any]] = {}
+    auto_fixes: List[str] = []
+    panglaodb_required_clusters: List[str] = []
+
+    if missing_clusters and not allow_partial:
+        validation_failures.append(
+            f"Missing evidence for {len(missing_clusters)} clusters: {missing_clusters[:10]}"
+        )
+    if unknown_clusters:
+        validation_failures.append(
+            f"evidence_summary references {len(unknown_clusters)} clusters not in the proposal: {unknown_clusters[:10]}"
+        )
+    if unexplained_missing_sources:
+        validation_failures.append(
+            "Missing reference source(s) lack concrete unavailable reasons: "
+            f"{unexplained_missing_sources}. Run the compatible reference tool(s), or pass "
+            "reference_source_unavailable with specific non-Scimilarity reasons such as package_missing, "
+            "model_download_failed, model_path_missing, no_species_compatible_model, or user_opted_out."
+        )
+    if "scimilarity" in missing_reference_sources:
+        if scimilarity_availability and scimilarity_availability.get("available"):
+            validation_failures.append(
+                "Scimilarity is available but missing from the annotation proposal. "
+                "Run run_scimilarity with the dataset organism before finalize_annotation; "
+                "manual reference_source_unavailable cannot excuse Scimilarity when the package "
+                f"and model path exist ({scimilarity_availability.get('available_model_paths')})."
+            )
+        elif not scimilarity_tool_unavailable:
+            if scimilarity_manual_unavailable:
+                validation_failures.append(
+                    "Scimilarity was manually marked unavailable in finalize_annotation, but no prior "
+                    "run_scimilarity tool failure recorded that blocker. Run run_scimilarity first, or "
+                    "let the tool record a real package/model/runtime failure."
+                )
+            else:
+                validation_failures.append(
+                    "Missing Scimilarity source lacks a tool-recorded unavailable reason. "
+                    "Run run_scimilarity before finalizing; if it truly cannot run, the failed tool "
+                    "result will record the concrete blocker."
+                )
+        else:
+            sci_reason = _reason_code(scimilarity_tool_unavailable)
+            sci_status = (
+                str(scimilarity_tool_unavailable.get("status") or "").lower()
+                if isinstance(scimilarity_tool_unavailable, dict)
+                else ""
+            )
+            if sci_reason in {"organism_ambiguous", "needs_input"} or sci_status == "needs_input":
+                validation_failures.append(
+                    "Scimilarity is not resolved yet: the prior run_scimilarity call needed an explicit "
+                    "organism. Resolve the organism and rerun Scimilarity before finalizing annotation."
+                )
+
+    any_panglaodb = False
+    for cid, ev in evidence_str.items():
+        if not isinstance(ev, dict):
+            validation_failures.append(f"Cluster {cid}: evidence is not an object.")
+            continue
+        checks: Dict[str, Any] = {"cluster_id": cid}
+        label = ev.get("label")
+        if not isinstance(label, str) or not label.strip():
+            validation_failures.append(f"Cluster {cid}: missing or empty 'label'.")
+            checks["label_ok"] = False
+        else:
+            checks["label"] = label
+            checks["label_ok"] = True
+
+        pq = bool(ev.get("panglaodb_queried", False))
+        checks["panglaodb_queried"] = pq
+        if pq:
+            any_panglaodb = True
+
+        panglaodb_label_used = ev.get("panglaodb_label_used")
+        panglaodb_label_candidates = _split_label_candidates(panglaodb_label_used)
+        effective_panglaodb_label_used = (
+            panglaodb_label_candidates[0] if panglaodb_label_candidates else None
+        )
+        if isinstance(panglaodb_label_used, str) and panglaodb_label_used.strip():
+            checks["panglaodb_label_used"] = panglaodb_label_used.strip()
+        label_in_history = False
+        reverse_hit = False
+        if queried_celltypes_normalized or queried_gene_symbols_normalized:
+            candidate_labels: List[str] = []
+            candidate_labels.extend(panglaodb_label_candidates)
+            if isinstance(label, str) and label.strip():
+                candidate_labels.append(label.strip())
+            queried_candidates = _queried_label_candidates(candidate_labels)
+            if queried_candidates:
+                label_in_history = True
+                if (
+                    panglaodb_label_candidates
+                    and effective_panglaodb_label_used != queried_candidates[0]
+                ):
+                    auto_fixes.append(
+                        f"Cluster {cid}: interpreted panglaodb_label_used={panglaodb_label_used!r} "
+                        f"as queried label {queried_candidates[0]!r}."
+                    )
+                effective_panglaodb_label_used = queried_candidates[0]
+            supporting_for_reverse = ev.get("supporting_genes") or []
+            if isinstance(supporting_for_reverse, list):
+                for g in supporting_for_reverse:
+                    if isinstance(g, str) and g.strip().upper() in queried_gene_symbols_normalized:
+                        reverse_hit = True
+                        break
+            checks["panglaodb_label_in_call_history"] = label_in_history
+            checks["panglaodb_reverse_gene_hit"] = reverse_hit
+        else:
+            checks["panglaodb_call_history_available"] = False
+
+        supporting = ev.get("supporting_genes") or []
+        checks["n_supporting_genes"] = len(supporting) if isinstance(supporting, list) else 0
+        checks["supporting_genes"] = supporting if isinstance(supporting, list) else []
+        nuisance_supporting: List[Dict[str, str]] = []
+        broad_supporting: List[Dict[str, str]] = []
+        non_nuisance_supporting: List[str] = []
+        matched_degs: List[str] = []
+        non_nuisance_matched_degs: List[str] = []
+        discriminating_matched_degs: List[str] = []
+        if not isinstance(supporting, list) or len(supporting) == 0:
+            validation_failures.append(
+                f"Cluster {cid}: supporting_genes is empty — every label must cite at least one submitted marker gene from this cluster's DEGs."
+            )
+        else:
+            for gene in supporting:
+                if not isinstance(gene, str) or not gene.strip():
+                    continue
+                nuisance_reason = _annotation_nuisance_reason(gene)
+                if nuisance_reason:
+                    nuisance_supporting.append({"gene": gene.strip(), "reason": nuisance_reason})
+                else:
+                    non_nuisance_supporting.append(gene.strip())
+                    broad_reason = _annotation_broad_support_reason(gene)
+                    if broad_reason:
+                        broad_supporting.append({"gene": gene.strip(), "reason": broad_reason})
+            checks["nuisance_supporting_genes"] = nuisance_supporting
+            checks["broad_supporting_genes"] = broad_supporting
+            checks["non_nuisance_supporting_genes"] = non_nuisance_supporting
+            if not non_nuisance_supporting:
+                validation_failures.append(
+                    f"Cluster {cid}: supporting_genes are all nuisance/non-specific genes "
+                    f"({[g.get('gene') for g in nuisance_supporting[:10]]}). "
+                    "MT, ribosomal, hemoglobin, MALAT1, and generic locus genes cannot be the sole support for a cell-type label."
+                )
+            cluster_genes = cluster_deg_genes.get(cid, set())
+            if cluster_genes:
+                supporting_upper = {
+                    str(g).strip().upper() for g in supporting if isinstance(g, str) and g.strip()
+                }
+                matched_degs = sorted(supporting_upper & cluster_genes)
+                nuisance_upper = {
+                    str(g.get("gene")).strip().upper()
+                    for g in nuisance_supporting
+                    if isinstance(g, dict) and g.get("gene")
+                }
+                non_nuisance_matched_degs = [
+                    g for g in matched_degs if g not in nuisance_upper
+                ]
+                broad_upper = {
+                    str(g.get("gene")).strip().upper()
+                    for g in broad_supporting
+                    if isinstance(g, dict) and g.get("gene")
+                }
+                discriminating_matched_degs = [
+                    g for g in non_nuisance_matched_degs if g not in broad_upper
+                ]
+                checks["supporting_genes_matched_cluster_degs"] = matched_degs
+                checks["n_supporting_genes_matched_cluster_degs"] = len(matched_degs)
+                checks["non_nuisance_supporting_genes_matched_cluster_degs"] = non_nuisance_matched_degs
+                checks["n_non_nuisance_supporting_genes_matched_cluster_degs"] = len(non_nuisance_matched_degs)
+                checks["discriminating_supporting_genes_matched_cluster_degs"] = discriminating_matched_degs
+                checks["n_discriminating_supporting_genes_matched_cluster_degs"] = len(discriminating_matched_degs)
+                if not matched_degs:
+                    validation_failures.append(
+                        f"Cluster {cid}: none of supporting_genes={supporting[:10]} appear in this "
+                        f"cluster's top DEGs. Cite genes that are actually differentially expressed in cluster {cid}."
+                    )
+                elif not non_nuisance_matched_degs:
+                    validation_failures.append(
+                        f"Cluster {cid}: supporting genes matched cluster DEGs, but all matched genes are nuisance/non-specific "
+                        f"({matched_degs[:10]}). Provide at least one non-nuisance lineage marker among this cluster's DEGs."
+                    )
+                elif not discriminating_matched_degs:
+                    validation_failures.append(
+                        f"Cluster {cid}: supporting genes matched cluster DEGs, but all matched non-nuisance genes are broad/context markers "
+                        f"({non_nuisance_matched_degs[:10]}). Add at least one discriminating marker DEG for the final label; "
+                        "broad immune, stress, interferon, MHC, housekeeping, and generic myeloid markers cannot decide a label alone."
+                    )
+
+        final_label_text = label if isinstance(label, str) else ""
+        panglao_label_text = (
+            effective_panglaodb_label_used.strip()
+            if isinstance(effective_panglaodb_label_used, str) and effective_panglaodb_label_used.strip()
+            else final_label_text
+        )
+        panglao_exact_or_fine = _labels_exact_or_alias(final_label_text, panglao_label_text)
+        panglao_compatible = _labels_biologically_compatible(final_label_text, panglao_label_text)
+        broad_lineage_only = bool(
+            panglao_label_text
+            and final_label_text
+            and not panglao_exact_or_fine
+            and panglao_compatible
+            and not reverse_hit
+        )
+        # Defer the compatibility failure: whether it is a real error or a
+        # harmless over-claim depends on panglaodb_required, computed below.
+        _panglao_incompatible_msg = None
+        if panglao_label_text and final_label_text and not panglao_compatible and not reverse_hit:
+            _panglao_incompatible_msg = (
+                f"Cluster {cid}: panglaodb_label_used={panglao_label_text!r} is not biologically compatible "
+                f"with final label {final_label_text!r}. Use a compatible PanglaoDB label, exact label query, "
+                "or reverse marker support."
+            )
+        if reverse_hit and non_nuisance_matched_degs:
+            panglaodb_support_level = "reverse_marker_plus_deg"
+        elif label_in_history and panglao_exact_or_fine and non_nuisance_matched_degs:
+            panglaodb_support_level = "fine_label_plus_deg"
+        elif label_in_history and broad_lineage_only and non_nuisance_matched_degs:
+            panglaodb_support_level = "broad_lineage_only"
+        elif label_in_history:
+            panglaodb_support_level = "label_queried_but_weak_deg_support"
+        else:
+            panglaodb_support_level = "self_attested_or_unavailable_history"
+        checks["panglaodb_support_level"] = panglaodb_support_level
+
+        proposal_entry = proposal_cluster_entries.get(cid, {})
+        reference_consensus = _reference_consensus_for_cluster(proposal_entry)
+        source_groups = reference_consensus.get("source_groups") or sorted({
+            item.get("source")
+            for item in (reference_consensus.get("usable_references") or [])
+            if isinstance(item, dict) and item.get("source")
+        })
+        n_reference_source_groups = len(source_groups)
+        reference_groups = reference_consensus.get("reference_groups") or []
+        best_reference_group = (
+            sorted(
+                reference_groups,
+                key=lambda g: (g.get("n_sources", 0), g.get("score", 0.0)),
+                reverse=True,
+            )[0]
+            if reference_groups else {}
+        )
+        final_matches_reference_consensus = False
+        final_matches_single_reference = False
+        if reference_consensus.get("has_consensus"):
+            checks["reference_consensus"] = {
+                "label": reference_consensus.get("label"),
+                "family": reference_consensus.get("family"),
+                "sources": reference_consensus.get("sources", []),
+                "labels": reference_consensus.get("labels", []),
+                "score": reference_consensus.get("score"),
+            }
+            final_matches_reference_consensus = _labels_biologically_compatible(
+                final_label_text,
+                reference_consensus.get("label"),
+            )
+            checks["final_label_matches_reference_consensus"] = final_matches_reference_consensus
+        elif reference_consensus.get("reference_groups"):
+            checks["reference_groups"] = reference_consensus.get("reference_groups")
+            final_matches_single_reference = bool(
+                n_reference_source_groups == 1
+                and best_reference_group.get("label")
+                and _labels_biologically_compatible(final_label_text, best_reference_group.get("label"))
+            )
+            if best_reference_group:
+                checks["best_reference_group"] = {
+                    "label": best_reference_group.get("label"),
+                    "sources": best_reference_group.get("sources", []),
+                    "labels": best_reference_group.get("labels", []),
+                    "score": best_reference_group.get("score"),
+                }
+                checks["final_label_matches_single_reference"] = final_matches_single_reference
+        checks["reference_source_groups"] = source_groups
+
+        n_submitted_deg_support = len(discriminating_matched_degs)
+        raw_conf = ev.get("confidence")
+
+        # --- Cytopus (local) adjudication ---------------------------------
+        # Does the final label best match this cluster's DEGs among candidates,
+        # using the curated local Cytopus KnowledgeBase? This is the PRIMARY
+        # external marker check alongside reference consensus + DEGs. PanglaoDB
+        # is consulted ONLY when neither reference consensus nor Cytopus can
+        # resolve the cluster — i.e. genuinely ambiguous.
+        cluster_top_deg_genes: List[str] = []
+        for _d in (proposal_entry.get("top_degs") or []):
+            _g = _d.get("gene") if isinstance(_d, dict) else _d
+            if isinstance(_g, str) and _g.strip():
+                cluster_top_deg_genes.append(_g.strip())
+        competing_for_cytopus: List[str] = []
+        for _comp in (proposal_entry.get("competing_labels") or []):
+            _cl = _comp.get("label") if isinstance(_comp, dict) else _comp
+            if isinstance(_cl, str) and _cl.strip():
+                competing_for_cytopus.append(_cl.strip())
+        _ev_comp = ev.get("competing_labels_considered")
+        if isinstance(_ev_comp, list):
+            competing_for_cytopus.extend([str(c) for c in _ev_comp if str(c).strip()])
+
+        cytopus_adj: Dict[str, Any] = {"available": False}
+        try:
+            from ..annotation import cytopus_markers as _cyto
+            cytopus_adj = _cyto.adjudicate(
+                final_label_text, competing_for_cytopus, cluster_top_deg_genes, min_margin=1
+            )
+        except Exception:
+            cytopus_adj = {"available": False}
+        cytopus_available = bool(cytopus_adj.get("available"))
+        cytopus_confirms = bool(cytopus_available and cytopus_adj.get("candidate_is_best"))
+        cytopus_thin_margin = bool(cytopus_confirms and (cytopus_adj.get("margin") or 0) < 2)
+        if cytopus_available:
+            checks["cytopus_adjudication"] = {
+                "candidate_covered": cytopus_adj.get("candidate_covered"),
+                "candidate_is_best": cytopus_adj.get("candidate_is_best"),
+                "best_label": cytopus_adj.get("best_label"),
+                "best_overlap": cytopus_adj.get("best_overlap"),
+                "margin": cytopus_adj.get("margin"),
+            }
+
+        # A cross-lineage override of a TWO-SOURCE reference consensus keeps the
+        # high bar (handled later) — Cytopus alone cannot rescue it.
+        crosses_two_source_consensus = bool(
+            reference_consensus.get("has_consensus") and not final_matches_reference_consensus
+        )
+
+        panglaodb_required_reasons: List[str] = []
+        validation_tier = "needs_external_adjudication"
+
+        if (
+            reference_consensus.get("has_consensus")
+            and final_matches_reference_consensus
+            and n_submitted_deg_support >= 2
+        ):
+            validation_tier = "reference_consensus_plus_deg"
+        elif (
+            n_reference_source_groups == 1
+            and final_matches_single_reference
+            and n_submitted_deg_support >= 3
+        ):
+            validation_tier = "reference_partial_plus_deg"
+        elif cytopus_confirms and n_submitted_deg_support >= 1 and not crosses_two_source_consensus:
+            # Local Cytopus markers best-match the cluster DEGs for this label —
+            # sufficient without PanglaoDB. (Thin margins cap confidence below.)
+            validation_tier = "cytopus_plus_deg"
+        else:
+            # Genuinely unresolved by reference + Cytopus + DEGs → PanglaoDB.
+            if cid in ambiguous_set:
+                panglaodb_required_reasons.append("flagged_ambiguous")
+            if n_reference_source_groups == 0:
+                panglaodb_required_reasons.append("deg_only_no_reference_source")
+            if n_reference_source_groups >= 2 and not reference_consensus.get("has_consensus"):
+                panglaodb_required_reasons.append("reference_sources_disagree")
+            if crosses_two_source_consensus:
+                panglaodb_required_reasons.append("cross_lineage_or_reference_consensus_override")
+            if cytopus_available and not cytopus_adj.get("candidate_covered"):
+                panglaodb_required_reasons.append("cytopus_uncovered_label")
+            elif cytopus_available and not cytopus_confirms:
+                panglaodb_required_reasons.append("cytopus_label_not_best_match")
+            if n_submitted_deg_support < 1:
+                panglaodb_required_reasons.append("no_discriminating_deg_support")
+            if not panglaodb_required_reasons:
+                panglaodb_required_reasons.append("unresolved_by_reference_cytopus_deg")
+
+        panglaodb_required = bool(validation_tier == "needs_external_adjudication")
+        panglaodb_has_call_history_support = bool(label_in_history or reverse_hit)
+        if panglaodb_required and panglaodb_has_call_history_support:
+            # A compatible label was actually queried this session (it is in the
+            # PanglaoDB call history) — external adjudication genuinely happened.
+            # Accept it even if the agent forgot to set panglaodb_queried=true,
+            # rather than looping finalize on the missing flag.
+            if not pq and apply_auto_fixes:
+                ev = dict(ev)
+                ev["panglaodb_queried"] = True
+                evidence_str[cid] = ev
+                pq = True
+                checks["panglaodb_queried"] = True
+                auto_fixes.append(
+                    f"Cluster {cid}: set panglaodb_queried=true — a compatible label was queried in "
+                    "PanglaoDB this session (present in the call history), so external adjudication did occur."
+                )
+            validation_tier = "external_adjudicated"
+            panglaodb_required = False
+        elif panglaodb_required and pq and not (
+            queried_celltypes_normalized or queried_gene_symbols_normalized
+        ):
+            # PanglaoDB/MCP unavailable this session: accept the agent's attested query.
+            validation_tier = "external_adjudicated"
+            panglaodb_required = False
+        checks["n_submitted_discriminating_deg_support"] = n_submitted_deg_support
+        checks["panglaodb_required"] = panglaodb_required
+        checks["validation_tier"] = validation_tier
+        checks["panglaodb_required_reasons"] = panglaodb_required_reasons
+
+        # Resolve a deferred PanglaoDB-compatibility issue now that we know
+        # whether the cluster actually needs external adjudication. On a cluster
+        # that is NOT panglaodb_required (reference+DEG sufficient), a
+        # wrong/over-claimed panglaodb_label_used is harmless noise — normalize
+        # it to panglaodb_queried=false rather than hard-failing. This prevents
+        # over-claims (e.g. 'dendritic cells' pasted onto a T-cell cluster) from
+        # cascading into a blocked finalize.
+        if _panglao_incompatible_msg:
+            if not panglaodb_required and apply_auto_fixes and pq:
+                ev = dict(ev)
+                ev["panglaodb_queried"] = False
+                ev.pop("panglaodb_label_used", None)
+                evidence_str[cid] = ev
+                pq = False
+                checks["panglaodb_queried"] = False
+                auto_fixes.append(
+                    f"Cluster {cid}: dropped an unsupported PanglaoDB claim "
+                    f"(panglaodb_label_used={panglao_label_text!r} is not compatible with {final_label_text!r}); "
+                    "the cluster is reference+DEG sufficient, so set panglaodb_queried=false."
+                )
+            else:
+                validation_failures.append(_panglao_incompatible_msg)
+
+        if panglaodb_required:
+            panglaodb_required_clusters.append(cid)
+            if not pq:
+                validation_failures.append(
+                    f"Cluster {cid}: panglaodb_queried must be true because external adjudication is required "
+                    f"({', '.join(panglaodb_required_reasons) or 'needs_external_adjudication'})."
+                )
+            elif (queried_celltypes_normalized or queried_gene_symbols_normalized) and not panglaodb_has_call_history_support:
+                validation_failures.append(
+                    f"Cluster {cid}: label {label!r} (panglaodb_label_used={panglaodb_label_used!r}) "
+                    "was not found in the PanglaoDB call history recorded in world state. "
+                    "Either query PanglaoDB for this label or record the gene_symbol reverse query that supports it."
+                )
+
+        if validation_tier in {"reference_consensus_plus_deg", "reference_partial_plus_deg", "cytopus_plus_deg"}:
+            panglaodb_support_level = validation_tier
+            checks["panglaodb_support_level"] = panglaodb_support_level
+
+        competing = ev.get("competing_labels_considered")
+        if cid in ambiguous_set:
+            if not isinstance(competing, list) or len(competing) == 0:
+                inferred_competing: List[str] = []
+                for comp in proposal_entry.get("competing_labels", []) or []:
+                    if isinstance(comp, dict):
+                        comp_label = comp.get("label") or comp.get("cell_type") or comp.get("candidate")
+                    else:
+                        comp_label = comp
+                    if isinstance(comp_label, str) and comp_label.strip():
+                        inferred_competing.append(comp_label.strip())
+                label_for_filter = label.strip() if isinstance(label, str) else ""
+                inferred_competing = [
+                    x for i, x in enumerate(inferred_competing)
+                    if x and x != label_for_filter and x not in inferred_competing[:i]
+                ]
+                if inferred_competing:
+                    ev = dict(ev)
+                    ev["competing_labels_considered"] = inferred_competing
+                    evidence_str[cid] = ev
+                    competing = inferred_competing
+                    auto_fixes.append(
+                        f"Cluster {cid}: filled competing_labels_considered from prepare_annotation proposal."
+                    )
+                else:
+                    validation_failures.append(
+                        f"Cluster {cid} was flagged ambiguous by prepare_annotation but evidence provides no competing_labels_considered."
+                    )
+        checks["competing_labels_considered"] = competing or []
+        ref_support = ev.get("reference_annotation_support")
+        if reference_keys:
+            ref_support_ok = False
+            if isinstance(ref_support, dict):
+                ref_support_ok = any(
+                    value not in (None, "", [], {})
+                    for value in ref_support.values()
+                )
+            elif isinstance(ref_support, list):
+                ref_support_ok = len(ref_support) > 0
+            elif isinstance(ref_support, str):
+                ref_support_ok = bool(ref_support.strip())
+            if not ref_support_ok:
+                validation_failures.append(
+                    f"Cluster {cid}: missing reference_annotation_support for reference columns {reference_keys}."
+                )
+        if "reference_annotation_support" in ev:
+            checks["reference_annotation_support"] = ev.get("reference_annotation_support")
+        if "reference_annotation_conflicts" in ev:
+            conflicts = ev.get("reference_annotation_conflicts")
+            checks["reference_annotation_conflicts"] = conflicts if isinstance(conflicts, list) else [str(conflicts)]
+        if "reverse_marker_support" in ev:
+            checks["reverse_marker_support"] = ev.get("reverse_marker_support")
+        if "panglaodb_label_used" in ev:
+            checks["panglaodb_label_used"] = (
+                str(effective_panglaodb_label_used)
+                if effective_panglaodb_label_used
+                else str(ev.get("panglaodb_label_used"))
+            )
+        if "external_sources" in ev:
+            external_sources = ev.get("external_sources")
+            checks["external_sources"] = external_sources if isinstance(external_sources, list) else [str(external_sources)]
+        reasoning = ev.get("reasoning")
+        if not isinstance(reasoning, str) or len(reasoning.strip()) < 20:
+            validation_failures.append(
+                f"Cluster {cid}: reasoning must explain the final label using reference labels, DEGs, PanglaoDB evidence, and alternatives considered."
+            )
+        else:
+            checks["reasoning"] = reasoning.strip()
+
+        conf = ev.get("confidence")
+        if conf not in {"high", "medium", "low"}:
+            validation_failures.append(f"Cluster {cid}: confidence must be 'high', 'medium', or 'low'.")
+        checks["confidence_original"] = conf
+
+        # Deterministic confidence-cap fixes — auto-downgrade rather than reject
+        # when the support level already tells us what the right ceiling is.
+        if apply_auto_fixes and conf == "high":
+            reference_label_for_fine_cap = (
+                reference_consensus.get("label")
+                if reference_consensus.get("has_consensus")
+                else best_reference_group.get("label")
+            )
+            fine_label_without_direct_external = bool(
+                panglaodb_support_level in {"reference_consensus_plus_deg", "reference_partial_plus_deg"}
+                and reference_label_for_fine_cap
+                and final_label_text
+                and _labels_biologically_compatible(final_label_text, reference_label_for_fine_cap)
+                and not _labels_exact_or_alias(final_label_text, reference_label_for_fine_cap)
+            )
+            if panglaodb_support_level == "reference_partial_plus_deg" and n_submitted_deg_support < 4:
+                ev = dict(ev)
+                ev["confidence"] = "medium"
+                evidence_str[cid] = ev
+                conf = "medium"
+                auto_fixes.append(
+                    f"Cluster {cid}: auto-lowered confidence high → medium because only one reference source "
+                    f"supported the label and submitted DEG support was {n_submitted_deg_support}; use at least "
+                    "four discriminating submitted DEG markers for high confidence without PanglaoDB."
+                )
+            elif panglaodb_support_level == "cytopus_plus_deg" and cytopus_thin_margin:
+                ev = dict(ev)
+                ev["confidence"] = "medium"
+                evidence_str[cid] = ev
+                conf = "medium"
+                auto_fixes.append(
+                    f"Cluster {cid}: auto-lowered confidence high → medium because the Cytopus marker "
+                    f"adjudication margin over the runner-up label was thin "
+                    f"(margin {cytopus_adj.get('margin')}); the local winner is trusted but the evidence is not strong."
+                )
+            elif fine_label_without_direct_external:
+                ev = dict(ev)
+                ev["confidence"] = "medium"
+                evidence_str[cid] = ev
+                conf = "medium"
+                auto_fixes.append(
+                    f"Cluster {cid}: auto-lowered confidence high → medium because the final label "
+                    f"{final_label_text!r} is finer than the reference label {reference_label_for_fine_cap!r} "
+                    "and no direct PanglaoDB fine-label query was recorded."
+                )
+            elif panglaodb_support_level == "broad_lineage_only":
+                ev = dict(ev)
+                ev["confidence"] = "medium"
+                evidence_str[cid] = ev
+                conf = "medium"
+                auto_fixes.append(
+                    f"Cluster {cid}: auto-lowered confidence high → medium because PanglaoDB only validated "
+                    f"a broader parent lineage ({panglao_label_text!r}) for {final_label_text!r}."
+                )
+            elif panglaodb_support_level == "label_queried_but_weak_deg_support":
+                ev = dict(ev)
+                ev["confidence"] = "medium"
+                evidence_str[cid] = ev
+                conf = "medium"
+                auto_fixes.append(
+                    f"Cluster {cid}: auto-lowered confidence high → medium because PanglaoDB label was queried "
+                    "but cluster DEGs only weakly match its markers."
+                )
+            elif panglaodb_support_level == "self_attested_or_unavailable_history":
+                ev = dict(ev)
+                ev["confidence"] = "low"
+                evidence_str[cid] = ev
+                conf = "low"
+                auto_fixes.append(
+                    f"Cluster {cid}: auto-lowered confidence high → low because no PanglaoDB call history "
+                    "backs this label (self-attested)."
+                )
+        checks["confidence"] = conf
+        # If auto-fixes are disabled we still emit the prior strict messages
+        # so callers that want the raw rejection report can see them.
+        if not apply_auto_fixes:
+            if conf == "high" and panglaodb_support_level == "reference_partial_plus_deg" and n_submitted_deg_support < 4:
+                validation_failures.append(
+                    f"Cluster {cid}: confidence cannot be high for a one-reference-source label with only "
+                    f"{n_submitted_deg_support} discriminating submitted DEG markers and no PanglaoDB query."
+                )
+            if conf == "high" and panglaodb_support_level == "broad_lineage_only":
+                validation_failures.append(
+                    f"Cluster {cid}: confidence cannot be high when PanglaoDB only validates a broader parent lineage "
+                    f"({panglao_label_text!r}) for final label {final_label_text!r}. Add exact/fine-label or reverse-marker support, "
+                    "or lower confidence."
+                )
+            if conf == "high" and panglaodb_support_level in {
+                "label_queried_but_weak_deg_support",
+                "self_attested_or_unavailable_history",
+            }:
+                validation_failures.append(
+                    f"Cluster {cid}: confidence cannot be high with weak PanglaoDB/DEG support "
+                    f"({panglaodb_support_level})."
+                )
+
+        qc_caveats = proposal_entry.get("qc_annotation_caveats") or []
+        if isinstance(qc_caveats, list) and qc_caveats:
+            checks["qc_annotation_caveats"] = qc_caveats
+            strictest_cap = "high"
+            for caveat in qc_caveats:
+                if not isinstance(caveat, dict):
+                    continue
+                cap = caveat.get("confidence_cap")
+                if cap in {"low", "medium", "high"} and _confidence_rank(cap) < _confidence_rank(strictest_cap):
+                    strictest_cap = cap
+            checks["qc_confidence_cap"] = strictest_cap
+            if conf in {"high", "medium", "low"} and _confidence_exceeds(conf, strictest_cap):
+                if apply_auto_fixes:
+                    ev = dict(ev)
+                    ev["confidence"] = strictest_cap
+                    evidence_str[cid] = ev
+                    auto_fixes.append(
+                        f"Cluster {cid}: auto-lowered confidence {conf!r} → {strictest_cap!r} to honour "
+                        "the QC-derived cap (high MT, doublet enrichment, low complexity, or structure-QC review)."
+                    )
+                    conf = strictest_cap
+                    checks["confidence"] = conf
+                else:
+                    validation_failures.append(
+                        f"Cluster {cid}: confidence={conf!r} exceeds QC-derived cap {strictest_cap!r}. "
+                        "Clusters with high MT, doublet enrichment, low complexity, or structure-QC review/conflict "
+                        "must be labeled lower-confidence unless the evidence explicitly resolves the caveat."
+                    )
+
+        source_synthesis = ev.get("source_synthesis")
+        if isinstance(source_synthesis, str) and source_synthesis.strip():
+            text = source_synthesis.strip()
+            source_synthesis = {
+                "agreement": text,
+                "final_decision_basis": (
+                    reasoning.strip()
+                    if isinstance(reasoning, str) and len(reasoning.strip()) >= 20
+                    else text
+                ),
+            }
+            ev = dict(ev)
+            ev["source_synthesis"] = source_synthesis
+            evidence_str[cid] = ev
+            auto_fixes.append(
+                f"Cluster {cid}: converted string source_synthesis into structured agreement/final_decision_basis."
+            )
+        elif isinstance(source_synthesis, dict):
+            source_synthesis = dict(source_synthesis)
+            if (
+                not source_synthesis.get("final_decision_basis")
+                and isinstance(source_synthesis.get("decision_basis"), str)
+                and source_synthesis.get("decision_basis", "").strip()
+            ):
+                source_synthesis["final_decision_basis"] = source_synthesis["decision_basis"].strip()
+                ev = dict(ev)
+                ev["source_synthesis"] = source_synthesis
+                evidence_str[cid] = ev
+                auto_fixes.append(
+                    f"Cluster {cid}: used source_synthesis.decision_basis as final_decision_basis."
+                )
+            if (
+                not source_synthesis.get("agreement")
+                and any(source_synthesis.get(k) for k in ("celltypist", "scimilarity", "panglaodb_evidence"))
+            ):
+                parts = [
+                    str(source_synthesis.get(k))
+                    for k in ("celltypist", "scimilarity", "panglaodb_evidence")
+                    if source_synthesis.get(k)
+                ]
+                source_synthesis["agreement"] = "; ".join(parts)
+                ev = dict(ev)
+                ev["source_synthesis"] = source_synthesis
+                evidence_str[cid] = ev
+                auto_fixes.append(
+                    f"Cluster {cid}: derived source_synthesis.agreement from source fields."
+                )
+        if reference_keys or missing_reference_sources or qc_caveats:
+            if not isinstance(source_synthesis, dict) or not source_synthesis:
+                validation_failures.append(
+                    f"Cluster {cid}: source_synthesis is required. Summarize CellTypist/Scimilarity candidates, "
+                    "DEG/PanglaoDB support, QC caveats, source agreement/discordance, and the final decision basis."
+                )
+            else:
+                checks["source_synthesis"] = source_synthesis
+                agreement = source_synthesis.get("agreement")
+                basis = source_synthesis.get("final_decision_basis")
+                if not isinstance(agreement, str) or not agreement.strip():
+                    validation_failures.append(
+                        f"Cluster {cid}: source_synthesis.agreement is required."
+                    )
+                if not isinstance(basis, str) or len(basis.strip()) < 20:
+                    validation_failures.append(
+                        f"Cluster {cid}: source_synthesis.final_decision_basis must explain the synthesized decision."
+                    )
+
+        if reference_consensus.get("has_consensus") and not checks.get("final_label_matches_reference_consensus"):
+            consensus_label = reference_consensus.get("label")
+            consensus_sources = reference_consensus.get("sources", [])
+            candidate_competing_labels = []
+            candidate_competing_labels.extend(_list_labels_from_evidence(competing))
+            candidate_competing_labels.extend(_list_labels_from_evidence(ev.get("reference_annotation_conflicts")))
+            consensus_considered = any(
+                _labels_biologically_compatible(item, consensus_label)
+                for item in candidate_competing_labels
+            )
+            basis_text = ""
+            agreement_text = ""
+            if isinstance(source_synthesis, dict):
+                basis_text = str(source_synthesis.get("final_decision_basis") or "")
+                agreement_text = str(source_synthesis.get("agreement") or "")
+            combined_source_text = f"{agreement_text} {basis_text}".lower()
+            sources_named = [
+                source for source in consensus_sources
+                if str(source).lower() in combined_source_text
+            ]
+            high_bar_checks = {
+                "fine_or_reverse_panglaodb_support": panglaodb_support_level in {
+                    "fine_label_plus_deg",
+                    "reverse_marker_plus_deg",
+                },
+                "n_discriminating_deg_markers": len(discriminating_matched_degs),
+                "has_three_discriminating_deg_markers": len(discriminating_matched_degs) >= 3,
+                "reference_consensus_considered_as_competitor": consensus_considered,
+                "source_synthesis_names_consensus_sources": len(sources_named) == len(consensus_sources),
+                "source_synthesis_basis_is_detailed": len(basis_text.strip()) >= 60,
+            }
+            high_bar_passed = all(high_bar_checks.values())
+            checks["reference_consensus_override"] = {
+                "consensus_label": consensus_label,
+                "consensus_sources": consensus_sources,
+                "consensus_labels": reference_consensus.get("labels", []),
+                "final_label": final_label_text,
+                "high_bar_checks": high_bar_checks,
+                "passed": high_bar_passed,
+            }
+            if not high_bar_passed:
+                validation_failures.append(
+                    f"Cluster {cid}: final label {final_label_text!r} crosses lineages away from "
+                    f"CellTypist/Scimilarity reference consensus {consensus_label!r} "
+                    f"({consensus_sources}). Cross-lineage overrides require exact/reverse PanglaoDB "
+                    "support, at least three discriminating non-broad supporting DEGs, the consensus label "
+                    "listed as a competing label/conflict, and a detailed source_synthesis explaining why "
+                    "the reference consensus lost."
+                )
+
+        per_cluster_validation[cid] = checks
+
+    return {
+        "validation_failures": validation_failures,
+        "per_cluster_validation": per_cluster_validation,
+        "auto_fixes": auto_fixes,
+        "evidence_str": evidence_str,
+        "missing_clusters": missing_clusters,
+        "unknown_clusters": unknown_clusters,
+        "missing_reference_sources": missing_reference_sources,
+        "unexplained_missing_sources": unexplained_missing_sources,
+        "tool_recorded_unavailable_sources": tool_recorded_unavailable_sources,
+        "manual_unavailable_sources": manual_unavailable_sources,
+        "unavailable_reference_sources": unavailable_reference_sources,
+        "scimilarity_availability": scimilarity_availability,
+        "any_panglaodb": any_panglaodb,
+        "panglaodb_required_clusters": panglaodb_required_clusters,
+        "ambiguous_set": ambiguous_set,
+        "reference_keys": reference_keys,
+        "proposal_clusters": proposal_clusters,
+        "proposal_cluster_entries": proposal_cluster_entries,
+    }
 
 
 def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
@@ -256,7 +2335,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_scimilarity",
-            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Requires a known organism ('human' or 'mouse') or an explicit model_path; if species is ambiguous, ask before running. Different from CellTypist - use when you want embedding-based annotation.",
+            "description": "Annotate cell types with Scimilarity (embedding-based). Uses pretrained embeddings and kNN to annotate cells. Requires a known organism ('human' or 'mouse') or an explicit model_path; if species is ambiguous, ask before running. In the Iris scagent environment, Scimilarity model files are expected to be available, so run this whenever the organism is known instead of treating DEG-only annotation as sufficient.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -276,16 +2355,21 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "against clusters using normalized expression fractions (not raw means), flag ambiguous clusters "
                 "where top-2 candidate labels are close, and identify shared markers that don't discriminate. "
                 "If CellTypist or Scimilarity columns are present, summarize their dominant cluster-level labels "
-                "as reference-derived candidate labels so DEG/PanglaoDB validation can adjudicate them. "
-                "Also stage reverse PanglaoDB marker lookups for a panel of top non-nuisance DEGs per cluster, "
-                "so plausible alternative labels can be discovered from observed markers instead of relying on "
-                "a single gene or hard-coded ambiguity lists. "
+                "as reference-derived candidate labels so DEG support can be synthesized first and "
+                "PanglaoDB can adjudicate only structurally unresolved clusters. "
+                "Also stage reverse PanglaoDB marker lookups for top non-nuisance DEGs only on clusters "
+                "that are ambiguous, DEG-only, or reference-discordant, so plausible alternative labels can "
+                "be discovered without flooding context. "
                 "Stores the proposal in adata.uns['annotation_proposal'] and returns per-cluster candidates "
-                "with competing labels and the specific PanglaoDB label and reverse-marker queries you must run next. "
+                "with competing labels, validation_tier, panglaodb_required, the specific PanglaoDB label "
+                "and reverse-marker queries to run next for required clusters, and — critically — each "
+                "cluster's DEGs pre-classified into `discriminating_degs`, `broad_context_degs`, and "
+                "`nuisance_degs`, plus `suggested_supporting_genes` (the discriminating DEGs to cite as "
+                "supporting_genes so evidence passes validation on the first try). "
                 "This is the validation/adjudication stage, not a replacement for reference-based annotation "
                 "when a compatible CellTypist or Scimilarity model is available. After this, query PanglaoDB "
-                "for each proposed label, reference-derived candidate label, competing label, and staged DEG "
-                "gene-symbol reverse lookup, then call finalize_annotation with the evidence."
+                "only for panglaodb_required_clusters, then call finalize_annotation with reference, DEG, "
+                "and required external-adjudication evidence."
             ),
             "input_schema": {
                 "type": "object",
@@ -302,7 +2386,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                         ),
                         "additionalProperties": {"type": "array", "items": {"type": "string"}}
                     },
-                    "n_deg_genes": {"type": "integer", "description": "Number of top DEGs to extract per cluster for PanglaoDB comparison (default: 20)"},
+                    "n_deg_genes": {"type": "integer", "description": "Number of top DEGs to extract per cluster for annotation evidence and conditional PanglaoDB comparison (default: 20)"},
                     "deg_key": {"type": "string", "description": "adata.uns key for existing DEG results (default: rank_genes_groups). If the key exists, DEGs are read from it; otherwise rank_genes_groups is run automatically."},
                     "annotation_key": {"type": "string", "description": "Name of the obs column that finalize_annotation will write (default: cell_type). Stored in the proposal so finalize_annotation knows where to write."},
                     "reference_annotation_keys": {
@@ -317,7 +2401,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     },
                     "panglaodb_species": {"type": "string", "enum": ["Hs", "Mm"], "description": "Optional PanglaoDB species code to include in staged queries: Hs for human, Mm for mouse."},
                     "reverse_lookup_n_genes_per_cluster": {"type": "integer", "description": "Number of top non-nuisance DEGs per cluster to stage for PanglaoDB gene_symbol reverse lookup (default: 10; use 0 to disable)."},
-                    "reverse_lookup_max_unique_genes": {"type": "integer", "description": "Maximum unique DEG gene_symbol reverse lookup queries to stage across all clusters (default: 120). Genes are selected round-robin across clusters so small/high-numbered clusters are represented."},
+                    "reverse_lookup_max_unique_genes": {"type": "integer", "description": "Maximum unique DEG gene_symbol reverse lookup queries to stage across all clusters (default: 60). Genes are selected round-robin across clusters so small/high-numbered clusters are represented without overwhelming context."},
                     "reverse_lookup_exclude_patterns": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -330,14 +2414,96 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "stage_annotation_evidence",
+            "description": (
+                "Incrementally stage final annotation evidence after prepare_annotation and any required PanglaoDB queries. "
+                "Use this when there are many clusters so evidence can be submitted in batches instead of one "
+                "large finalize_annotation call. Merges entries into adata.uns['annotation_evidence_summary']; "
+                "does not write labels. "
+                "STAGING ALSO VALIDATES: this tool runs the full finalize-time validator on the merged evidence "
+                "and surfaces every issue per cluster, so problems are visible at staging time rather than only "
+                "when finalize is called. Deterministic fixes (e.g., lowering confidence when only a broader "
+                "lineage was validated) are applied automatically and reported in `validation.auto_fixes`. "
+                "Required per-cluster fields and rules: "
+                "(1) `label`, `confidence` ∈ {high, medium, low}, explicit `panglaodb_queried` (true/false), `supporting_genes` "
+                "(non-empty, must overlap this cluster's top DEGs, must include at least one non-nuisance "
+                "marker — MT/ribosomal/hemoglobin/MALAT1 genes alone do not count). "
+                "(2) `panglaodb_queried=false` is acceptable for reference_consensus_plus_deg and "
+                "reference_partial_plus_deg clusters; clusters in needs_external_adjudication must have "
+                "PanglaoDB evidence. If queried, `panglaodb_label_used` is the PanglaoDB cell_type backing "
+                "the label and must be biologically compatible with `label`, or provide `reverse_marker_support`. "
+                "(3) Confidence is auto-capped from evidence tier: one-reference-source labels need stronger "
+                "submitted DEG support for high confidence; broad-parent PanglaoDB labels cap confidence to "
+                "`medium`; QC-derived caps "
+                "(high MT, doublet enrichment, low complexity, structure-QC review) auto-lower confidence too. "
+                "(4) `reasoning`: ≥20 chars explaining the chosen label. "
+                "(5) `source_synthesis`: `{agreement, final_decision_basis}` required when CellTypist/Scimilarity "
+                "reference columns were used or QC caveats apply. "
+                "(6) `competing_labels_considered`: required for clusters that prepare_annotation flagged ambiguous. "
+                "(7) If CellTypist and Scimilarity agree on a lineage, the final label must stay compatible "
+                "with that consensus unless the evidence clears the cross-lineage override gate: exact/reverse "
+                "PanglaoDB support, at least three discriminating non-broad DEG markers, the consensus label "
+                "listed as a competitor/conflict, and source_synthesis explicitly explaining why the consensus lost."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "evidence_summary": {
+                        "type": ["object", "string"],
+                        "description": (
+                            "Dict mapping cluster_id to annotation evidence. Each entry should include label, "
+                            "panglaodb_queried true/false, supporting_genes, confidence, reasoning, and where relevant "
+                            "competing_labels_considered. If reference annotation columns were used by "
+                            "prepare_annotation, include reference_annotation_support for each cluster; add "
+                            "reference_annotation_conflicts when CellTypist/Scimilarity disagree. May also be "
+                            "a JSON string encoding the same dict. Use external_sources for literature/web "
+                            "evidence used to resolve ambiguous cases."
+                        ),
+                        "additionalProperties": {"type": "object"},
+                    },
+                    "evidence_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional path to a JSON file containing the evidence_summary dict. Relative paths "
+                            "are resolved from the run directory when available, then the current working directory. "
+                            "Use this for large evidence payloads instead of passing huge JSON through the tool call."
+                        ),
+                    },
+                    "replace": {
+                        "type": "boolean",
+                        "description": "If true, replace any previously staged annotation evidence. Default false merges entries.",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
             "name": "finalize_annotation",
             "description": (
-                "Write final cell-type annotation labels to adata.obs after PanglaoDB evidence has been "
-                "collected. Requires: (1) prepare_annotation was called first (proposal in adata.uns), "
-                "(2) evidence_summary maps every cluster to a label with PanglaoDB evidence. "
+                "Write final cell-type annotation labels to adata.obs after reference-label, DEG, and any "
+                "required PanglaoDB evidence has been collected. Requires: (1) prepare_annotation was called "
+                "first (proposal in adata.uns), "
+                "(2) evidence_summary maps every cluster to a label with enough evidence for its validation tier, or evidence "
+                "has already been staged with stage_annotation_evidence. "
                 "Writes adata.obs[annotation_key] and records the full evidence in adata.uns['annotation_validation']. "
-                "This is step 2 of 2 — never call this before querying PanglaoDB for each proposed label "
-                "and each competing label from the prepare_annotation output."
+                "This is step 2 of 2 — never call this before querying PanglaoDB for clusters listed in "
+                "panglaodb_required_clusters and their required competing labels. "
+                "Recommended flow: use stage_annotation_evidence (which runs the same validator and applies "
+                "auto-fixes) to surface and resolve all issues, then call finalize_annotation. If you pass "
+                "evidence directly, the same per-cluster rules apply: "
+                "(1) `label`, `confidence` ∈ {high, medium, low}, explicit `panglaodb_queried`, `supporting_genes` "
+                "(non-empty, overlapping the cluster's top DEGs, at least one non-nuisance lineage marker). "
+                "(2) `panglaodb_queried=false` is acceptable for reference_consensus_plus_deg and "
+                "reference_partial_plus_deg clusters; needs_external_adjudication clusters require "
+                "PanglaoDB call evidence. "
+                "(3) Confidence is auto-capped to `medium` when PanglaoDB only validated a broader parent "
+                "lineage or a one-reference-source label lacks excellent submitted DEG support; QC-derived caps "
+                "(high MT, doublets, low complexity, structure-QC review) also auto-lower confidence. "
+                "(4) `reasoning` ≥20 chars. (5) `source_synthesis={agreement, final_decision_basis}` required "
+                "when reference columns or QC caveats apply. (6) `competing_labels_considered` required for "
+                "clusters that prepare_annotation flagged ambiguous. (7) CellTypist+Scimilarity consensus is "
+                "trusted with DEGs as the biological anchor; cross-lineage overrides must pass the high-bar "
+                "consensus override checks described in stage_annotation_evidence."
             ),
             "input_schema": {
                 "type": "object",
@@ -345,13 +2511,19 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "evidence_summary": {
                         "type": "object",
                         "description": (
-                            "Required. Dict mapping cluster_id (as string) to annotation evidence. "
+                            "Optional if stage_annotation_evidence has already staged all clusters. "
+                            "Dict mapping cluster_id (as string) to annotation evidence. "
                             "Each entry must include: 'label' (final cell-type string), "
-                            "'panglaodb_queried' (true/false), 'supporting_genes' (list of marker "
-                            "genes that matched PanglaoDB), 'confidence' ('high'/'medium'/'low'). "
+                            "'panglaodb_queried' (true/false; false is valid for reference+DEG-sufficient "
+                            "clusters), 'supporting_genes' (list of submitted marker genes that overlap "
+                            "this cluster's top DEGs), 'confidence' ('high'/'medium'/'low'). "
                             "When reference labels were used, include 'reference_annotation_support' "
                             "and 'reference_annotation_conflicts' so the final record preserves whether "
                             "CellTypist/Scimilarity agreed with the DEG/PanglaoDB evidence. "
+                            "Include 'source_synthesis' with the CellTypist/Scimilarity/DEG/PanglaoDB-if-used/QC "
+                            "agreement summary and final decision basis. "
+                            "For more than a few clusters, stage evidence with evidence_path rather than "
+                            "passing a large inline JSON string."
                             "When reverse marker lookup was used, include 'reverse_marker_support' "
                             "(candidate PanglaoDB labels and the DEG genes supporting each) and "
                             "'panglaodb_label_used' if the final biological label had to be validated "
@@ -368,8 +2540,10 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                                 "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                                 "reference_annotation_support": {"type": "object"},
                                 "reference_annotation_conflicts": {"type": "array", "items": {"type": "string"}},
+                                "source_synthesis": {"type": "object"},
                                 "reverse_marker_support": {"type": "object"},
                                 "panglaodb_label_used": {"type": "string"},
+                                "external_sources": {"type": "array", "items": {"type": "string"}},
                                 "reasoning": {"type": "string"}
                             },
                             "required": ["label", "panglaodb_queried"]
@@ -377,9 +2551,20 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     },
                     "annotation_key": {"type": "string", "description": "obs column to write labels into (default: reads from adata.uns['annotation_proposal']['annotation_key'] or 'cell_type')"},
                     "cluster_key": {"type": "string", "description": "obs column with cluster ids (default: reads from adata.uns['annotation_proposal']['cluster_key'] or 'leiden')"},
+                    "validate_only": {"type": "boolean", "description": "If true, run all evidence checks and return the validation report without writing adata.obs[annotation_key]. Use this before finalizing large staged evidence."},
+                    "reference_source_unavailable": {
+                        "type": "object",
+                        "description": (
+                            "Optional mapping of missing non-Scimilarity reference sources to concrete "
+                            "unavailable reasons, e.g. {'celltypist': {'reason': 'no_species_compatible_model'}}. "
+                            "Scimilarity unavailability is accepted only when a prior run_scimilarity tool call "
+                            "recorded the blocker; manual finalize_annotation input cannot excuse an available "
+                            "Scimilarity model."
+                        ),
+                    },
                     "overwrite": {"type": "boolean", "description": "If true, overwrite an existing annotation column (default: false — raises an error if the column already exists)"}
                 },
-                "required": ["evidence_summary"]
+                "required": []
             }
         },
         {
@@ -774,7 +2959,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells — presents proposed removals for user confirmation. Call this after first clustering to identify low-quality, low-complexity, doublet-enriched, or ambiguous clusters before annotation.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells; it nominates proposed-removal and ambiguous clusters for structure QC adjudication. Call this after first clustering to identify low-quality, low-complexity, doublet-enriched, or ambiguous clusters before annotation. Also saves a per-cluster QC box-plot figure (one compact multi-panel figure per iteration, metric-flagged clusters highlighted) to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png and returns its path in `qc_metrics_figure` — cite it in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -788,6 +2973,40 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 },
                 "required": []
             }
+        },
+        {
+            "name": "run_cluster_structure_qc",
+            "description": (
+                "Adjudicate proposed/ambiguous cluster-level QC calls with covariance-structure evidence. "
+                "For flagged clusters, selects top informative HVGs, computes gene-gene Pearson correlation "
+                "module metrics, saves clustered correlation heatmaps, and computes technical Moran's I for "
+                "MT% and library size on the existing KNN graph. Does NOT remove cells; returns synthesized "
+                "cleanup recommendations for evidence-based reporting and cleanup decisions."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cluster_key": {"type": "string", "description": "obs column to group by (default: leiden)"},
+                    "clusters_to_analyze": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Cluster IDs to analyze. Defaults to latest run_cluster_qc metric_flagged_clusters + ambiguous clusters.",
+                    },
+                    "n_genes": {"type": "integer", "description": "Maximum genes for structure analysis and heatmap (default: 150)."},
+                    "min_cells": {"type": "integer", "description": "Minimum cells required for correlation structure analysis (default: 15)."},
+                    "moran_min_cells": {"type": "integer", "description": "Minimum cells required for technical Moran's I summaries (default: 40)."},
+                    "corr_threshold": {"type": "number", "description": "Absolute correlation threshold for high-correlation pair fraction (default: 0.3)."},
+                    "figure_dir": {
+                        "type": "string",
+                        "description": (
+                            "Base directory for clustered correlation heatmaps "
+                            "(default: <run_dir>/figures/cluster_qc). The tool creates provenance-safe "
+                            "cluster_key/pass_NNN subdirectories automatically."
+                        ),
+                    },
+                },
+                "required": [],
+            },
         },
         {
             "name": "save_data",
@@ -811,15 +3030,61 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
     meta_tools = [
         {
             "name": "run_code",
-            "description": "FLEXIBLE FALLBACK: Execute custom Python code on the AnnData object. This is your most versatile tool - use it for ANY valid request not covered by specialized tools. Examples: custom plots (variance explained, gene correlations, histograms), data filtering (remove clusters, subset cells), calculations (cluster sizes, gene stats), or any scanpy/pandas operation. Access: adata, sc (scanpy), plt (matplotlib), np, pd, output_dir, Path, ensure_dir(path). Use ensure_dir() to create directories before saving. For destructive edits, build and validate a candidate first, then assign adata = candidate only as the final step. ALWAYS prefer this over saying 'I can't do that'.",
+            "description": "FLEXIBLE FALLBACK: Execute custom Python code on the AnnData object. This is your most versatile tool - use it for ANY valid request not covered by specialized tools. DO NOT `import os`, `import sys`, `subprocess`, or `shutil` — they are hard-blocked. Use the namespace helpers `ensure_dir(path)` (mkdir + return Path), `Path(output_dir) / 'sub'` (path joins), `write_report(name, content)` (save markdown), and `register_artifact(path, role=..., metadata=...)` (record a file you wrote so its absolute path comes back in `result.artifacts_created` for the next tool to use). Access: adata, sc (scanpy), plt (matplotlib), np, pd, output_dir, Path, ensure_dir(path), write_report(name, content), register_artifact(path). Examples: custom plots (variance explained, gene correlations, histograms), data filtering (remove clusters, subset cells), calculations (cluster sizes, gene stats), or any scanpy/pandas operation. For destructive edits, build and validate a candidate first, then assign adata = candidate only as the final step. ALWAYS prefer this over saying 'I can't do that'.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Python code to execute. Has access to: adata, sc, plt, np, pd, output_dir, Path, ensure_dir(), write_report(). Key helpers: ensure_dir(path) creates the dir and returns a Path — use it for figures: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'. write_report(name, content) saves a markdown report to reports/name.md and returns the path — always use this instead of open() when saving text results, never write .txt files. Do NOT import os. For destructive edits, do not mutate adata in-place; create candidate = adata[keep_mask].copy(), validate candidate, then assign adata = candidate as the final step. When loading 10x h5 files with sc.read_10x_h5(), always call .var_names_make_unique() on each AnnData before concatenating. Use series.iloc[pos] not series[pos] for positional pandas access."},
+                    "code": {"type": "string", "description": "Python code to execute. DO NOT `import os`, `import sys`, `subprocess`, or `shutil` — these are hard-blocked and will fail the call. For every filesystem op use the namespace helpers instead: `ensure_dir(path)` to make a directory and return it as a Path; `Path(output_dir) / 'subdir' / 'file.json'` to join paths; `write_report(name, content)` to save markdown to reports/name.md (auto-registers as an artifact). When you write a file with `Path(...).write_text(...)`, `json.dump(...)`, or `fig.savefig(...)` that the *next* tool call will need to reference, call `register_artifact(path)` so its absolute path comes back in `result.artifacts_created` — then paste that path verbatim into the next tool, no guessing. Namespace also provides: adata, sc, plt, np, pd, output_dir, Path. The working directory is set to output_dir for the duration of this call, so bare relative paths like 'evidence.json' land inside the run folder; absolute paths still work normally for reads elsewhere. Example figure save: fig_dir = ensure_dir(Path(output_dir) / 'figures'); out = fig_dir / 'plot.png'; fig.savefig(out); register_artifact(out, role='figure'). Always use write_report() instead of open() when saving text results — never write .txt files. For destructive edits, do not mutate adata in-place; create candidate = adata[keep_mask].copy(), validate candidate, then assign adata = candidate as the final step. When loading 10x h5 files with sc.read_10x_h5(), always call .var_names_make_unique() on each AnnData before concatenating. Use series.iloc[pos] not series[pos] for positional pandas access."},
                     "description": {"type": "string", "description": "Brief description of what the code does"},
                     "save_to": {"type": "string", "description": "Optional path to save adata after execution"}
                 },
                 "required": ["code", "description"]
+            }
+        },
+        {
+            "name": "write_report",
+            "description": (
+                "Write a comprehensive markdown analysis report to reports/<name>.md and return its path. "
+                "Use this for the final analysis report and any saved text result — never write .txt files "
+                "or use open() directly. Put your narrative in `content`: explain the REASONING behind every "
+                "decision — why each QC threshold was chosen, which cells/clusters were removed or kept and "
+                "why, the normalization/HVG choices, clustering resolution, batch correction rationale, and "
+                "for every cluster the annotation call and why it won over competing labels. "
+                "By default the tool then appends a deterministic 'Complete Analysis Record' assembled from "
+                "the session's stored decisions (initial QC thresholds and what was removed/kept, cluster QC "
+                "decisions with their reasons, normalization/HVG, clustering, batch correction, and the full "
+                "per-cluster annotation evidence with reasonings) so the report is exhaustive even if your "
+                "narrative omits something. The report is auto-registered as an artifact."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Report file name without extension; written to reports/<name>.md"},
+                    "content": {"type": "string", "description": "Markdown narrative: your interpretation and the reasoning behind each decision (QC, cleanup, normalization, clustering, batch correction, annotation)."},
+                    "include_analysis_record": {"type": "boolean", "description": "Append the auto-assembled comprehensive decision record from session state (default: true)."}
+                },
+                "required": ["name", "content"]
+            }
+        },
+        {
+            "name": "write_json",
+            "description": (
+                "Write a structured object (or array) to reports/<name>.json and return its absolute path. "
+                "Pass the data as the `data` argument — a real JSON object, NOT a stringified blob. "
+                "Use this whenever you need to persist a large/complex payload to a file, especially "
+                "annotation evidence for `stage_annotation_evidence`/`finalize_annotation`: call "
+                "write_json(name='annotation_evidence', data={...}) then pass the returned path as "
+                "`evidence_path`. This is the correct way to create an evidence file — do NOT build the "
+                "JSON by pasting a long string literal inside `run_code` (long reasoning strings with "
+                "quotes/newlines cause 'unterminated string literal' SyntaxErrors). The file is auto-registered."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "File name without extension; written to reports/<name>.json"},
+                    "data": {"type": ["object", "array"], "description": "The structured data to serialize — a JSON object or array, passed directly (not as a string)."}
+                },
+                "required": ["name", "data"]
             }
         },
         {
@@ -978,6 +3243,42 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "include_history": {"type": "boolean", "description": "Include recent events and resolved decisions (default: true)"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "list_celltypist_models",
+            "description": (
+                "List CellTypist models from the installed CellTypist catalog with inferred organism, "
+                "description, and local cache state. Use this before CellTypist annotation when the "
+                "default immune model may not match the dataset organism/tissue."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "organism": {"type": "string", "enum": ["human", "mouse"], "description": "Optional organism filter."},
+                    "query": {"type": "string", "description": "Optional case-insensitive text filter over model name and description, e.g. PBMC, skin, gut, brain."},
+                    "force_update": {"type": "boolean", "description": "Ask CellTypist to refresh its model catalog before listing (default: false)."},
+                    "limit": {"type": "integer", "description": "Maximum number of model records to return (default: 50)."}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "check_celltypist_model",
+            "description": (
+                "Check whether a specific CellTypist model is compatible with the dataset organism, "
+                "whether it is locally cached, whether download is required, and which alternative "
+                "models may fit the organism/query."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "description": "CellTypist model name or explicit path (default: Immune_All_Low.pkl)."},
+                    "organism": {"type": "string", "enum": ["human", "mouse"], "description": "Dataset organism for compatibility checking."},
+                    "query": {"type": "string", "description": "Optional tissue/context query used to filter recommendations."},
+                    "force_update": {"type": "boolean", "description": "Ask CellTypist to refresh its model catalog before checking (default: false)."}
                 },
                 "required": []
             }
@@ -1305,6 +3606,8 @@ def process_tool_call(
     from ..core.clustering import run_differential_expression, get_top_markers
     from ..annotation import (
         available_celltypist_models_for_organism,
+        celltypist_model_records,
+        check_celltypist_model,
         infer_celltypist_model_organism,
         run_celltypist,
         run_scimilarity,
@@ -1488,23 +3791,70 @@ def process_tool_call(
             for record in get_clustering_registry(adata_obj)
         ]
 
-    def _batch_relevance(goal: Any = None, context: str = "") -> bool:
+    def _batch_relevance(state=None, *, goal: Any = None, context: str = "") -> bool:
         goal_text = str(goal or "").strip().lower()
+        if goal_text in {"batch_correct", "cluster", "annotate", "umap", "deg"}:
+            if state is not None and getattr(state, "n_batches", 0) and getattr(state, "n_batches", 0) > 1:
+                return True
         if goal_text == "batch_correct":
             return True
         context_text = str(context or "").lower()
+        if state is not None and getattr(state, "n_batches", 0) and getattr(state, "n_batches", 0) > 1:
+            if re.search(r"\b(analy[sz]e|cluster|annotat|umap|integrat|multi[- ]sample|samples?|donors?|patients?|libraries|batches)\b", context_text):
+                return True
         return bool(
             re.search(
-                r"\b(batch|integration|integrate|harmony|scanorama|correct(?:ion)?|multi[- ]sample)\b",
+                r"\b(batch|integration|integrate|harmony|scanorama|correct(?:ion)?|multi[- ]sample|samples?|donors?|patients?|libraries)\b",
                 context_text,
             )
         )
 
     def _analysis_guidance(state, *, goal: Any = None, context: str = "") -> Dict[str, Any]:
+        batch_relevant_now = _batch_relevance(state, goal=goal, context=context)
+        batch_strategy = {
+            "status": "not_applicable",
+            "batch_key": state.batch_key,
+            "n_batches": state.n_batches,
+        }
+        if state.batch_key and state.n_batches > 1:
+            if state.batch_correction_applied:
+                batch_strategy = {
+                    "status": "corrected",
+                    "batch_key": state.batch_key,
+                    "n_batches": state.n_batches,
+                    "method": state.batch_correction_method or "unknown",
+                    "next_action": "Use the corrected graph/embedding for UMAP, clustering, and annotation.",
+                }
+            elif state.has_neighbors or state.has_umap or state.has_clusters:
+                batch_strategy = {
+                    "status": "needs_review",
+                    "batch_key": state.batch_key,
+                    "n_batches": state.n_batches,
+                    "next_action": "Score or inspect batch mixing; rerun batch correction if sample structure remains.",
+                }
+            elif state.has_pca:
+                batch_strategy = {
+                    "status": "needs_decision",
+                    "batch_key": state.batch_key,
+                    "n_batches": state.n_batches,
+                    "next_action": "Run score_integration on X_pca and/or run_batch_correction before neighbors/UMAP/clustering.",
+                }
+            else:
+                batch_strategy = {
+                    "status": "pending_pca",
+                    "batch_key": state.batch_key,
+                    "n_batches": state.n_batches,
+                    "next_action": "Carry batch metadata through preprocessing, then decide after PCA.",
+                }
+
         if not state.has_qc_metrics:
             next_priority = "qc_preview"
         elif not state.is_normalized:
             next_priority = "normalize_and_hvg"
+        elif batch_relevant_now and state.has_pca and not state.batch_correction_applied and not state.has_neighbors:
+            next_priority = "batch_strategy"
+        elif batch_relevant_now and state.has_neighbors and not state.batch_correction_applied:
+            next_priority = "review_batch_strategy"
         elif not (state.has_pca and state.has_neighbors and state.has_umap):
             next_priority = "run_pca"
         elif not state.has_clusters:
@@ -1518,13 +3868,12 @@ def process_tool_call(
         else:
             next_priority = "annotation_or_deg"
 
-        batch_relevant_now = _batch_relevance(goal, context)
         notes = [
             "For a routine first pass, keep the workflow QC-first before moving into normalization, embedding, and clustering.",
         ]
         if batch_relevant_now:
             notes.append(
-                "Batch handling is relevant for this request, so confirm the partition column before correction or other batch-sensitive steps."
+                "Batch handling is relevant for this request. For multi-sample data, record a batch strategy before neighbors/UMAP/clustering: run correction, or score/inspect mixing and record why correction is unnecessary."
             )
         else:
             notes.append(
@@ -1534,8 +3883,17 @@ def process_tool_call(
         return {
             "next_priority": next_priority,
             "batch_relevant_now": batch_relevant_now,
+            "batch_strategy": batch_strategy,
             "notes": notes,
         }
+
+    def _batch_correction_present(adata_obj) -> bool:
+        if adata_obj is None:
+            return False
+        return bool(
+            adata_obj.uns.get("bbknn_batch_key") is not None
+            or any(key in adata_obj.obsm for key in ("X_pca_harmony", "X_scVI", "X_scanorama"))
+        )
 
     def _available_annotation_keys(adata_obj) -> List[str]:
         ocd = _obs_columns_detail(adata_obj.obs, adata_obj.n_obs).get("columns", {})
@@ -2647,7 +5005,7 @@ def process_tool_call(
             import matplotlib.pyplot as plt
 
             code = tool_input["code"]
-            description = tool_input["description"]
+            description = tool_input.get("description") or "Custom Python code"
             save_to = tool_input.get("save_to")
             save_warning = None
 
@@ -2656,15 +5014,69 @@ def process_tool_call(
             forbidden = ["import os", "import sys", "subprocess", "eval(",
                         "__import__", "rm -rf", "shutil.rmtree", "requests.",
                         "os.system", "os.popen", "os.exec"]
+            # Map each forbidden token to a concrete in-namespace replacement so
+            # the agent does not retry with the same banned idiom.
+            _filesystem_alternative = (
+                "Use the run_code namespace helpers instead — they cover every legitimate filesystem op:\n"
+                "  • Make a directory: ensure_dir(Path(output_dir) / 'subdir')\n"
+                "  • Join paths:       Path(output_dir) / 'subdir' / 'file.json'\n"
+                "  • Save text/report: write_report('name', content)  → reports/name.md\n"
+                "  • Save figure:      fig_dir = ensure_dir(Path(output_dir) / 'figures'); fig.savefig(fig_dir / 'plot.png')\n"
+                "  • Save JSON:        (Path(output_dir) / 'evidence.json').write_text(json.dumps(...))"
+            )
+            _forbidden_guidance = {
+                "import os": _filesystem_alternative,
+                "os.system": _filesystem_alternative,
+                "os.popen": _filesystem_alternative,
+                "os.exec": _filesystem_alternative,
+                "shutil.rmtree": "Removing files/directories from run_code is not allowed. If you need to drop cells, build a keep-mask candidate (candidate = adata[mask].copy()) and assign adata = candidate instead.",
+                "import sys": "sys is not needed inside run_code — the agent already manages the Python process. If you need a path constant, use output_dir or Path(__file__).",
+                "subprocess": "Shell-outs are not allowed from run_code. Use the run_shell tool for legitimate shell commands.",
+                "__import__": "Dynamic imports are blocked. Import normally at the top of your snippet or use what is already in the namespace (sc, np, pd, plt, Path).",
+                "eval(": "eval() is blocked. Build the value directly in code rather than evaluating a string.",
+                "requests.": "Network calls from run_code are not allowed. Use the fetch_url or search_papers tool for HTTP.",
+                "rm -rf": "Shell deletion is blocked. Build candidate AnnData via masking instead of deleting files.",
+            }
             for f in forbidden:
                 if f in code:
+                    guidance = _forbidden_guidance.get(f, _filesystem_alternative)
                     return _error_result(
                         tool="run_code",
-                        message=f"Forbidden operation: {f}. Use Path from namespace for file operations.",
+                        message=(
+                            f"Forbidden operation: {f!r} is blocked inside run_code.\n\n"
+                            f"{guidance}"
+                        ),
                         adata_obj=adata,
                         recovery_options=[
-                            "Rewrite the code using the provided namespace (Path, ensure_dir, write_report).",
+                            "Rewrite the snippet using ensure_dir / Path / write_report from the run_code namespace — do NOT retry with the same import or call.",
                             "For shell commands, use the run_shell tool instead.",
+                            "For HTTP, use fetch_url or search_papers.",
+                        ],
+                    )
+
+            provenance_bypass_patterns = [
+                (
+                    r"\badata\s*\[[^\]]+\]\s*\.\s*write(?:_h5ad)?\s*\(",
+                    "Do not write a primary AnnData subset to disk from run_code. "
+                    "This can bypass cleanup provenance and destructive-removal preflight.",
+                ),
+                (
+                    r"\badata\s*=\s*(?:sc|ad|anndata)\.read_h5ad\s*\(",
+                    "Do not replace the primary AnnData by reading an h5ad inside run_code. "
+                    "Use load_data for intentional dataset switches; use native cleanup tools or "
+                    "authorized validated subsetting for cell removal.",
+                ),
+            ]
+            for pattern, message in provenance_bypass_patterns:
+                if re.search(pattern, code, flags=re.DOTALL):
+                    return _error_result(
+                        tool="run_code",
+                        message=message,
+                        adata_obj=adata,
+                        recovery_options=[
+                            "If the goal is cleanup, run run_cluster_structure_qc and remove only the synthesized clusters.",
+                            "If structure QC synthesized no removal set, keep the reviewed clusters and continue with analysis.",
+                            "If the user explicitly requests a different dataset, use load_data rather than sc.read_h5ad in run_code.",
                         ],
                     )
 
@@ -2751,6 +5163,20 @@ def process_tool_call(
                         )
                         if assign_match:
                             labels = _literal_string_list(assign_match.group(1))
+                        if not labels:
+                            # Detect the common bypass pattern:
+                            #   clusters_to_keep = [...]
+                            #   clusters_to_keep.remove('15')
+                            #   keep_mask = adata.obs[key].isin(clusters_to_keep)
+                            #   adata = adata[keep_mask].copy()
+                            # In this case the labels removed from the keep-list are
+                            # exactly the clusters being filtered out.
+                            removed_from_keep = re.findall(
+                                rf"{re.escape(isin_arg)}\.remove\(\s*['\"]([^'\"]+)['\"]\s*\)",
+                                code,
+                            )
+                            if removed_from_keep:
+                                labels = [str(label) for label in removed_from_keep]
                 else:
                     comparison_match = re.search(
                         rf"{obs_ref}\s*(==|!=)\s*['\"]([^'\"]+)['\"]",
@@ -2772,6 +5198,29 @@ def process_tool_call(
                     "observed_cells": observed,
                 }
 
+            def _primary_adata_subset_reassignment_detected() -> bool:
+                """Detect primary AnnData replacement via row-subset copy.
+
+                This catches non-literal keep-mask variants that intentionally
+                avoid the exact cluster-removal regex. If the code reassigns the
+                live `adata` to a subset, but we cannot extract a verifiable
+                cluster-removal plan, the safe behavior is to block before
+                execution.
+                """
+                subset_vars = set(
+                    re.findall(
+                        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*adata\s*\[[^\]]+\]\s*\.copy\s*\(",
+                        code,
+                        flags=re.DOTALL,
+                    )
+                )
+                if re.search(r"\badata\s*=\s*adata\s*\[[^\]]+\]\s*\.copy\s*\(", code, flags=re.DOTALL):
+                    return True
+                for var_name in subset_vars:
+                    if re.search(rf"\badata\s*=\s*{re.escape(var_name)}\b", code):
+                        return True
+                return False
+
             def _validate_cleanup_authorization(plan: Dict[str, Any]) -> Dict[str, Any]:
                 authorization = tool_input.get("cleanup_authorization") or {}
                 proposal = authorization.get("proposal") or {}
@@ -2792,7 +5241,7 @@ def process_tool_call(
                     check["failures"].append("No cleanup authorization was provided.")
                     return check
 
-                if source in {"auto_policy", "user_confirmation"}:
+                if source in {"auto_policy", "auto_structure_qc", "user_confirmation"}:
                     proposal_key = proposal.get("cluster_key")
                     proposal_labels = {str(label) for label in proposal.get("proposed_removal", [])}
                     plan_labels = {str(label) for label in plan.get("labels", [])}
@@ -2834,8 +5283,108 @@ def process_tool_call(
                             "Only remove clusters that match the current cluster QC proposal and cell counts.",
                         ],
                     )
+            elif _primary_adata_subset_reassignment_detected():
+                return _error_result(
+                    tool="run_code",
+                    message=(
+                        "Primary AnnData row-subsetting was detected, but the code does not expose a "
+                        "verifiable authorized cluster-removal plan. This can bypass cleanup provenance "
+                        "and destructive-removal preflight."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "If structure QC synthesized a cleanup set, remove exactly those clusters using a literal clusters_to_remove list.",
+                        "If structure QC synthesized no removal set, keep the reviewed clusters and continue with analysis.",
+                        "If the user wants an explicit override, create a proper cleanup checkpoint/proposal first; do not bypass via keep-mask subsetting.",
+                    ],
+                )
 
-            # Soft warning: direct obs annotation assignment without the prepare/finalize workflow
+            # Hard block: direct cluster-to-label annotation bypass.
+            # Catches the canonical anti-pattern
+            #   adata.obs['cell_type'] = adata.obs['leiden'].map({0: 'T cell', ...})
+            # which sidesteps the prepare_annotation → conditional external adjudication → finalize_annotation
+            # validation chain.
+            _cluster_keys_known: set = set()
+            if world_state is not None:
+                try:
+                    for _rec in (getattr(world_state, "clustering_registry", []) or []):
+                        if isinstance(_rec, dict) and _rec.get("key"):
+                            _cluster_keys_known.add(str(_rec["key"]).lower())
+                except Exception:
+                    pass
+            _cluster_name_tokens = ("leiden", "louvain", "phenograph", "cluster")
+
+            for _match in re.finditer(
+                r'\badata\.obs\s*\[\s*[\'"]([^\'"]+)[\'"]\s*\]\s*=\s*'
+                r'adata\.obs\s*\[\s*[\'"]([^\'"]+)[\'"]\s*\]\s*\.\s*map\s*\(\s*(\{[^}]{0,4000}\})',
+                code,
+                flags=re.DOTALL,
+            ):
+                lhs_col = _match.group(1)
+                rhs_col = _match.group(2)
+                map_literal = _match.group(3) or ""
+                rhs_lower = rhs_col.lower()
+                lhs_lower = lhs_col.lower()
+                is_cluster_rhs = (
+                    rhs_lower in _cluster_keys_known
+                    or any(tok in rhs_lower for tok in _cluster_name_tokens)
+                )
+                # Quoted string values on the RHS dict are a strong tell that
+                # this is a label dict rather than a numeric remap.
+                has_string_values = bool(
+                    re.search(r":\s*[\'\"][A-Za-z][^\'\"]{0,200}[\'\"]", map_literal)
+                )
+                # An LHS that looks like an annotation column reinforces the signal.
+                looks_like_annotation_lhs = any(
+                    tok in lhs_lower
+                    for tok in ("cell_type", "celltype", "annotation", "label", "ident")
+                )
+                if not (is_cluster_rhs and (has_string_values or looks_like_annotation_lhs)):
+                    continue
+
+                _validated = False
+                if adata is not None and hasattr(adata, "uns"):
+                    _val = adata.uns.get("annotation_validation") or {}
+                    _validated = bool(
+                        isinstance(_val, dict)
+                        and _val.get("panglaodb_validated")
+                        and _val.get("finalized")
+                    )
+                if _validated:
+                    # Already validated this proposal — allow the assignment.
+                    continue
+
+                _proposal_exists = bool(
+                    adata is not None
+                    and hasattr(adata, "uns")
+                    and (adata.uns.get("annotation_proposal") or {}).get("cluster_ids")
+                )
+                return _error_result(
+                    tool="run_code",
+                    message=(
+                        f"Direct cluster-to-label annotation bypass detected: "
+                        f"adata.obs[{lhs_col!r}] = adata.obs[{rhs_col!r}].map({{...}}). "
+                        "Cell-type labels must go through prepare_annotation → conditional external adjudication → "
+                        "finalize_annotation so they are validated against reference labels, cluster DEGs, and "
+                        "PanglaoDB where required. "
+                        "Refusing to write annotation column without validation."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        (
+                            "Call prepare_annotation to extract DEGs and identify clusters that require PanglaoDB adjudication."
+                            if not _proposal_exists else
+                            "A proposal already exists; query PanglaoDB only for required clusters, then finalize_annotation."
+                        ),
+                        "Stage reference+DEG evidence for optional clusters and PanglaoDB evidence for required clusters.",
+                        "Stage evidence with stage_annotation_evidence, then call finalize_annotation to write labels.",
+                    ],
+                )
+
+            # Soft warning: direct obs annotation assignment without the prepare/finalize workflow.
+            # Intentionally excludes type-conversion and boolean idioms so we do not
+            # warn for benign computations. The targeted hard block above catches
+            # the cluster→label .map() bypass even when .map( is excluded here.
             _anno_assign = re.search(
                 r'\badata\.obs\s*\[\s*[\'"][^\'"]+[\'"]\s*\]\s*='
                 r'(?!.*\.astype|.*\.map\(|.*int|.*float|.*bool|.*isin)',
@@ -2850,13 +5399,13 @@ def process_tool_call(
                         "name": "direct_annotation_assignment",
                         "status": "warning",
                         "details": (
-                            "Direct obs column assignment detected. If this is a cell-type annotation, "
-                            "use prepare_annotation → PanglaoDB queries → finalize_annotation instead "
+                        "Direct obs column assignment detected. If this is a cell-type annotation, "
+                            "use prepare_annotation → conditional external adjudication → finalize_annotation instead "
                             "of assigning labels directly in run_code. "
-                            + ("prepare_annotation has been called; proceed to PanglaoDB queries then finalize_annotation."
+                            + ("prepare_annotation has been called; query PanglaoDB only for required clusters, then finalize_annotation."
                                if _proposal_exists else
                                "prepare_annotation has NOT been called yet — call it first to get DEGs, "
-                               "scoring, and the list of PanglaoDB queries needed before finalizing labels.")
+                               "scoring, and the required/optional adjudication lists before finalizing labels.")
                         ),
                     })
 
@@ -2868,13 +5417,70 @@ def process_tool_call(
                 p.mkdir(parents=True, exist_ok=True)
                 return p
 
-            _run_dir = _Path(tool_input.get("output_dir", "."))
+            _run_dir = _Path(tool_input.get("output_dir", ".")).resolve()
+            _run_dir.mkdir(parents=True, exist_ok=True)
+
+            # Track files produced by user code so they can be surfaced in the
+            # tool result. Anything register_artifact()'d (or written via
+            # write_report) appears in result.artifacts_created with an
+            # absolute path the next tool call can paste verbatim.
+            _written_artifacts: List[Dict[str, Any]] = []
+
+            def _register_artifact_record(path, role=None, metadata=None):
+                # Resolve to an absolute path, anchoring relative inputs in the
+                # run directory (run_code chdirs into _run_dir, so this matches
+                # what the user code actually wrote).
+                try:
+                    p = _Path(path)
+                except Exception:
+                    return None
+                try:
+                    if p.is_absolute():
+                        abs_p = p.resolve()
+                    elif p.exists():
+                        abs_p = p.resolve()
+                    else:
+                        abs_p = (_run_dir / p).resolve()
+                except Exception:
+                    abs_p = p
+                # Build an ArtifactRecord-compliant dict via the shared helper
+                # so world_state.register_artifact accepts it. Falls back to a
+                # minimal dict if the closure isn't available for some reason.
+                try:
+                    rec = _artifact_payload(
+                        str(abs_p),
+                        role=str(role) if role else "artifact",
+                        metadata=dict(metadata) if isinstance(metadata, dict) else {},
+                    )
+                except Exception:
+                    rec = None
+                if not isinstance(rec, dict):
+                    rec = {
+                        "path": str(abs_p),
+                        "role": str(role) if role else "artifact",
+                        "metadata": dict(metadata) if isinstance(metadata, dict) else {},
+                    }
+                # Deduplicate by absolute path.
+                for existing in _written_artifacts:
+                    if existing.get("path") == rec.get("path"):
+                        if role and not existing.get("role"):
+                            existing["role"] = rec.get("role", "artifact")
+                        new_meta = rec.get("metadata") or {}
+                        if new_meta:
+                            existing_meta = existing.get("metadata") or {}
+                            existing_meta.update(new_meta)
+                            existing["metadata"] = existing_meta
+                        return existing
+                _written_artifacts.append(rec)
+                return rec
 
             def write_report(name: str, content: str) -> str:
                 """Write a markdown report to reports/name.md and return the path.
 
                 Always use this instead of open() when saving analysis results —
                 it ensures reports land in the right directory as readable .md files.
+                The returned path is also auto-registered as an artifact so it
+                appears in the tool result's artifacts_created list.
 
                 Example:
                     write_report('cluster_summary', '## Cluster Summary\\n\\n...')
@@ -2883,7 +5489,24 @@ def process_tool_call(
                 safe_name = name.replace(" ", "_").rstrip(".md")
                 path = reports_dir / f"{safe_name}.md"
                 path.write_text(content)
+                _register_artifact_record(path, role="report", metadata={"name": safe_name})
                 return str(path)
+
+            def register_artifact(path, role: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
+                """Record a file written by this run_code call so its absolute
+                path comes back in result.artifacts_created.
+
+                Call this after fig.savefig(), json.dump(), or any direct file
+                write you want the next tool call to be able to reference by
+                path. The returned dict has an absolute ``path`` field plus
+                optional ``role`` and ``metadata``.
+
+                Example:
+                    p = Path(output_dir) / "evidence.json"
+                    p.write_text(json.dumps(evidence))
+                    register_artifact(p, role="annotation_evidence_json")
+                """
+                return _register_artifact_record(path, role=role, metadata=metadata)
 
             # Execute in controlled namespace
             # Note: Path and ensure_dir are provided - no need to import os
@@ -2895,10 +5518,11 @@ def process_tool_call(
                 "plt": plt,
                 "scanpy": sc,
                 "matplotlib": matplotlib,
-                "output_dir": tool_input.get("output_dir", "."),
+                "output_dir": str(_run_dir),
                 "Path": _Path,
                 "ensure_dir": ensure_dir,
                 "write_report": write_report,
+                "register_artifact": register_artifact,
             }
 
             # Capture stdout so LLM can see print outputs
@@ -2913,8 +5537,10 @@ def process_tool_call(
             import warnings as _warnings
             exec_error = None
             _caught = []
+            _orig_cwd = os.getcwd()
             try:
                 sys.stdout = stdout_capture
+                os.chdir(_run_dir)
                 with _warnings.catch_warnings(record=True) as _caught:
                     _warnings.simplefilter("always")
                     exec(code, namespace)
@@ -2922,6 +5548,10 @@ def process_tool_call(
                 exec_error = _exec_err
             finally:
                 sys.stdout = old_stdout
+                try:
+                    os.chdir(_orig_cwd)
+                except Exception:
+                    pass
 
             captured_output = stdout_capture.getvalue()
 
@@ -3036,6 +5666,10 @@ def process_tool_call(
                 result["code_file"] = code_file
             if custom_output_path:
                 result["output_path"] = str(custom_output_path)
+                # Auto-register so it also appears in artifacts_created.
+                _register_artifact_record(custom_output_path, role="output_path")
+            if _written_artifacts:
+                result["artifacts_created"] = list(_written_artifacts)
             if captured_output:
                 # Truncate if too long
                 result["output"] = captured_output[:2000]
@@ -3447,6 +6081,103 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "write_report":
+            name = str(tool_input.get("name") or "analysis_report").strip() or "analysis_report"
+            safe_name = re.sub(r"\s+", "_", name)
+            if safe_name.endswith(".md"):
+                safe_name = safe_name[:-3]
+            content = tool_input.get("content") or ""
+            include_record = tool_input.get("include_analysis_record", True)
+
+            sections: List[str] = []
+            if isinstance(content, str) and content.strip():
+                sections.append(content.strip())
+            record = ""
+            if include_record:
+                try:
+                    record = _assemble_analysis_record(world_state, adata)
+                except Exception as exc:  # defensive: a report should never hard-fail
+                    record = f"_(Analysis record could not be assembled: {exc})_"
+                if record:
+                    sections.append("---\n\n# Complete Analysis Record\n\n" + record)
+            report_md = "\n\n".join(sections) if sections else "# Report\n\n(No content provided.)"
+
+            if run_manager is not None:
+                report_path = run_manager.write_text_report(safe_name, report_md, ext="md")
+            else:
+                reports_dir = Path.cwd() / "reports"
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                report_path = str(reports_dir / f"{safe_name}.md")
+                Path(report_path).write_text(report_md)
+
+            artifact = _artifact_payload(report_path, role="report", metadata={"name": safe_name})
+            result = {
+                "status": "ok",
+                "tool": "write_report",
+                "report_path": report_path,
+                "name": safe_name,
+                "included_analysis_record": bool(include_record) and bool(record),
+                "n_chars": len(report_md),
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result, adata,
+                dataset_changed=False,
+                summary=f"Wrote report '{safe_name}.md' ({len(report_md)} chars).",
+                artifacts_created=[artifact] if artifact else [],
+            )
+
+        elif tool_name == "write_json":
+            name = str(tool_input.get("name") or "data").strip() or "data"
+            safe_name = re.sub(r"\s+", "_", name)
+            if safe_name.endswith(".json"):
+                safe_name = safe_name[:-5]
+            data = tool_input.get("data")
+            if isinstance(data, str):
+                # Tolerate a stringified payload (json / python-literal / trailing
+                # commas). Genuinely truncated blobs still fail -> clear error.
+                parsed = _loads_tolerant(data)
+                if parsed is None:
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "write_json",
+                        "message": "`data` must be a JSON object or array, not a string. Pass the structured data directly (data={...}), not a quoted/serialized blob.",
+                        "recovery_options": ["Call write_json with data as a real object: data={\"0\": {...}, \"1\": {...}}."],
+                    }, indent=2), adata
+                data = parsed
+            if not isinstance(data, (dict, list)):
+                return json.dumps({
+                    "status": "error",
+                    "tool": "write_json",
+                    "message": f"`data` must be a JSON object or array (got {type(data).__name__}).",
+                    "recovery_options": ["Pass the evidence/payload as data={...} or data=[...]."],
+                }, indent=2), adata
+
+            if run_manager is not None:
+                json_path = run_manager.write_json_report(safe_name, data)
+            else:
+                reports_dir = Path.cwd() / "reports"
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                json_path = str(reports_dir / f"{safe_name}.json")
+                Path(json_path).write_text(json.dumps(data, indent=2))
+
+            artifact = _artifact_payload(json_path, role="json", metadata={"name": safe_name})
+            n_entries = len(data) if isinstance(data, (dict, list)) else None
+            result = {
+                "status": "ok",
+                "tool": "write_json",
+                "json_path": json_path,
+                "name": safe_name,
+                "n_entries": n_entries,
+                "state": make_state(adata),
+            }
+            return _finalize_result(
+                result, adata,
+                dataset_changed=False,
+                summary=f"Wrote JSON '{safe_name}.json' ({n_entries} top-level entries).",
+                artifacts_created=[artifact] if artifact else [],
+            )
+
         elif tool_name == "run_shell":
             import subprocess
             import shlex
@@ -3618,12 +6349,15 @@ def process_tool_call(
                     "confirmed_batch_key": confirmed_batch_key,
                     "inferred_batch_key": state.batch_key,
                     "n_batches": state.n_batches,
+                    "batch_correction_applied": state.batch_correction_applied,
+                    "batch_correction_method": state.batch_correction_method,
                     "status": batch_resolution.status,
                     "recommended_batch_key": batch_resolution.recommended_column,
                     "recommended_role": batch_resolution.recommended_role,
                     "needs_confirmation": batch_resolution.needs_user_confirmation,
                     "reason": batch_resolution.reason,
                     "relevance": "current" if guidance["batch_relevant_now"] else "later_optional",
+                    "strategy": guidance["batch_strategy"],
                     "candidates": [
                         metadata_candidate_to_dict(candidate)
                         for candidate in state.metadata_candidates
@@ -3719,6 +6453,96 @@ def process_tool_call(
                         ),
                     ],
                 ),
+            )
+
+        elif tool_name == "list_celltypist_models":
+            organism = (tool_input.get("organism") or "").strip().lower()
+            if organism not in {"human", "mouse"}:
+                organism = None
+            query = tool_input.get("query")
+            force_update = bool(tool_input.get("force_update", False))
+            limit = int(tool_input.get("limit", 50))
+            try:
+                records = celltypist_model_records(
+                    organism=organism,
+                    query=query,
+                    force_update=force_update,
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="list_celltypist_models",
+                    message=f"Could not read CellTypist model catalog: {e}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Check that CellTypist is installed in the active environment.",
+                        "Retry with force_update=false if catalog refresh failed due network access.",
+                    ],
+                    install_hint="pip install celltypist" if "celltypist" in str(e).lower() else None,
+                )
+            shown = records[:limit]
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "list_celltypist_models",
+                    "organism": organism,
+                    "query": query,
+                    "force_update": force_update,
+                    "n_models": len(records),
+                    "n_returned": len(shown),
+                    "models": shown,
+                    "model_discovery": {
+                        "list_models_code": "celltypist.models.models_description()",
+                        "download_model_code": "celltypist.models.download_models(model='<model>.pkl')",
+                        "refresh_catalog_code": "celltypist.models.download_models(force_update=True)",
+                        "official_models_url": "https://www.celltypist.org/models",
+                    },
+                },
+                adata,
+                dataset_changed=False,
+                summary=f"Listed {len(shown)} CellTypist model(s).",
+            )
+
+        elif tool_name == "check_celltypist_model":
+            model = tool_input.get("model") or "Immune_All_Low.pkl"
+            organism = (tool_input.get("organism") or "").strip().lower()
+            if organism not in {"human", "mouse"}:
+                organism = None
+            query = tool_input.get("query")
+            force_update = bool(tool_input.get("force_update", False))
+            try:
+                check = check_celltypist_model(
+                    model,
+                    organism=organism,
+                    query=query,
+                    force_update=force_update,
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="check_celltypist_model",
+                    message=f"Could not check CellTypist model '{model}': {e}",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Use list_celltypist_models to inspect available model names.",
+                        "Retry with force_update=false if catalog refresh failed due network access.",
+                    ],
+                    install_hint="pip install celltypist" if "celltypist" in str(e).lower() else None,
+                    extra={"model": model, "requested_organism": organism},
+                )
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "check_celltypist_model",
+                    **check,
+                    "model_discovery": {
+                        "list_models_code": "celltypist.models.models_description()",
+                        "download_model_code": "celltypist.models.download_models(model='<model>.pkl')",
+                        "refresh_catalog_code": "celltypist.models.download_models(force_update=True)",
+                        "official_models_url": "https://www.celltypist.org/models",
+                    },
+                },
+                adata,
+                dataset_changed=False,
+                summary=f"Checked CellTypist model '{model}'.",
             )
 
         elif tool_name == "list_artifacts":
@@ -4009,9 +6833,10 @@ def process_tool_call(
             if not artifact_path:
                 raise ValueError("Provide artifact_path/figure_path or artifact_id to review an artifact.")
 
-            artifact_path = os.path.abspath(artifact_path)
-            if not os.path.exists(artifact_path):
+            _resolved_artifact = _resolve_run_path(artifact_path, run_manager=run_manager, must_exist=True)
+            if _resolved_artifact is None:
                 raise FileNotFoundError(f"Artifact not found: {artifact_path}")
+            artifact_path = str(_resolved_artifact)
 
             artifact_kind = _artifact_kind_from_path(artifact_path)
             result = {
@@ -5383,7 +8208,22 @@ def process_tool_call(
                 return int(np.argmax(dist)) + 1  # 1-indexed
 
             elbow_pc = _find_pca_elbow(variance_ratios)
-            suggested_n_pcs = min(elbow_pc + 5, n_shown)
+            elbow_buffer_n_pcs = 10
+            elbow_buffered_n_pcs = min(elbow_pc + elbow_buffer_n_pcs, n_shown)
+            conservative_floor_n_pcs = min(30, n_shown)
+            suggested_n_pcs = max(elbow_buffered_n_pcs, conservative_floor_n_pcs)
+            pca_selection_rationale = (
+                f"Elbow detection placed the knee at PC{elbow_pc}. The buffered knee keeps "
+                f"{elbow_buffered_n_pcs} PCs by adding {elbow_buffer_n_pcs} PCs beyond the knee, "
+                "which is a conservative margin meant to retain biological signal that may sit "
+                "just past the sharpest variance drop, not treating the knee as a hard cutoff. "
+                f"The tool recommends {suggested_n_pcs} PCs because single-cell analyses usually "
+                f"benefit from retaining at least {conservative_floor_n_pcs} PCs when available, "
+                "so subtler immune states, rare populations, and technical structure are not "
+                "discarded too early. "
+                "The agent should still override this with explicit reasoning if the dataset "
+                "is very small, clearly over-noisy, or the user/source specifies a different value."
+            )
 
             # Scree plot
             scree_path = None
@@ -5394,7 +8234,9 @@ def process_tool_call(
                 import matplotlib.pyplot as _plt
 
                 _base = Path(run_manager.run_dir) if run_manager else Path(".")
-                scree_path = str(ensure_dir(_base / "figures") / "pca_variance_explained.png")
+                figures_dir = _base / "figures"
+                figures_dir.mkdir(parents=True, exist_ok=True)
+                scree_path = str(figures_dir / "pca_variance_explained.png")
 
                 pcs = np.arange(1, n_shown + 1)
                 cumvar = np.cumsum(variance_ratios) * 100
@@ -5440,7 +8282,11 @@ def process_tool_call(
                 "variance_explained_total": float(variance_ratios.sum()),
                 "variance_ratio_per_pc": [round(float(v), 5) for v in variance_ratios],
                 "elbow_pc": elbow_pc,
+                "elbow_buffer_n_pcs": elbow_buffer_n_pcs,
+                "elbow_buffered_n_pcs": elbow_buffered_n_pcs,
+                "conservative_floor_n_pcs": conservative_floor_n_pcs,
                 "suggested_n_pcs": suggested_n_pcs,
+                "pca_selection_rationale": pca_selection_rationale,
                 "scree_plot": scree_path,
                 "side_effects": {
                     "pca_computed": True,
@@ -5459,7 +8305,11 @@ def process_tool_call(
                 result,
                 adata,
                 dataset_changed=True,
-                summary=f"Ran PCA with n_comps={n_comps}; elbow at PC{elbow_pc}, suggested n_pcs={suggested_n_pcs} for run_neighbors.",
+                summary=(
+                    f"Ran PCA with n_comps={n_comps}; elbow at PC{elbow_pc}, "
+                    f"elbow+{elbow_buffer_n_pcs}={elbow_buffered_n_pcs}, suggested n_pcs={suggested_n_pcs} "
+                    "for run_neighbors."
+                ),
                 verification=_build_verification(
                     "passed",
                     "PCA was computed without downstream graph or embedding side effects.",
@@ -5494,6 +8344,17 @@ def process_tool_call(
                     ],
                     extra={"available_representations": available_reps},
                 )
+
+            if use_rep == "X_pca" and not _batch_correction_present(adata):
+                batch_resolution = resolve_batch_metadata(adata)
+                batch_key = batch_resolution.applied_column
+                n_batches = int(adata.obs[batch_key].nunique(dropna=True)) if batch_key else 0
+                if n_batches > 1:
+                    warnings.append(
+                        f"Detected {n_batches} groups in batch key '{batch_key}' and no recorded batch correction. "
+                        "For open-ended multi-sample analyses, run score_integration and/or run_batch_correction "
+                        "before building an uncorrected PCA neighbor graph unless this is intentional."
+                    )
 
             compute_neighbors(
                 adata,
@@ -5571,6 +8432,16 @@ def process_tool_call(
             spread = float(tool_input.get("spread", 1.0))
             n_components = int(tool_input.get("n_components", 2))
             random_state = int(tool_input.get("random_state", 0))
+
+            if not _batch_correction_present(adata):
+                batch_resolution = resolve_batch_metadata(adata)
+                batch_key = batch_resolution.applied_column
+                n_batches = int(adata.obs[batch_key].nunique(dropna=True)) if batch_key else 0
+                if n_batches > 1:
+                    warnings.append(
+                        f"Detected {n_batches} groups in batch key '{batch_key}' and no recorded batch correction. "
+                        "UMAP will reflect the existing uncorrected neighbor graph unless batch correction is run first."
+                    )
 
             compute_umap(
                 adata,
@@ -5909,6 +8780,9 @@ def process_tool_call(
                 return json.dumps({
                     "status": "needs_input",
                     "tool": "run_celltypist",
+                    "reference_source": "celltypist",
+                    "unavailable_reference_source": "celltypist",
+                    "unavailable_reason": "organism_ambiguous",
                     "message": (
                         "CellTypist needs dataset organism before using "
                         f"model '{model}'. The model appears to be {model_organism}, "
@@ -5940,6 +8814,9 @@ def process_tool_call(
                 return json.dumps({
                     "status": "needs_input",
                     "tool": "run_celltypist",
+                    "reference_source": "celltypist",
+                    "unavailable_reference_source": "celltypist",
+                    "unavailable_reason": "species_model_mismatch",
                     "message": (
                         f"Refusing to run CellTypist model '{model}' because the "
                         f"dataset organism is '{organism}', but the model appears "
@@ -5978,7 +8855,12 @@ def process_tool_call(
                         "Run clustering first, then rerun CellTypist.",
                         "Choose one of the available clustering keys for annotation.",
                     ],
-                    extra={"requested_cluster_key": cluster_key},
+                    extra={
+                        "reference_source": "celltypist",
+                        "unavailable_reference_source": "celltypist",
+                        "unavailable_reason": "missing_clustering",
+                        "requested_cluster_key": cluster_key,
+                    },
                 )
             if majority:
                 cluster_key = _validate_obs_column(
@@ -5998,21 +8880,63 @@ def process_tool_call(
                     majority_voting=majority,
                     over_clustering=cluster_key if majority else None,
                 )
-            except ValueError as e:
+            except (ValueError, RuntimeError, ImportError) as e:
                 # Most often: missing raw-counts layer when adata.X is already
                 # log-normalized. Surface a recoverable error rather than
                 # crashing the tool loop.
-                return _error_result(
-                    tool="run_celltypist",
-                    message=str(e),
-                    adata_obj=adata,
-                    recovery_options=[
+                message = str(e)
+                lower_message = message.lower()
+                if "raw integer counts" in lower_message or "raw-counts layer" in lower_message:
+                    unavailable_reason = "raw_counts_missing"
+                    recovery_options = [
                         "Ensure raw integer counts are in adata.layers['raw_counts'] "
                         "before running CellTypist (normalize_and_hvg preserves them "
                         "automatically; data loaded externally may not).",
                         "If you have raw counts under a different layer name, "
                         "pass it as raw_layer when invoking via run_code.",
-                    ],
+                    ]
+                elif "download failed" in lower_message:
+                    unavailable_reason = "model_download_failed"
+                    recovery_options = [
+                        "Use list_celltypist_models to choose a model already cached locally.",
+                        "Retry later if CellTypist model hosting or network access was unavailable.",
+                        "Use Scimilarity and marker validation while recording CellTypist as unavailable.",
+                    ]
+                elif "model path does not exist" in lower_message:
+                    unavailable_reason = "model_path_missing"
+                    recovery_options = [
+                        "Choose an existing explicit model path.",
+                        "Use a named CellTypist catalog model instead of a path.",
+                        "Use Scimilarity and marker validation while recording CellTypist as unavailable.",
+                    ]
+                elif isinstance(e, ImportError):
+                    unavailable_reason = "package_missing"
+                    recovery_options = [
+                        "Install CellTypist in the active environment.",
+                        "Use Scimilarity and marker validation while recording CellTypist as unavailable.",
+                    ]
+                else:
+                    unavailable_reason = "model_runtime_error"
+                    recovery_options = [
+                        "Use check_celltypist_model to verify species compatibility and cache/download state.",
+                        "Use list_celltypist_models to choose another compatible model.",
+                        "Use Scimilarity and marker validation while recording CellTypist as unavailable.",
+                    ]
+                return _error_result(
+                    tool="run_celltypist",
+                    message=message,
+                    adata_obj=adata,
+                    recovery_options=recovery_options,
+                    install_hint="pip install celltypist" if isinstance(e, ImportError) else None,
+                    extra={
+                        "reference_source": "celltypist",
+                        "unavailable_reference_source": "celltypist",
+                        "unavailable_reason": unavailable_reason,
+                        "model": model,
+                        "requested_organism": organism or None,
+                        "model_organism": model_organism,
+                        "model_info": model_info,
+                    },
                 )
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_celltypist")
@@ -6047,6 +8971,8 @@ def process_tool_call(
                 "model_organism": celltypist_meta.get("model_organism") or model_organism,
                 "model_organism_source": celltypist_meta.get("model_organism_source") or model_info.get("source"),
                 "model_description": celltypist_meta.get("model_description") or model_info.get("description"),
+                "model_cached": celltypist_meta.get("model_cached"),
+                "model_cache_path": celltypist_meta.get("model_cache_path"),
                 "allow_cross_species": allow_cross_species,
                 "majority_voting": majority,
                 "cluster_key_used": cluster_key if majority else None,
@@ -6111,6 +9037,9 @@ def process_tool_call(
                 return json.dumps({
                     "status": "needs_input",
                     "tool": "run_scimilarity",
+                    "reference_source": "scimilarity",
+                    "unavailable_reference_source": "scimilarity",
+                    "unavailable_reason": "organism_ambiguous",
                     "message": (
                         "Scimilarity needs an explicit organism before annotation. "
                         "Human and mouse models are separate, and the current species context is ambiguous."
@@ -6125,12 +9054,90 @@ def process_tool_call(
                     ],
                 }, indent=2), adata
 
-            run_scimilarity(
-                adata,
-                model_path=model_path or None,
-                organism=organism or None,
-                cluster_key=cluster_key,
-            )
+            try:
+                run_scimilarity(
+                    adata,
+                    model_path=model_path or None,
+                    organism=organism or None,
+                    cluster_key=cluster_key,
+                )
+            except ImportError as e:
+                return _error_result(
+                    tool="run_scimilarity",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Activate the scagent environment that includes scimilarity, then rerun run_scimilarity.",
+                        "If this environment intentionally lacks scimilarity, continue with CellTypist plus DEG/PanglaoDB and report package_missing.",
+                    ],
+                    extra={
+                        "reference_source": "scimilarity",
+                        "unavailable_reference_source": "scimilarity",
+                        "unavailable_reason": "package_missing",
+                        "requested_organism": organism or None,
+                        "model_path": model_path,
+                    },
+                )
+            except FileNotFoundError as e:
+                return _error_result(
+                    tool="run_scimilarity",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Check SCIMILARITY_MODEL_PATH or SCIMILARITY_MODEL_PATH_MOUSE.",
+                        "Rerun with an explicit model_path that points to the Scimilarity model directory.",
+                    ],
+                    extra={
+                        "reference_source": "scimilarity",
+                        "unavailable_reference_source": "scimilarity",
+                        "unavailable_reason": "model_path_missing",
+                        "requested_organism": organism or None,
+                        "model_path": model_path,
+                    },
+                )
+            except ValueError as e:
+                message = str(e)
+                reason = "organism_ambiguous" if "organism" in message.lower() or "species" in message.lower() else "model_runtime_error"
+                return _error_result(
+                    tool="run_scimilarity",
+                    message=message,
+                    adata_obj=adata,
+                    recovery_options=[
+                        "If the dataset species is known, rerun with organism='human' or organism='mouse'.",
+                        "If the model path was explicit, confirm it matches the dataset organism and gene symbols.",
+                    ],
+                    extra={
+                        "reference_source": "scimilarity",
+                        "unavailable_reference_source": "scimilarity",
+                        "unavailable_reason": reason,
+                        "requested_organism": organism or None,
+                        "model_path": model_path,
+                    },
+                )
+            except Exception as e:
+                message = str(e)
+                lowered = message.lower()
+                if any(token in lowered for token in ("model path", "not found", "no such file", "does not exist")):
+                    reason = "model_path_missing"
+                else:
+                    reason = "model_runtime_error"
+                return _error_result(
+                    tool="run_scimilarity",
+                    message=message,
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Review the Scimilarity traceback/message, organism, model path, and raw-count availability before deciding it is unavailable.",
+                        "If the model path exists and the package imports, fix the runtime issue and rerun rather than finalizing without Scimilarity.",
+                    ],
+                    extra={
+                        "reference_source": "scimilarity",
+                        "unavailable_reference_source": "scimilarity",
+                        "unavailable_reason": reason,
+                        "requested_organism": organism or None,
+                        "model_path": model_path,
+                        "error_type": type(e).__name__,
+                    },
+                )
             scimilarity_meta = adata.uns.get("scimilarity", {}) if hasattr(adata, "uns") else {}
 
             output_path = fix_output_path(tool_input.get("output_path"), "run_scimilarity")
@@ -7044,6 +10051,30 @@ def process_tool_call(
             if output_path:
                 write_h5ad_safe(adata, output_path)
 
+            # Persist the full DEG table to a tidy CSV so the user can browse it
+            # and the agent can re-read it later. The path is recorded in
+            # adata.uns['deg_csv_paths'][key] for durable lookup.
+            deg_csv_path, deg_csv_rows = _save_deg_table_csv(
+                adata, key_added, run_manager, groupby=groupby
+            )
+            deg_artifacts: List[Dict[str, Any]] = []
+            if deg_csv_path:
+                try:
+                    paths_map = adata.uns.get("deg_csv_paths")
+                    if not isinstance(paths_map, dict):
+                        paths_map = {}
+                    paths_map[str(key_added)] = deg_csv_path
+                    adata.uns["deg_csv_paths"] = paths_map
+                except Exception:
+                    pass
+                payload = _artifact_payload(
+                    deg_csv_path,
+                    role="deg_table",
+                    metadata={"key": key_added, "groupby": groupby, "n_rows": deg_csv_rows},
+                )
+                if payload:
+                    deg_artifacts.append(payload)
+
             # Get top 5 markers per cluster for immediate insight
             groups = list(adata.obs[groupby].unique())
             top_markers_summary = {}
@@ -7104,7 +10135,14 @@ def process_tool_call(
                 "validity": validity_summary,
                 "caveats_for_gsea": deg_caveats,
                 "top_markers_per_cluster": top_markers_summary,
-                "note": "Validity metadata stored in adata.uns['deg_validity'] - will propagate to GSEA",
+                "deg_table_csv": deg_csv_path,
+                "deg_table_rows": deg_csv_rows,
+                "artifacts_created": deg_artifacts,
+                "note": (
+                    "Full DEG table saved to CSV (deg_table_csv) and validity metadata stored in "
+                    "adata.uns['deg_validity']. The CSV path is also in adata.uns['deg_csv_paths']; "
+                    "read it with read_file when you need the complete ranking later."
+                ),
                 "warnings": warnings,
                 "state": make_state(adata)
             }, indent=2), adata
@@ -7420,14 +10458,19 @@ def process_tool_call(
 
         elif tool_name == "read_file":
             import re as _re
-            file_path = Path(tool_input["path"]).expanduser()
-            if not file_path.exists():
+            raw_arg = tool_input["path"]
+            resolved = _resolve_run_path(raw_arg, run_manager=run_manager, must_exist=True)
+            if resolved is None:
                 return _error_result(
                     tool="read_file",
-                    message=f"File not found: {file_path}",
+                    message=f"File not found: {raw_arg}",
                     adata_obj=adata,
-                    recovery_options=["Verify the file path exists and is accessible."],
+                    recovery_options=[
+                        "Verify the file path exists and is accessible.",
+                        "Bare filenames are resolved against the run directory first; pass an absolute path to read files outside it.",
+                    ],
                 )
+            file_path = resolved
 
             max_chars = int(tool_input.get("max_chars") or 20000)
             suffix = file_path.suffix.lower()
@@ -7682,6 +10725,8 @@ def process_tool_call(
             cells_proposed = int(cluster_labels.isin(proposed_removal).sum())
             cells_ambiguous = int(cluster_labels.isin(ambiguous).sum())
             cells_total = adata.n_obs
+            metric_flagged_clusters = list(proposed_removal)
+            cells_metric_flagged = cells_proposed
 
             checkpoint_path = None
             if save_checkpoint:
@@ -7690,6 +10735,54 @@ def process_tool_call(
                 cp_default = _os.path.join(_base, "checkpoint_pre_cleanup.h5ad")
                 checkpoint_path = tool_input.get("checkpoint_path") or cp_default
                 write_h5ad_safe(adata, checkpoint_path)
+
+            # Per-cluster QC metric box plots for this iteration. One compact
+            # multi-panel figure per call, organized under
+            # figures/cluster_qc/<cluster_key>/ alongside structure-QC figures,
+            # with a pass number so re-runs on the same key don't overwrite.
+            qc_metrics_figure = None
+            try:
+                safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
+                if run_manager is not None:
+                    qc_fig_dir = Path(run_manager.run_dir) / "figures" / "cluster_qc" / safe_key
+                else:
+                    qc_fig_dir = Path("figures") / "cluster_qc" / safe_key
+                qc_fig_dir.mkdir(parents=True, exist_ok=True)
+                # Pass number tracks the actual CLUSTERING, not the number of
+                # run_cluster_qc calls. A fingerprint of the cluster labels keys
+                # a small index file, so a redundant re-run on the same
+                # clustering overwrites the same pass figure (idempotent), and
+                # only a genuinely new clustering gets a new pass number.
+                import hashlib as _hashlib
+                import json as _json
+                _labels = adata.obs[cluster_key].astype(str).tolist()
+                _fp = _hashlib.md5(("|".join(_labels)).encode()).hexdigest()[:12]
+                _idx_path = qc_fig_dir / ".qc_metric_passes.json"
+                try:
+                    _idx = _json.loads(_idx_path.read_text()) if _idx_path.exists() else {}
+                    if not isinstance(_idx, dict):
+                        _idx = {}
+                except Exception:
+                    _idx = {}
+                if _fp in _idx:
+                    pass_n = int(_idx[_fp])
+                else:
+                    pass_n = max([int(v) for v in _idx.values()], default=0) + 1
+                    _idx[_fp] = pass_n
+                    try:
+                        _idx_path.write_text(_json.dumps(_idx))
+                    except Exception:
+                        pass
+                qc_metrics_figure = _plot_cluster_qc_metrics(
+                    adata,
+                    cluster_key,
+                    qc_fig_dir / f"qc_metrics_by_cluster_pass_{pass_n:03d}.png",
+                    flagged_clusters=proposed_removal,
+                )
+                if qc_metrics_figure and run_manager is not None:
+                    run_manager.add_output(qc_metrics_figure)
+            except Exception:
+                qc_metrics_figure = None
 
             cluster_table = cluster_qc.reset_index().rename(columns={cluster_key: "cluster"})
             cluster_table["cluster"] = cluster_table["cluster"].astype(str)
@@ -7716,6 +10809,13 @@ def process_tool_call(
                 "global_genes_median": round(global_genes, 1),
                 "cluster_table": cluster_table,
                 "cluster_decisions": cluster_decisions,
+                "metric_flagged_clusters": metric_flagged_clusters,
+                "cells_in_metric_flagged_clusters": cells_metric_flagged,
+                "pct_metric_flagged": round(cells_metric_flagged / cells_total * 100, 1),
+                "metric_qc_interpretation": (
+                    "Metric QC flagged these clusters as problematic/suspicious and in need of "
+                    "structure QC adjudication; this is not a removal decision."
+                ),
                 "proposed_removal": proposed_removal,
                 "ambiguous": ambiguous,
                 "clean": clean,
@@ -7724,6 +10824,7 @@ def process_tool_call(
                 "pct_proposed": round(cells_proposed / cells_total * 100, 1),
                 "cells_remaining_if_removed": cells_total - cells_proposed,
                 "checkpoint_path": checkpoint_path,
+                "qc_metrics_figure": qc_metrics_figure,
                 "thresholds_used": {
                     "mt_threshold": mt_threshold,
                     "doublet_threshold": doublet_threshold,
@@ -7735,11 +10836,778 @@ def process_tool_call(
             artifacts = []
             if checkpoint_path:
                 artifacts.append(_artifact_payload(checkpoint_path, role="checkpoint", metadata={"stage": "pre_cluster_qc_cleanup"}))
+            if qc_metrics_figure:
+                artifacts.append(_artifact_payload(
+                    qc_metrics_figure,
+                    role="figure",
+                    metadata={"kind": "per_cluster_qc_metrics", "cluster_key": cluster_key},
+                ))
             return _finalize_result(
                 result, adata,
                 dataset_changed=False,
-                summary=f"Cluster QC: {len(proposed_removal)} clusters proposed for removal ({cells_proposed} cells, {result['pct_proposed']}%), {len(ambiguous)} ambiguous.",
+                summary=(
+                    f"Cluster QC: {len(metric_flagged_clusters)} metric-flagged cluster(s) "
+                    f"({cells_metric_flagged} cells, {result['pct_metric_flagged']}%) and "
+                    f"{len(ambiguous)} ambiguous cluster(s) require structure QC adjudication."
+                ),
                 artifacts_created=artifacts,
+            )
+
+        elif tool_name == "run_cluster_structure_qc":
+            import math
+            import os as _os
+
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as _plt
+            import numpy as _np
+            import scipy.sparse as _sp
+            from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
+            from scipy.spatial.distance import pdist
+
+            if adata is None:
+                return _error_result(
+                    tool="run_cluster_structure_qc",
+                    message="No in-memory data available. Load, QC, embed, and cluster data first.",
+                    recovery_options=["Run load_data, run_qc, embedding, clustering, then run_cluster_qc."],
+                )
+
+            cluster_key = tool_input.get("cluster_key", "leiden")
+            if cluster_key not in adata.obs.columns:
+                return _error_result(
+                    tool="run_cluster_structure_qc",
+                    message=f"Cluster key '{cluster_key}' not found in adata.obs.",
+                    adata_obj=adata,
+                    recovery_options=["Run run_clustering first, or pass the correct cluster_key."],
+                )
+
+            n_genes = max(2, int(tool_input.get("n_genes", 150)))
+            min_cells = max(2, int(tool_input.get("min_cells", 15)))
+            moran_min_cells = max(2, int(tool_input.get("moran_min_cells", 40)))
+            corr_threshold = float(tool_input.get("corr_threshold", 0.3))
+
+            latest_cluster_qc = {}
+            if world_state is not None:
+                latest_cluster_qc = (
+                    getattr(world_state, "cluster_qc_registry", {}) or {}
+                ).get(str(cluster_key), {}) or {}
+
+            requested_clusters = tool_input.get("clusters_to_analyze")
+            if requested_clusters:
+                clusters_to_analyze = [str(c) for c in requested_clusters]
+            else:
+                clusters_to_analyze = [
+                    str(c)
+                    for c in (
+                        latest_cluster_qc.get("proposed_removal", [])
+                        + latest_cluster_qc.get("ambiguous", [])
+                    )
+                ]
+            clusters_to_analyze = list(dict.fromkeys(clusters_to_analyze))
+            if not clusters_to_analyze:
+                return _error_result(
+                    tool="run_cluster_structure_qc",
+                    message=(
+                        "No clusters were provided and no latest run_cluster_qc proposed/ambiguous "
+                        "clusters were available in world state."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Run run_cluster_qc first.",
+                        "Or pass clusters_to_analyze explicitly.",
+                    ],
+                )
+
+            cluster_labels = adata.obs[cluster_key].astype(str)
+            present_clusters = set(cluster_labels.unique())
+            missing_clusters = [c for c in clusters_to_analyze if c not in present_clusters]
+            clusters_to_analyze = [c for c in clusters_to_analyze if c in present_clusters]
+            if not clusters_to_analyze:
+                return _error_result(
+                    tool="run_cluster_structure_qc",
+                    message=f"None of the requested clusters are present in '{cluster_key}': {missing_clusters}",
+                    adata_obj=adata,
+                    recovery_options=["Inspect cluster sizes and retry with current cluster IDs."],
+                )
+
+            if tool_input.get("figure_dir"):
+                base_figure_dir = Path(str(tool_input["figure_dir"]))
+            elif run_manager:
+                base_figure_dir = Path(run_manager.run_dir) / "figures" / "cluster_qc"
+            else:
+                base_figure_dir = Path("figures") / "cluster_qc"
+
+            def _safe_path_component(value):
+                text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "unknown")).strip("._")
+                return text or "unknown"
+
+            safe_cluster_key = _safe_path_component(cluster_key)
+            structure_history = []
+            try:
+                history_root = adata.uns.get("cluster_structure_qc_history", {})
+                if isinstance(history_root, dict):
+                    existing = history_root.get(str(cluster_key), [])
+                    if isinstance(existing, list):
+                        structure_history = existing
+            except Exception:
+                structure_history = []
+
+            existing_latest = None
+            try:
+                latest_root = adata.uns.get("cluster_structure_qc", {})
+                if isinstance(latest_root, dict):
+                    existing_latest = latest_root.get(str(cluster_key))
+            except Exception:
+                existing_latest = None
+
+            if structure_history:
+                structure_qc_pass = len(structure_history) + 1
+            elif existing_latest:
+                # Data saved by older scagent versions may have a latest structure-QC
+                # record but no history list. Start at pass 002 to avoid reusing paths.
+                structure_qc_pass = 2
+            else:
+                structure_qc_pass = 1
+
+            structure_qc_run_id = f"{safe_cluster_key}__pass_{structure_qc_pass:03d}"
+            figure_dir = base_figure_dir / safe_cluster_key / f"pass_{structure_qc_pass:03d}"
+            figure_dir.mkdir(parents=True, exist_ok=True)
+
+            exclude_patterns = tool_input.get("exclude_patterns") or DEFAULT_STRUCTURE_EXCLUDE_PATTERNS
+            try:
+                exclude_regexes = [re.compile(str(p)) for p in exclude_patterns if str(p).strip()]
+            except Exception:
+                exclude_regexes = [re.compile(p) for p in DEFAULT_STRUCTURE_EXCLUDE_PATTERNS]
+            mt_regexes = [re.compile(r"^MT-"), re.compile(r"^mt-")]
+
+            var_names = _np.asarray(adata.var_names.astype(str))
+            hvg_mask = None
+            if "highly_variable" in adata.var.columns:
+                try:
+                    hvg_mask = _np.asarray(adata.var["highly_variable"].fillna(False).astype(bool))
+                except Exception:
+                    hvg_mask = None
+
+            def _matches_any(gene: str, regexes) -> bool:
+                for rx in regexes:
+                    try:
+                        if rx.search(gene):
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _dense_matrix(matrix):
+                return matrix.toarray() if _sp.issparse(matrix) else _np.asarray(matrix)
+
+            def _cluster_z(values, mask):
+                arr = _np.asarray(values, dtype=float)
+                finite = _np.isfinite(arr)
+                if not finite.any():
+                    return None, None
+                global_mean = float(_np.nanmean(arr))
+                global_std = float(_np.nanstd(arr))
+                cluster_mean = float(_np.nanmean(arr[mask])) if mask.any() else None
+                if cluster_mean is None or global_std <= 0 or not _np.isfinite(global_std):
+                    return cluster_mean, None
+                return cluster_mean, float((cluster_mean - global_mean) / global_std)
+
+            def _local_moran(values, graph):
+                arr = _np.asarray(values, dtype=float)
+                finite = _np.isfinite(arr)
+                if not finite.all():
+                    arr = arr.copy()
+                    arr[~finite] = _np.nanmean(arr[finite]) if finite.any() else 0.0
+                x_centered = arr - float(arr.mean())
+                w_sum = float(graph.sum())
+                denom = float(x_centered @ x_centered)
+                n_obs = len(arr)
+                if denom <= 0 or w_sum <= 0:
+                    return _np.zeros(n_obs), 0.0
+                lag = _np.asarray(graph @ x_centered).ravel()
+                local_i = (n_obs / w_sum) * x_centered * lag / (denom / n_obs)
+                global_i = float((n_obs / w_sum) * float(x_centered @ lag) / denom)
+                return local_i, global_i
+
+            graph = adata.obsp.get("connectivities") if hasattr(adata, "obsp") else None
+            if graph is not None and not _sp.issparse(graph):
+                graph = _sp.csr_matrix(graph)
+            moran_available = graph is not None and graph.shape == (adata.n_obs, adata.n_obs)
+            local_mt = local_lib = None
+            global_moran_mt = global_moran_lib = None
+            if moran_available:
+                if "pct_counts_mt" in adata.obs.columns:
+                    local_mt, global_moran_mt = _local_moran(adata.obs["pct_counts_mt"].values, graph)
+                if "total_counts" in adata.obs.columns:
+                    local_lib, global_moran_lib = _local_moran(adata.obs["total_counts"].values, graph)
+
+            metric_decisions = latest_cluster_qc.get("cluster_decisions") or {}
+            metric_table = {
+                str(row.get("cluster")): row
+                for row in (latest_cluster_qc.get("cluster_table") or [])
+                if isinstance(row, dict) and row.get("cluster") is not None
+            }
+
+            def _select_genes(mask):
+                x_cluster = adata.X[mask, :]
+                means = _np.asarray(x_cluster.mean(axis=0)).ravel()
+                means = _np.nan_to_num(means, nan=-_np.inf, posinf=-_np.inf, neginf=-_np.inf)
+                order = _np.argsort(means)[::-1]
+                top_order = order[: max(n_genes * 4, n_genes)]
+                non_nuisance = [
+                    int(idx)
+                    for idx in top_order
+                    if not _matches_any(str(var_names[idx]), exclude_regexes)
+                ]
+                hvg_filtered = [
+                    idx
+                    for idx in non_nuisance
+                    if hvg_mask is not None and bool(hvg_mask[idx])
+                ]
+                if len(hvg_filtered) >= 20:
+                    selected = hvg_filtered[:n_genes]
+                    strategy = "top_expressed_hvg_non_nuisance"
+                else:
+                    selected = [
+                        int(idx)
+                        for idx in top_order
+                        if not _matches_any(str(var_names[idx]), mt_regexes)
+                    ][:n_genes]
+                    strategy = "fallback_top_expressed_mt_excluded"
+                excluded_nuisance = [
+                    str(var_names[idx])
+                    for idx in top_order[:n_genes]
+                    if _matches_any(str(var_names[idx]), exclude_regexes)
+                ][:25]
+                return selected, {
+                    "gene_selection_strategy": strategy,
+                    "genes_after_hvg_filter": len(hvg_filtered),
+                    "excluded_nuisance_genes_preview": excluded_nuisance,
+                }
+
+            def _pca_support(x):
+                x = _np.asarray(x, dtype=float)
+                x = x - x.mean(axis=0, keepdims=True)
+                total_var = float(_np.sum(_np.var(x, axis=0)))
+                if total_var <= 0:
+                    return None, []
+                try:
+                    singular = _np.linalg.svd(x, compute_uv=False)
+                except Exception:
+                    return None, []
+                denom = max(x.shape[0] - 1, 1)
+                explained = (singular ** 2) / denom
+                ratios = (explained / explained.sum()).tolist() if explained.sum() > 0 else []
+                return (float(ratios[0]) if ratios else None), [float(v) for v in ratios[:5]]
+
+            def _structure_interpretation(mean_abs_corr, frac_pairs):
+                if mean_abs_corr is None:
+                    return "inconclusive"
+                if mean_abs_corr < 0.08 and frac_pairs < 0.05:
+                    return "unstructured"
+                if mean_abs_corr < 0.12:
+                    return "weak"
+                if mean_abs_corr < 0.18:
+                    return "moderate"
+                return "strong"
+
+            def _synthesize(metric_severity, structure_interp, moran_i_mt, mt_z, moran_i_lib, lib_z):
+                strong_structure = structure_interp in {"moderate", "strong"}
+                weak_structure = structure_interp in {"unstructured", "weak"}
+                mt_pocket = (
+                    moran_i_mt is not None
+                    and mt_z is not None
+                    and moran_i_mt > 0.3
+                    and mt_z > 0.5
+                )
+                low_lib_pocket = (
+                    moran_i_lib is not None
+                    and lib_z is not None
+                    and moran_i_lib > 0.3
+                    and lib_z < -0.5
+                )
+                bad_quality_pocket = bool(mt_pocket or low_lib_pocket)
+                metric = str(metric_severity or "unknown")
+
+                if structure_interp in {"inconclusive", "skipped_small_cluster", "skipped_low_gene_count"}:
+                    return "inconclusive", "review"
+                if metric == "obvious" and weak_structure:
+                    return "confirmed_junk", "remove"
+                if metric == "obvious" and strong_structure:
+                    return ("conflicting" if bad_quality_pocket else "obvious_but_structured"), "review"
+                if metric == "ambiguous" and weak_structure:
+                    return "unstructured_ambiguous", "remove" if bad_quality_pocket else "review"
+                if metric == "ambiguous" and strong_structure:
+                    return ("conflicting", "review") if bad_quality_pocket else ("structured_ambiguous", "keep")
+                if weak_structure and bad_quality_pocket:
+                    return "unstructured_ambiguous", "review"
+                if strong_structure:
+                    return "structured_ambiguous", "keep"
+                return "inconclusive", "review"
+
+            cluster_results = []
+            structure_evidence = {}
+            artifacts = []
+            heatmap_paths = []
+            heatmap_artifacts = []
+            synthesized_removal = []
+            rescued_clusters = []
+            conflicting_clusters = []
+            confirmed_junk = []
+            unstructured_ambiguous = []
+            structured_ambiguous = []
+
+            for cluster_id in clusters_to_analyze:
+                mask = (cluster_labels == str(cluster_id)).values
+                n_cells = int(mask.sum())
+                metric_decision = metric_decisions.get(str(cluster_id), {}) if isinstance(metric_decisions, dict) else {}
+                metric_severity = metric_decision.get("severity") or metric_table.get(str(cluster_id), {}).get("severity")
+                metric_action = metric_decision.get("recommended_action") or metric_table.get(str(cluster_id), {}).get("recommended_action")
+                reasons_added = []
+                heatmap_path = None
+                record = {
+                    "cluster_id": str(cluster_id),
+                    "n_cells": n_cells,
+                    "metric_severity_original": metric_severity,
+                    "metric_recommended_action": metric_action,
+                    "moran_computed": False,
+                    "moran_skip_reason": None,
+                    "heatmap_path": None,
+                    "structure_analysis_skipped": False,
+                    "structure_skip_reason": None,
+                }
+
+                if n_cells < min_cells:
+                    record.update({
+                        "structure_analysis_skipped": True,
+                        "structure_skip_reason": f"cluster has {n_cells} cells (< {min_cells} minimum)",
+                        "structure_interpretation": "skipped_small_cluster",
+                        "synthesis": "inconclusive",
+                        "synthesis_lean": "review",
+                        "reasons_added": [f"Structure analysis skipped: cluster has {n_cells} cells (< {min_cells} minimum)."],
+                    })
+                    cluster_results.append(record)
+                    structure_evidence[str(cluster_id)] = record
+                    continue
+
+                selected_genes, selection_info = _select_genes(mask)
+                x_sub = _dense_matrix(adata.X[mask, :][:, selected_genes]).astype(float)
+                variances = _np.nanvar(x_sub, axis=0)
+                keep_var = _np.isfinite(variances) & (variances > 1e-12)
+                selected_genes = [idx for idx, keep in zip(selected_genes, keep_var) if bool(keep)]
+                x_sub = x_sub[:, keep_var]
+                selected_gene_names = [str(var_names[idx]) for idx in selected_genes]
+
+                record.update(selection_info)
+                record["n_genes_selected"] = len(selected_genes)
+                record["selected_genes_preview"] = selected_gene_names[:20]
+
+                if x_sub.shape[1] < 2:
+                    record.update({
+                        "structure_analysis_skipped": True,
+                        "structure_skip_reason": "fewer than 2 nonzero-variance selected genes",
+                        "structure_interpretation": "skipped_low_gene_count",
+                        "synthesis": "inconclusive",
+                        "synthesis_lean": "review",
+                        "reasons_added": ["Structure analysis skipped: fewer than 2 nonzero-variance selected genes."],
+                    })
+                    cluster_results.append(record)
+                    structure_evidence[str(cluster_id)] = record
+                    continue
+
+                corr_matrix = _np.corrcoef(x_sub.T)
+                corr_matrix = _np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+                off_diag = ~_np.eye(corr_matrix.shape[0], dtype=bool)
+                abs_off = _np.abs(corr_matrix[off_diag])
+                mean_abs_corr = float(abs_off.mean()) if abs_off.size else None
+                frac_pairs = float((abs_off >= corr_threshold).sum() / abs_off.size) if abs_off.size else None
+                pc1, eigenspectrum_top5 = _pca_support(x_sub)
+
+                order = _np.arange(corr_matrix.shape[0])
+                n_modules = 1
+                module_size_summary = [int(corr_matrix.shape[0])]
+                linkage_status = "not_run"
+                if corr_matrix.shape[0] >= 3:
+                    try:
+                        distances = pdist(x_sub.T, metric="correlation")
+                        distances = _np.nan_to_num(distances, nan=1.0, posinf=1.0, neginf=1.0)
+                        z = linkage(distances, method="average")
+                        order = leaves_list(z)
+                        module_labels = fcluster(z, t=0.7, criterion="distance")
+                        _, counts = _np.unique(module_labels, return_counts=True)
+                        n_modules = int(len(counts))
+                        module_size_summary = [int(v) for v in sorted(counts, reverse=True)[:10]]
+                        linkage_status = "ok"
+                    except Exception as e:
+                        linkage_status = f"failed: {e}"
+
+                reordered = corr_matrix[_np.ix_(order, order)]
+                safe_cluster_id = _safe_path_component(cluster_id)
+                heatmap_path = figure_dir / f"cluster_{safe_cluster_id}_correlation.png"
+                fig_width = max(5.0, min(9.0, x_sub.shape[1] / 20))
+                fig, ax = _plt.subplots(figsize=(fig_width, fig_width))
+                image = ax.imshow(reordered, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+                ax.set_title(
+                    f"{cluster_key} / pass {structure_qc_pass:03d} / cluster {cluster_id}\n"
+                    f"{x_sub.shape[1]} genes x {n_cells} cells | mean_abs_corr={mean_abs_corr:.3f}"
+                )
+                if x_sub.shape[1] <= 60:
+                    ordered_names = [selected_gene_names[int(i)] for i in order]
+                    ax.set_xticks(range(len(ordered_names)))
+                    ax.set_yticks(range(len(ordered_names)))
+                    ax.set_xticklabels(ordered_names, rotation=90, fontsize=5)
+                    ax.set_yticklabels(ordered_names, fontsize=5)
+                else:
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+                fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+                fig.tight_layout()
+                fig.savefig(heatmap_path, dpi=180)
+                _plt.close(fig)
+                heatmap_path_str = str(heatmap_path)
+                heatmap_artifact = _artifact_payload(
+                    heatmap_path_str,
+                    role="cluster_structure_heatmap",
+                    metadata={
+                        "cluster": str(cluster_id),
+                        "cluster_key": cluster_key,
+                        "structure_qc_run_id": structure_qc_run_id,
+                        "structure_qc_pass": structure_qc_pass,
+                    },
+                )
+                if heatmap_artifact:
+                    artifacts.append(heatmap_artifact)
+                    heatmap_artifacts.append(heatmap_artifact)
+                    heatmap_paths.append(heatmap_artifact.get("path", heatmap_path_str))
+
+                structure_interp = _structure_interpretation(mean_abs_corr, frac_pairs)
+                mt_mean = mt_z = lib_mean = lib_z = None
+                moran_i_mt = moran_i_lib = None
+                if n_cells < moran_min_cells:
+                    moran_skip_reason = f"cluster has {n_cells} cells (< {moran_min_cells} minimum)"
+                elif not moran_available:
+                    moran_skip_reason = "neighbor connectivities graph is not available"
+                else:
+                    moran_skip_reason = None
+                    if local_mt is not None:
+                        moran_i_mt = float(_np.asarray(local_mt)[mask].mean())
+                        mt_mean, mt_z = _cluster_z(adata.obs["pct_counts_mt"].values, mask)
+                    if local_lib is not None:
+                        moran_i_lib = float(_np.asarray(local_lib)[mask].mean())
+                        lib_mean, lib_z = _cluster_z(adata.obs["total_counts"].values, mask)
+                    record["moran_computed"] = True
+
+                synthesis, synthesis_lean = _synthesize(
+                    metric_severity,
+                    structure_interp,
+                    moran_i_mt,
+                    mt_z,
+                    moran_i_lib,
+                    lib_z,
+                )
+
+                if structure_interp in {"unstructured", "weak"}:
+                    reasons_added.append(
+                        f"Correlation structure is {structure_interp} "
+                        f"(mean_abs_corr={mean_abs_corr:.3f}, frac_abs_corr>={corr_threshold:g}={frac_pairs:.3f})."
+                    )
+                elif structure_interp in {"moderate", "strong"}:
+                    reasons_added.append(
+                        f"Well-structured transcriptional program detected "
+                        f"(mean_abs_corr={mean_abs_corr:.3f}, modules={n_modules})."
+                    )
+                if moran_i_mt is not None:
+                    direction = "elevated" if (mt_z is not None and mt_z > 0.5) else "not elevated"
+                    reasons_added.append(
+                        f"Local MT% Moran's I={moran_i_mt:.3f} with cluster MT z={mt_z:.2f} ({direction})."
+                        if mt_z is not None
+                        else f"Local MT% Moran's I={moran_i_mt:.3f}."
+                    )
+                if moran_i_lib is not None:
+                    if lib_z is not None and lib_z < -0.5:
+                        lib_direction = "low-library pocket"
+                    elif lib_z is not None and lib_z > 0.5:
+                        lib_direction = "high-library pocket"
+                    else:
+                        lib_direction = "near global library size"
+                    reasons_added.append(
+                        f"Local library-size Moran's I={moran_i_lib:.3f} with cluster library z={lib_z:.2f} ({lib_direction})."
+                        if lib_z is not None
+                        else f"Local library-size Moran's I={moran_i_lib:.3f}."
+                    )
+                if moran_skip_reason:
+                    reasons_added.append(f"Technical Moran's I skipped: {moran_skip_reason}.")
+
+                record.update({
+                    "mean_abs_corr": mean_abs_corr,
+                    "frac_pairs_above_threshold": frac_pairs,
+                    "corr_threshold": corr_threshold,
+                    "n_modules": n_modules,
+                    "module_size_summary": module_size_summary,
+                    "linkage_status": linkage_status,
+                    "variance_explained_pc1": pc1,
+                    "eigenspectrum_top5": eigenspectrum_top5,
+                    "structure_interpretation": structure_interp,
+                    "moran_i_mt": moran_i_mt,
+                    "moran_i_lib": moran_i_lib,
+                    "global_moran_i_mt": global_moran_mt,
+                    "global_moran_i_lib": global_moran_lib,
+                    "cluster_mean_mt": mt_mean,
+                    "cluster_mean_total_counts": lib_mean,
+                    "cluster_mt_z": mt_z,
+                    "cluster_lib_z": lib_z,
+                    "moran_skip_reason": moran_skip_reason,
+                    "heatmap_path": heatmap_path_str,
+                    "synthesis": synthesis,
+                    "synthesis_lean": synthesis_lean,
+                    "reasons_added": reasons_added,
+                })
+
+                if synthesis_lean == "remove":
+                    synthesized_removal.append(str(cluster_id))
+                if synthesis == "confirmed_junk":
+                    confirmed_junk.append(str(cluster_id))
+                if synthesis == "structured_ambiguous":
+                    structured_ambiguous.append(str(cluster_id))
+                    rescued_clusters.append(str(cluster_id))
+                if synthesis == "unstructured_ambiguous":
+                    unstructured_ambiguous.append(str(cluster_id))
+                if synthesis == "conflicting":
+                    conflicting_clusters.append(str(cluster_id))
+
+                cluster_results.append(record)
+                structure_evidence[str(cluster_id)] = record
+
+            cells_in_synthesized_removal = int(cluster_labels.isin(synthesized_removal).sum())
+            result = {
+                "status": "ok",
+                "tool": "run_cluster_structure_qc",
+                "cluster_key": cluster_key,
+                "clusters_analyzed": clusters_to_analyze,
+                "missing_clusters": missing_clusters,
+                "n_clusters_analyzed": len(cluster_results),
+                "cluster_structure_evidence": cluster_results,
+                "structure_evidence_by_cluster": structure_evidence,
+                "synthesized_removal": synthesized_removal,
+                "cells_in_synthesized_removal": cells_in_synthesized_removal,
+                "pct_synthesized_removal": round(cells_in_synthesized_removal / adata.n_obs * 100, 1),
+                "rescued_clusters": rescued_clusters,
+                "confirmed_junk": confirmed_junk,
+                "structured_ambiguous": structured_ambiguous,
+                "unstructured_ambiguous": unstructured_ambiguous,
+                "conflicting": conflicting_clusters,
+                "structure_qc_run_id": structure_qc_run_id,
+                "structure_qc_pass": structure_qc_pass,
+                "base_figure_dir": str(base_figure_dir),
+                "figure_dir": str(figure_dir),
+                "heatmap_paths": heatmap_paths,
+                "heatmap_artifacts": heatmap_artifacts,
+                "visual_evidence_guidance": (
+                    "Correlation heatmaps are saved as figure artifacts. When using visual heatmap "
+                    "evidence in reasoning, cite the cluster's heatmap_path or artifact path. If a "
+                    "cluster has no heatmap_path because structure analysis was skipped, do not claim "
+                    "visual heatmap evidence for that cluster."
+                ),
+                "thresholds_used": {
+                    "n_genes": n_genes,
+                    "min_cells": min_cells,
+                    "moran_min_cells": moran_min_cells,
+                    "corr_threshold": corr_threshold,
+                    "structure_thresholds": {
+                        "unstructured_mean_abs_corr": 0.08,
+                        "weak_mean_abs_corr": 0.12,
+                        "moderate_mean_abs_corr": 0.18,
+                        "technical_moran_high": 0.3,
+                        "technical_z_direction": 0.5,
+                    },
+                },
+                "state": make_state(adata),
+            }
+
+            if run_manager:
+                report_path = run_manager.write_json_report(
+                    f"cluster_structure_qc_{structure_qc_run_id}",
+                    {
+                        k: v
+                        for k, v in result.items()
+                        if k not in {"state"}
+                    },
+                )
+                result["structure_qc_json"] = report_path
+                artifacts.append(
+                    _artifact_payload(
+                        report_path,
+                        role="cluster_structure_qc_report",
+                        metadata={
+                            "cluster_key": cluster_key,
+                            "structure_qc_run_id": structure_qc_run_id,
+                            "structure_qc_pass": structure_qc_pass,
+                        },
+                    )
+                )
+                def _fmt_num(value, digits=3):
+                    try:
+                        if value is None or (isinstance(value, float) and not math.isfinite(value)):
+                            return "NA"
+                        return f"{float(value):.{digits}f}"
+                    except Exception:
+                        return "NA"
+
+                def _fmt_list(values, limit=4):
+                    if not isinstance(values, list) or not values:
+                        return "none"
+                    shown = [str(v) for v in values[:limit]]
+                    return ", ".join(shown) + (f", +{len(values) - limit} more" if len(values) > limit else "")
+
+                def _safe_cell(value):
+                    text = str(value if value is not None else "NA")
+                    return text.replace("|", "\\|").replace("\n", " ")
+
+                md_lines = [
+                    f"# Cluster Structure QC - `{cluster_key}`",
+                    "",
+                    "This report is the human-readable companion to the machine-readable structure QC JSON. "
+                    "Metric QC nominates suspicious clusters; this pass adjudicates them with gene-gene "
+                    "correlation structure, saved heatmaps, and technical Moran's I context.",
+                    "",
+                    "## Summary",
+                    "",
+                    f"- Clusters analyzed: **{len(cluster_results)}**",
+                    f"- Synthesized removal set: **{_fmt_list(synthesized_removal, limit=12)}** "
+                    f"({cells_in_synthesized_removal} cells; {result['pct_synthesized_removal']}%)",
+                    f"- Rescued/structured clusters: **{_fmt_list(rescued_clusters, limit=12)}**",
+                    f"- Conflicting clusters for review: **{_fmt_list(conflicting_clusters, limit=12)}**",
+                    f"- Heatmaps saved under: `{figure_dir}`",
+                    "",
+                    "## Per-Cluster Evidence",
+                    "",
+                    "| Cluster | Cells | Metric severity | Structure | Mean abs corr | Modules | MT Moran / z | Library Moran / z | Synthesis | Heatmap |",
+                    "|---|---:|---|---|---:|---:|---|---|---|---|",
+                ]
+                for rec in cluster_results:
+                    heatmap = rec.get("heatmap_path")
+                    heatmap_cell = f"`{heatmap}`" if heatmap else "not generated"
+                    md_lines.append(
+                        "| "
+                        + " | ".join([
+                            _safe_cell(rec.get("cluster_id")),
+                            _safe_cell(rec.get("n_cells")),
+                            _safe_cell(rec.get("metric_severity_original")),
+                            _safe_cell(rec.get("structure_interpretation")),
+                            _fmt_num(rec.get("mean_abs_corr")),
+                            _safe_cell(rec.get("n_modules")),
+                            f"{_fmt_num(rec.get('moran_i_mt'))} / {_fmt_num(rec.get('cluster_mt_z'), 2)}",
+                            f"{_fmt_num(rec.get('moran_i_lib'))} / {_fmt_num(rec.get('cluster_lib_z'), 2)}",
+                            _safe_cell(f"{rec.get('synthesis')} ({rec.get('synthesis_lean')})"),
+                            _safe_cell(heatmap_cell),
+                        ])
+                        + " |"
+                    )
+                md_lines.extend(["", "## Reasoning Notes", ""])
+                for rec in cluster_results:
+                    md_lines.append(f"### Cluster {rec.get('cluster_id')}")
+                    md_lines.append("")
+                    md_lines.append(f"- Synthesis: **{rec.get('synthesis')}**; lean: **{rec.get('synthesis_lean')}**.")
+                    md_lines.append(f"- Gene selection: `{rec.get('gene_selection_strategy', 'NA')}`; selected genes: **{rec.get('n_genes_selected', 'NA')}**.")
+                    if rec.get("selected_genes_preview"):
+                        md_lines.append(f"- Selected gene preview: {_fmt_list(rec.get('selected_genes_preview'), limit=12)}.")
+                    for reason in rec.get("reasons_added", []) or []:
+                        md_lines.append(f"- {reason}")
+                    if rec.get("heatmap_path"):
+                        md_lines.append(f"- Heatmap artifact: `{rec.get('heatmap_path')}`.")
+                    if rec.get("structure_analysis_skipped"):
+                        md_lines.append(f"- Structure analysis skipped: {rec.get('structure_skip_reason')}.")
+                    md_lines.append("")
+                md_lines.extend([
+                    "## Interpretation Guide",
+                    "",
+                    "- Low/flat correlation structure supports apoptotic, ambient, or otherwise unstructured droplets when it agrees with poor metric QC.",
+                    "- Moderate or strong gene-gene structure is evidence that a cluster contains a coherent transcriptional program; if metric QC is poor, treat this as a rescue or conflict signal rather than automatic removal.",
+                    "- Moran's I is interpreted with direction: high MT Moran matters most when the cluster also has elevated MT z-score; library Moran is interpreted as low- or high-library depending on the cluster z-score.",
+                    "- Heatmap statements in the final analysis should cite the heatmap path above.",
+                    "",
+                ])
+                markdown_path = run_manager.write_text_report(
+                    f"cluster_structure_qc_{structure_qc_run_id}_summary",
+                    "\n".join(md_lines),
+                    ext="md",
+                )
+                result["structure_qc_markdown"] = markdown_path
+                artifacts.append(
+                    _artifact_payload(
+                        markdown_path,
+                        role="cluster_structure_qc_summary",
+                        metadata={
+                            "cluster_key": cluster_key,
+                            "structure_qc_run_id": structure_qc_run_id,
+                            "structure_qc_pass": structure_qc_pass,
+                        },
+                    )
+                )
+
+            adata.uns.setdefault("cluster_structure_qc", {})
+            adata.uns["cluster_structure_qc"][str(cluster_key)] = {
+                "structure_qc_run_id": structure_qc_run_id,
+                "structure_qc_pass": structure_qc_pass,
+                "base_figure_dir": str(base_figure_dir),
+                "figure_dir": str(figure_dir),
+                "clusters_analyzed": clusters_to_analyze,
+                "structure_evidence_by_cluster": structure_evidence,
+                "synthesized_removal": synthesized_removal,
+                "rescued_clusters": rescued_clusters,
+                "confirmed_junk": confirmed_junk,
+                "conflicting": conflicting_clusters,
+                "thresholds_used": result["thresholds_used"],
+                "heatmap_paths": heatmap_paths,
+                "structure_qc_json": result.get("structure_qc_json"),
+                "structure_qc_markdown": result.get("structure_qc_markdown"),
+            }
+            if not isinstance(adata.uns.get("cluster_structure_qc_history"), dict):
+                adata.uns["cluster_structure_qc_history"] = {}
+            if not isinstance(adata.uns["cluster_structure_qc_history"].get(str(cluster_key)), list):
+                adata.uns["cluster_structure_qc_history"][str(cluster_key)] = []
+            adata.uns["cluster_structure_qc_history"][str(cluster_key)].append(
+                {
+                    "structure_qc_run_id": structure_qc_run_id,
+                    "structure_qc_pass": structure_qc_pass,
+                    "cluster_key": str(cluster_key),
+                    "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
+                    "clusters_analyzed": clusters_to_analyze,
+                    "synthesized_removal": synthesized_removal,
+                    "cells_in_synthesized_removal": cells_in_synthesized_removal,
+                    "pct_synthesized_removal": result["pct_synthesized_removal"],
+                    "figure_dir": str(figure_dir),
+                    "heatmap_paths": heatmap_paths,
+                    "structure_qc_json": result.get("structure_qc_json"),
+                    "structure_qc_markdown": result.get("structure_qc_markdown"),
+                }
+            )
+
+            return _finalize_result(
+                result,
+                adata,
+                dataset_changed=False,
+                summary=(
+                    f"Cluster structure QC analyzed {len(cluster_results)} cluster(s); "
+                    f"{len(synthesized_removal)} synthesized removal candidate(s), "
+                    f"{len(rescued_clusters)} rescued structured ambiguous cluster(s)."
+                ),
+                artifacts_created=[artifact for artifact in artifacts if artifact],
+                verification=_build_verification(
+                    "passed",
+                    "Cluster structure QC completed without mutating AnnData cells or genes.",
+                    [
+                        _check("dataset_shape_unchanged", True, "No cells or genes were removed."),
+                        _check(
+                            "heatmap_artifacts_created",
+                            len(heatmap_paths) == len([r for r in cluster_results if r.get("heatmap_path")])
+                            and all(_os.path.exists(path) for path in heatmap_paths),
+                            f"Saved {len(heatmap_paths)} cluster-structure heatmap figure artifact(s).",
+                        ),
+                    ],
+                ),
             )
 
         elif tool_name == "prepare_annotation":
@@ -7784,7 +11652,7 @@ def process_tool_call(
                 0, int(tool_input.get("reverse_lookup_n_genes_per_cluster", 10))
             )
             reverse_lookup_max_unique = max(
-                0, int(tool_input.get("reverse_lookup_max_unique_genes", 120))
+                0, int(tool_input.get("reverse_lookup_max_unique_genes", 60))
             )
             default_reverse_exclude_patterns = [
                 r"^MT-",
@@ -7854,6 +11722,43 @@ def process_tool_call(
             missing_reference_keys = [
                 k for k in reference_annotation_keys if k not in adata.obs.columns
             ]
+            reference_source_coverage: Dict[str, List[str]] = {
+                "celltypist": [],
+                "scimilarity": [],
+                "other": [],
+            }
+            for key in valid_reference_keys:
+                lower_key = key.lower()
+                if "celltypist" in lower_key:
+                    reference_source_coverage["celltypist"].append(key)
+                elif "scimilarity" in lower_key:
+                    reference_source_coverage["scimilarity"].append(key)
+                else:
+                    reference_source_coverage["other"].append(key)
+            missing_reference_sources = [
+                source
+                for source in ("celltypist", "scimilarity")
+                if not reference_source_coverage.get(source)
+            ]
+            if not valid_reference_keys:
+                reference_annotation_notice = (
+                    "No CellTypist/Scimilarity annotation columns were supplied or auto-detected. "
+                    "If a compatible reference model is available, run it before treating this proposal "
+                    "as the main source of candidate labels."
+                )
+            elif missing_reference_sources:
+                present_sources = [
+                    source for source in ("celltypist", "scimilarity")
+                    if reference_source_coverage.get(source)
+                ]
+                reference_annotation_notice = (
+                    "Reference annotation is partial: present sources="
+                    f"{present_sources or ['other']}; missing sources={missing_reference_sources}. "
+                    "Run the missing compatible reference tool before finalizing, or record the concrete "
+                    "reason it was unavailable in the staged evidence."
+                )
+            else:
+                reference_annotation_notice = None
 
             cluster_series = adata.obs[cluster_key].astype(str)
             cluster_ids = sorted(cluster_series.unique(), key=lambda s: (len(s), s))
@@ -8063,15 +11968,315 @@ def process_tool_call(
                         })
                     reference_annotation_summary[c] = per_cluster_reference
 
+            def _norm_label(label: Any) -> str:
+                text = str(label or "").lower()
+                text = _re.sub(r"[^a-z0-9]+", " ", text)
+                text = _re.sub(r"\s+", " ", text).strip()
+                return text
+
+            def _label_family(label: Any) -> Optional[str]:
+                text = _norm_label(label)
+                if not text:
+                    return None
+                if "platelet" in text or "megakary" in text:
+                    return "platelet"
+                if "plasma" in text:
+                    return "plasma"
+                if "monocyte" in text or "macrophage" in text:
+                    return "monocyte"
+                if "plasmacytoid dendritic" in text or text == "pdc" or " pdc" in f" {text}":
+                    return "pdc"
+                if "dendritic" in text or text in {"dc", "cdc", "cdc1", "cdc2"} or " cdc" in f" {text}":
+                    return "dendritic"
+                if "natural killer" in text or " nk" in f" {text}" or text.startswith("nk"):
+                    return "nk"
+                if "b cell" in text or text.startswith("b ") or " b " in f" {text} ":
+                    return "b"
+                if "t cell" in text or text.startswith("t ") or " t " in f" {text} " or "mait" in text or "treg" in text:
+                    return "t"
+                if "neutrophil" in text:
+                    return "neutrophil"
+                if "mast" in text or "basophil" in text:
+                    return "mast_basophil"
+                if "eryth" in text or "red blood" in text:
+                    return "erythroid"
+                if "epithelial" in text:
+                    return "epithelial"
+                if "endothelial" in text:
+                    return "endothelial"
+                if "fibroblast" in text or "stromal" in text:
+                    return "stromal"
+                return None
+
+            def _labels_compatible(a: Any, b: Any) -> bool:
+                a_norm = _norm_label(a)
+                b_norm = _norm_label(b)
+                if not a_norm or not b_norm:
+                    return False
+                if a_norm == b_norm:
+                    return True
+                a_singular = _re.sub(r"\bcells\b", "cell", a_norm)
+                b_singular = _re.sub(r"\bcells\b", "cell", b_norm)
+                if a_singular in b_singular or b_singular in a_singular:
+                    return True
+                a_family = _label_family(a_norm)
+                b_family = _label_family(b_norm)
+                return bool(a_family and a_family == b_family)
+
+            def _cluster_annotation_qc_caveats(cid: str) -> List[Dict[str, Any]]:
+                caveats: List[Dict[str, Any]] = []
+                mask = (cluster_series == str(cid)).values
+                n_in = int(mask.sum())
+                if n_in <= 0:
+                    return caveats
+
+                def _obs_mean(col: str):
+                    if col not in adata.obs.columns:
+                        return None
+                    try:
+                        return float(_np.asarray(adata.obs.loc[mask, col], dtype=float).mean())
+                    except Exception:
+                        return None
+
+                mt_mean = _obs_mean("pct_counts_mt")
+                if mt_mean is not None and mt_mean >= 25.0:
+                    caveats.append({
+                        "type": "high_mt_cluster",
+                        "severity": "strong",
+                        "value": round(mt_mean, 3),
+                        "confidence_cap": "low" if mt_mean >= 40.0 else "medium",
+                        "message": f"Cluster mean mitochondrial percentage is high ({mt_mean:.2f}%).",
+                    })
+                if "qc_flag_high_mt" in adata.obs.columns:
+                    try:
+                        frac = float(adata.obs.loc[mask, "qc_flag_high_mt"].astype(bool).mean())
+                        if frac >= 0.5:
+                            caveats.append({
+                                "type": "high_mt_flag_fraction",
+                                "severity": "strong",
+                                "value": round(frac, 4),
+                                "confidence_cap": "medium",
+                                "message": f"{frac:.1%} of cells are high-MT flagged.",
+                            })
+                    except Exception:
+                        pass
+
+                doublet_mean = _obs_mean("doublet_score")
+                if doublet_mean is not None and doublet_mean >= 0.30:
+                    caveats.append({
+                        "type": "doublet_enriched_cluster",
+                        "severity": "strong",
+                        "value": round(doublet_mean, 4),
+                        "confidence_cap": "low" if doublet_mean >= 0.50 else "medium",
+                        "message": f"Cluster mean doublet score is high ({doublet_mean:.3f}).",
+                    })
+                if "predicted_doublet" in adata.obs.columns:
+                    try:
+                        frac = float(adata.obs.loc[mask, "predicted_doublet"].astype(bool).mean())
+                        if frac >= 0.30:
+                            caveats.append({
+                                "type": "predicted_doublet_enriched_cluster",
+                                "severity": "strong",
+                                "value": round(frac, 4),
+                                "confidence_cap": "low" if frac >= 0.80 else "medium",
+                                "message": f"{frac:.1%} of cells are predicted doublets.",
+                            })
+                    except Exception:
+                        pass
+
+                lib_mean = _obs_mean("total_counts")
+                gene_mean = _obs_mean("n_genes_by_counts")
+                try:
+                    global_lib = float(_np.nanmedian(_np.asarray(adata.obs["total_counts"], dtype=float)))
+                    if lib_mean is not None and global_lib > 0 and lib_mean < 0.5 * global_lib:
+                        caveats.append({
+                            "type": "low_library_cluster",
+                            "severity": "moderate",
+                            "value": round(lib_mean / global_lib, 4),
+                            "confidence_cap": "medium",
+                            "message": "Cluster mean library size is <0.5x global median.",
+                        })
+                except Exception:
+                    pass
+                try:
+                    global_genes = float(_np.nanmedian(_np.asarray(adata.obs["n_genes_by_counts"], dtype=float)))
+                    if gene_mean is not None and global_genes > 0 and gene_mean < 0.5 * global_genes:
+                        caveats.append({
+                            "type": "low_gene_complexity_cluster",
+                            "severity": "moderate",
+                            "value": round(gene_mean / global_genes, 4),
+                            "confidence_cap": "medium",
+                            "message": "Cluster mean detected genes is <0.5x global median.",
+                        })
+                except Exception:
+                    pass
+
+                structure_qc = {}
+                try:
+                    structure_qc = (
+                        adata.uns.get("cluster_structure_qc", {})
+                        .get(str(cluster_key), {})
+                    )
+                except Exception:
+                    structure_qc = {}
+                if isinstance(structure_qc, dict):
+                    evidence_by_cluster = structure_qc.get("structure_evidence_by_cluster") or {}
+                    structure_record = evidence_by_cluster.get(str(cid)) or {}
+                    synthesis = str(structure_record.get("synthesis") or "")
+                    lean = str(structure_record.get("synthesis_lean") or "")
+                    if str(cid) in [str(c) for c in structure_qc.get("synthesized_removal", []) or []] or lean == "remove":
+                        caveats.append({
+                            "type": "structure_qc_synthesized_removal",
+                            "severity": "strong",
+                            "confidence_cap": "low",
+                            "message": "Structure QC synthesized this cluster for removal; do not assign a high-confidence biological label.",
+                        })
+                    elif str(cid) in [str(c) for c in structure_qc.get("conflicting", []) or []] or synthesis in {"conflicting", "obvious_but_structured", "inconclusive"} or lean == "review":
+                        caveats.append({
+                            "type": "structure_qc_review",
+                            "severity": "moderate",
+                            "confidence_cap": "medium",
+                            "synthesis": synthesis or None,
+                            "message": "Structure QC marked this cluster for review/conflict; confidence is capped unless resolved explicitly.",
+                        })
+                return caveats
+
+            def _reference_proposal(ref_entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+                real_entries = [
+                    e for e in ref_entries
+                    if isinstance(e, dict) and e.get("top_label")
+                ]
+                if not real_entries:
+                    return {
+                        "label": None,
+                        "score": None,
+                        "competing_labels": [],
+                        "is_ambiguous": True,
+                        "ambiguity_delta": None,
+                        "warnings": ["No usable reference annotation label for this cluster."],
+                    }
+
+                def _key_priority(entry: Dict[str, Any]) -> int:
+                    key = str(entry.get("annotation_key", "")).lower()
+                    if "celltypist_majority" in key:
+                        return 0
+                    if "celltypist" in key:
+                        return 1
+                    if "scimilarity_representative" in key:
+                        return 2
+                    if "scimilarity" in key:
+                        return 3
+                    return 4
+
+                preferred = sorted(real_entries, key=_key_priority)[0]
+                proposed = str(preferred.get("top_label"))
+                proposed_fraction = float(preferred.get("top_fraction") or 0.0)
+                candidates: Dict[str, Dict[str, Any]] = {}
+                warnings: List[str] = []
+
+                for entry in real_entries:
+                    key = str(entry.get("annotation_key") or "")
+                    labels = entry.get("top_labels")
+                    if not isinstance(labels, list) or not labels:
+                        labels = [{
+                            "label": entry.get("top_label"),
+                            "fraction": entry.get("top_fraction", 0.0),
+                            "count": entry.get("top_count", 0),
+                        }]
+                    for rank, label_entry in enumerate(labels[:5]):
+                        label = str(label_entry.get("label") or "").strip()
+                        if not label:
+                            continue
+                        try:
+                            frac = float(label_entry.get("fraction") or 0.0)
+                        except Exception:
+                            frac = 0.0
+                        existing = candidates.get(label)
+                        if existing is None or frac > existing.get("score", 0.0):
+                            candidates[label] = {
+                                "label": label,
+                                "score": round(frac, 4),
+                                "source": key,
+                                "rank": rank + 1,
+                            }
+
+                competing = []
+                incompatible_top = False
+                for label, candidate in candidates.items():
+                    if label == proposed:
+                        continue
+                    compatible = _labels_compatible(proposed, label)
+                    item = dict(candidate)
+                    item["compatible_with_proposed"] = compatible
+                    if not compatible:
+                        competing.append(item)
+                        if item.get("rank") == 1 and float(item.get("score") or 0.0) >= 0.35:
+                            incompatible_top = True
+                    elif float(item.get("score") or 0.0) >= 0.5:
+                        # Keep high-support fine-grained variants visible for reporting without
+                        # turning broad-lineage agreement into an avoidable ambiguity failure.
+                        item["same_lineage_variant"] = True
+                        competing.append(item)
+
+                non_majority_entries = [
+                    e for e in real_entries
+                    if "majority" not in str(e.get("annotation_key", "")).lower()
+                ]
+                low_raw_support = False
+                if non_majority_entries:
+                    best_non_majority_support = max(
+                        float(e.get("top_fraction") or 0.0)
+                        for e in non_majority_entries
+                        if _labels_compatible(proposed, e.get("top_label"))
+                    ) if any(_labels_compatible(proposed, e.get("top_label")) for e in non_majority_entries) else 0.0
+                    low_raw_support = best_non_majority_support > 0 and best_non_majority_support < 0.35
+                    if low_raw_support:
+                        warnings.append(
+                            "Reference majority label has low raw per-cell support; use DEGs and reverse markers carefully."
+                        )
+
+                is_ambiguous = bool(incompatible_top or low_raw_support)
+                return {
+                    "label": proposed,
+                    "score": round(proposed_fraction, 4),
+                    "competing_labels": competing[:6],
+                    "is_ambiguous": is_ambiguous,
+                    "ambiguity_delta": None,
+                    "warnings": warnings,
+                    "source": preferred.get("annotation_key"),
+                }
+
             for c in cluster_ids:
                 summary: Dict[str, Any] = {
                     "cluster_id": c,
                     "n_cells": cluster_sizes[c],
                     "top_degs": [d["gene"] for d in top_degs_per_cluster.get(c, [])][:n_deg_genes],
-                    "top_degs_detail": top_degs_per_cluster.get(c, []),
+                    # top_degs_detail (per-gene score/logfc/pval) intentionally omitted —
+                    # it is never read downstream and the full ranking is in the DEG CSV.
                     "reverse_lookup_genes": reverse_lookup_by_cluster.get(c, []),
                     "reverse_lookup_excluded_genes": reverse_lookup_excluded_by_cluster.get(c, []),
+                    "qc_annotation_caveats": _cluster_annotation_qc_caveats(c),
                 }
+                # Pre-classify this cluster's top DEGs so the agent can cite
+                # discriminating markers on the first try instead of guessing.
+                # Uses the SAME functions the evidence validator applies, so
+                # genes in `suggested_supporting_genes` are guaranteed to pass
+                # the non-nuisance + discriminating checks.
+                _disc, _broad, _nuis = [], [], []
+                for _d in top_degs_per_cluster.get(c, []):
+                    _g = _d.get("gene")
+                    if not _g:
+                        continue
+                    if _annotation_nuisance_reason(_g):
+                        _nuis.append(_g)
+                    elif _annotation_broad_support_reason(_g):
+                        _broad.append(_g)
+                    else:
+                        _disc.append(_g)
+                summary["discriminating_degs"] = _disc
+                summary["broad_context_degs"] = _broad
+                summary["nuisance_degs"] = _nuis
+                summary["suggested_supporting_genes"] = _disc[:6]
                 if reference_annotation_summary.get(c):
                     summary["reference_annotations"] = reference_annotation_summary[c]
                 if score_matrix.get(c):
@@ -8093,19 +12298,128 @@ def process_tool_call(
                     if is_ambiguous:
                         ambiguous_clusters.append(c)
                 else:
-                    summary.update({
-                        "proposed_label": None,
-                        "proposed_score": None,
-                        "competing_labels": [],
-                        "is_ambiguous": True,
-                        "ambiguity_delta": None,
-                    })
-                    ambiguous_clusters.append(c)
+                    ref_proposal = _reference_proposal(reference_annotation_summary.get(c, []))
+                    if ref_proposal.get("label"):
+                        is_ambiguous = bool(ref_proposal.get("is_ambiguous"))
+                        summary.update({
+                            "proposed_label": ref_proposal.get("label"),
+                            "proposed_score": ref_proposal.get("score"),
+                            "proposed_label_source": "reference_annotation",
+                            "proposed_label_reference_key": ref_proposal.get("source"),
+                            "competing_labels": ref_proposal.get("competing_labels", []),
+                            "is_ambiguous": is_ambiguous,
+                            "ambiguity_delta": ref_proposal.get("ambiguity_delta"),
+                            "reference_confidence_warnings": ref_proposal.get("warnings", []),
+                        })
+                        if is_ambiguous:
+                            ambiguous_clusters.append(c)
+                    else:
+                        summary.update({
+                            "proposed_label": None,
+                            "proposed_score": None,
+                            "competing_labels": [],
+                            "is_ambiguous": True,
+                            "ambiguity_delta": None,
+                            "reference_confidence_warnings": ref_proposal.get("warnings", []),
+                        })
+                        ambiguous_clusters.append(c)
+                ref_consensus = _reference_consensus_from_entries(summary.get("reference_annotations") or [])
+                source_groups = ref_consensus.get("source_groups") or []
+
+                # Cytopus (local) prediction: does the proposed label best-match
+                # this cluster's DEGs? Cytopus + DEGs + reference are primary;
+                # PanglaoDB is staged ONLY for clusters none of them can resolve.
+                cyto_pred: Dict[str, Any] = {"available": False}
+                proposed_lbl = summary.get("proposed_label")
+                if proposed_lbl:
+                    try:
+                        from ..annotation import cytopus_markers as _cyto
+                        _comp = [
+                            (cc.get("label") if isinstance(cc, dict) else cc)
+                            for cc in (summary.get("competing_labels") or [])
+                        ]
+                        cyto_pred = _cyto.adjudicate(
+                            proposed_lbl,
+                            [str(x) for x in _comp if x],
+                            summary.get("top_degs") or [],
+                            min_margin=1,
+                        )
+                    except Exception:
+                        cyto_pred = {"available": False}
+                cyto_confirms = bool(cyto_pred.get("available") and cyto_pred.get("candidate_is_best"))
+                # Prepare is a prediction (validator is authoritative): if Cytopus
+                # has a CONFIDENT local call for this cluster's DEGs (clear best +
+                # margin), treat the cluster as locally resolvable and don't pre-stage
+                # PanglaoDB, even if the (murky) proposed_label didn't match. If the
+                # agent's final label diverges, the validator re-flags it.
+                cyto_confident = bool(
+                    cyto_pred.get("available")
+                    and (cyto_pred.get("best_overlap") or 0) >= 2
+                    and (cyto_pred.get("margin") or 0) >= 1
+                )
+                cyto_resolves = cyto_confirms or cyto_confident
+                ref_two_source = bool(ref_consensus.get("has_consensus"))
+
+                required_reasons: List[str] = []
+                if not (ref_two_source or cyto_resolves):
+                    if summary.get("is_ambiguous"):
+                        required_reasons.append("flagged_ambiguous")
+                    if not source_groups:
+                        required_reasons.append("deg_only_no_reference_source")
+                    if len(source_groups) >= 2 and not ref_consensus.get("has_consensus"):
+                        required_reasons.append("reference_sources_disagree")
+                    if cyto_pred.get("available") and (cyto_pred.get("best_overlap") or 0) == 0:
+                        required_reasons.append("cytopus_no_marker_overlap")
+                    elif cyto_pred.get("available"):
+                        required_reasons.append("cytopus_inconclusive")
+                    if not required_reasons:
+                        required_reasons.append("unresolved_by_reference_cytopus_deg")
+                panglaodb_required = bool(required_reasons)
+                summary["reference_source_groups"] = source_groups
+                summary["reference_consensus"] = {
+                    "has_consensus": bool(ref_consensus.get("has_consensus")),
+                    "label": ref_consensus.get("label"),
+                    "sources": ref_consensus.get("sources", []),
+                    "labels": ref_consensus.get("labels", []),
+                    "score": ref_consensus.get("score"),
+                }
+                if cyto_pred.get("available"):
+                    summary["cytopus_adjudication"] = {
+                        "candidate_covered": cyto_pred.get("candidate_covered"),
+                        "candidate_is_best": cyto_pred.get("candidate_is_best"),
+                        "best_label": cyto_pred.get("best_label"),
+                        "best_overlap": cyto_pred.get("best_overlap"),
+                        "margin": cyto_pred.get("margin"),
+                    }
+                summary["panglaodb_required"] = panglaodb_required
+                summary["validation_tier"] = (
+                    "needs_external_adjudication"
+                    if panglaodb_required
+                    else (
+                        "reference_consensus_plus_deg"
+                        if ref_two_source
+                        else ("cytopus_plus_deg" if cyto_resolves else "reference_partial_plus_deg")
+                    )
+                )
+                summary["panglaodb_required_reasons"] = required_reasons
                 cluster_summaries.append(summary)
+
+            panglaodb_required_clusters = [
+                str(entry.get("cluster_id"))
+                for entry in cluster_summaries
+                if entry.get("panglaodb_required")
+            ]
+            panglaodb_optional_clusters = [
+                str(entry.get("cluster_id"))
+                for entry in cluster_summaries
+                if not entry.get("panglaodb_required")
+            ]
 
             panglaodb_queries: List[Dict[str, Any]] = []
             seen_queries: set = set()
             for entry in cluster_summaries:
+                if not entry.get("panglaodb_required"):
+                    continue
                 proposed = entry.get("proposed_label")
                 if proposed and proposed not in seen_queries:
                     panglaodb_queries.append({
@@ -8136,7 +12450,10 @@ def process_tool_call(
 
             panglaodb_reverse_queries: List[Dict[str, Any]] = []
             reverse_gene_to_clusters: Dict[str, List[str]] = {}
+            required_cluster_set = set(panglaodb_required_clusters)
             for c, genes in reverse_lookup_by_cluster.items():
+                if str(c) not in required_cluster_set:
+                    continue
                 for g in genes:
                     reverse_gene_to_clusters.setdefault(g, []).append(c)
             selected_reverse_genes: List[str] = []
@@ -8144,6 +12461,8 @@ def process_tool_call(
             max_depth = max((len(v) for v in reverse_lookup_by_cluster.values()), default=0)
             for rank in range(max_depth):
                 for c in cluster_ids:
+                    if str(c) not in required_cluster_set:
+                        continue
                     genes = reverse_lookup_by_cluster.get(c, [])
                     if rank >= len(genes):
                         continue
@@ -8169,6 +12488,15 @@ def process_tool_call(
                     query["species"] = panglaodb_species
                 panglaodb_reverse_queries.append(query)
 
+            proposal_fingerprint = _make_annotation_proposal_fingerprint(
+                cluster_key=cluster_key,
+                cluster_ids=cluster_ids,
+                deg_key=deg_key,
+                annotation_key=annotation_key,
+                n_obs=int(adata.n_obs),
+                adata=adata,
+            )
+
             proposal = {
                 "cluster_key": cluster_key,
                 "annotation_key": annotation_key,
@@ -8180,68 +12508,182 @@ def process_tool_call(
                 "label_marker_lists_used": {k: list(v) for k, v in label_marker_lists.items()},
                 "reference_annotation_keys": valid_reference_keys,
                 "missing_reference_annotation_keys": missing_reference_keys,
+                "reference_source_coverage": reference_source_coverage,
+                "missing_reference_sources": missing_reference_sources,
                 "reference_annotation_summary": reference_annotation_summary,
                 "reverse_lookup_n_genes_per_cluster": reverse_lookup_n_genes,
                 "reverse_lookup_max_unique_genes": reverse_lookup_max_unique,
                 "reverse_lookup_exclude_patterns": reverse_exclude_patterns,
                 "reverse_lookup_by_cluster": reverse_lookup_by_cluster,
                 "reverse_lookup_excluded_by_cluster": reverse_lookup_excluded_by_cluster,
-                "scoring_method": "normalized_expression_fraction" if label_marker_lists else "deg_only",
+                "scoring_method": (
+                    "normalized_expression_fraction"
+                    if label_marker_lists
+                    else ("reference_annotation_plus_deg" if valid_reference_keys else "deg_only")
+                ),
                 "ambiguity_threshold": ambiguity_threshold,
                 "shared_marker_threshold": shared_marker_threshold,
                 "panglaodb_queries_required": panglaodb_queries,
                 "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
+                "panglaodb_required_clusters": panglaodb_required_clusters,
+                "panglaodb_optional_clusters": panglaodb_optional_clusters,
                 "panglaodb_species": panglaodb_species,
                 "deg_key": deg_key,
                 "deg_method": deg_method,
+                "fingerprint": proposal_fingerprint,
+                "n_obs_at_propose": int(adata.n_obs),
             }
             try:
                 adata.uns["annotation_proposal"] = proposal
             except Exception:
                 pass
 
+            # Clear staged evidence when the new proposal does not match what was
+            # last staged. Without this, finalize_annotation will silently reuse
+            # stale labels from a prior clustering whose cluster ids happen to
+            # overlap. Carry forward only when the fingerprint matches exactly.
+            try:
+                prior_fp = adata.uns.get("annotation_evidence_fingerprint")
+            except Exception:
+                prior_fp = None
+            evidence_cleared = False
+            n_evidence_cleared = 0
+            if prior_fp != proposal_fingerprint:
+                try:
+                    prior_evidence = adata.uns.get("annotation_evidence_summary")
+                    if isinstance(prior_evidence, dict):
+                        n_evidence_cleared = len(prior_evidence)
+                except Exception:
+                    n_evidence_cleared = 0
+                try:
+                    if "annotation_evidence_summary" in adata.uns:
+                        del adata.uns["annotation_evidence_summary"]
+                    if "annotation_evidence_fingerprint" in adata.uns:
+                        del adata.uns["annotation_evidence_fingerprint"]
+                except Exception:
+                    try:
+                        adata.uns["annotation_evidence_summary"] = {}
+                    except Exception:
+                        pass
+                evidence_cleared = True
+
+            # Persist the full per-cluster DEG table to a tidy CSV for the user
+            # and for the agent's later lookups.
+            deg_csv_path, deg_csv_rows = _save_deg_table_csv(
+                adata, deg_key, run_manager, groupby=cluster_key
+            )
+            prepare_artifacts: List[Dict[str, Any]] = []
+            if deg_csv_path:
+                try:
+                    paths_map = adata.uns.get("deg_csv_paths")
+                    if not isinstance(paths_map, dict):
+                        paths_map = {}
+                    paths_map[str(deg_key)] = deg_csv_path
+                    adata.uns["deg_csv_paths"] = paths_map
+                except Exception:
+                    pass
+                payload = _artifact_payload(
+                    deg_csv_path,
+                    role="deg_table",
+                    metadata={"key": deg_key, "groupby": cluster_key, "n_rows": deg_csv_rows},
+                )
+                if payload:
+                    prepare_artifacts.append(payload)
+
+            # Build a SLIM per-cluster view for the tool result. The full
+            # cluster_summaries (top_degs_detail, full broad/nuisance/discriminating
+            # lists, per-key reference_annotations, reverse-lookup genes) stay in
+            # adata.uns['annotation_proposal'] — they are not needed in the model's
+            # context and were the dominant driver of EMERGENCY context compactions.
+            # The result keeps only what the model must act on per cluster.
+            def _slim_cluster_view(s: Dict[str, Any]) -> Dict[str, Any]:
+                v = {
+                    "cluster_id": s.get("cluster_id"),
+                    "n_cells": s.get("n_cells"),
+                    "proposed_label": s.get("proposed_label"),
+                    "is_ambiguous": s.get("is_ambiguous"),
+                    "validation_tier": s.get("validation_tier"),
+                    "panglaodb_required": s.get("panglaodb_required"),
+                    "suggested_supporting_genes": s.get("suggested_supporting_genes"),
+                    "top_degs": (s.get("top_degs") or [])[:8],
+                }
+                rc = s.get("reference_consensus") or {}
+                if rc:
+                    v["reference_consensus"] = {
+                        "has_consensus": rc.get("has_consensus"),
+                        "label": rc.get("label"),
+                        "sources": rc.get("sources"),
+                    }
+                ca = s.get("cytopus_adjudication") or {}
+                if ca:
+                    v["cytopus_adjudication"] = {
+                        "candidate_is_best": ca.get("candidate_is_best"),
+                        "best_label": ca.get("best_label"),
+                        "margin": ca.get("margin"),
+                    }
+                if s.get("is_ambiguous") and s.get("competing_labels"):
+                    v["competing_labels"] = s.get("competing_labels")
+                if s.get("panglaodb_required") and s.get("panglaodb_required_reasons"):
+                    v["panglaodb_required_reasons"] = s.get("panglaodb_required_reasons")
+                if s.get("qc_annotation_caveats"):
+                    v["qc_annotation_caveats"] = s.get("qc_annotation_caveats")
+                return v
+
+            clusters_result_view = [_slim_cluster_view(s) for s in cluster_summaries]
+
             result = {
                 "status": "ok",
                 "tool": "prepare_annotation",
                 "cluster_key": cluster_key,
+                "deg_table_csv": deg_csv_path,
+                "deg_table_rows": deg_csv_rows,
                 "annotation_key": annotation_key,
                 "n_clusters": len(cluster_ids),
                 "n_ambiguous": len(ambiguous_clusters),
                 "ambiguous_clusters": ambiguous_clusters,
-                "shared_markers_flagged": shared_markers,
+                "shared_markers_flagged": shared_markers[:30],
                 "scoring_method": proposal["scoring_method"],
                 "reference_annotation_keys": valid_reference_keys,
                 "missing_reference_annotation_keys": missing_reference_keys,
-                "reference_annotation_summary": reference_annotation_summary,
-                "reference_annotation_notice": (
-                    "No CellTypist/Scimilarity annotation columns were supplied or auto-detected. "
-                    "If a compatible reference model is available, run it before treating this proposal "
-                    "as the main source of candidate labels."
-                ) if not valid_reference_keys else None,
-                "clusters": cluster_summaries,
+                "reference_source_coverage": reference_source_coverage,
+                "missing_reference_sources": missing_reference_sources,
+                "reference_annotation_notice": reference_annotation_notice,
+                "clusters": clusters_result_view,
+                "full_proposal_in": "adata.uns['annotation_proposal'] (full per-cluster DEGs/reference detail; the DEG table is also at deg_table_csv)",
                 "panglaodb_queries_required": panglaodb_queries,
                 "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
+                "panglaodb_required_clusters": panglaodb_required_clusters,
+                "panglaodb_optional_clusters": panglaodb_optional_clusters,
                 "reverse_lookup_n_genes_per_cluster": reverse_lookup_n_genes,
                 "reverse_lookup_max_unique_genes": reverse_lookup_max_unique,
                 "reverse_lookup_exclude_patterns": reverse_exclude_patterns,
                 "panglaodb_species": panglaodb_species,
+                "proposal_fingerprint": proposal_fingerprint,
+                "stale_evidence_cleared": evidence_cleared,
+                "n_stale_evidence_entries_cleared": n_evidence_cleared,
+                "prior_evidence_fingerprint": prior_fp,
                 "next_steps": [
-                    "If no reference_annotation_keys are present and CellTypist or Scimilarity is compatible, run reference annotation before finalizing broad cell-type labels.",
-                    "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate).",
-                    "For each entry in panglaodb_reverse_marker_queries_required, call bc_get_panglaodb_marker_genes with gene_symbol and species; aggregate returned cell_type values per cluster across multiple genes.",
+                    "Set each cluster's supporting_genes from its `suggested_supporting_genes` (these are the discriminating DEGs — already non-nuisance and non-broad, so they pass validation on the first try). Add cluster-specific markers from `discriminating_degs` if needed.",
+                    "Do NOT cite genes from `broad_context_degs` (MHC-II like HLA-DRA/CD74, housekeeping, generic myeloid) or `nuisance_degs` (MT/ribosomal/hemoglobin/MALAT1) as the supporting evidence — the validator rejects them as non-discriminating, which is the #1 cause of re-staging loops.",
+                    "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in staged evidence.",
+                    "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate); these are limited to clusters needing external adjudication.",
+                    "For each entry in panglaodb_reverse_marker_queries_required, call bc_get_panglaodb_marker_genes with gene_symbol and species; aggregate returned cell_type values per required cluster across multiple genes.",
                     "Do not infer alternatives from a single top gene. Treat reverse-lookup labels as candidates only when supported by multiple DEG genes, then query those cell_type labels directly.",
-                    "Compare PanglaoDB markers against each cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
+                    "For panglaodb_optional_clusters, synthesize labels from CellTypist/Scimilarity agreement and submitted DEG support; PanglaoDB can remain false unless validation later flags that cluster.",
+                    "Compare PanglaoDB markers against each required cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
                     "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
-                    "Once every cluster has external evidence, call finalize_annotation with evidence_summary.",
+                    "Stage ALL clusters in ONE stage_annotation_evidence call (pass evidence_summary as a structured object; for >~25 clusters use write_json then evidence_path). Read result.validation, fix only the flagged clusters, and re-stage. Call finalize_annotation only after stage reports validation.status='ok' for every cluster — do not call finalize speculatively while clusters are still failing.",
                 ],
                 "state": make_state(adata),
             }
             return _finalize_result(
                 result, adata,
                 dataset_changed=False,
+                artifacts_created=prepare_artifacts,
                 summary=(
                     f"Annotation proposal staged for {len(cluster_ids)} clusters "
-                    f"({len(ambiguous_clusters)} ambiguous, {len(shared_markers)} shared markers flagged). "
+                    f"({len(ambiguous_clusters)} ambiguous, {len(shared_markers)} shared markers flagged, "
+                    f"{len(panglaodb_required_clusters)} requiring PanglaoDB adjudication). "
                     f"Now query PanglaoDB for {len(panglaodb_queries)} candidate labels "
                     f"and {len(panglaodb_reverse_queries)} reverse marker genes."
                 ),
@@ -8258,6 +12700,301 @@ def process_tool_call(
                             "degs_available",
                             bool(top_degs_per_cluster),
                             f"Top DEGs extracted for {len(top_degs_per_cluster)} clusters.",
+                        ),
+                    ],
+                ),
+            )
+
+        elif tool_name == "stage_annotation_evidence":
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            if adata is None:
+                return _error_result(
+                    tool="stage_annotation_evidence",
+                    message="No data in memory.",
+                    adata_obj=adata,
+                    recovery_options=["Load data and run prepare_annotation first."],
+                )
+
+            proposal = adata.uns.get("annotation_proposal")
+            if not isinstance(proposal, dict) or not proposal.get("cluster_ids"):
+                return _error_result(
+                    tool="stage_annotation_evidence",
+                    message=(
+                        "No annotation_proposal found on adata.uns. Stage evidence only after "
+                        "prepare_annotation has created the cluster proposal."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=["Call prepare_annotation first, then stage evidence in batches."],
+                )
+
+            proposal_fp = proposal.get("fingerprint")
+            staged_fp = adata.uns.get("annotation_evidence_fingerprint")
+            if (
+                isinstance(proposal_fp, str)
+                and isinstance(staged_fp, str)
+                and staged_fp != proposal_fp
+            ):
+                # Previously staged evidence belongs to a different proposal —
+                # do not silently merge labels from a stale clustering. Wipe and
+                # require the agent to re-stage against the current proposal.
+                try:
+                    if "annotation_evidence_summary" in adata.uns:
+                        del adata.uns["annotation_evidence_summary"]
+                    if "annotation_evidence_fingerprint" in adata.uns:
+                        del adata.uns["annotation_evidence_fingerprint"]
+                except Exception:
+                    pass
+                return _error_result(
+                    tool="stage_annotation_evidence",
+                    message=(
+                        "Staged evidence fingerprint does not match the current proposal "
+                        f"(staged={staged_fp}, proposal={proposal_fp}). Stale evidence was discarded; "
+                        "re-stage against the current proposal."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Call stage_annotation_evidence again with evidence keyed by the current cluster ids.",
+                        "If you intended to keep old labels, re-run prepare_annotation with the same clustering and re-stage explicitly.",
+                    ],
+                )
+
+            incoming = tool_input.get("evidence_summary")
+            evidence_source = "direct"
+            evidence_path = tool_input.get("evidence_path")
+            if incoming is None and evidence_path:
+                resolved_path = _resolve_run_path(evidence_path, run_manager=run_manager, must_exist=True)
+                if resolved_path is None:
+                    return _error_result(
+                        tool="stage_annotation_evidence",
+                        message=f"evidence_path was provided but no file was found: {evidence_path}",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Write the evidence JSON file inside the run directory (Path(output_dir) / 'evidence.json').write_text(json.dumps(...))",
+                            "Then pass evidence_path with the bare filename — it is resolved against the run directory automatically.",
+                            "Use register_artifact(path) inside run_code to surface the absolute path in the previous tool result.",
+                        ],
+                    )
+                parsed_file = _loads_tolerant(resolved_path.read_text())
+                if parsed_file is None:
+                    return _error_result(
+                        tool="stage_annotation_evidence",
+                        message=f"Could not parse evidence_path as JSON: {resolved_path}",
+                        adata_obj=adata,
+                        recovery_options=["Ensure the file contains a JSON object keyed by cluster id."],
+                    )
+                incoming = parsed_file
+                evidence_source = f"file:{resolved_path}"
+            elif isinstance(incoming, str):
+                parsed_inline = _loads_tolerant(incoming)
+                if parsed_inline is not None:
+                    incoming = parsed_inline
+                    evidence_source = "json_string"
+                else:
+                    incoming_len = len(incoming)
+                    likely_truncated = incoming_len > 6000
+                    return _error_result(
+                        tool="stage_annotation_evidence",
+                        message=(
+                            "Could not parse evidence_summary as JSON/structured data. "
+                            + (
+                                "The inline evidence payload is large and likely truncated; write evidence to a JSON file and pass evidence_path instead."
+                                if likely_truncated
+                                else "Pass evidence_summary as a JSON object rather than a string when possible."
+                            )
+                        ),
+                        adata_obj=adata,
+                        recovery_options=[
+                            "For more than five clusters, write evidence to a JSON file in the run directory and pass evidence_path.",
+                            "For small batches, pass evidence_summary as an object, not a JSON-encoded string.",
+                        ],
+                        extra={
+                            "inline_evidence_length": incoming_len,
+                            "likely_truncated_inline_evidence": likely_truncated,
+                            "recommended_next_call": {
+                                "tool": "stage_annotation_evidence",
+                                "arguments": {"evidence_path": "annotation_evidence.json", "replace": False},
+                            },
+                        },
+                    )
+            if not isinstance(incoming, dict) or not incoming:
+                return _error_result(
+                    tool="stage_annotation_evidence",
+                    message="evidence_summary or evidence_path is required and must contain at least one cluster entry.",
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Pass evidence_summary={cluster_id: {label, panglaodb_queried, supporting_genes, confidence}} for one or more clusters.",
+                        "For large payloads, write a JSON object to disk and pass evidence_path.",
+                    ],
+                )
+
+            invalid_entries = [str(k) for k, v in incoming.items() if not isinstance(v, dict)]
+            if invalid_entries:
+                return _error_result(
+                    tool="stage_annotation_evidence",
+                    message=f"Evidence entries must be objects. Invalid cluster ids: {invalid_entries[:10]}",
+                    adata_obj=adata,
+                    recovery_options=["Wrap each cluster's label, genes, confidence, and reasoning in a dict."],
+                )
+
+            replace = bool(tool_input.get("replace", False))
+            staged_existing = adata.uns.get("annotation_evidence_summary")
+            if replace or not isinstance(staged_existing, dict):
+                staged: Dict[str, Any] = {}
+            else:
+                staged = {str(k): v for k, v in staged_existing.items() if isinstance(v, dict)}
+
+            normalized_incoming = {str(k): v for k, v in incoming.items()}
+            staged.update(normalized_incoming)
+            try:
+                adata.uns["annotation_evidence_summary"] = staged
+            except Exception:
+                pass
+            # Stamp the staged-evidence fingerprint so finalize_annotation and
+            # subsequent stage calls can detect proposal/evidence drift.
+            try:
+                if isinstance(proposal_fp, str) and proposal_fp:
+                    adata.uns["annotation_evidence_fingerprint"] = proposal_fp
+            except Exception:
+                pass
+
+            proposal_clusters = [str(c) for c in proposal.get("cluster_ids", [])]
+            covered = [c for c in proposal_clusters if c in staged]
+            missing = [c for c in proposal_clusters if c not in staged]
+            unknown = [c for c in staged.keys() if c not in proposal_clusters]
+
+            # Validate the merged evidence so the model sees every issue at
+            # staging time, not only when finalize_annotation is called. Run
+            # auto-fixes (e.g., confidence cap from PanglaoDB support level)
+            # and persist the corrected evidence back to adata.uns so the
+            # corrections survive into finalize. We treat ``allow_partial`` as
+            # true here regardless of caller intent — incomplete coverage is
+            # the normal state during multi-batch staging and shouldn't be a
+            # validation failure on its own (it's surfaced in ``coverage``).
+            _stage_validation = _validate_annotation_evidence(
+                adata=adata,
+                proposal=proposal,
+                evidence=staged,
+                world_state=world_state,
+                tool_input_unavailable_sources=(
+                    tool_input.get("reference_source_unavailable")
+                    or tool_input.get("reference_sources_unavailable")
+                    or {}
+                ),
+                allow_partial=True,
+                apply_auto_fixes=True,
+            )
+            stage_evidence_str = _stage_validation["evidence_str"]
+            stage_auto_fixes = _stage_validation["auto_fixes"]
+            stage_failures = _stage_validation["validation_failures"]
+            stage_per_cluster = _stage_validation["per_cluster_validation"]
+            stage_panglaodb_required = _stage_validation["panglaodb_required_clusters"]
+            # Persist any auto-fixed evidence so finalize sees the corrections.
+            try:
+                adata.uns["annotation_evidence_summary"] = stage_evidence_str
+                staged = stage_evidence_str
+            except Exception:
+                pass
+
+            n_covered_with_evidence = len(covered)
+            n_proposal = len(proposal_clusters)
+            full_coverage = n_covered_with_evidence == n_proposal and n_proposal > 0
+            has_blocking_issues = bool(stage_failures)
+            validation_status = "ok" if not has_blocking_issues else "issues"
+            # Unambiguous gate for the model: only finalize when every proposal
+            # cluster is covered AND no cluster has a blocking validation issue.
+            ready_to_finalize = full_coverage and not has_blocking_issues
+            clusters_failing = sorted({
+                m.group(1)
+                for f in stage_failures
+                for m in [re.match(r"Cluster (\S+?):", str(f))]
+                if m
+            })
+
+            result = {
+                "status": "ok",
+                "tool": "stage_annotation_evidence",
+                "ready_to_finalize": ready_to_finalize,
+                "clusters_failing": clusters_failing,
+                "n_entries_received": len(normalized_incoming),
+                "n_entries_staged_total": len(staged),
+                "evidence_source": evidence_source,
+                "replace": replace,
+                "coverage": {
+                    "n_proposal_clusters": n_proposal,
+                    "n_covered": n_covered_with_evidence,
+                    "n_missing": len(missing),
+                    "missing_clusters": missing[:50],
+                    "unknown_clusters": unknown[:50],
+                },
+                "validation": {
+                    "status": validation_status,
+                    "n_issues": len(stage_failures),
+                    "auto_fixes": stage_auto_fixes,
+                    "validation_failures": stage_failures,
+                    "validation_failures_grouped": (
+                        _format_validation_failures_per_cluster(stage_failures)
+                        if stage_failures else ""
+                    ),
+                    "per_cluster_validation": stage_per_cluster,
+                    "panglaodb_required_clusters": stage_panglaodb_required,
+                },
+                "next_steps": (
+                    [
+                        f"Fix the {len(stage_failures)} validation issue(s) above before calling finalize_annotation.",
+                        "Resubmit stage_annotation_evidence with the corrected entries (only the failing clusters need to be re-sent).",
+                    ]
+                    if has_blocking_issues
+                    else (
+                        [
+                            "Call finalize_annotation to write the labels; evidence_summary can be omitted if the staged evidence is complete.",
+                        ]
+                        if full_coverage
+                        else [
+                            "Continue staging evidence until all proposal clusters are covered.",
+                            "Then call finalize_annotation; evidence_summary can be omitted if staged evidence is complete.",
+                        ]
+                    )
+                ),
+                "state": make_state(adata),
+            }
+            summary = (
+                f"Staged annotation evidence for {len(normalized_incoming)} clusters "
+                f"({n_covered_with_evidence}/{n_proposal} proposal clusters covered)"
+            )
+            if stage_auto_fixes:
+                summary += f"; {len(stage_auto_fixes)} auto-fix(es) applied"
+            if has_blocking_issues:
+                summary += f"; {len(stage_failures)} validation issue(s) — see validation report"
+            return _finalize_result(
+                result, adata,
+                dataset_changed=False,
+                summary=summary + ".",
+                verification=_build_verification(
+                    "passed" if not has_blocking_issues else "warn",
+                    (
+                        "Annotation evidence staged and validated without writing cell-type labels."
+                        if not has_blocking_issues
+                        else "Annotation evidence staged but failed validation — labels not written."
+                    ),
+                    [
+                        _check(
+                            "evidence_staged",
+                            isinstance(adata.uns.get("annotation_evidence_summary"), dict),
+                            "adata.uns['annotation_evidence_summary'] present.",
+                        ),
+                        _check(
+                            "labels_not_written",
+                            True,
+                            "stage_annotation_evidence did not write or overwrite annotation labels.",
+                        ),
+                        _check(
+                            "validation_ok",
+                            not has_blocking_issues,
+                            (
+                                "All staged evidence passes validation."
+                                if not has_blocking_issues
+                                else f"{len(stage_failures)} validation issue(s) need to be addressed before finalize."
+                            ),
                         ),
                     ],
                 ),
@@ -8286,18 +13023,87 @@ def process_tool_call(
                     adata_obj=adata,
                     recovery_options=[
                         "Call prepare_annotation first to produce DEGs and a proposal.",
-                        "Then query PanglaoDB for each candidate label and call finalize_annotation with evidence.",
+                        "Then query PanglaoDB only for clusters flagged as requiring external adjudication and call finalize_annotation with evidence.",
                     ],
                 )
 
-            evidence = tool_input.get("evidence_summary")
-            if not isinstance(evidence, dict) or not evidence:
+            # Cross-check that the proposal still matches the live clustering.
+            # We recompute the fingerprint from the live ``adata`` (cluster
+            # membership included), not from the stored proposal fields, so
+            # that same-label/same-size membership swaps after prepare are
+            # detected. Using stored fields would be circular.
+            proposal_fp = proposal.get("fingerprint")
+            live_cluster_key = proposal.get("cluster_key", tool_input.get("cluster_key", "leiden"))
+            current_fp = _make_annotation_proposal_fingerprint(
+                cluster_key=live_cluster_key,
+                cluster_ids=(
+                    sorted(adata.obs[live_cluster_key].astype(str).unique().tolist())
+                    if live_cluster_key in adata.obs.columns
+                    else proposal.get("cluster_ids", [])
+                ),
+                deg_key=proposal.get("deg_key", "rank_genes_groups"),
+                annotation_key=proposal.get("annotation_key", "cell_type"),
+                n_obs=int(adata.n_obs),
+                adata=adata,
+            )
+            if isinstance(proposal_fp, str) and proposal_fp and proposal_fp != current_fp:
                 return _error_result(
                     tool="finalize_annotation",
-                    message="evidence_summary is required and must map every cluster to a label with evidence.",
+                    message=(
+                        "Annotation proposal fingerprint does not match the live AnnData "
+                        f"(stored={proposal_fp}, live={current_fp}). Cluster membership or "
+                        "cell set drifted since prepare_annotation. Re-run prepare_annotation "
+                        "to regenerate the proposal before finalizing."
+                    ),
                     adata_obj=adata,
                     recovery_options=[
-                        "Pass evidence_summary={cluster_id: {label, panglaodb_queried, supporting_genes, confidence}} for every cluster.",
+                        "Call prepare_annotation again with the active cluster_key.",
+                        "Re-stage evidence against the new proposal, then call finalize_annotation.",
+                    ],
+                )
+
+            incoming_evidence = tool_input.get("evidence_summary")
+            staged_evidence = adata.uns.get("annotation_evidence_summary")
+            staged_fp = adata.uns.get("annotation_evidence_fingerprint")
+            if (
+                isinstance(staged_evidence, dict) and staged_evidence
+                and isinstance(proposal_fp, str) and proposal_fp
+                and isinstance(staged_fp, str) and staged_fp != proposal_fp
+            ):
+                # Refuse to finalize using evidence that was staged against a
+                # different proposal. This is the central anti-stale-evidence
+                # guard — without it, a re-clustering with overlapping ids
+                # would silently inherit old labels.
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        "Staged annotation evidence fingerprint does not match the current proposal "
+                        f"(staged={staged_fp}, proposal={proposal_fp}). Refusing to finalize on stale evidence."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Call stage_annotation_evidence to re-stage evidence against the current proposal.",
+                        "Or pass evidence_summary directly in this finalize_annotation call.",
+                    ],
+                )
+            evidence: Dict[str, Any] = {}
+            used_staged_evidence = False
+            if isinstance(staged_evidence, dict) and staged_evidence:
+                evidence.update({str(k): v for k, v in staged_evidence.items() if isinstance(v, dict)})
+                used_staged_evidence = True
+            if isinstance(incoming_evidence, dict) and incoming_evidence:
+                evidence.update({str(k): v for k, v in incoming_evidence.items()})
+            if not evidence:
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        "Annotation evidence is required and must map every cluster to a label with evidence. "
+                        "Pass evidence_summary directly or stage it first with stage_annotation_evidence."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Use stage_annotation_evidence in batches, then call finalize_annotation after all clusters are covered.",
+                        "Or pass evidence_summary={cluster_id: {label, panglaodb_queried, supporting_genes, confidence}} for every cluster.",
                     ],
                 )
 
@@ -8305,6 +13111,7 @@ def process_tool_call(
             annotation_key = tool_input.get("annotation_key") or proposal.get("annotation_key", "cell_type")
             overwrite = bool(tool_input.get("overwrite", False))
             allow_partial = bool(tool_input.get("allow_partial", False))
+            validate_only = bool(tool_input.get("validate_only", False) or tool_input.get("dry_run", False))
 
             if cluster_key not in adata.obs.columns:
                 return _error_result(
@@ -8313,7 +13120,7 @@ def process_tool_call(
                     adata_obj=adata,
                     recovery_options=["Re-run prepare_annotation with the correct cluster_key."],
                 )
-            if annotation_key in adata.obs.columns and not overwrite:
+            if annotation_key in adata.obs.columns and not overwrite and not validate_only:
                 return _error_result(
                     tool="finalize_annotation",
                     message=(
@@ -8327,97 +13134,151 @@ def process_tool_call(
                     ],
                 )
 
-            proposal_clusters = [str(c) for c in proposal.get("cluster_ids", [])]
-            evidence_str = {str(k): v for k, v in evidence.items()}
-            missing_clusters = [c for c in proposal_clusters if c not in evidence_str]
-            unknown_clusters = [c for c in evidence_str.keys() if c not in proposal_clusters]
+            _validation_report = _validate_annotation_evidence(
+                adata=adata,
+                proposal=proposal,
+                evidence=evidence,
+                world_state=world_state,
+                tool_input_unavailable_sources=(
+                    tool_input.get("reference_source_unavailable")
+                    or tool_input.get("reference_sources_unavailable")
+                    or {}
+                ),
+                allow_partial=allow_partial,
+                apply_auto_fixes=True,
+            )
+            validation_failures = _validation_report["validation_failures"]
+            per_cluster_validation = _validation_report["per_cluster_validation"]
+            auto_fixes = _validation_report["auto_fixes"]
+            evidence_str = _validation_report["evidence_str"]
+            proposal_clusters = _validation_report["proposal_clusters"]
+            proposal_cluster_entries = _validation_report["proposal_cluster_entries"]
+            ambiguous_set = _validation_report["ambiguous_set"]
+            reference_keys = _validation_report["reference_keys"]
+            missing_reference_sources = _validation_report["missing_reference_sources"]
+            tool_recorded_unavailable_sources = _validation_report["tool_recorded_unavailable_sources"]
+            manual_unavailable_sources = _validation_report["manual_unavailable_sources"]
+            unavailable_reference_sources = _validation_report["unavailable_reference_sources"]
+            unexplained_missing_sources = _validation_report["unexplained_missing_sources"]
+            scimilarity_availability = _validation_report["scimilarity_availability"]
+            any_panglaodb = _validation_report["any_panglaodb"]
+            panglaodb_required_clusters = _validation_report["panglaodb_required_clusters"]
 
-            ambiguous_set = set(str(c) for c in proposal.get("ambiguous_clusters", []))
-            validation_failures: List[str] = []
-            per_cluster_validation: Dict[str, Dict[str, Any]] = {}
-
-            if missing_clusters and not allow_partial:
-                validation_failures.append(
-                    f"Missing evidence for {len(missing_clusters)} clusters: {missing_clusters[:10]}"
-                )
-            if unknown_clusters:
-                validation_failures.append(
-                    f"evidence_summary references {len(unknown_clusters)} clusters not in the proposal: {unknown_clusters[:10]}"
-                )
-
-            any_panglaodb = False
-            for cid, ev in evidence_str.items():
-                if not isinstance(ev, dict):
-                    validation_failures.append(f"Cluster {cid}: evidence is not an object.")
-                    continue
-                checks: Dict[str, Any] = {"cluster_id": cid}
-                label = ev.get("label")
-                if not isinstance(label, str) or not label.strip():
-                    validation_failures.append(f"Cluster {cid}: missing or empty 'label'.")
-                    checks["label_ok"] = False
-                else:
-                    checks["label"] = label
-                    checks["label_ok"] = True
-
-                pq = bool(ev.get("panglaodb_queried", False))
-                checks["panglaodb_queried"] = pq
-                if pq:
-                    any_panglaodb = True
-
-                supporting = ev.get("supporting_genes") or []
-                checks["n_supporting_genes"] = len(supporting) if isinstance(supporting, list) else 0
-                if isinstance(supporting, list) and len(supporting) == 0:
-                    validation_failures.append(
-                        f"Cluster {cid}: supporting_genes is empty — every label must cite at least one cluster DEG that matched a PanglaoDB marker."
-                    )
-
-                competing = ev.get("competing_labels_considered")
-                if cid in ambiguous_set:
-                    if not isinstance(competing, list) or len(competing) == 0:
-                        validation_failures.append(
-                            f"Cluster {cid} was flagged ambiguous by prepare_annotation but evidence provides no competing_labels_considered."
-                        )
-                checks["competing_labels_considered"] = competing or []
-                if "reference_annotation_support" in ev:
-                    checks["reference_annotation_support"] = ev.get("reference_annotation_support")
-                if "reference_annotation_conflicts" in ev:
-                    conflicts = ev.get("reference_annotation_conflicts")
-                    checks["reference_annotation_conflicts"] = conflicts if isinstance(conflicts, list) else [str(conflicts)]
-                if "reverse_marker_support" in ev:
-                    checks["reverse_marker_support"] = ev.get("reverse_marker_support")
-                if "panglaodb_label_used" in ev:
-                    checks["panglaodb_label_used"] = str(ev.get("panglaodb_label_used"))
-                if "reasoning" in ev:
-                    checks["reasoning"] = str(ev.get("reasoning"))
-
-                conf = ev.get("confidence")
-                if conf not in {"high", "medium", "low"}:
-                    validation_failures.append(f"Cluster {cid}: confidence must be 'high', 'medium', or 'low'.")
-                checks["confidence"] = conf
-
-                per_cluster_validation[cid] = checks
-
-            if not any_panglaodb:
-                validation_failures.append(
-                    "No cluster has panglaodb_queried=true. At least one PanglaoDB query must back the labels — "
-                    "this tool refuses to write annotations without external marker validation."
-                )
 
             if validation_failures:
                 return _error_result(
                     tool="finalize_annotation",
-                    message="Evidence validation failed: " + "; ".join(validation_failures[:6]),
+                    message="Evidence validation failed: " + _format_validation_failures_per_cluster(validation_failures),
                     adata_obj=adata,
                     recovery_options=[
-                        "Query PanglaoDB for each proposed label and competing label.",
-                        "Fill supporting_genes with the cluster DEGs that match PanglaoDB markers.",
+                        "Do NOT retry finalize_annotation directly. Correct the flagged clusters via stage_annotation_evidence and wait until it reports ready_to_finalize=true (clusters_failing empty), then call finalize once.",
+                        "Set supporting_genes from the cluster's suggested_supporting_genes / discriminating_degs in the prepare_annotation proposal — these are guaranteed non-nuisance, non-broad, and present in the DEGs.",
+                        "Do not cite broad_context_degs (MHC-II like HLA-DRA/CD74, housekeeping, generic myeloid) or nuisance_degs (MT/ribosomal/hemoglobin/MALAT1) as the supporting evidence.",
+                        "Query PanglaoDB only for clusters whose validation_tier is needs_external_adjudication.",
+                        "Include source_synthesis and lower confidence for QC/structure-review clusters.",
                         "For ambiguous clusters, list the alternative labels you considered in competing_labels_considered.",
-                        "Resubmit finalize_annotation with the corrected evidence_summary.",
+                        "Run missing CellTypist/Scimilarity sources; Scimilarity needs a prior tool-recorded blocker if it truly cannot run.",
                     ],
                     extra={
                         "validation_failures": validation_failures,
                         "per_cluster_validation": per_cluster_validation,
+                        "auto_fixes": auto_fixes,
+                        "missing_reference_sources": missing_reference_sources,
+                        "reference_source_unavailable_tool_recorded": tool_recorded_unavailable_sources,
+                        "reference_source_unavailable_manual": manual_unavailable_sources,
+                        "accepted_reference_source_unavailable": unavailable_reference_sources,
+                        "scimilarity_availability": scimilarity_availability,
+                        "panglaodb_required_clusters": panglaodb_required_clusters,
                     },
+                )
+
+            if validate_only:
+                cluster_to_label_preview: Dict[str, str] = {}
+                for cid in proposal_clusters:
+                    ev = evidence_str.get(cid)
+                    if isinstance(ev, dict) and isinstance(ev.get("label"), str):
+                        cluster_to_label_preview[cid] = ev["label"]
+                    elif allow_partial:
+                        cluster_to_label_preview[cid] = "Unassigned"
+                preview_series = adata.obs[cluster_key].astype(str).map(cluster_to_label_preview)
+                mapping_has_missing = bool((not allow_partial) and preview_series.isna().any())
+                if mapping_has_missing:
+                    return _error_result(
+                        tool="finalize_annotation",
+                        message="Validation passed, but mapping would produce NaNs because some obs cluster ids are absent from the evidence.",
+                        adata_obj=adata,
+                        recovery_options=["Re-run prepare_annotation; verify the cluster_key matches the staged evidence."],
+                        extra={
+                            "validation_failures": [
+                                "Mapping would produce NaNs — some cluster ids in obs were not in the evidence."
+                            ],
+                            "per_cluster_validation": per_cluster_validation,
+                            "auto_fixes": auto_fixes,
+                        },
+                    )
+                preview_series = preview_series.fillna("Unassigned")
+                label_counts_preview: Dict[str, int] = {}
+                for value in preview_series.astype(str).values:
+                    label_counts_preview[value] = label_counts_preview.get(value, 0) + 1
+                validation_payload_preview = {
+                    "annotation_key": annotation_key,
+                    "cluster_key": cluster_key,
+                    "panglaodb_validated": True,
+                    "external_validation_policy": "conditional_panglaodb_adjudication",
+                    "validation_strategy": "reference_and_submitted_deg_primary_panglaodb_for_required_clusters",
+                    "panglaodb_required_clusters": panglaodb_required_clusters,
+                    "validate_only": True,
+                    "used_staged_evidence": used_staged_evidence,
+                    "auto_fixes": auto_fixes,
+                    "reference_annotation_keys": reference_keys,
+                    "reference_source_coverage": proposal.get("reference_source_coverage") or {},
+                    "missing_reference_sources": proposal.get("missing_reference_sources") or [],
+                    "reference_source_unavailable": unavailable_reference_sources,
+                    "reference_source_unavailable_tool_recorded": tool_recorded_unavailable_sources,
+                    "reference_source_unavailable_manual": manual_unavailable_sources,
+                    "unexplained_missing_reference_sources": unexplained_missing_sources,
+                    "scimilarity_availability": scimilarity_availability,
+                    "n_clusters_validated": len([c for c in per_cluster_validation.values() if c.get("panglaodb_queried")]),
+                    "per_cluster_evidence": per_cluster_validation,
+                    "label_counts": label_counts_preview,
+                    "finalized": False,
+                }
+                return _finalize_result(
+                    {
+                        "status": "ok",
+                        "tool": "finalize_annotation",
+                        "validate_only": True,
+                        "annotation_key": annotation_key,
+                        "cluster_key": cluster_key,
+                        "n_clusters_validated": len(cluster_to_label_preview),
+                        "label_counts": label_counts_preview,
+                        "annotation_validation": validation_payload_preview,
+                        "used_staged_evidence": used_staged_evidence,
+                        "auto_fixes": auto_fixes,
+                        "state": make_state(adata),
+                    },
+                    adata,
+                    dataset_changed=False,
+                    summary=(
+                        f"Annotation evidence validation passed for {len(cluster_to_label_preview)} clusters. "
+                        "No labels were written because validate_only=true."
+                    ),
+                    verification=_build_verification(
+                        "passed",
+                        "Annotation evidence passed validation without writing labels.",
+                        [
+                            _check("validation_only", True, "validate_only=true; annotation column was not written."),
+                            _check(
+                                "external_adjudication_satisfied",
+                                not panglaodb_required_clusters,
+                                (
+                                    "No cluster still requires PanglaoDB adjudication."
+                                    if not panglaodb_required_clusters
+                                    else f"{len(panglaodb_required_clusters)} cluster(s) still require PanglaoDB adjudication."
+                                ),
+                            ),
+                        ],
+                    ),
                 )
 
             cluster_to_label: Dict[str, str] = {}
@@ -8451,11 +13312,39 @@ def process_tool_call(
             for v in adata.obs[annotation_key].astype(str).values:
                 label_counts[v] = label_counts.get(v, 0) + 1
 
+            # Provenance rollup: how each cluster was adjudicated. Cytopus (local)
+            # + reference + DEGs are primary; PanglaoDB is the rare fallback.
+            validation_tier_breakdown: Dict[str, int] = {}
+            for _c in per_cluster_validation.values():
+                _t = _c.get("validation_tier") or "unknown"
+                validation_tier_breakdown[_t] = validation_tier_breakdown.get(_t, 0) + 1
+            n_panglaodb_adjudicated = len([
+                c for c in per_cluster_validation.values() if c.get("panglaodb_queried")
+            ])
+            n_cytopus_adjudicated = validation_tier_breakdown.get("cytopus_plus_deg", 0)
+
             validation_payload = {
                 "annotation_key": annotation_key,
                 "cluster_key": cluster_key,
                 "panglaodb_validated": True,
-                "n_clusters_validated": len([c for c in per_cluster_validation.values() if c.get("panglaodb_queried")]),
+                "external_validation_policy": "cytopus_local_primary_panglaodb_fallback",
+                "validation_strategy": "reference_consensus_and_local_cytopus_and_submitted_deg_primary;panglaodb_only_for_ambiguous",
+                "marker_adjudication_sources": ["cytopus_local", "reference_consensus", "submitted_deg", "panglaodb_fallback"],
+                "validation_tier_breakdown": validation_tier_breakdown,
+                "n_cytopus_adjudicated": n_cytopus_adjudicated,
+                "n_panglaodb_adjudicated": n_panglaodb_adjudicated,
+                "panglaodb_required_clusters": panglaodb_required_clusters,
+                "used_staged_evidence": used_staged_evidence,
+                "auto_fixes": auto_fixes,
+                "reference_annotation_keys": reference_keys,
+                "reference_source_coverage": proposal.get("reference_source_coverage") or {},
+                "missing_reference_sources": proposal.get("missing_reference_sources") or [],
+                "reference_source_unavailable": unavailable_reference_sources,
+                "reference_source_unavailable_tool_recorded": tool_recorded_unavailable_sources,
+                "reference_source_unavailable_manual": manual_unavailable_sources,
+                "unexplained_missing_reference_sources": unexplained_missing_sources,
+                "scimilarity_availability": scimilarity_availability,
+                "n_clusters_validated": len(per_cluster_validation),
                 "per_cluster_evidence": per_cluster_validation,
                 "label_counts": label_counts,
                 "finalized": True,
@@ -8464,6 +13353,144 @@ def process_tool_call(
                 adata.uns["annotation_validation"] = validation_payload
             except Exception:
                 pass
+
+            artifacts: List[Dict[str, Any]] = []
+            if run_manager:
+                def _fmt_report_value(value, limit=None):
+                    # Reports must never truncate; render the value in full.
+                    # ``limit`` is accepted for backward compatibility but ignored.
+                    if value is None:
+                        return "NA"
+                    if isinstance(value, dict):
+                        parts = [f"{k}: {v}" for k, v in value.items() if v not in (None, "", [], {})]
+                        text = "; ".join(parts) if parts else "none"
+                    elif isinstance(value, list):
+                        text = ", ".join(str(v) for v in value) if value else "none"
+                    else:
+                        text = str(value)
+                    return text.replace("|", "\\|").replace("\n", " ")
+
+                annotation_json_path = run_manager.write_json_report(
+                    f"annotation_validation_{annotation_key}",
+                    validation_payload,
+                )
+                artifacts.append(
+                    _artifact_payload(
+                        annotation_json_path,
+                        role="annotation_validation_json",
+                        metadata={"annotation_key": annotation_key, "cluster_key": cluster_key},
+                    )
+                )
+
+                md_lines = [
+                    f"# Annotation Validation - `{annotation_key}`",
+                    "",
+                    "This report summarizes the finalized consensus annotation evidence. Automated reference "
+                    "labels are treated as candidates; final labels are written only after reference, submitted "
+                    "DEG, and any required external-adjudication evidence is validated.",
+                    "",
+                    "## Summary",
+                    "",
+                    f"- Cluster key: `{cluster_key}`",
+                    f"- Clusters labeled: **{len(cluster_to_label)}**",
+                    f"- Unique labels: **{len(label_counts)}**",
+                    f"- Used staged evidence: **{used_staged_evidence}**",
+                    f"- External validation policy: **conditional PanglaoDB adjudication**",
+                    f"- Clusters still requiring PanglaoDB after validation: **{_fmt_report_value(panglaodb_required_clusters)}**",
+                    f"- Reference annotation columns: **{_fmt_report_value(reference_keys)}**",
+                    f"- Missing reference sources: **{_fmt_report_value(proposal.get('missing_reference_sources') or [])}**",
+                    "",
+                    "## Cell-Type Counts",
+                    "",
+                    "| Label | Cells |",
+                    "|---|---:|",
+                ]
+                for label, count in sorted(label_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+                    md_lines.append(f"| {_fmt_report_value(label)} | {int(count)} |")
+
+                md_lines.extend([
+                    "",
+                    "## Per-Cluster Annotation Evidence",
+                    "",
+                    "| Cluster | Final label | Confidence | Validation tier | Support level | QC cap | Supporting genes | PanglaoDB label used | Competing labels considered | Reference support/conflict |",
+                    "|---|---|---|---|---|---|---|---|---|---|",
+                ])
+                for cid in proposal_clusters:
+                    ev = per_cluster_validation.get(cid, {})
+                    ref_bits = []
+                    if ev.get("reference_annotation_support"):
+                        ref_bits.append("support: " + _fmt_report_value(ev.get("reference_annotation_support"), limit=90))
+                    if ev.get("reference_annotation_conflicts"):
+                        ref_bits.append("conflict: " + _fmt_report_value(ev.get("reference_annotation_conflicts"), limit=90))
+                    md_lines.append(
+                        "| "
+                        + " | ".join([
+                            _fmt_report_value(cid),
+                            _fmt_report_value(ev.get("label")),
+                            _fmt_report_value(ev.get("confidence")),
+                            _fmt_report_value(ev.get("validation_tier")),
+                            _fmt_report_value(ev.get("panglaodb_support_level")),
+                            _fmt_report_value(ev.get("qc_confidence_cap", "none")),
+                            _fmt_report_value(ev.get("supporting_genes"), limit=80),
+                            _fmt_report_value(ev.get("panglaodb_label_used", "same/as stated")),
+                            _fmt_report_value(ev.get("competing_labels_considered"), limit=90),
+                            _fmt_report_value("; ".join(ref_bits) if ref_bits else "not recorded", limit=140),
+                        ])
+                        + " |"
+                    )
+
+                md_lines.extend(["", "## Reasoning By Cluster", ""])
+                for cid in proposal_clusters:
+                    ev = per_cluster_validation.get(cid, {})
+                    proposal_entry = proposal_cluster_entries.get(cid, {})
+                    top_degs = proposal_entry.get("top_degs") or []
+                    md_lines.append(f"### Cluster {cid}: {ev.get('label', 'Unassigned')}")
+                    md_lines.append("")
+                    md_lines.append(f"- Confidence: **{ev.get('confidence', 'NA')}**.")
+                    if ev.get("validation_tier"):
+                        md_lines.append(f"- Validation tier: **{ev.get('validation_tier')}**.")
+                    if ev.get("panglaodb_support_level"):
+                        md_lines.append(f"- PanglaoDB support level: **{ev.get('panglaodb_support_level')}**.")
+                    if ev.get("qc_annotation_caveats"):
+                        md_lines.append(f"- QC/structure caveats: {_fmt_report_value(ev.get('qc_annotation_caveats'), limit=300)}.")
+                    md_lines.append(f"- Supporting genes: {_fmt_report_value(ev.get('supporting_genes'))}.")
+                    if ev.get("non_nuisance_supporting_genes"):
+                        md_lines.append(f"- Non-nuisance support: {_fmt_report_value(ev.get('non_nuisance_supporting_genes'))}.")
+                    if top_degs:
+                        md_lines.append(f"- Top DEGs reviewed: {_fmt_report_value(top_degs[:12])}.")
+                    if ev.get("source_synthesis"):
+                        md_lines.append(f"- Source synthesis: {_fmt_report_value(ev.get('source_synthesis'), limit=400)}.")
+                    if ev.get("reference_annotation_support"):
+                        md_lines.append(f"- Reference support: {_fmt_report_value(ev.get('reference_annotation_support'), limit=300)}.")
+                    if ev.get("reference_annotation_conflicts"):
+                        md_lines.append(f"- Reference conflicts: {_fmt_report_value(ev.get('reference_annotation_conflicts'), limit=300)}.")
+                    if ev.get("competing_labels_considered"):
+                        md_lines.append(f"- Competing labels considered: {_fmt_report_value(ev.get('competing_labels_considered'))}.")
+                    if ev.get("reverse_marker_support"):
+                        md_lines.append(f"- Reverse marker support: {_fmt_report_value(ev.get('reverse_marker_support'), limit=300)}.")
+                    md_lines.append(f"- Reasoning: {ev.get('reasoning', 'No reasoning recorded')}")
+                    md_lines.append("")
+
+                md_lines.extend([
+                    "## Reporting Notes",
+                    "",
+                    "- CellTypist majority-voted cluster labels are not the same as raw per-cell unanimity; use raw prediction fractions when claiming agreement strength.",
+                    "- If `panglaodb_label_used` is broader than the final label, the report should say the broad lineage was externally validated and the fine subtype was resolved from DEGs/reference labels.",
+                    "- This Markdown report is derived from `adata.uns['annotation_validation']`; the companion JSON preserves the full machine-readable evidence.",
+                    "",
+                ])
+                annotation_md_path = run_manager.write_text_report(
+                    f"annotation_validation_{annotation_key}_summary",
+                    "\n".join(md_lines),
+                    ext="md",
+                )
+                artifacts.append(
+                    _artifact_payload(
+                        annotation_md_path,
+                        role="annotation_validation_summary",
+                        metadata={"annotation_key": annotation_key, "cluster_key": cluster_key},
+                    )
+                )
 
             result = {
                 "status": "ok",
@@ -8474,6 +13501,14 @@ def process_tool_call(
                 "label_counts": label_counts,
                 "cell_type_breakdown": label_counts,
                 "annotation_validation": validation_payload,
+                "used_staged_evidence": used_staged_evidence,
+                "auto_fixes": auto_fixes,
+                "annotation_validation_json": (
+                    annotation_json_path if run_manager else None
+                ),
+                "annotation_validation_markdown": (
+                    annotation_md_path if run_manager else None
+                ),
                 "state": make_state(adata),
             }
             return _finalize_result(
@@ -8481,8 +13516,9 @@ def process_tool_call(
                 dataset_changed=True,
                 summary=(
                     f"Wrote final annotation '{annotation_key}' for {len(cluster_to_label)} clusters "
-                    f"({len(label_counts)} unique labels, all PanglaoDB-validated)."
+                    f"({len(label_counts)} unique labels) with conditional annotation validation."
                 ),
+                artifacts_created=[artifact for artifact in artifacts if artifact],
                 verification=_build_verification(
                     "passed",
                     "Annotation finalized with external marker evidence.",
@@ -8498,9 +13534,13 @@ def process_tool_call(
                             "adata.uns['annotation_validation'] recorded.",
                         ),
                         _check(
-                            "panglaodb_evidence_present",
-                            any_panglaodb,
-                            "At least one cluster has PanglaoDB-backed evidence.",
+                            "external_adjudication_satisfied",
+                            not panglaodb_required_clusters,
+                            (
+                                "No cluster still requires PanglaoDB adjudication."
+                                if not panglaodb_required_clusters
+                                else f"{len(panglaodb_required_clusters)} cluster(s) still require PanglaoDB adjudication."
+                            ),
                         ),
                     ],
                 ),

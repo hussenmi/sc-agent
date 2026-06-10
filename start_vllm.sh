@@ -31,7 +31,17 @@ PORT=${2:-8000}
 GPUS=${3:-"auto"}
 THINKING=${THINKING:-0}
 SPEC=${SPEC:-"auto"}
-LONG_CTX=${LONG_CTX:-1}
+LONG_CTX=${LONG_CTX:-0}
+
+# Waterfall benchmark overrides — set these to isolate the effect of each
+# optimization. Normal usage leaves all three unset (default behaviour).
+#   ENFORCE_EAGER=1   — disable CUDA graphs (adds --enforce-eager)
+#   KV_DTYPE=bf16     — skip FP8 KV cache (use BF16 KV, the hardware default)
+#   NO_PREFIX_CACHE=1 — disable prefix caching
+ENFORCE_EAGER=${ENFORCE_EAGER:-0}
+KV_DTYPE=${KV_DTYPE:-auto}
+NO_PREFIX_CACHE=${NO_PREFIX_CACHE:-0}
+DFLASH=${DFLASH:-0}   # set to 1 to use DFlash instead of MTP (H100 only, for benchmarking)
 
 HF_DIR="/data1/peerd/ibrahih3/hf"
 SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_gemma4.sif"}
@@ -109,10 +119,15 @@ case "$GPU_CC" in
     HW_CLASS="ampere"                  # A100
     ;;
   9.0)
-    if [[ "$GPU_NAME" == *"SXM"* || "$GPU_NAME" == *"HBM3"* ]]; then
-      HW_CLASS="hopper_nvswitch"       # H100 SXM
+    # Probe for NVSwitch directly rather than guessing from the SKU name. The name
+    # string is an unreliable proxy: H100 SXM reports "...SXM..." but H200 SXM
+    # reports a bare "NVIDIA H200" with no SXM/HBM3 marker — so a name match
+    # misclassifies a full-NVSwitch HGX board as no-NVSwitch. The kernel exposes
+    # one entry per NVSwitch chip here when the fabric is physically present.
+    if ls /proc/driver/nvidia-nvswitch/devices/* >/dev/null 2>&1; then
+      HW_CLASS="hopper_nvswitch"       # H100/H200 SXM (HGX baseboard w/ NVSwitch)
     else
-      HW_CLASS="hopper_no_nvswitch"    # H100 PCIe / H100 NVL
+      HW_CLASS="hopper_no_nvswitch"    # H100/H200 PCIe / NVL
     fi
     ;;
   *)
@@ -179,6 +194,9 @@ case "$HW_CLASS" in
     if [[ "$PARSER" == "gemma4" ]]; then
       VLLM_USE_DEEP_GEMM=0
       echo "Config:   BF16 weights + BF16 KV cache (Gemma 4 on A100 — FP8 KV not supported)"
+    elif [[ "$KV_DTYPE" == "bf16" ]]; then
+      VLLM_USE_DEEP_GEMM=0
+      echo "Config:   BF16 weights + BF16 KV cache (KV_DTYPE=bf16 override)"
     else
       EXTRA_FLAGS+=("--kv-cache-dtype" "fp8_e5m2")
       VLLM_USE_DEEP_GEMM=0
@@ -196,23 +214,42 @@ case "$HW_CLASS" in
     # Pre-disabling the fusion prevents the mid-compile retry and keeps memory stable.
     EXTRA_FLAGS+=("--compilation-config" '{"pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true,"fuse_attn_quant":false,"enable_sp":false,"fuse_gemm_comms":false,"fuse_allreduce_rms":false}}')
     EXTRA_FLAGS+=("--disable-custom-all-reduce")
-    EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
+    if [[ "$KV_DTYPE" != "bf16" ]]; then
+      EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
+      echo "Config:   FP8 weights + FP8 KV cache"
+    else
+      echo "Config:   FP8 weights + BF16 KV cache (KV_DTYPE=bf16 override)"
+    fi
     VLLM_USE_DEEP_GEMM=0
-    echo "Config:   FP8 weights + FP8 KV cache"
     echo "Config:   SymmMem-dependent fusions disabled (no NVSwitch)"
     echo "Config:   custom all-reduce disabled, DeepGEMM disabled"
     ;;
   hopper_nvswitch)
-    EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
-    echo "Config:   FP8 weights + FP8 KV cache + DeepGEMM + SymmMem fusions"
+    if [[ "$KV_DTYPE" != "bf16" ]]; then
+      EXTRA_FLAGS+=("--kv-cache-dtype" "fp8")
+      echo "Config:   FP8 weights + FP8 KV cache + DeepGEMM + SymmMem fusions"
+    else
+      echo "Config:   FP8 weights + BF16 KV cache (KV_DTYPE=bf16 override) + DeepGEMM + SymmMem fusions"
+    fi
     ;;
   *)
     echo "WARNING:  Unknown GPU class — using vLLM defaults"
     ;;
 esac
 
+# CUDA graphs: on by default. ENFORCE_EAGER=1 disables them for waterfall baseline.
+if [[ "$ENFORCE_EAGER" == "1" ]]; then
+  EXTRA_FLAGS+=("--enforce-eager")
+  echo "Config:   CUDA graphs DISABLED (ENFORCE_EAGER=1 override)"
+fi
+
 # Prefix caching: on by default in vLLM V1. Explicit flag for V0 compatibility.
-EXTRA_FLAGS+=("--enable-prefix-caching")
+# NO_PREFIX_CACHE=1 disables it for waterfall baseline.
+if [[ "$NO_PREFIX_CACHE" == "1" ]]; then
+  echo "Config:   prefix caching DISABLED (NO_PREFIX_CACHE=1 override)"
+else
+  EXTRA_FLAGS+=("--enable-prefix-caching")
+fi
 
 # Single-user interactive session: limit concurrent sequences. Default (256)
 # pre-allocates KV slots for 256 phantom sessions and blows out memory headroom.
@@ -238,8 +275,23 @@ fi
 if [[ "$THINKING" == "0" && "$SPEC" != "0" ]]; then
   case "$MODEL" in
     Qwen/Qwen3.6-27B|Qwen/Qwen3.6-27B-FP8)
-      EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":1}')
-      echo "Speculative: MTP (k=1, native to Qwen3.6)"
+      if [[ "$DFLASH" == "1" ]]; then
+        if [[ "$HW_CLASS" != "hopper_nvswitch" && "$HW_CLASS" != "hopper_no_nvswitch" ]]; then
+          echo "WARNING: DFLASH=1 requested but DFlash requires an H100 — falling back to MTP"
+          EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":1}')
+          echo "Speculative: MTP (k=1, native to Qwen3.6)"
+        else
+          DRAFT_HASH=$(cat "$HF_DIR/hub/models--z-lab--Qwen3.6-27B-DFlash/refs/main" 2>/dev/null)
+          DRAFT_LOCAL="/hf_cache/hub/models--z-lab--Qwen3.6-27B-DFlash/snapshots/$DRAFT_HASH"
+          EXTRA_FLAGS+=("--speculative-config" "{\"method\":\"dflash\",\"model\":\"$DRAFT_LOCAL\",\"num_speculative_tokens\":15}")
+          EXTRA_FLAGS+=("--attention-backend" "flash_attn")
+          echo "Speculative: DFlash (z-lab/Qwen3.6-27B-DFlash, k=15)"
+          echo "Speculative: WARNING — model still under training, acceptance may be low"
+        fi
+      else
+        EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":1}')
+        echo "Speculative: MTP (k=1, native to Qwen3.6)"
+      fi
       ;;
     *)
       if [[ "$SPEC" == "1" ]]; then

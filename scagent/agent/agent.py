@@ -76,18 +76,19 @@ load_data
   → run_umap                  [narrate: "UMAP computed." → then run_code for QC overlay → then run_clustering]
   → run_clustering(res=1.5)   [narrate: "N clusters."]
   → run_cluster_qc            [narrate full table + evidence]
-  → PAUSE: present removal proposal, wait for confirmation
-  → [loop: normalize_and_hvg → run_pca → run_neighbors → run_umap → run_clustering → run_cluster_qc → until clean]
+  → run_cluster_structure_qc  [for proposed/ambiguous clusters; narrate synthesis + heatmap evidence]
+  → remove evidence-supported cleanup clusters when below the pause threshold, otherwise pause for review
+  → [loop: normalize_and_hvg → run_pca → run_neighbors → run_umap → run_clustering → run_cluster_qc → run_cluster_structure_qc → until clean]
   → run_celltypist and/or run_scimilarity when organism/model compatibility allows
   → prepare_annotation with reference annotation keys
-  → bc_get_panglaodb_marker_genes per candidate and plausible competitor (MCP)
-  → finalize_annotation with DEG, reference-label, and PanglaoDB evidence
+  → bc_get_panglaodb_marker_genes only for clusters flagged as requiring external adjudication
+  → finalize_annotation with DEG + reference-label evidence, plus PanglaoDB evidence where required
   → final UMAP
 ```
 
-**Each `→` is a tool call in the same response turn. The only places you stop and wait are: cluster removal confirmation, user domain knowledge, or surprising results.**
+**Each `→` is a tool call in the same response turn. The only places you stop and wait are: high-impact cleanup review, user domain knowledge, or surprising results.**
 
-After `run_cluster_qc`: this IS a stopping point — you present the full per-cluster table with evidence, propose which clusters to remove, and wait for the user to confirm before removing anything.
+After `run_cluster_qc`: if any clusters are proposed/ambiguous, first call `run_cluster_structure_qc` to add covariance/Moran evidence. If structure QC synthesizes a cleanup set below the 15% pause threshold, remove exactly those clusters with `run_code`, explain the biological and technical evidence, and rerun the embedding/QC loop. If structure QC synthesizes no removal set, explicitly say that the reviewed clusters are being kept for now and proceed; do not keep asking about the stale metric-QC proposal. In user-facing narration, do not mention internal authorization or confirmation mechanics; frame it as an evidence-supported cleanup decision. Pause for review only when the structure-synthesized removal is at or above 15% or the tool explicitly marks the decision as high-impact/uncertain.
 """
 
 FAILURE_PATTERNS = [
@@ -154,6 +155,7 @@ ACTION_TOOL_NAMES = {
     "run_celltypist",
     "run_scimilarity",
     "prepare_annotation",
+    "stage_annotation_evidence",
     "finalize_annotation",
     "run_batch_correction",
     "score_integration",
@@ -166,7 +168,10 @@ ACTION_TOOL_NAMES = {
     "query_cells",
     "save_data",
     "run_cluster_qc",
+    "run_cluster_structure_qc",
     "run_code",
+    "write_report",
+    "write_json",
     "run_shell",
     "install_package",
 }
@@ -174,6 +179,8 @@ ACTION_TOOL_NAMES = {
 INSPECTION_TOOL_NAMES = {
     "inspect_data",
     "inspect_session",
+    "list_celltypist_models",
+    "check_celltypist_model",
     "list_artifacts",
     "get_cluster_sizes",
     "get_top_markers",
@@ -892,11 +899,11 @@ class SCAgent:
         return tool_name in INSPECTION_TOOL_NAMES
 
     def _annotation_validation_guard(self, tool_name: str, tool_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Prevent finalization immediately after automated annotation without marker validation."""
+        """Prevent final save/report before annotation consensus is finalized."""
         validation = getattr(self.world_state, "annotation_validation", {}) or {}
         if not validation.get("required"):
             return None
-        if validation.get("reference_marker_queries"):
+        if validation.get("finalized") or validation.get("status") == "validated_and_finalized":
             return None
 
         is_final_save = tool_name == "save_data"
@@ -933,17 +940,19 @@ class SCAgent:
             "status": "needs_validation",
             "tool": tool_name,
             "message": (
-                "Automated cell type annotation is present, but no external marker "
-                "validation has been run yet. Do not finalize or save the analysis "
-                "as complete based only on model training knowledge."
+                "Cell-type annotation candidates are present, but the annotation consensus "
+                "has not been finalized. Do not save or report the analysis as complete from "
+                "CellTypist/Scimilarity/PanglaoDB snippets alone; run the full consensus path "
+                "and finalize a curated annotation first."
             ),
             "annotation_validation": validation,
             "required_next_steps": [
+                "Run both run_celltypist and run_scimilarity when compatible; if one cannot run, record the concrete reason.",
                 "Run run_deg by the primary cluster key if marker DEGs are not already available.",
-                "Call bc_get_panglaodb_marker_genes for each proposed cell type label, using Hs for human or Mm for mouse.",
-                "For ambiguous clusters, also query plausible competing labels suggested by the DEGs or lineage context.",
-                "Compare high-sensitivity PanglaoDB markers and marker specificity against cluster DEGs.",
-                "Choose the best-supported label; revise unsupported labels, broaden them, or mark them uncertain before final report/save.",
+                "Call prepare_annotation with CellTypist and Scimilarity columns as reference_annotation_keys.",
+                "Query PanglaoDB only for clusters flagged as requiring external adjudication, including plausible competitors and staged reverse marker lookup genes.",
+                "Use search_papers/web_search as supporting context for ambiguous labels, but PanglaoDB remains the structured external adjudicator in v1.",
+                "Stage per-cluster evidence with stage_annotation_evidence, then call finalize_annotation.",
             ],
         }
 
@@ -1294,7 +1303,10 @@ class SCAgent:
         "list_obs_columns",
         "review_figure",
         "review_artifact",
+        "run_cluster_structure_qc",  # Refines an existing cleanup checkpoint.
         "generate_figure",  # Visualization doesn't change state
+        "write_report",  # Writing a report doesn't change state
+        "write_json",  # Writing a JSON file doesn't change state
         "save_data",  # Saving is always ok
         "read_file",
         "search_papers",
@@ -2051,6 +2063,124 @@ class SCAgent:
             "requires_user_confirmation": not auto_allowed,
         }
 
+    def _cluster_structure_qc_required_after_metric_qc(self, result_data: Dict[str, Any]) -> bool:
+        if result_data.get("status") != "ok":
+            return False
+        proposed = result_data.get("proposed_removal") or []
+        ambiguous = result_data.get("ambiguous") or []
+        return bool(proposed or ambiguous)
+
+    def _auto_structure_cleanup_allowed(self, proposal: Dict[str, Any]) -> tuple[bool, str]:
+        proposed = [str(cluster) for cluster in proposal.get("proposed_removal", []) or []]
+        if not proposed:
+            return False, "no structure-synthesized removal candidates"
+        pct = float(proposal.get("pct_proposed") or 0.0)
+        max_pct = 15.0
+        if pct >= max_pct:
+            return False, f"structure-synthesized removal {pct:.1f}% is at or above the {max_pct:.1f}% pause threshold"
+        return True, (
+            "Structure QC synthesized a removal set below the 15% pause threshold; "
+            "proceeding with the evidence-supported cleanup after saving the pre-cleanup checkpoint."
+        )
+
+    def _refine_cluster_cleanup_checkpoint_from_structure(
+        self,
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        checkpoint = self._pending_checkpoint or {}
+        if checkpoint.get("kind") == "cluster_qc_cleanup":
+            proposal = dict(checkpoint.get("proposal") or {})
+        else:
+            cluster_key = result_data.get("cluster_key") or self.world_state.data_summary.get("cluster_key") or "leiden"
+            metric_record = (self.world_state.cluster_qc_registry or {}).get(str(cluster_key), {})
+            proposal = {
+                "cluster_key": cluster_key,
+                "proposed_removal": [str(c) for c in metric_record.get("proposed_removal", []) or []],
+                "cluster_decisions": metric_record.get("cluster_decisions", {}),
+                "cells_in_proposed_removal": metric_record.get("cells_in_proposed_removal"),
+                "pct_proposed": metric_record.get("pct_proposed"),
+                "ambiguous": [str(c) for c in metric_record.get("ambiguous", []) or []],
+                "thresholds_used": metric_record.get("thresholds_used", {}),
+                "cluster_table": metric_record.get("cluster_table", []),
+            }
+        metric_proposed = [
+            str(cluster)
+            for cluster in proposal.get("metric_proposed_removal", proposal.get("proposed_removal", [])) or []
+        ]
+        synthesized = [str(cluster) for cluster in result_data.get("synthesized_removal", []) or []]
+        cells = int(result_data.get("cells_in_synthesized_removal") or 0)
+        pct = float(result_data.get("pct_synthesized_removal") or 0.0)
+        proposal.update(
+            {
+                "metric_proposed_removal": metric_proposed,
+                "proposed_removal": synthesized,
+                "cells_in_proposed_removal": cells,
+                "pct_proposed": pct,
+                "cells_remaining_if_removed": (
+                    None
+                    if self.adata is None
+                    else int(self.adata.n_obs) - cells
+                ),
+                "structure_evidence": result_data.get("structure_evidence_by_cluster", {}),
+                "structure_clusters_analyzed": result_data.get("clusters_analyzed", []),
+                "synthesized_removal": synthesized,
+                "rescued_clusters": result_data.get("rescued_clusters", []),
+                "confirmed_junk": result_data.get("confirmed_junk", []),
+                "conflicting": result_data.get("conflicting", []),
+                "structure_thresholds_used": result_data.get("thresholds_used", {}),
+            }
+        )
+        auto_allowed, auto_reason = self._auto_structure_cleanup_allowed(proposal)
+
+        if synthesized:
+            options, option_actions = self._checkpoint_options([
+                ("Remove the structure-supported low-quality clusters and rerun embedding", "remove_proposed_clusters"),
+                ("Keep these clusters and proceed", "keep_proposed_clusters"),
+                ("Inspect cluster structure details before deciding", "review_cluster_qc"),
+                ("Something else", "custom"),
+            ])
+            summary = (
+                f"Structure QC synthesized removing {len(synthesized)} cluster(s) "
+                f"({', '.join(synthesized)}) from '{proposal.get('cluster_key', 'leiden')}', "
+                f"totaling {cells} cells ({pct:.1f}%)."
+            )
+            recommendation = options[0]
+        else:
+            return {
+                "kind": "cluster_qc_cleanup_resolved",
+                "resolved_action": "keep_structure_reviewed_clusters",
+                "summary": (
+                    "Structure QC did not synthesize any removal candidates; "
+                    "the reviewed metric-flagged clusters should be kept for now."
+                ),
+                "proposal": proposal,
+                "review_clusters": result_data.get("conflicting", []) or [],
+                "auto_allowed": False,
+                "requires_user_confirmation": False,
+                "structure_refined": True,
+                "resolved": True,
+            }
+
+        refined = dict(checkpoint) if checkpoint.get("kind") == "cluster_qc_cleanup" else {}
+        refined.update(
+            {
+                "kind": "cluster_qc_cleanup",
+                "question": "Cluster structure QC refined the cleanup proposal. How should I proceed?",
+                "options": options,
+                "option_actions": option_actions,
+                "default": recommendation,
+                "recommendation": recommendation,
+                "decision_key": "cluster_qc_cleanup",
+                "summary": summary,
+                "proposal": proposal,
+                "auto_allowed": auto_allowed,
+                "auto_reason": auto_reason,
+                "requires_user_confirmation": not auto_allowed,
+                "structure_refined": True,
+            }
+        )
+        return refined
+
     def _authorize_pending_cleanup_from_user(self, request: str) -> bool:
         checkpoint = self._pending_checkpoint or {}
         if checkpoint.get("kind") != "cluster_qc_cleanup":
@@ -2150,6 +2280,37 @@ class SCAgent:
         self.world_state.sync_from_adata(
             self.adata,
             request_text=extra_text or self._active_request,
+        )
+
+    def _complete_run(self, final_result: str) -> None:
+        """Finalize a turn: guarantee a comprehensive analysis report exists, then
+        append the findings-log entry (full prompt + tool counts + report link).
+
+        A deterministic ``analysis_record.md`` is always written from stored
+        session state via ``_assemble_analysis_record`` so a full report exists
+        even when the model did not call ``write_report``. When the model did
+        call it, that narrative report layers on top of the same record.
+        """
+        if not self.run_manager:
+            return
+        report_path: Optional[str] = None
+        try:
+            from .tools import _assemble_analysis_record
+            record = _assemble_analysis_record(self.world_state, self.adata)
+            if record:
+                header = f"# Comprehensive Analysis Record — {self.run_manager.run_id}\n\n"
+                req = (self._active_request or "").strip()
+                if req:
+                    header += f"**Original request:**\n\n{req}\n\n---\n\n"
+                report_path = self.run_manager.write_text_report(
+                    "analysis_record", header + record, ext="md"
+                )
+        except Exception:
+            report_path = None
+        self.run_manager.complete(
+            summary=final_result,
+            request=self._active_request,
+            report_path=report_path,
         )
 
     def _record_world_state_snapshot(self) -> None:
@@ -2429,6 +2590,15 @@ class SCAgent:
                     "min_sensitivity": tool_input.get("min_sensitivity"),
                 },
             )
+            if isinstance(result_data.get("markers"), list) and len(result_data["markers"]) == 0:
+                result_data["no_markers_found"] = True
+                result_data["next_step"] = (
+                    "No PanglaoDB entries matched this cell_type string. "
+                    "Call bc_get_panglaodb_options once (if not already called this session) "
+                    "to retrieve the valid vocabulary, pick the closest matching term, "
+                    "retry bc_get_panglaodb_marker_genes with that term, and record the "
+                    "substitution in panglaodb_label_used on the evidence entry."
+                )
 
         if "state_delta" not in result_data:
             before_stage = before_snapshot.get("analysis_stage", "uninitialized")
@@ -2651,7 +2821,7 @@ class SCAgent:
                     "last_action": self.world_state.last_action,
                 },
             )
-            self.run_manager.complete(summary=final_result, request=self._active_request)
+            self._complete_run(final_result)
 
         self._print("\n" + "-" * 50)
         self._print(final_result)
@@ -2691,7 +2861,7 @@ class SCAgent:
                     "last_action": self.world_state.last_action,
                 },
             )
-            self.run_manager.complete(summary=final_result, request=self._active_request)
+            self._complete_run(final_result)
 
         self._print("\n" + "-" * 50)
         self._print(final_result)
@@ -3051,7 +3221,7 @@ class SCAgent:
                         continue
                     self._conversation_history = messages
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
 
@@ -3206,7 +3376,7 @@ class SCAgent:
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -3835,6 +4005,96 @@ class SCAgent:
                 if changed:
                     messages[i] = {**msg, "content": new_blocks}
 
+        # --- Pass 3: emergency-only tail compaction ---
+        #
+        # The last few messages are normally protected so the model can see the
+        # immediate tool result it just requested. That breaks down for batched
+        # evidence-query workflows: a single protected assistant/user pair can
+        # contain dozens of PanglaoDB tool_use/tool_result blocks and remain
+        # larger than the whole history budget. In emergency mode, compact
+        # machine payloads even inside the tail while preserving natural user
+        # text and the structural tool ids the provider expects.
+        if emergency:
+            for i in range(first_trimmable, len(messages)):
+                msg = messages[i]
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role == "tool":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and content != PLACEHOLDER:
+                        messages[i] = {**msg, "content": PLACEHOLDER}
+                    continue
+
+                if role == "user" and isinstance(msg.get("content"), list):
+                    new_blocks, changed = [], False
+                    for block in msg["content"]:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            if block.get("content") != PLACEHOLDER:
+                                new_blocks.append({**block, "content": PLACEHOLDER})
+                                changed = True
+                            else:
+                                new_blocks.append(block)
+                        elif isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if isinstance(text, str) and len(text) > EMERGENCY_ASSISTANT_CHARS:
+                                new_blocks.append({**block, "text": text[:EMERGENCY_ASSISTANT_CHARS] + " [truncated]"})
+                                changed = True
+                            else:
+                                new_blocks.append(block)
+                        else:
+                            new_blocks.append(block)
+                    if changed:
+                        messages[i] = {**msg, "content": new_blocks}
+                    continue
+
+                if role != "assistant":
+                    continue
+
+                if not anthropic:
+                    tcs = msg.get("tool_calls") or []
+                    if tcs:
+                        new_tcs, changed = [], False
+                        for tc in tcs:
+                            if isinstance(tc, dict):
+                                func = tc.get("function", {})
+                                args = func.get("arguments", "")
+                                if isinstance(args, str) and args != ARGS_PLACEHOLDER_OPENAI:
+                                    new_tcs.append({**tc, "function": {**func, "arguments": ARGS_PLACEHOLDER_OPENAI}})
+                                    changed = True
+                                    continue
+                            new_tcs.append(tc)
+                        if changed:
+                            messages[i] = {**msg, "tool_calls": new_tcs}
+                    content = messages[i].get("content")
+                    if isinstance(content, str) and len(content) > EMERGENCY_ASSISTANT_CHARS:
+                        messages[i] = {**messages[i], "content": content[:EMERGENCY_ASSISTANT_CHARS] + " [truncated]"}
+                else:
+                    blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
+                    if blocks:
+                        new_blocks, changed = [], False
+                        for block in blocks:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                if block.get("input") != ARGS_PLACEHOLDER_ANTHROPIC:
+                                    new_blocks.append({**block, "input": ARGS_PLACEHOLDER_ANTHROPIC})
+                                    changed = True
+                                else:
+                                    new_blocks.append(block)
+                            elif isinstance(block, dict) and block.get("type") == "text":
+                                text = block.get("text", "")
+                                if isinstance(text, str) and len(text) > EMERGENCY_ASSISTANT_CHARS:
+                                    new_blocks.append({**block, "text": text[:EMERGENCY_ASSISTANT_CHARS] + " [truncated]"})
+                                    changed = True
+                                else:
+                                    new_blocks.append(block)
+                            else:
+                                new_blocks.append(block)
+                        if changed:
+                            messages[i] = {**msg, "content": new_blocks}
+                    content = messages[i].get("content")
+                    if isinstance(content, str) and len(content) > EMERGENCY_ASSISTANT_CHARS:
+                        messages[i] = {**messages[i], "content": content[:EMERGENCY_ASSISTANT_CHARS] + " [truncated]"}
+
         after_snapshot = self._context_usage_snapshot(
             messages,
             system_prompt=system_prompt,
@@ -4109,7 +4369,7 @@ class SCAgent:
                     self._conversation_history = messages
 
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
@@ -4122,7 +4382,7 @@ class SCAgent:
                     self._print(final_result)
                     self._conversation_history = messages
                     if self.run_manager:
-                        self.run_manager.complete(summary=final_result, request=self._active_request)
+                        self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
 
@@ -4160,9 +4420,12 @@ class SCAgent:
         "run_umap":             "Computing UMAP",
         "run_clustering":       "Clustering",
         "compare_clusterings":  "Comparing clusterings",
+        "list_celltypist_models": "Listing CellTypist models",
+        "check_celltypist_model": "Checking CellTypist model",
         "run_celltypist":       "Cell type annotation",
         "run_scimilarity":      "Scimilarity annotation",
         "prepare_annotation":   "Preparing annotation proposal",
+        "stage_annotation_evidence": "Staging annotation evidence",
         "finalize_annotation":  "Finalizing annotation",
         "run_batch_correction": "Batch correction",
         "run_deg":              "Differential expression",
@@ -4173,7 +4436,10 @@ class SCAgent:
         "query_cells":          "Querying Scimilarity reference database",
         "save_data":            "Saving data",
         "run_cluster_qc":       "Cluster QC assessment",
+        "run_cluster_structure_qc": "Analyzing cluster structure",
         "run_code":             "Running code",
+        "write_report":         "Writing report",
+        "write_json":           "Writing JSON file",
         "run_shell":            "Running shell command",
         "install_package":      "Installing package",
         "generate_figure":      "Generating figure",
@@ -4244,6 +4510,7 @@ class SCAgent:
         "run_celltypist",
         "run_scimilarity",
         "prepare_annotation",     # runs rank_genes_groups, can be slow
+        "stage_annotation_evidence",
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
         "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets
@@ -4257,6 +4524,7 @@ class SCAgent:
         "query_cells",
         "save_data",
         "run_cluster_qc",
+        "run_cluster_structure_qc",
         "generate_figure",
         "run_code",               # unknown — user code may print progress
         "run_shell",              # external system checks/commands should be visible in terminal history
@@ -4616,7 +4884,24 @@ class SCAgent:
                 if cleanup_checkpoint is not None:
                     result_data["cluster_cleanup_proposal"] = cleanup_checkpoint.get("proposal", {})
                     result_data["cleanup_policy"] = self._cleanup_policy()
-                    if cleanup_checkpoint.get("auto_allowed"):
+                    if self._cluster_structure_qc_required_after_metric_qc(result_data):
+                        result_data["cluster_structure_qc_required"] = True
+                        result_data["recommended_next_tool"] = "run_cluster_structure_qc"
+                        result_data["metric_qc_interpretation"] = (
+                            "Metric QC has flagged problematic clusters for structure review; "
+                            "this is not yet a removal decision."
+                        )
+                        result_data["recommended_next_tool_input"] = {
+                            "cluster_key": result_data.get("cluster_key"),
+                            "clusters_to_analyze": [
+                                str(c)
+                                for c in (
+                                    result_data.get("proposed_removal", [])
+                                    + result_data.get("ambiguous", [])
+                                )
+                            ],
+                        }
+                    elif cleanup_checkpoint.get("auto_allowed"):
                         self._active_cleanup_authorization = {
                             "source": "auto_policy",
                             "proposal": cleanup_checkpoint.get("proposal", {}),
@@ -4627,6 +4912,39 @@ class SCAgent:
                         checkpoint = cleanup_checkpoint
                 else:
                     self._active_cleanup_authorization = None
+            if tool_name == "run_cluster_structure_qc" and result_data.get("status") == "ok":
+                refined_checkpoint = self._refine_cluster_cleanup_checkpoint_from_structure(result_data)
+                if refined_checkpoint is not None:
+                    result_data["cluster_cleanup_proposal"] = refined_checkpoint.get("proposal", {})
+                    result_data["cleanup_policy"] = {
+                        "mode": "auto_after_structure_qc",
+                        "max_auto_cleanup_pct": 15.0,
+                        "requires_structure_qc": True,
+                    }
+                    if refined_checkpoint.get("resolved"):
+                        self._active_cleanup_authorization = None
+                        self._clear_pending_checkpoint(refined_checkpoint.get("summary"))
+                        result_data["cleanup_resolved"] = refined_checkpoint.get("resolved_action")
+                        result_data["review_clusters_kept"] = refined_checkpoint.get("review_clusters", [])
+                        result_data["recommended_next_action"] = (
+                            "Proceed without cell removal; structure QC did not synthesize "
+                            "a cleanup set from the reviewed metric-flagged clusters."
+                        )
+                    elif refined_checkpoint.get("auto_allowed"):
+                        self._active_cleanup_authorization = {
+                            "source": "auto_structure_qc",
+                            "proposal": refined_checkpoint.get("proposal", {}),
+                            "reason": refined_checkpoint.get("auto_reason", ""),
+                        }
+                        result_data["cleanup_authorization_available"] = self._active_cleanup_authorization
+                        result_data["recommended_next_tool"] = "run_code"
+                        result_data["recommended_next_action"] = (
+                            "Remove exactly the structure-synthesized cleanup clusters, "
+                            "then rerun normalize_and_hvg, PCA, neighbors, UMAP, clustering, "
+                            "cluster QC, and structure QC."
+                        )
+                    else:
+                        checkpoint = refined_checkpoint
             if checkpoint is None:
                 checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
             if checkpoint is None:
@@ -5332,6 +5650,25 @@ class SCAgent:
         question = tool_input.get("question", "")
         context = tool_input.get("context", "")
         options = tool_input.get("options") or []
+        cleanup_text = " ".join([str(question), str(context)] + [str(option) for option in options]).lower()
+        if (
+            re.search(r"\b(remove|drop|filter|exclude|subset)\b", cleanup_text)
+            and re.search(r"\b(cluster|clusters|cells?)\b", cleanup_text)
+        ):
+            return json.dumps({
+                "status": "error",
+                "tool": "pause_and_ask",
+                "message": (
+                    "Do not create a manual cleanup decision after structure QC unless a "
+                    "structure-refined cluster cleanup checkpoint is pending. If structure QC "
+                    "synthesized no removal set, keep the reviewed clusters for now, document "
+                    "the caveat, and continue."
+                ),
+                "recovery_options": [
+                    "Proceed to annotation with the structure-reviewed clusters kept.",
+                    "If the user explicitly asks for stricter cleanup, run a new structure-aware proposal instead of inventing a keep-mask removal.",
+                ],
+            }, indent=2)
         option_actions = ["custom"] * len(options)
 
         checkpoint = {

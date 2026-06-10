@@ -69,8 +69,46 @@ def _metadata_species(adata: AnnData) -> tuple[str, str]:
     return "unknown", "unknown"
 
 
+def _genome_column_species(adata: AnnData) -> tuple[str, str, List[str]]:
+    """Infer species from the ``genome`` column 10x CellRanger writes into ``var``.
+
+    CellRanger ``.h5`` outputs tag each feature with the reference assembly
+    (e.g. ``GRCh38`` for human, ``mm10``/``GRCm39`` for mouse). This is the most
+    authoritative species signal when present. A barnyard / multi-reference
+    dataset carries more than one assembly and is reported as ambiguous.
+
+    Returns ``(species, source, observed_values)``.
+    """
+    col = next((k for k in ("genome", "Genome") if k in adata.var.columns), None)
+    if col is None:
+        return "unknown", "unknown", []
+    try:
+        values = [str(v).strip() for v in adata.var[col].astype(str).unique() if str(v).strip()]
+    except Exception:
+        return "unknown", "unknown", []
+    if not values:
+        return "unknown", "unknown", []
+
+    human_tokens = ("grch38", "grch37", "hg19", "hg38", "homo", "human")
+    mouse_tokens = ("grcm39", "grcm38", "mm39", "mm10", "mm9", "mus", "mouse")
+    species_found = set()
+    for v in values:
+        lv = v.lower()
+        if any(t in lv for t in human_tokens):
+            species_found.add("human")
+        elif any(t in lv for t in mouse_tokens):
+            species_found.add("mouse")
+    if len(species_found) == 1:
+        return species_found.pop(), "var_genome_column", values
+    if len(species_found) > 1:
+        return "unknown", "conflicting_genome_column", values
+    # Genome column present but the assembly string is unrecognized — let the
+    # downstream gene-identifier / marker checks decide rather than blocking.
+    return "unknown", "unknown", values
+
+
 def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, Dict[str, Any]]:
-    """Infer species from user text, metadata, and gene identifiers."""
+    """Infer species from user text, metadata, the genome column, and gene identifiers."""
     evidence: Dict[str, Any] = {}
 
     text_species, text_source = _species_from_text(text_context)
@@ -85,6 +123,17 @@ def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, Di
     if metadata_source != "unknown":
         evidence["metadata_species"] = metadata_species
         return metadata_species, metadata_source, evidence
+
+    # 10x CellRanger genome assembly column — authoritative when present.
+    genome_species, genome_source, genome_values = _genome_column_species(adata)
+    if genome_values:
+        evidence["genome_column_values"] = genome_values
+    if genome_source == "var_genome_column":
+        evidence["genome_column_species"] = genome_species
+        return genome_species, genome_source, evidence
+    if genome_source == "conflicting_genome_column":
+        evidence["conflicting_genome_column"] = True
+        return "unknown", genome_source, evidence
 
     sample_names = [str(name) for name in adata.var_names[:50000]]
     sample_var_values: List[str] = []
