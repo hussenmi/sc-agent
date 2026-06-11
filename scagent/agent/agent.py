@@ -51,6 +51,13 @@ interactive selector; do not duplicate its numbered menu in prose.
 
 **Proceed without pausing for:** standard preprocessing (normalization, HVG, PCA, neighbors, UMAP), algorithm parameter choices with established best practices, reversible steps you can re-run with different settings.
 
+**Multi-sample data is an explicit exception:** when inspection identifies
+multiple sample-like groups and no strategy has been selected, the runtime asks
+the user how to handle them. Do not infer that correction is required from
+metadata names or group count. Honor the structured `multi_sample_strategy`;
+explicit integration uses scVI unless the user or a source workflow specifies
+another method.
+
 ### When to use `pause_and_ask`
 
 Use it — and only use it — when:
@@ -194,6 +201,7 @@ INSPECTION_TOOL_NAMES = {
     "review_figure",
     "review_artifact",
     "inspect_run_state",
+    "inspect_data_inputs",
     "inspect_workspace",
     "read_file",
     "search_papers",
@@ -1146,6 +1154,237 @@ class SCAgent:
             actions.append(slug)
         return actions
 
+    @staticmethod
+    def _multi_sample_partition_from_result(
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract the best sample-like partition from an inspection result."""
+        batch = result_data.get("batch") or {}
+        candidates = batch.get("candidates") or result_data.get("metadata_candidates") or []
+        candidate = candidates[0] if candidates else {}
+        column = (
+            batch.get("confirmed_batch_key")
+            or batch.get("inferred_batch_key")
+            or batch.get("recommended_batch_key")
+            or candidate.get("column")
+        )
+        n_groups = int(batch.get("n_batches") or candidate.get("n_unique") or 0)
+        if not column or n_groups < 2:
+            return None
+        return {
+            "column": str(column),
+            "n_groups": n_groups,
+            "role": batch.get("recommended_role") or candidate.get("role") or "sample",
+            "status": batch.get("status") or "candidate",
+            "needs_key_confirmation": bool(batch.get("needs_confirmation")),
+            "reason": batch.get("reason") or candidate.get("rationale") or "",
+            "examples": candidate.get("examples") or [],
+        }
+
+    def _multi_sample_strategy_checkpoint(
+        self,
+        partition: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the initial user-owned strategy decision for multi-sample data."""
+        column = partition["column"]
+        n_groups = partition["n_groups"]
+        experiment_design = self.world_state.get_confirmed_value("experiment_design")
+        context = (
+            f"I found {n_groups} groups in the {partition.get('role', 'sample')}-like "
+            f"column `{column}`. Their presence does not by itself justify batch correction, "
+            "so I will not integrate them automatically."
+        )
+        if experiment_design:
+            context += f"\n\nExperiment context you provided:\n{experiment_design}"
+
+        options, option_actions = self._checkpoint_options([
+            ("Investigate whether integration is needed (recommended)", "investigate_integration"),
+            ("Integrate the samples with scVI", "integrate_scvi"),
+            ("Keep samples combined without integration", "keep_unintegrated"),
+            ("Analyze samples separately", "analyze_separately"),
+            ("Describe the experiment first", "describe_experiment"),
+        ])
+        return {
+            "kind": "multi_sample_strategy",
+            "decision_key": "multi_sample_strategy",
+            "question": "How should I handle these samples?",
+            "context": context,
+            "summary": context,
+            "options": options,
+            "option_actions": option_actions,
+            "default": options[0],
+            "recommendation": options[0],
+            "allow_custom": True,
+            "custom_label": "Type something else...",
+            "custom_prompt": "Describe another strategy: ",
+            "custom_placeholder": (
+                "For example: integrate within each condition, but keep conditions separate"
+            ),
+            "text_input_actions": {
+                "describe_experiment": {
+                    "prompt": "Describe the experiment: ",
+                    "placeholder": (
+                        "Samples, donors, conditions, tissues, protocols, known technical "
+                        "batches, and the comparisons that matter. You can paste a table."
+                    ),
+                }
+            },
+            "partition": partition,
+            "action_inputs": {
+                "investigate_integration": {
+                    "batch_key": column,
+                    "mode": "progressive",
+                },
+                "integrate_scvi": {
+                    "batch_key": column,
+                    "method": "scvi",
+                    "batch_key_needs_confirmation": partition.get("needs_key_confirmation", False),
+                },
+                "keep_unintegrated": {"batch_key": column},
+                "analyze_separately": {"sample_key": column},
+            },
+            "artifacts": [],
+        }
+
+    def _build_multi_sample_strategy_checkpoint(
+        self,
+        tool_name: str,
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if tool_name != "inspect_data" or result_data.get("status") != "ok":
+            return None
+        if self.world_state.get_confirmed_value("multi_sample_strategy"):
+            return None
+        if (result_data.get("batch") or {}).get("batch_correction_applied"):
+            return None
+        partition = self._multi_sample_partition_from_result(result_data)
+        if partition is None:
+            return None
+        return self._multi_sample_strategy_checkpoint(partition)
+
+    def _build_post_concatenation_strategy_checkpoint(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Open the integration decision immediately after a successful concat."""
+        if tool_name != "run_code" or result_data.get("status") != "ok":
+            return None
+        code = str(tool_input.get("code") or "")
+        if not re.search(r"\b(?:anndata|ad)\.concat\s*\(|\bconcat_datasets\s*\(", code):
+            return None
+        if self.world_state.get_confirmed_value("multi_sample_strategy"):
+            return None
+
+        summary = self.world_state.data_summary or {}
+        candidates = self.world_state.metadata_candidates or []
+        candidate = candidates[0] if candidates else {}
+        column = (
+            summary.get("batch_key")
+            or summary.get("recommended_batch_key")
+            or candidate.get("column")
+        )
+        n_groups = int(summary.get("n_batches") or candidate.get("n_unique") or 0)
+        if not column or n_groups < 2:
+            return None
+        return self._multi_sample_strategy_checkpoint({
+            "column": str(column),
+            "n_groups": n_groups,
+            "role": candidate.get("role") or "sample",
+            "status": "post_concatenation",
+            "needs_key_confirmation": False,
+            "reason": candidate.get("rationale") or "",
+            "examples": candidate.get("examples") or [],
+        })
+
+    def _multi_dataset_loading_checkpoint(
+        self,
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Ask how multiple files should become analysis objects before loading."""
+        source_datasets = result_data.get("source_datasets") or []
+        if len(source_datasets) < 2:
+            return None
+        if self.world_state.get_confirmed_value("multi_dataset_loading_strategy"):
+            return None
+
+        names = [str(dataset.get("name") or dataset.get("path")) for dataset in source_datasets]
+        preview = "\n".join(f"- {name}" for name in names[:8])
+        if len(names) > 8:
+            preview += f"\n- ... and {len(names) - 8} more"
+        context = (
+            f"I found {len(source_datasets)} source datasets.\n\n{preview}\n\n"
+            "Outer join is the recommended default for compatible replicate matrices: "
+            "it keeps the union of genes and fills genes absent from a dataset with zero. "
+            "If these datasets use different assays, panels, or feature definitions, "
+            "separate analysis or custom handling may be safer."
+        )
+        likely_outputs = result_data.get("likely_combined_outputs") or []
+        if likely_outputs:
+            output_names = ", ".join(
+                str(item.get("name") or item.get("path")) for item in likely_outputs[:4]
+            )
+            context += (
+                "\n\nI also found file(s) that look like previous combined outputs and "
+                f"excluded them from the source count: {output_names}."
+            )
+
+        options, option_actions = self._checkpoint_options([
+            (
+                "Concatenate with an outer join (recommended; keep all genes from all datasets)",
+                "concatenate_outer",
+            ),
+            (
+                "Concatenate with an inner join (keep only genes shared by every dataset)",
+                "concatenate_inner",
+            ),
+            ("Analyze each dataset separately", "analyze_separately"),
+        ])
+        return {
+            "kind": "multi_dataset_loading",
+            "decision_key": "multi_dataset_loading_strategy",
+            "question": "How should I handle these datasets before analysis?",
+            "context": context,
+            "summary": context,
+            "options": options,
+            "option_actions": option_actions,
+            "default": options[0],
+            "recommendation": options[0],
+            "allow_custom": True,
+            "custom_label": "Type something else...",
+            "custom_prompt": "Describe how these datasets should be handled: ",
+            "custom_placeholder": (
+                "For example: concatenate Rep1 and Rep2, but analyze the control separately"
+            ),
+            "datasets": source_datasets,
+            "action_inputs": {
+                "concatenate_outer": {
+                    "join": "outer",
+                    "keep_genes": "union",
+                    "datasets": source_datasets,
+                },
+                "concatenate_inner": {
+                    "join": "inner",
+                    "keep_genes": "intersection",
+                    "datasets": source_datasets,
+                },
+                "analyze_separately": {
+                    "datasets": source_datasets,
+                },
+            },
+            "artifacts": [],
+        }
+
+    def _build_multi_dataset_loading_checkpoint(
+        self,
+        tool_name: str,
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if tool_name != "inspect_data_inputs" or result_data.get("status") != "ok":
+            return None
+        return self._multi_dataset_loading_checkpoint(result_data)
+
     def _checkpoint_options(
         self,
         entries: List[tuple[str, str]],
@@ -1171,10 +1410,20 @@ class SCAgent:
         checkpoint = self._pending_checkpoint
         options = checkpoint.get("options", []) or []
         actions = checkpoint.get("option_actions", []) or []
-        choices = [
-            DecisionChoice(label=label, action=actions[index])
-            for index, label in enumerate(options)
-        ]
+        text_input_actions = checkpoint.get("text_input_actions") or {}
+        choices = []
+        for index, label in enumerate(options):
+            action = actions[index]
+            text_input = text_input_actions.get(action) or {}
+            choices.append(
+                DecisionChoice(
+                    label=label,
+                    action=action,
+                    requires_text=bool(text_input),
+                    text_prompt=text_input.get("prompt", "Your response: "),
+                    placeholder=text_input.get("placeholder", ""),
+                )
+            )
         default = checkpoint.get("default")
         default_index = options.index(default) if default in options else 0
         context = str(checkpoint.get("context") or checkpoint.get("summary") or "").strip()
@@ -1186,6 +1435,9 @@ class SCAgent:
             choices,
             default_index=default_index,
             allow_custom=bool(checkpoint.get("allow_custom", True)),
+            custom_label=checkpoint.get("custom_label", "Type something else..."),
+            custom_prompt=checkpoint.get("custom_prompt", "Your response: "),
+            custom_placeholder=checkpoint.get("custom_placeholder", ""),
             force_text_fallback=force_text_fallback,
         )
 
@@ -1223,12 +1475,35 @@ class SCAgent:
             self._authorize_pending_cleanup_from_user(selected_action)
 
         decision_key = checkpoint.get("decision_key", checkpoint.get("kind", "pending_decision"))
-        self.world_state.resolve_decision(
-            decision_key,
-            selected_action or selected_value,
-            source="user",
-            message=selected_value,
-        )
+        reprompt_checkpoint = None
+        if (
+            checkpoint.get("kind") == "multi_sample_strategy"
+            and selected_action == "describe_experiment"
+        ):
+            self.world_state.resolve_decision(
+                "experiment_design",
+                selected_value,
+                source="user",
+                message=selected_value,
+            )
+            self.world_state.add_context_hint(f"Experiment design: {selected_value}")
+            decision_key = "experiment_design"
+            reprompt_checkpoint = self._multi_sample_strategy_checkpoint(
+                checkpoint.get("partition") or {}
+            )
+        else:
+            applied_value: Any = selected_action or selected_value
+            if selected_action == "custom":
+                applied_value = {
+                    "action": "custom",
+                    "details": selected_value,
+                }
+            self.world_state.resolve_decision(
+                decision_key,
+                applied_value,
+                source="user",
+                message=selected_value,
+            )
         payload = {
             "decision_key": decision_key,
             "checkpoint_kind": checkpoint.get("kind"),
@@ -1247,6 +1522,9 @@ class SCAgent:
             payload["proposal"] = checkpoint["proposal"]
         if self._pending_checkpoint is not None:
             self._clear_pending_checkpoint(payload)
+        if reprompt_checkpoint is not None:
+            payload["reprompt"] = True
+            self._set_pending_checkpoint(reprompt_checkpoint)
         return payload
 
     def structured_decision_request(self, selection) -> str:
@@ -1423,6 +1701,7 @@ class SCAgent:
     CHECKPOINT_EXEMPT_TOOLS = {
         "run_code",  # Flexible fallback - always allow
         "inspect_data",
+        "inspect_data_inputs",
         "inspect_session",
         "list_artifacts",
         "get_cluster_sizes",
@@ -1443,6 +1722,62 @@ class SCAgent:
         "web_search",
         "research_findings",
     }
+
+    def _multi_dataset_loading_guard(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+    ) -> Optional[str]:
+        """Prevent silent concatenation or a join that differs from the user's choice."""
+        if tool_name != "run_code":
+            return None
+        code = str(tool_input.get("code") or "")
+        concatenates = bool(re.search(
+            r"\b(?:anndata|ad)\.concat\s*\(|\bconcat_datasets\s*\(",
+            code,
+        ))
+        if not concatenates:
+            return None
+
+        strategy = self.world_state.get_confirmed_value("multi_dataset_loading_strategy")
+        action = strategy.get("action") if isinstance(strategy, dict) else strategy
+        if not action:
+            return json.dumps({
+                "status": "error",
+                "tool": "run_code",
+                "message": (
+                    "Multiple datasets cannot be concatenated before the user chooses how "
+                    "to handle them. Run inspect_data_inputs on the input directory first."
+                ),
+                "requires_user_decision": True,
+                "decision_key": "multi_dataset_loading_strategy",
+            }, indent=2)
+        if action == "analyze_separately":
+            return json.dumps({
+                "status": "error",
+                "tool": "run_code",
+                "message": "The user selected separate analyses, so concatenation is not allowed.",
+                "selected_strategy": action,
+            }, indent=2)
+
+        expected_join = {
+            "concatenate_outer": "outer",
+            "concatenate_inner": "inner",
+        }.get(action)
+        if expected_join:
+            join_pattern = rf"\bjoin\s*=\s*['\"]{expected_join}['\"]"
+            if not re.search(join_pattern, code):
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_code",
+                    "message": (
+                        f"The user selected a {expected_join} join. The concatenation code "
+                        f"must explicitly pass join='{expected_join}'."
+                    ),
+                    "selected_strategy": action,
+                    "required_join": expected_join,
+                }, indent=2)
+        return None
 
     def _checkpoint_context_for_tool(self, tool_name: str) -> Optional[Dict[str, Any]]:
         """Return checkpoint context without blocking the tool call."""
@@ -2499,6 +2834,102 @@ class SCAgent:
                         "user_message": message,
                     }
                 )
+
+        loading_strategy = None
+        if re.search(
+            r"\b(concatenate|concat|combine|merge)\b.*\bouter(?:\s+join)?\b"
+            r"|\bouter\s+join\b.*\b(concatenate|concat|combine|merge)\b",
+            text,
+        ):
+            loading_strategy = "concatenate_outer"
+        elif re.search(
+            r"\b(concatenate|concat|combine|merge)\b.*\binner(?:\s+join)?\b"
+            r"|\binner\s+join\b.*\b(concatenate|concat|combine|merge)\b",
+            text,
+        ):
+            loading_strategy = "concatenate_inner"
+        elif re.search(
+            r"\b(analy[sz]e|process|run)\b.*\b(datasets?|files?)\b.*\bseparately\b",
+            text,
+        ):
+            loading_strategy = "analyze_separately"
+        if loading_strategy:
+            self.world_state.resolve_decision(
+                "multi_dataset_loading_strategy",
+                loading_strategy,
+                source="user",
+                message=message,
+            )
+
+        strategy_patterns = [
+            (
+                "integrate_scvi",
+                [
+                    r"\b(integrate|batch[- ]?correct)\b.*\bscvi\b",
+                    r"\buse\s+scvi\b.*\b(integrat|batch)",
+                    r"\bintegrate\s+(?:the\s+)?(?:samples?|datasets?)\b",
+                ],
+            ),
+            (
+                "keep_unintegrated",
+                [
+                    r"\b(do not|don't|dont|no)\s+(integrate|batch[- ]?correct)\b",
+                    r"\bkeep\b.*\b(unintegrated|uncorrected)\b",
+                    r"\bleave\b.*\b(unintegrated|uncorrected|as is)\b",
+                ],
+            ),
+            (
+                "investigate_integration",
+                [
+                    r"\binvestigate\b.*\b(batch|integrat)",
+                    r"\b(check|assess|decide)\b.*\b(whether|if)\b.*\b(integrat|batch[- ]?correct)",
+                ],
+            ),
+            (
+                "analyze_separately",
+                [
+                    r"\b(analy[sz]e|process|run)\b.*\b(samples?|datasets?)\b.*\bseparately\b",
+                    r"\bseparate\b.*\b(sample|dataset)[- ]specific\b.*\banalys",
+                ],
+            ),
+        ]
+        for strategy, patterns in strategy_patterns:
+            if not any(re.search(pattern, text) for pattern in patterns):
+                continue
+            self.world_state.resolve_decision(
+                "multi_sample_strategy",
+                strategy,
+                source="user",
+                message=message,
+            )
+            if self.run_manager:
+                self.run_manager.add_user_decision(
+                    {
+                        "key": "multi_sample_strategy",
+                        "policy_action": "recommend_and_confirm",
+                        "status": "user_corrected",
+                        "applied_value": strategy,
+                        "user_message": message,
+                    }
+                )
+            break
+
+        explicit_method_match = re.search(r"\b(harmony|bbknn|scanorama)\b", text)
+        if explicit_method_match and re.search(
+            r"\b(use|run|apply|integrate|integration|integrating|batch[- ]?correct)\b",
+            text,
+        ):
+            method = explicit_method_match.group(1)
+            self.world_state.resolve_decision(
+                "multi_sample_strategy",
+                {
+                    "action": "custom",
+                    "details": f"Integrate using {method}.",
+                    "method": method,
+                },
+                source="user",
+                message=message,
+            )
 
         batch_patterns = [
             r"\buse\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s+(?:the\s+)?batch(?:\s+key|\s+column)?\b",
@@ -4538,6 +4969,7 @@ class SCAgent:
         "install_package":      "Installing package",
         "generate_figure":      "Generating figure",
         "inspect_data":         "Inspecting data",
+        "inspect_data_inputs":  "Inspecting data inputs",
         "search_papers":        "Searching papers",
         "research_findings":    "Searching literature",
         "web_search":           "Searching web",
@@ -4666,6 +5098,16 @@ class SCAgent:
         # Only block truly pipeline-progressing tools when checkpoint pending
         # Allow flexible tools (run_code, inspection, visualization) to proceed
         if self._pending_checkpoint and self._is_action_tool(tool_name):
+            if (
+                self._pending_checkpoint.get("kind") == "multi_dataset_loading"
+                and tool_name in {"run_code", "load_data"}
+            ):
+                return self._blocked_by_checkpoint_result(tool_name)
+            if (
+                self._pending_checkpoint.get("kind") == "multi_sample_strategy"
+                and tool_name == "run_code"
+            ):
+                return self._blocked_by_checkpoint_result(tool_name)
             if tool_name not in self.CHECKPOINT_EXEMPT_TOOLS:
                 return self._blocked_by_checkpoint_result(tool_name)
             # For exempt tools, we'll include checkpoint context in the result later
@@ -4783,6 +5225,9 @@ class SCAgent:
                 tool_input["output_path"] = self.run_manager.get_intermediate_path(_sanitize_name(tool_name))
 
         _prepare_tool_paths()
+        loading_guard = self._multi_dataset_loading_guard(tool_name, tool_input)
+        if loading_guard is not None:
+            return loading_guard
         auto_checkpoint_path = self._maybe_auto_checkpoint(tool_name, tool_input)
         self._apply_world_state_overrides(tool_name, tool_input)
         # Don't re-sync here — we already synced at the start of analyze() and after
@@ -5028,6 +5473,22 @@ class SCAgent:
                         )
                     else:
                         checkpoint = refined_checkpoint
+            if checkpoint is None:
+                checkpoint = self._build_multi_dataset_loading_checkpoint(
+                    tool_name,
+                    result_data,
+                )
+            if checkpoint is None:
+                checkpoint = self._build_post_concatenation_strategy_checkpoint(
+                    tool_name,
+                    tool_input,
+                    result_data,
+                )
+            if checkpoint is None:
+                checkpoint = self._build_multi_sample_strategy_checkpoint(
+                    tool_name,
+                    result_data,
+                )
             if checkpoint is None:
                 checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
             if checkpoint is None:
@@ -5601,7 +6062,7 @@ class SCAgent:
 
     def _handle_pause_and_ask(self, tool_input: Dict[str, Any]) -> str:
         """Handle pause_and_ask tool — create a pending checkpoint from LLM-initiated pause."""
-        if (self._pending_checkpoint or {}).get("kind") == "cluster_qc_cleanup":
+        if self._pending_checkpoint:
             checkpoint = self._pending_checkpoint or {}
             return json.dumps({
                 "status": "ok",
@@ -5612,9 +6073,11 @@ class SCAgent:
                 "options": checkpoint.get("options", tool_input.get("options", [])),
                 "option_actions": checkpoint.get("option_actions", []),
                 "decision_key": checkpoint.get("decision_key", ""),
+                "kind": checkpoint.get("kind"),
+                "action_inputs": checkpoint.get("action_inputs", {}),
                 "message": (
-                    "Analysis paused at the existing cluster cleanup checkpoint. "
-                    "Explain why input is needed and end the turn; the runtime renders the choices."
+                    "Analysis is already paused at a structured runtime checkpoint. "
+                    "End the turn; the runtime renders the existing choices."
                 ),
             }, indent=2)
 

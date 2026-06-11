@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import hashlib
+import importlib.util
 import json
 import os
 
@@ -263,8 +264,20 @@ class AgentWorldState:
                 blocked_actions.append({"action": "run_deg", "needs": "clusters or annotations"})
 
             # Pseudobulk DEG — needs groups to aggregate AND raw counts for DESeq2
-            if (processing.get("has_clusters") or self.annotation_sources) and processing.get("has_raw_counts"):
+            pseudobulk_available = (
+                importlib.util.find_spec("scagent.analysis.pseudobulk") is not None
+            )
+            if (
+                pseudobulk_available
+                and (processing.get("has_clusters") or self.annotation_sources)
+                and processing.get("has_raw_counts")
+            ):
                 available_actions.append("run_pseudobulk_deg")
+            elif not pseudobulk_available:
+                blocked_actions.append({
+                    "action": "run_pseudobulk_deg",
+                    "needs": "pseudobulk implementation is not installed in this checkout",
+                })
             elif not (processing.get("has_clusters") or self.annotation_sources):
                 blocked_actions.append({"action": "run_pseudobulk_deg", "needs": "clusters or annotations"})
             else:
@@ -298,8 +311,18 @@ class AgentWorldState:
                 blocked_actions.append({"action": "score_gene_signature", "needs": "normalized data"})
 
             # Spectra — needs annotations/clusters for cell_type_key, normalized data
-            if (processing.get("has_clusters") or self.annotation_sources) and processing.get("is_normalized"):
+            spectra_available = importlib.util.find_spec("scagent.analysis.spectra") is not None
+            if (
+                spectra_available
+                and (processing.get("has_clusters") or self.annotation_sources)
+                and processing.get("is_normalized")
+            ):
                 available_actions.append("run_spectra")
+            elif not spectra_available:
+                blocked_actions.append({
+                    "action": "run_spectra",
+                    "needs": "Spectra implementation is not installed in this checkout",
+                })
             else:
                 blocked_actions.append({"action": "run_spectra", "needs": "normalized data and cell type labels or clusters"})
 
@@ -351,6 +374,10 @@ class AgentWorldState:
         """Summarize whether a multi-partition dataset has an explicit batch plan."""
         batch_key = self.get_confirmed_value("batch_key") or state.batch_key
         n_batches = int(state.n_batches or 0)
+        if (not batch_key or n_batches < 2) and state.metadata_candidates:
+            top_candidate = state.metadata_candidates[0]
+            batch_key = batch_key or top_candidate.column
+            n_batches = max(n_batches, int(top_candidate.n_unique or 0))
 
         if not batch_key or n_batches < 2:
             return {
@@ -369,25 +396,73 @@ class AgentWorldState:
                 "reason": "A batch-corrected representation or graph is present.",
             }
 
+        selected_strategy = self.get_confirmed_value("multi_sample_strategy")
+        if selected_strategy:
+            strategy_action = (
+                selected_strategy.get("action")
+                if isinstance(selected_strategy, dict)
+                else selected_strategy
+            )
+            strategy_details = (
+                selected_strategy.get("details")
+                if isinstance(selected_strategy, dict)
+                else None
+            )
+            strategy_summaries = {
+                "investigate_integration": (
+                    "investigate_requested",
+                    "Run an uncorrected first pass and progressively assess whether integration is justified.",
+                ),
+                "integrate_scvi": (
+                    "scvi_requested",
+                    "Confirm the sample key if needed, then integrate with scVI before the final graph and clustering.",
+                ),
+                "keep_unintegrated": (
+                    "uncorrected_requested",
+                    "Keep samples combined in one analysis without batch correction.",
+                ),
+                "analyze_separately": (
+                    "separate_analysis_requested",
+                    "Run sample-specific analyses rather than constructing a shared integrated representation.",
+                ),
+                "custom": (
+                    "custom_strategy",
+                    strategy_details or "Follow the user's custom multi-sample strategy.",
+                ),
+            }
+            status, next_action = strategy_summaries.get(
+                strategy_action,
+                ("strategy_selected", f"Follow the selected strategy: {strategy_action}."),
+            )
+            return {
+                "status": status,
+                "batch_key": batch_key,
+                "n_batches": n_batches,
+                "method": "scvi" if strategy_action == "integrate_scvi" else None,
+                "selected_strategy": selected_strategy,
+                "reason": "The user explicitly selected how the samples should be handled.",
+                "next_action": next_action,
+            }
+
         if processing.get("has_neighbors") or processing.get("has_umap") or processing.get("has_clusters"):
             status = "needs_review"
-            next_action = "Score or inspect batch mixing, then rerun batch correction if sample structure remains."
+            next_action = "Ask the user whether to investigate, integrate with scVI, keep the shared analysis uncorrected, or analyze samples separately."
             reason = (
                 "A multi-group batch key is present, but neighbors/UMAP/clustering already exist "
-                "without a recorded correction strategy."
+                "without a user-selected sample-handling strategy."
             )
         elif processing.get("has_pca"):
             status = "needs_decision"
-            next_action = "Run score_integration on X_pca and/or run_batch_correction before neighbors/UMAP/clustering."
-            reason = "A multi-group batch key is present after PCA; choose and record a batch strategy before graph construction."
+            next_action = "Ask the user to choose the sample-handling strategy; do not correct automatically."
+            reason = "A multi-group sample-like key is present after PCA, but no strategy has been selected."
         elif processing.get("is_normalized") or processing.get("has_hvg"):
             status = "pending_pca"
-            next_action = "Run PCA, then assess batch mixing or run batch correction before graph construction."
-            reason = "A multi-group batch key is present and will matter once PCA is available."
+            next_action = "Use the user's selected strategy before constructing the final graph."
+            reason = "A multi-group sample-like key is present, but its presence alone does not justify correction."
         else:
             status = "pending_preprocessing"
-            next_action = "Carry the batch key through QC/normalization and revisit before neighbors/UMAP/clustering."
-            reason = "A multi-group batch key is present early in the workflow."
+            next_action = "Ask how the user wants the samples handled, then carry that decision through preprocessing."
+            reason = "A multi-group sample-like key is present early in the workflow; correction is opt-in."
 
         return {
             "status": status,

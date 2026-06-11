@@ -15,6 +15,7 @@ os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
 from typing import List, Dict, Any, Optional
 import hashlib
+import importlib.util
 import json
 import logging
 from pathlib import Path
@@ -2570,11 +2571,12 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         {
             "name": "run_batch_correction",
             "description": (
-                "Correct batch effects using Harmony, BBKNN, Scanorama, or scVI. "
+                "Correct batch effects using scVI, Harmony, BBKNN, or Scanorama. "
+                "Correction is opt-in and must follow an explicit user strategy; metadata names alone are not sufficient. "
+                "scVI is the default when the user chooses integration. "
                 "Harmony: fast, corrects PCA embeddings, good for mild-to-moderate batch effects. "
                 "BBKNN: fast, builds a batch-balanced k-NN graph in PCA space; correction lives in "
                 "the neighbor graph (not a separate embedding). Run UMAP/clustering separately unless explicitly requested. "
-                "Good default when you have many samples (e.g. >10 batches). "
                 "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
                 "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
                 "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
@@ -2590,9 +2592,8 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                         "type": "string",
                         "enum": ["harmony", "bbknn", "scanorama", "scvi"],
                         "description": (
-                            "Correction method (default: harmony). "
-                            "bbknn: batch-balanced graph, good for many batches (>10 samples). "
-                            "scvi: best for complex effects but needs raw_counts layer."
+                            "Correction method (default: scvi). Other methods are used only when "
+                            "the user or a source workflow explicitly selects them."
                         )
                     },
                     "n_pcs": {"type": "integer", "description": "BBKNN only: number of PCA components to use (default: 30)"},
@@ -3415,6 +3416,24 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "inspect_data_inputs",
+            "description": (
+                "Inspect a file or directory for supported single-cell datasets without "
+                "loading or concatenating them. Always use this first when the user gives "
+                "a directory or multiple input files."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or workspace-relative input file/directory path."
+                    }
+                },
+                "required": ["path"]
+            }
+        },
+        {
             "name": "inspect_workspace",
             "description": "Read-only workspace inspection for the current project or run directory. Use this sparingly for awareness and recovery.",
             "input_schema": {
@@ -3472,6 +3491,16 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
     ]
 
     tools = action_tools + meta_tools + inspection_tools
+    optional_analysis_tools = {
+        "run_pseudobulk_deg": "scagent.analysis.pseudobulk",
+        "run_spectra": "scagent.analysis.spectra",
+    }
+    tools = [
+        tool
+        for tool in tools
+        if tool["name"] not in optional_analysis_tools
+        or importlib.util.find_spec(optional_analysis_tools[tool["name"]]) is not None
+    ]
 
     if include_describe_image:
         tools.append({
@@ -3619,6 +3648,7 @@ def process_tool_call(
         run_phenograph,
         calculate_qc_metrics,
         detect_doublets,
+        discover_data_inputs,
     )
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
@@ -3829,6 +3859,7 @@ def process_tool_call(
 
     def _analysis_guidance(state, *, goal: Any = None, context: str = "") -> Dict[str, Any]:
         batch_relevant_now = _batch_relevance(state, goal=goal, context=context)
+        selected_strategy = _confirmed_decision_value("multi_sample_strategy")
         batch_strategy = {
             "status": "not_applicable",
             "batch_key": state.batch_key,
@@ -3843,36 +3874,56 @@ def process_tool_call(
                     "method": state.batch_correction_method or "unknown",
                     "next_action": "Use the corrected graph/embedding for UMAP, clustering, and annotation.",
                 }
+            elif selected_strategy:
+                strategy_action = (
+                    selected_strategy.get("action")
+                    if isinstance(selected_strategy, dict)
+                    else selected_strategy
+                )
+                batch_strategy = {
+                    "status": "selected",
+                    "batch_key": state.batch_key,
+                    "n_batches": state.n_batches,
+                    "selected_strategy": selected_strategy,
+                    "next_action": {
+                        "investigate_integration": "Run the progressive uncorrected integration diagnostic.",
+                        "integrate_scvi": "Integrate with scVI using the confirmed sample key.",
+                        "keep_unintegrated": "Proceed with one combined uncorrected representation.",
+                        "analyze_separately": "Run separate sample-specific analyses.",
+                    }.get(strategy_action, "Follow the user's custom sample-handling strategy."),
+                }
             elif state.has_neighbors or state.has_umap or state.has_clusters:
                 batch_strategy = {
                     "status": "needs_review",
                     "batch_key": state.batch_key,
                     "n_batches": state.n_batches,
-                    "next_action": "Score or inspect batch mixing; rerun batch correction if sample structure remains.",
+                    "next_action": "Ask the user to select a sample-handling strategy; do not correct automatically.",
                 }
             elif state.has_pca:
                 batch_strategy = {
                     "status": "needs_decision",
                     "batch_key": state.batch_key,
                     "n_batches": state.n_batches,
-                    "next_action": "Run score_integration on X_pca and/or run_batch_correction before neighbors/UMAP/clustering.",
+                    "next_action": "Ask whether to investigate, integrate with scVI, keep uncorrected, or analyze separately.",
                 }
             else:
                 batch_strategy = {
-                    "status": "pending_pca",
+                    "status": "needs_decision",
                     "batch_key": state.batch_key,
                     "n_batches": state.n_batches,
-                    "next_action": "Carry batch metadata through preprocessing, then decide after PCA.",
+                    "next_action": "Ask how the samples should be handled; metadata alone does not justify correction.",
                 }
 
         if not state.has_qc_metrics:
             next_priority = "qc_preview"
         elif not state.is_normalized:
             next_priority = "normalize_and_hvg"
-        elif batch_relevant_now and state.has_pca and not state.batch_correction_applied and not state.has_neighbors:
+        elif (
+            batch_relevant_now
+            and not selected_strategy
+            and not state.batch_correction_applied
+        ):
             next_priority = "batch_strategy"
-        elif batch_relevant_now and state.has_neighbors and not state.batch_correction_applied:
-            next_priority = "review_batch_strategy"
         elif not (state.has_pca and state.has_neighbors and state.has_umap):
             next_priority = "run_pca"
         elif not state.has_clusters:
@@ -3891,7 +3942,7 @@ def process_tool_call(
         ]
         if batch_relevant_now:
             notes.append(
-                "Batch handling is relevant for this request. For multi-sample data, record a batch strategy before neighbors/UMAP/clustering: run correction, or score/inspect mixing and record why correction is unnecessary."
+                "Multiple sample-like groups are present. Do not batch-correct automatically; obtain and follow the user's multi-sample strategy."
             )
         else:
             notes.append(
@@ -6952,6 +7003,30 @@ def process_tool_call(
                 summary="Inspected the active or persisted run ledger.",
             )
 
+        elif tool_name == "inspect_data_inputs":
+            try:
+                discovery = discover_data_inputs(tool_input["path"])
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                return _error_result(
+                    tool="inspect_data_inputs",
+                    message=str(exc),
+                    adata_obj=adata,
+                    recovery_options=["Check the path and inspect its parent directory."],
+                )
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "inspect_data_inputs",
+                    **discovery,
+                },
+                adata,
+                dataset_changed=False,
+                summary=(
+                    f"Found {discovery['n_source_datasets']} source-like single-cell "
+                    f"dataset(s) in {discovery['path']}."
+                ),
+            )
+
         elif tool_name == "inspect_workspace":
             workspace_root = Path.cwd().resolve()
             allowed_roots = [workspace_root]
@@ -8356,11 +8431,22 @@ def process_tool_call(
                 batch_key = batch_resolution.applied_column
                 n_batches = int(adata.obs[batch_key].nunique(dropna=True)) if batch_key else 0
                 if n_batches > 1:
-                    warnings.append(
-                        f"Detected {n_batches} groups in batch key '{batch_key}' and no recorded batch correction. "
-                        "For open-ended multi-sample analyses, run score_integration and/or run_batch_correction "
-                        "before building an uncorrected PCA neighbor graph unless this is intentional."
+                    selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+                    strategy_action = (
+                        selected_strategy.get("action")
+                        if isinstance(selected_strategy, dict)
+                        else selected_strategy
                     )
+                    if not selected_strategy:
+                        warnings.append(
+                            f"Detected {n_batches} groups in sample-like key '{batch_key}', but no "
+                            "multi-sample strategy is recorded. Do not infer correction from metadata alone."
+                        )
+                    elif strategy_action == "analyze_separately":
+                        warnings.append(
+                            "The user selected separate sample-specific analyses, but this call is building "
+                            "one combined neighbor graph. Confirm that this combined graph is intentional."
+                        )
 
             compute_neighbors(
                 adata,
@@ -8444,10 +8530,22 @@ def process_tool_call(
                 batch_key = batch_resolution.applied_column
                 n_batches = int(adata.obs[batch_key].nunique(dropna=True)) if batch_key else 0
                 if n_batches > 1:
-                    warnings.append(
-                        f"Detected {n_batches} groups in batch key '{batch_key}' and no recorded batch correction. "
-                        "UMAP will reflect the existing uncorrected neighbor graph unless batch correction is run first."
+                    selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+                    strategy_action = (
+                        selected_strategy.get("action")
+                        if isinstance(selected_strategy, dict)
+                        else selected_strategy
                     )
+                    if not selected_strategy:
+                        warnings.append(
+                            f"Detected {n_batches} groups in sample-like key '{batch_key}', but no "
+                            "multi-sample strategy is recorded. UMAP remains uncorrected; correction is not automatic."
+                        )
+                    elif strategy_action == "analyze_separately":
+                        warnings.append(
+                            "The user selected separate sample-specific analyses, but this call is computing "
+                            "a combined UMAP. Confirm that this combined view is intentional."
+                        )
 
             compute_umap(
                 adata,
@@ -9504,8 +9602,6 @@ def process_tool_call(
                 }, indent=2), adata
 
         elif tool_name == "run_spectra":
-            from ..analysis.spectra import run_spectra
-
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
 
@@ -9524,6 +9620,8 @@ def process_tool_call(
             output_dir = fix_output_path(tool_input.get("output_dir"), "run_spectra")
 
             try:
+                from ..analysis.spectra import run_spectra
+
                 result = run_spectra(
                     adata,
                     cell_type_key=cell_type_key,
@@ -9655,7 +9753,67 @@ def process_tool_call(
         elif tool_name == "run_batch_correction":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            method = tool_input.get("method", "harmony")
+            method = tool_input.get("method", "scvi")
+            selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+            strategy_action = (
+                selected_strategy.get("action")
+                if isinstance(selected_strategy, dict)
+                else selected_strategy
+            )
+            explicitly_selected_method = (
+                selected_strategy.get("method")
+                if isinstance(selected_strategy, dict)
+                else None
+            )
+            if not selected_strategy:
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        "Batch correction is opt-in. No user-selected multi-sample strategy "
+                        "is recorded, so correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ask whether to investigate integration need, integrate with scVI, "
+                        "keep samples combined without correction, or analyze samples separately."
+                    ],
+                    extra={"method": method, "requires_user_strategy": True},
+                )
+            if strategy_action not in {"integrate_scvi", "custom"}:
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        f"The recorded multi-sample strategy is '{strategy_action}', not integration. "
+                        "Batch correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Continue with the selected strategy, or ask the user to explicitly change it."
+                    ],
+                    extra={"method": method, "selected_strategy": selected_strategy},
+                )
+            if strategy_action == "integrate_scvi" and method != "scvi":
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        f"The user selected scVI integration, but method='{method}' was requested. "
+                        "Batch correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=["Retry with method='scvi'."],
+                    extra={"method": method, "selected_strategy": selected_strategy},
+                )
+            if explicitly_selected_method and method != explicitly_selected_method:
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        f"The user explicitly selected '{explicitly_selected_method}', but "
+                        f"method='{method}' was requested. Batch correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[f"Retry with method='{explicitly_selected_method}'."],
+                    extra={"method": method, "selected_strategy": selected_strategy},
+                )
             requested_batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
             if not requested_batch_key:
                 raise ValueError(
@@ -10154,8 +10312,6 @@ def process_tool_call(
             }, indent=2), adata
 
         elif tool_name == "run_pseudobulk_deg":
-            from ..analysis.pseudobulk import run_pseudobulk_deg
-
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
 
@@ -10184,6 +10340,8 @@ def process_tool_call(
                 )
 
             try:
+                from ..analysis.pseudobulk import run_pseudobulk_deg
+
                 result = run_pseudobulk_deg(
                     adata,
                     sample_col=sample_col,

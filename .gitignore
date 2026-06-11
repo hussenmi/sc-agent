@@ -73,6 +73,7 @@ andrew_data/
 # Keep the large local test workspace ignored, but track focused regression tests.
 tests/*
 !tests/decision_interaction_test.py
+!tests/loading_regression_test.py
 cellbender_test/
 results/
 article_figures/

@@ -22,7 +22,7 @@ from .inspector import (
     resolve_batch_metadata,
     semantic_roles_to_dict,
 )
-from .io import load_data, load_10x_h5, load_h5ad
+from .io import concat_datasets, discover_data_inputs, load_data, load_10x_h5, load_h5ad
 from .qc import (
     run_qc_pipeline,
     calculate_qc_metrics,
@@ -62,6 +62,8 @@ __all__ = [
     "load_data",
     "load_10x_h5",
     "load_h5ad",
+    "concat_datasets",
+    "discover_data_inputs",
     # QC
     "run_qc_pipeline",
     "calculate_qc_metrics",

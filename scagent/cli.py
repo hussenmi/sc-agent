@@ -319,8 +319,14 @@ def _analyze_with_decisions(agent, **analyze_kwargs):
         selection = agent.prompt_pending_decision()
         if selection is None:
             break
+        decision_request = agent.structured_decision_request(selection)
+        # Some choices collect context and intentionally open a refined version
+        # of the same decision. Re-render it immediately without asking the
+        # model to interpret an intermediate, non-final strategy selection.
+        if agent.has_pending_decision:
+            continue
         result = agent.analyze(
-            request=agent.structured_decision_request(selection),
+            request=decision_request,
             data_path=None,
             max_iterations=max_iterations,
             continue_conversation=True,

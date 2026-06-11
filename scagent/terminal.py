@@ -17,6 +17,9 @@ class DecisionChoice:
 
     label: str
     action: str
+    requires_text: bool = False
+    text_prompt: str = "Your response: "
+    placeholder: str = ""
 
 
 @dataclass(frozen=True)
@@ -188,15 +191,24 @@ def prompt_for_decision(
     *,
     default_index: int | None = 0,
     allow_custom: bool = True,
+    custom_label: str = "Type something else...",
+    custom_prompt: str = "Your response: ",
+    custom_placeholder: str = "",
     force_text_fallback: bool = False,
-    input_reader: Callable[[str], str] | None = None,
+    input_reader: Callable[..., str] | None = None,
 ) -> DecisionSelection:
     """Ask a discrete question using a selector, with a numbered text fallback."""
 
     input_reader = input_reader or read_user_input
+
+    def read_text(prompt: str, placeholder: str = "") -> str:
+        if input_reader is read_user_input:
+            return input_reader(prompt, placeholder=placeholder)
+        return input_reader(prompt)
+
     normalized_choices = list(choices)
     if not normalized_choices:
-        response = input_reader(f"{question}\n> ")
+        response = read_text(f"{question}\n> ", custom_placeholder)
         return DecisionSelection(
             action="custom",
             label="Custom response",
@@ -213,7 +225,15 @@ def prompt_for_decision(
     )
     if allow_custom and custom_index is None:
         custom_index = len(normalized_choices)
-        normalized_choices.append(DecisionChoice("Enter a custom response", "custom"))
+        normalized_choices.append(
+            DecisionChoice(
+                custom_label,
+                "custom",
+                requires_text=True,
+                text_prompt=custom_prompt,
+                placeholder=custom_placeholder,
+            )
+        )
 
     use_selector = (
         not force_text_fallback
@@ -227,16 +247,16 @@ def prompt_for_decision(
             default_index=default_index or 0,
         )
         choice = normalized_choices[selected_index]
-        if choice.action == "custom":
-            response = input_reader("Your response: ")
+        if choice.requires_text or choice.action == "custom":
+            response = read_text(choice.text_prompt, choice.placeholder)
             return DecisionSelection(
-                action="custom",
+                action=choice.action,
                 label=choice.label,
                 index=selected_index,
                 value=response,
                 raw_response=response,
                 input_mode="selector",
-                custom=True,
+                custom=choice.action == "custom",
             )
         return DecisionSelection(
             action=choice.action,
@@ -252,7 +272,7 @@ def prompt_for_decision(
     for index, choice in enumerate(normalized_choices, 1):
         suffix = " [default]" if default_index == index - 1 else ""
         print(f"  {index}. {choice.label}{suffix}")
-    response = input_reader("> ")
+    response = read_text("> ")
     selection = resolve_decision_response(
         response,
         normalized_choices,
@@ -260,16 +280,27 @@ def prompt_for_decision(
         allow_custom=allow_custom,
         input_mode="text",
     )
-    if selection.action == "custom" and selection.index == custom_index:
-        custom_response = input_reader("Your response: ")
+    selected_choice = (
+        normalized_choices[selection.index]
+        if selection.index is not None and 0 <= selection.index < len(normalized_choices)
+        else None
+    )
+    if selected_choice is not None and (
+        selected_choice.requires_text
+        or (selection.action == "custom" and selection.index == custom_index)
+    ):
+        custom_response = read_text(
+            selected_choice.text_prompt,
+            selected_choice.placeholder,
+        )
         return DecisionSelection(
-            action="custom",
+            action=selected_choice.action,
             label=selection.label,
             index=selection.index,
             value=custom_response,
             raw_response=custom_response,
             input_mode="text",
-            custom=True,
+            custom=selected_choice.action == "custom",
         )
     return selection
 
@@ -341,7 +372,12 @@ def _get_prompt_session():
     return _PROMPT_SESSION
 
 
-def read_user_input(prompt: str = "", *, strip: bool = True) -> str:
+def read_user_input(
+    prompt: str = "",
+    *,
+    strip: bool = True,
+    placeholder: str = "",
+) -> str:
     """Read a line (or a full multi-line paste) from the user.
 
     When prompt_toolkit is available, pasted multi-line content is inserted into
@@ -353,9 +389,11 @@ def read_user_input(prompt: str = "", *, strip: bool = True) -> str:
     """
     session = _get_prompt_session()
     if session is not None:
-        response = session.prompt(prompt)
+        response = session.prompt(prompt, placeholder=placeholder)
     else:
         _configure_readline()
+        if placeholder:
+            print(f"[{placeholder}]")
         response = input(prompt)
 
     # Normalise line endings (\r\n from some terminals/clipboard managers → \n)
