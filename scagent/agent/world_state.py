@@ -979,6 +979,22 @@ class AgentWorldState:
                 ),
             }
             return
+        if tool_name == "finalize_annotation" and status not in {"ok", "success"}:
+            # Count only *genuine* finalize attempts — ones where evidence was
+            # actually evaluated and failed validation, not the trivial
+            # "stage evidence first" rejection. The save guard uses this so it
+            # can degrade to an honestly-labeled unvalidated save after the
+            # agent has truly tried, instead of blocking forever and ending the
+            # run with no final dataset on disk.
+            is_genuine_attempt = bool(result.get("validation_failures")) or (
+                "validation failed" in str(result.get("message", "")).lower()
+            )
+            if is_genuine_attempt and isinstance(self.annotation_validation, dict):
+                self.annotation_validation["finalize_attempts"] = (
+                    int(self.annotation_validation.get("finalize_attempts", 0)) + 1
+                )
+                self.annotation_validation["last_finalize_error"] = result.get("message")
+            return
         if status not in {"ok", "success"}:
             return
 
@@ -1101,7 +1117,11 @@ class AgentWorldState:
                         "Query PanglaoDB only for clusters in panglaodb_required_clusters using "
                         "panglaodb_queries_required and panglaodb_reverse_marker_queries_required, "
                         "aggregate reverse gene-symbol hits across multiple DEGs, compare markers "
-                        "against each required cluster's top_degs, then stage/finalize annotation."
+                        "against each required cluster's top_degs, then stage/finalize annotation. "
+                        "PanglaoDB is optional, not a gate: if a flagged cluster cannot be resolved "
+                        "(label not covered, e.g. CMP/MEP/early-erythroid, or query inconclusive), "
+                        "stage it with panglaodb_queried=false and confidence=low — the validator "
+                        "accepts reference+DEG evidence and will not block finalize. Do not loop."
                     )
                     if required_clusters else
                     "No cluster was flagged for upfront PanglaoDB adjudication. Stage evidence from "

@@ -273,6 +273,11 @@ class SCAgent:
     >>> result = agent.analyze("QC and cluster this PBMC data", data_path="pbmc.h5")
     """
 
+    # After this many genuine finalize_annotation attempts fail validation, the
+    # annotation save guard stops hard-blocking and lets save_data write a
+    # clearly-marked UNVALIDATED dataset, so a run never ends with nothing saved.
+    MAX_FINALIZE_ATTEMPTS_BEFORE_UNVALIDATED_SAVE = 2
+
     def __init__(
         self,
         provider: Optional[Provider] = None,
@@ -548,7 +553,7 @@ class SCAgent:
             api_key=api_key,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
-        self.model = model or "gemini-3.1-flash"
+        self.model = model or "gemini-3.5-flash"
         self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = self._resolve_context_limit()
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
@@ -596,7 +601,7 @@ class SCAgent:
         self.client = OpenAI(api_key=token, base_url=base_url)
         self._vertex_token_expiry = __import__("time").time() + 3600
 
-        m = model or "gemini-3.1-flash"
+        m = model or "gemini-3.5-flash"
         self.model = m if m.startswith("google/") else f"google/{m}"
         self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = int(os.environ.get("SCAGENT_CONTEXT_LIMIT", "1000000"))
@@ -870,9 +875,10 @@ class SCAgent:
           SCAGENT_THINKING=0  → disable thinking entirely.
           SCAGENT_THINKING_EFFORT=high|max  → reasoning depth (default: high).
 
-        Gemini (cloud): thinking OFF by default.
-          SCAGENT_THINKING=1  → enable via thinking_config.
-          SCAGENT_THINKING_BUDGET=N  → token budget (default: 8000).
+        Gemini (cloud): provider default unless explicitly configured.
+          SCAGENT_THINKING=1  → set OpenAI-compatible reasoning_effort.
+          SCAGENT_THINKING_EFFORT=minimal|low|medium|high.
+          SCAGENT_THINKING_BUDGET=N  → legacy budget mapped to an effort level.
 
         vLLM local models (Qwen/Gemma): thinking OFF by default (server default).
           SCAGENT_THINKING=1  → enable via chat_template_kwargs.
@@ -891,8 +897,11 @@ class SCAgent:
             return kwargs
         if "gemini" in m:
             if os.environ.get("SCAGENT_THINKING", "0") == "1":
-                budget = int(os.environ.get("SCAGENT_THINKING_BUDGET", "8000"))
-                return {"extra_body": {"thinking_config": {"thinking_budget": budget, "include_thoughts": True}}}
+                effort = os.environ.get("SCAGENT_THINKING_EFFORT")
+                if effort not in {"minimal", "low", "medium", "high"}:
+                    budget = int(os.environ.get("SCAGENT_THINKING_BUDGET", "8000"))
+                    effort = "low" if budget <= 1024 else "medium" if budget <= 8192 else "high"
+                return {"reasoning_effort": effort}
             return {}
         # vLLM local models (Qwen/Gemma)
         if os.environ.get("SCAGENT_THINKING", "0") == "1":
@@ -949,6 +958,24 @@ class SCAgent:
         if not (is_final_save or is_final_report_code):
             return None
 
+        # Escape hatch: never let the run end with no dataset on disk. Once the
+        # agent has genuinely attempted finalize_annotation and it keeps failing
+        # validation (or the caller explicitly passes allow_unvalidated), stop
+        # hard-blocking and let the save proceed. save_data then degrades it to
+        # an honestly-labeled UNVALIDATED file (uns flag + filename suffix +
+        # manifest warning) rather than silently saving a "clean" dataset.
+        finalize_attempts = int(validation.get("finalize_attempts", 0) or 0)
+        allow_unvalidated = is_final_save and bool(tool_input.get("allow_unvalidated"))
+        if allow_unvalidated or finalize_attempts >= self.MAX_FINALIZE_ATTEMPTS_BEFORE_UNVALIDATED_SAVE:
+            return None
+
+        attempts_note = (
+            f" ({finalize_attempts} genuine finalize attempt(s) so far; after "
+            f"{self.MAX_FINALIZE_ATTEMPTS_BEFORE_UNVALIDATED_SAVE} the save is allowed as a "
+            f"clearly-marked UNVALIDATED file)"
+            if finalize_attempts
+            else ""
+        )
         return {
             "status": "needs_validation",
             "tool": tool_name,
@@ -956,7 +983,7 @@ class SCAgent:
                 "Cell-type annotation candidates are present, but the annotation consensus "
                 "has not been finalized. Do not save or report the analysis as complete from "
                 "CellTypist/Scimilarity/PanglaoDB snippets alone; run the full consensus path "
-                "and finalize a curated annotation first."
+                "and finalize a curated annotation first." + attempts_note
             ),
             "annotation_validation": validation,
             "required_next_steps": [
@@ -966,6 +993,7 @@ class SCAgent:
                 "Query PanglaoDB only for clusters flagged as requiring external adjudication, including plausible competitors and staged reverse marker lookup genes.",
                 "Use search_papers/web_search as supporting context for ambiguous labels, but PanglaoDB remains the structured external adjudicator in v1.",
                 "Stage per-cluster evidence with stage_annotation_evidence, then call finalize_annotation.",
+                "If finalize genuinely cannot pass after honest attempts, call save_data with allow_unvalidated=true to write a clearly-marked UNVALIDATED dataset instead of losing the analysis.",
             ],
         }
 
@@ -1280,12 +1308,43 @@ class SCAgent:
         summary = self.world_state.data_summary or {}
         candidates = self.world_state.metadata_candidates or []
         candidate = candidates[0] if candidates else {}
+
+        # Prefer the batch column the concat code itself named (anndata.concat
+        # uses label=, concat_datasets uses batch_key=), then fall back to
+        # anything a prior inspect_data recorded in world_state. Relying only on
+        # world_state fails when the concat runs before any successful
+        # inspect_data — which is exactly the case this safety net must cover.
+        column = None
+        m = re.search(r"\b(?:label|batch_key)\s*=\s*['\"]([^'\"]+)['\"]", code)
+        if m:
+            column = m.group(1)
         column = (
-            summary.get("batch_key")
+            column
+            or summary.get("batch_key")
             or summary.get("recommended_batch_key")
             or candidate.get("column")
         )
-        n_groups = int(summary.get("n_batches") or candidate.get("n_unique") or 0)
+
+        # Resolve the group count from the live concatenated AnnData (the source
+        # of truth right after the concat), falling back to recorded metadata.
+        # If we still have no column, sniff obs for a sample-like column the
+        # concat may have created (e.g. anndata.concat's default 'batch' label).
+        n_groups = 0
+        obs = getattr(getattr(self, "adata", None), "obs", None)
+        if obs is not None:
+            if not column:
+                for cand_col in ("batch", "sample", "replicate", "donor", "library", "dataset"):
+                    if cand_col in obs.columns:
+                        column = cand_col
+                        break
+            if column and column in obs.columns:
+                try:
+                    n_groups = int(obs[column].nunique())
+                except Exception:
+                    n_groups = 0
+        if not n_groups:
+            n_groups = int(summary.get("n_batches") or candidate.get("n_unique") or 0)
+
         if not column or n_groups < 2:
             return None
         return self._multi_sample_strategy_checkpoint({

@@ -9,7 +9,7 @@ Supports multiple input formats:
 
 import os
 from pathlib import Path
-from typing import Union, Optional, List
+from typing import Any, Union, Optional, List
 import scanpy as sc
 from anndata import AnnData
 import logging
@@ -251,6 +251,7 @@ def concat_datasets(
     batch_key: str = 'batch_id',
     batch_names: Optional[List[str]] = None,
     join: str = 'outer',
+    **kwargs: Any,
 ) -> AnnData:
     """
     Concatenate multiple AnnData objects.
@@ -266,6 +267,14 @@ def concat_datasets(
     join : {'outer', 'inner'}, default 'outer'
         Outer keeps every gene observed in any dataset. Inner keeps only genes
         shared by every dataset.
+    **kwargs
+        Tolerated ``anndata.concat``-style aliases so a near-miss call form does
+        not dead-end the load step (callers frequently conflate the two APIs):
+        ``label=`` (alias for ``batch_key``), ``keys=`` (alias for
+        ``batch_names``), and ``fill_value=`` (honored; otherwise 0 for outer
+        joins, None for inner). Structural kwargs this helper manages itself
+        (``axis``, ``index_unique``, ``merge``) are accepted and ignored. Any
+        other unexpected kwarg raises a TypeError naming the accepted parameters.
 
     Returns
     -------
@@ -273,6 +282,28 @@ def concat_datasets(
         Concatenated AnnData object.
     """
     import anndata
+
+    # Tolerate the anndata.concat-style kwargs models commonly reach for, so a
+    # single near-miss does not cascade into hand-rolled concat fallbacks.
+    if batch_key == 'batch_id' and kwargs.get('label'):
+        batch_key = kwargs.pop('label')
+    else:
+        kwargs.pop('label', None)
+    if batch_names is None and kwargs.get('keys') is not None:
+        batch_names = kwargs.pop('keys')
+    else:
+        kwargs.pop('keys', None)
+    has_fill_override = 'fill_value' in kwargs
+    fill_value_override = kwargs.pop('fill_value', None)
+    for _structural in ('axis', 'index_unique', 'merge'):
+        kwargs.pop(_structural, None)
+    if kwargs:
+        raise TypeError(
+            f"concat_datasets() got unexpected keyword argument(s) {sorted(kwargs)}. "
+            "Accepted: datasets, batch_key, batch_names, join ('outer'/'inner'). "
+            "anndata.concat aliases label=, keys=, fill_value= are tolerated; "
+            "axis/index_unique/merge are managed internally."
+        )
 
     if not datasets:
         raise ValueError("datasets must contain at least one AnnData object")
@@ -300,6 +331,7 @@ def concat_datasets(
 
     logger.info(f"Concatenating {len(datasets)} datasets")
 
+    fill_value = fill_value_override if has_fill_override else (0 if join == "outer" else None)
     adata = anndata.concat(
         datasets,
         axis=0,
@@ -307,7 +339,7 @@ def concat_datasets(
         label=batch_key,
         keys=batch_names,
         index_unique='-',
-        fill_value=0 if join == "outer" else None,
+        fill_value=fill_value,
         merge='same',
     )
 

@@ -441,6 +441,11 @@ def _loads_tolerant(text: str) -> Optional[Any]:
     raw = text.strip()
     if not raw:
         return None
+    # Strip a ```json ... ``` (or bare ```) markdown fence if the model wrapped
+    # its payload in one — a common quirk that otherwise dead-ends parsing.
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[A-Za-z0-9_-]*[ \t]*\r?\n?", "", raw)
+        raw = re.sub(r"\r?\n?```[ \t]*$", "", raw).strip()
     try:
         return json.loads(raw)
     except Exception:
@@ -1504,9 +1509,32 @@ def _validate_annotation_evidence(
                 checks["discriminating_supporting_genes_matched_cluster_degs"] = discriminating_matched_degs
                 checks["n_discriminating_supporting_genes_matched_cluster_degs"] = len(discriminating_matched_degs)
                 if not matched_degs:
+                    # Echo the cluster's pre-validated markers so the agent fixes
+                    # this in one shot instead of guessing (and re-tripping the
+                    # nuisance gate above). suggested_supporting_genes /
+                    # discriminating_degs are built with the SAME nuisance/broad
+                    # filters this validator applies, so they are guaranteed to
+                    # pass both checks. Falling back to the raw DEG set would risk
+                    # re-suggesting nuisance genes, so we don't.
+                    _entry = proposal_cluster_entries.get(cid, {}) or {}
+                    _suggested = (
+                        _entry.get("suggested_supporting_genes")
+                        or _entry.get("discriminating_degs")
+                    )
+                    if _suggested:
+                        _hint = (
+                            "Cite from these (already validated for this cluster — non-nuisance, "
+                            f"present in its DEGs): {list(_suggested)[:15]}."
+                        )
+                    else:
+                        _hint = (
+                            "this cluster has no discriminating DEGs (its top DEGs are all "
+                            "nuisance/broad-context) — it may be low-quality or a doublet; lower "
+                            "the confidence or flag it rather than forcing a specific marker."
+                        )
                     validation_failures.append(
                         f"Cluster {cid}: none of supporting_genes={supporting[:10]} appear in this "
-                        f"cluster's top DEGs. Cite genes that are actually differentially expressed in cluster {cid}."
+                        f"cluster's top DEGs. {_hint}"
                     )
                 elif not non_nuisance_matched_degs:
                     validation_failures.append(
@@ -1729,8 +1757,12 @@ def _validate_annotation_evidence(
         # it to panglaodb_queried=false rather than hard-failing. This prevents
         # over-claims (e.g. 'dendritic cells' pasted onto a T-cell cluster) from
         # cascading into a blocked finalize.
+        # An over-claimed/incompatible panglaodb_label_used is never worth
+        # blocking finalize on. Drop it and fall back to reference+DEG evidence;
+        # if the cluster genuinely needed external adjudication, the soft
+        # handling just below caps confidence and records a caveat.
         if _panglao_incompatible_msg:
-            if not panglaodb_required and apply_auto_fixes and pq:
+            if apply_auto_fixes and pq:
                 ev = dict(ev)
                 ev["panglaodb_queried"] = False
                 ev.pop("panglaodb_label_used", None)
@@ -1739,25 +1771,43 @@ def _validate_annotation_evidence(
                 checks["panglaodb_queried"] = False
                 auto_fixes.append(
                     f"Cluster {cid}: dropped an unsupported PanglaoDB claim "
-                    f"(panglaodb_label_used={panglao_label_text!r} is not compatible with {final_label_text!r}); "
-                    "the cluster is reference+DEG sufficient, so set panglaodb_queried=false."
+                    f"(panglaodb_label_used={panglao_label_text!r} is not compatible with {final_label_text!r})."
                 )
-            else:
-                validation_failures.append(_panglao_incompatible_msg)
+            checks["panglaodb_label_incompatible_note"] = _panglao_incompatible_msg
 
+        # PanglaoDB is an OPTIONAL external adjudicator, NOT a gate. DEGs +
+        # CellTypist/Scimilarity + Cytopus are the primary drivers. When a
+        # cluster still needs external adjudication that PanglaoDB could not
+        # provide — references disagree and neither Cytopus nor PanglaoDB covers
+        # the label (common for progenitor/transitional types like CMP/MEP) —
+        # do NOT loop finalize. Accept the label on reference + DEG evidence,
+        # flag it unresolved, and cap confidence to low (below) so the result is
+        # honest rather than blocked. A cluster PanglaoDB *can* adjudicate is
+        # still upgraded above this tier via the call-history path earlier.
+        external_adjudication_unresolved = False
         if panglaodb_required:
             panglaodb_required_clusters.append(cid)
-            if not pq:
-                validation_failures.append(
-                    f"Cluster {cid}: panglaodb_queried must be true because external adjudication is required "
-                    f"({', '.join(panglaodb_required_reasons) or 'needs_external_adjudication'})."
-                )
-            elif (queried_celltypes_normalized or queried_gene_symbols_normalized) and not panglaodb_has_call_history_support:
-                validation_failures.append(
-                    f"Cluster {cid}: label {label!r} (panglaodb_label_used={panglaodb_label_used!r}) "
-                    "was not found in the PanglaoDB call history recorded in world state. "
-                    "Either query PanglaoDB for this label or record the gene_symbol reverse query that supports it."
-                )
+            external_adjudication_unresolved = True
+            validation_tier = "reference_deg_unadjudicated"
+            checks["validation_tier"] = validation_tier
+            note = (
+                "External adjudication was warranted ("
+                + (", ".join(panglaodb_required_reasons) or "needs_external_adjudication")
+                + ") but PanglaoDB could not resolve it; label rests on reference + DEG "
+                "evidence at reduced (low) confidence."
+            )
+            checks["external_adjudication_status"] = "attempted_unresolved"
+            checks["external_adjudication_note"] = note
+            if apply_auto_fixes:
+                ev = dict(ev)
+                ev["external_adjudication_status"] = "attempted_unresolved"
+                ev["external_adjudication_note"] = note
+                evidence_str[cid] = ev
+            auto_fixes.append(
+                f"Cluster {cid}: external adjudication unresolved by PanglaoDB "
+                f"({', '.join(panglaodb_required_reasons) or 'needs_external_adjudication'}); "
+                "accepted on reference + DEG evidence with confidence capped to low."
+            )
 
         if validation_tier in {"reference_consensus_plus_deg", "reference_partial_plus_deg", "cytopus_plus_deg"}:
             panglaodb_support_level = validation_tier
@@ -1909,6 +1959,17 @@ def _validate_annotation_evidence(
                     f"Cluster {cid}: auto-lowered confidence high → low because no PanglaoDB call history "
                     "backs this label (self-attested)."
                 )
+        # Unresolved external adjudication → honest low confidence (any starting
+        # level), since the label rests on reference + DEG evidence only.
+        if external_adjudication_unresolved and apply_auto_fixes and conf in {"high", "medium"}:
+            ev = dict(ev)
+            ev["confidence"] = "low"
+            evidence_str[cid] = ev
+            conf = "low"
+            auto_fixes.append(
+                f"Cluster {cid}: capped confidence to low — external adjudication warranted but "
+                "unresolved (reference + DEG support only)."
+            )
         checks["confidence"] = conf
         # If auto-fixes are disabled we still emit the prior strict messages
         # so callers that want the raw rejection report can see them.
@@ -3011,11 +3072,12 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "save_data",
-            "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete.",
+            "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete. If annotation was required but finalize_annotation genuinely cannot pass validation after honest attempts, pass allow_unvalidated=true to save anyway as a clearly-marked UNVALIDATED file rather than losing the analysis.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "output_path": {"type": "string", "description": "Path to save the current in-memory h5ad"}
+                    "output_path": {"type": "string", "description": "Path to save the current in-memory h5ad"},
+                    "allow_unvalidated": {"type": "boolean", "description": "Escape hatch: when annotation consensus could not be finalized, set true to save anyway. The file is suffixed _UNVALIDATED and adata.uns['annotation_status'] is set to 'unvalidated'. Only use after genuine finalize_annotation attempts have failed."}
                 },
                 "required": ["output_path"]
             }
@@ -4062,6 +4124,12 @@ def process_tool_call(
         and does not replace the active in-memory AnnData tracked by the agent.
         """
         data_path = tool_input.get("data_path")
+        # Normalize the path: strip whitespace, and treat an empty/whitespace-only
+        # string as "no path given" so it falls back to in-memory data instead of
+        # erroring. A stray data_path="" is a common model artifact (e.g. after a
+        # concat in run_code) and should not be read as "load from disk".
+        if isinstance(data_path, str):
+            data_path = data_path.strip() or None
         if prefer_memory and existing_adata is not None:
             return existing_adata, existing_adata
         # If adata is already in memory and no specific path given, use it
@@ -6195,11 +6263,38 @@ def process_tool_call(
                 # commas). Genuinely truncated blobs still fail -> clear error.
                 parsed = _loads_tolerant(data)
                 if parsed is None:
+                    n_chars = len(data)
+                    looks_truncated = (
+                        data.count("{") != data.count("}")
+                        or data.count("[") != data.count("]")
+                    )
+                    if looks_truncated:
+                        message = (
+                            f"`data` could not be parsed — it looks truncated ({n_chars} chars, "
+                            "unbalanced braces/brackets). A large payload stringified into this "
+                            "argument was almost certainly cut off. Do NOT retry write_json with a "
+                            "stringified blob — build the object in run_code and write it directly "
+                            "with json.dump to a file, then register_artifact the path."
+                        )
+                        recovery_options = [
+                            "In run_code: `p = Path(output_dir)/'<name>.json'; "
+                            "p.write_text(json.dumps(obj)); register_artifact(p)` — no size limit.",
+                            "For annotation evidence specifically, pass that file path to "
+                            "stage_annotation_evidence(evidence_path=...).",
+                        ]
+                    else:
+                        message = (
+                            f"`data` must be a JSON object or array, not a string ({n_chars} chars). "
+                            "Pass the structured data directly (data={...}), not a quoted/serialized blob."
+                        )
+                        recovery_options = [
+                            "Call write_json with data as a real object: data={\"0\": {...}, \"1\": {...}}.",
+                        ]
                     return json.dumps({
                         "status": "error",
                         "tool": "write_json",
-                        "message": "`data` must be a JSON object or array, not a string. Pass the structured data directly (data={...}), not a quoted/serialized blob.",
-                        "recovery_options": ["Call write_json with data as a real object: data={\"0\": {...}, \"1\": {...}}."],
+                        "message": message,
+                        "recovery_options": recovery_options,
                     }, indent=2), adata
                 data = parsed
             if not isinstance(data, (dict, list)):
@@ -9723,15 +9818,58 @@ def process_tool_call(
                     recovery_options=["Provide output_path as a .h5ad file path or directory."],
                 )
 
+            # If annotation validation was required but never finalized, the save
+            # guard only let this through as an escape hatch (attempts exhausted
+            # or allow_unvalidated). Mark the dataset honestly so a
+            # not-formally-validated annotation can never be mistaken for a
+            # finalized one: stamp adata.uns, suffix the filename, and warn.
+            unvalidated_warnings: List[str] = []
+            _av = getattr(world_state, "annotation_validation", None) or {}
+            annotation_unvalidated = bool(_av.get("required")) and not (
+                _av.get("finalized") or _av.get("status") == "validated_and_finalized"
+            )
+            if annotation_unvalidated:
+                from datetime import datetime, timezone
+                try:
+                    adata.uns["annotation_status"] = "unvalidated"
+                    adata.uns["annotation_validation_note"] = {
+                        "reason": (
+                            "Saved before finalize_annotation passed consensus validation. "
+                            "Cell-type labels are NOT formally validated."
+                        ),
+                        "validation_status": _av.get("status"),
+                        "finalize_attempts": int(_av.get("finalize_attempts", 0) or 0),
+                        "last_finalize_error": _av.get("last_finalize_error"),
+                        "saved_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                except Exception:
+                    pass
+                _stem, _ext = os.path.splitext(output_path)
+                if "UNVALIDATED" not in os.path.basename(_stem).upper():
+                    output_path = f"{_stem}_UNVALIDATED{_ext or '.h5ad'}"
+                unvalidated_warnings.append(
+                    "Annotation was NOT finalized through consensus validation. Saved as a "
+                    f"clearly-marked UNVALIDATED dataset ({os.path.basename(output_path)}); "
+                    "adata.uns['annotation_status']='unvalidated'. Treat cell-type labels as provisional."
+                )
+
             save_details = write_h5ad_safe(adata, output_path)
-            artifact = _artifact_payload(output_path, role="saved_dataset", metadata={"save_mode": save_details.get("save_mode", "direct")})
+            artifact = _artifact_payload(
+                output_path,
+                role="saved_dataset",
+                metadata={
+                    "save_mode": save_details.get("save_mode", "direct"),
+                    "annotation_status": "unvalidated" if annotation_unvalidated else "validated",
+                },
+            )
             save_result = {
                 "status": "ok",
                 "tool": "save_data",
                 "output_path": output_path,
                 "saved": True,
+                "annotation_unvalidated": annotation_unvalidated,
                 "save_mode": save_details.get("save_mode", "direct"),
-                "warnings": save_details.get("warnings", []),
+                "warnings": list(save_details.get("warnings", [])) + unvalidated_warnings,
                 "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "state": make_state(adata)
             }

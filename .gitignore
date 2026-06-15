@@ -10,7 +10,7 @@ __pycache__/
 *$py.class
 *.so
 
-# Markdown files except README.md
+# Markdown files except project docs
 *.md
 !README.md
 
@@ -74,6 +74,12 @@ andrew_data/
 tests/*
 !tests/decision_interaction_test.py
 !tests/loading_regression_test.py
+!tests/annotation_save_escape_test.py
+!tests/batch_strategy_trigger_test.py
+!tests/annotation_adjudication_soft_test.py
+!tests/write_json_robustness_test.py
+!tests/concat_datasets_robustness_test.py
+!tests/gemini_provider_test.py
 cellbender_test/
 results/
 article_figures/
