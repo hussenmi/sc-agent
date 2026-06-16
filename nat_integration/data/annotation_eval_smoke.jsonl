@@ -1,0 +1,1 @@
+{"id": "gse155249_smoke", "question": "{\"instruction\": \"Run quality control, clustering, and cell-type annotation on this bronchoalveolar lavage (BAL) scRNA-seq dataset.\", \"data_path\": \"/data1/peerd/ibrahih3/cs_agent/test_data/GSE155249_smoke.h5ad\"}", "answer": "/data1/peerd/ibrahih3/cs_agent/test_data/GSE155249_smoke.h5ad::Cluster"}

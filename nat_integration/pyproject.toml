@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scagent-nat"
+version = "0.1.0"
+description = "NeMo Agent Toolkit (NAT) integration for the scagent scRNA-seq agent"
+requires-python = ">=3.11"
+dependencies = [
+  "nvidia-nat[eval]",
+  "langchain-core",    # nat.plugins.eval runtime hard-imports langchain_core.agents (trajectory adapter)
+  "anndata>=0.10",     # evaluator reads scagent's annotated .h5ad + the ground-truth .h5ad
+  "scikit-learn>=1.3", # adjusted_rand_score / normalized_mutual_info_score
+  "numpy",
+]
+
+# NAT discovers components (functions, evaluators) via this entry-point group.
+[project.entry-points."nat.components"]
+scagent_nat = "scagent_nat.register"
+
+[tool.setuptools]
+packages = ["scagent_nat"]

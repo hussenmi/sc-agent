@@ -440,7 +440,13 @@ def run_analyze(args):
     from scagent.agent import SCAgent
     from scagent.terminal import read_user_input
 
-    if not sys.stdin.isatty():
+    # Smart autonomous mode runs headless (e.g. under NAT eval / batch jobs); only
+    # collaborative mode needs a TTY so the agent can pause for decisions. (This mirrors
+    # the guard in SCAgent.run, which only blocks collaborative + non-smart + no-TTY.)
+    smart = getattr(args, 'smart_autonomous', None)
+    if smart is None:
+        smart = True  # default to smart mode when neither --smart nor --collaborative given
+    if not smart and not sys.stdin.isatty():
         print(
             "Collaborative agent mode requires an interactive terminal. "
             "Run `scagent analyze` from a TTY so the agent can pause for decisions."
@@ -459,10 +465,7 @@ def run_analyze(args):
             "annotation. Provide a summary of your findings."
         )
 
-    # Create agent
-    smart = getattr(args, 'smart_autonomous', None)
-    if smart is None:
-        smart = True  # default to smart mode when neither --smart nor --collaborative given
+    # Create agent  (smart resolved above)
     agent = SCAgent(
         provider=args.provider,
         model=args.model,

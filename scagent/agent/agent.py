@@ -18,6 +18,7 @@ import re
 
 from .codex_bridge import CODEX_DECISION_SCHEMA, CodexCLIClient, CodexCLIError
 from .tools import get_tools, get_openai_tools, process_tool_call, encode_image_base64, get_image_mime_type
+from . import tracing as _tracing  # optional OpenTelemetry per-step tracing (no-op unless SCAGENT_TRACE)
 from .prompts import SYSTEM_PROMPT
 from .run_manager import RunManager, create_run
 from .decision_policy import (
@@ -3572,14 +3573,23 @@ class SCAgent:
                 self.run_manager.fail(message)
             raise RuntimeError(message)
 
-        # Route to provider-specific implementation
-        if self.provider == "anthropic":
-            return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
-        elif self.provider in {"openai", "groq", "gemini", "vertex"}:
-            return self._analyze_openai(user_message, max_iterations, continue_conversation)
-        elif self.provider == "codex":
-            return self._analyze_codex(user_message, max_iterations, continue_conversation)
-        raise RuntimeError(f"Unsupported provider: {self.provider}")
+        # Route to provider-specific implementation, wrapped in a tracing root span so
+        # per-iteration LLM/tool spans nest under one trace (and under NAT's eval
+        # workflow span when a W3C traceparent is propagated in via the environment).
+        _tracing.start_root("scagent.analyze", {
+            "scagent.provider": self.provider,
+            "scagent.model": str(self.model),
+        })
+        try:
+            if self.provider == "anthropic":
+                return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
+            elif self.provider in {"openai", "groq", "gemini", "vertex"}:
+                return self._analyze_openai(user_message, max_iterations, continue_conversation)
+            elif self.provider == "codex":
+                return self._analyze_codex(user_message, max_iterations, continue_conversation)
+            raise RuntimeError(f"Unsupported provider: {self.provider}")
+        finally:
+            _tracing.end_root()
 
     def _codex_tool_specs(self) -> List[Dict[str, Any]]:
         """Return compact tool specs for the Codex decision prompt."""
@@ -3843,6 +3853,7 @@ class SCAgent:
                     messages, anthropic=True,
                     trim_target=trim_target, hard_limit=hard_limit,
                 )
+                _t0_llm = _tracing.now_ns()
                 try:
                     response = self._with_llm_status(
                         lambda: self.client.messages.create(
@@ -3899,6 +3910,14 @@ class SCAgent:
                             min(_new_ratio, 4.0),
                         )
 
+                _usage = getattr(response, "usage", None)
+                _tracing.record_llm(
+                    iteration, self.model,
+                    getattr(_usage, "input_tokens", None) if _usage else None,
+                    getattr(_usage, "output_tokens", None) if _usage else None,
+                    _t0_llm,
+                )
+
                 if response.stop_reason == "tool_use":
                     tool_results = []
                     assistant_content = []
@@ -3910,7 +3929,9 @@ class SCAgent:
 
                         elif content.type == "tool_use":
                             assistant_content.append(content)
+                            _t0_tool = _tracing.now_ns()
                             result_json = self._execute_tool(content.name, content.input)
+                            _tracing.record_tool(content.name, iteration, _t0_tool)
 
                             tool_results.append({
                                 "type": "tool_result",
@@ -4800,6 +4821,7 @@ class SCAgent:
                 messages = self._trim_messages_if_needed(
                     messages, trim_target=trim_target, hard_limit=hard_limit,
                 )
+                _t0_llm = _tracing.now_ns()
                 try:
                     response = self._with_llm_status(
                         lambda: self.client.chat.completions.create(
@@ -4862,6 +4884,14 @@ class SCAgent:
                             min(_new_ratio, 4.0),
                         )
 
+                _usage = getattr(response, "usage", None)
+                _tracing.record_llm(
+                    iteration, self.model,
+                    getattr(_usage, "prompt_tokens", None) if _usage else None,
+                    getattr(_usage, "completion_tokens", None) if _usage else None,
+                    _t0_llm,
+                )
+
                 if choice.finish_reason == "tool_calls" and message.tool_calls:
                     # Add assistant message with tool calls
                     messages.append(message)
@@ -4879,7 +4909,9 @@ class SCAgent:
                     # Process each tool call
                     for tool_call in message.tool_calls:
                         tool_input = json.loads(tool_call.function.arguments)
+                        _t0_tool = _tracing.now_ns()
                         result_json = self._execute_tool(tool_call.function.name, tool_input)
+                        _tracing.record_tool(tool_call.function.name, iteration, _t0_tool)
 
                         messages.append({
                             "role": "tool",

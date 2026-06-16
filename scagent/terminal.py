@@ -235,6 +235,28 @@ def prompt_for_decision(
             )
         )
 
+    # Headless / non-interactive (e.g. NAT eval, batch jobs, CI): there is no TTY to
+    # prompt on, so auto-select the default (recommended) option instead of blocking
+    # on stdin. Prefer a concrete option over the synthetic "custom" text choice.
+    # Only when using the real stdin reader — if a caller injected an input_reader
+    # (tests / programmatic drivers), honor it instead.
+    if input_reader is read_user_input and not sys.stdin.isatty():
+        auto_index = default_index if (default_index is not None
+                                       and 0 <= default_index < len(normalized_choices)) else 0
+        if normalized_choices[auto_index].action == "custom":
+            auto_index = next((i for i, c in enumerate(normalized_choices)
+                               if c.action != "custom"), auto_index)
+        choice = normalized_choices[auto_index]
+        return DecisionSelection(
+            action=choice.action,
+            label=choice.label,
+            index=auto_index,
+            value=choice.label,
+            raw_response=choice.label,
+            input_mode="auto-default",
+            custom=False,
+        )
+
     use_selector = (
         not force_text_fallback
         and sys.stdin.isatty()

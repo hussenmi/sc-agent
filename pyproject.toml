@@ -58,8 +58,15 @@ dev = [
     "ruff",
     "mypy",
 ]
+tracing = [
+    # Optional per-step OpenTelemetry tracing of the agent loop (scagent/agent/tracing.py).
+    # Exports to Phoenix / any OTLP-HTTP collector. No-op unless SCAGENT_TRACE is set.
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
+]
 all = [
-    "scagent[agent,scimilarity,dev]",
+    "scagent[agent,scimilarity,dev,tracing]",
 ]
 
 [project.scripts]

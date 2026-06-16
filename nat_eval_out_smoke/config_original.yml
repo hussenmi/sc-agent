@@ -1,0 +1,24 @@
+# Smoke variant: same as annotation_eval.yml but on the ~8.6k-cell subsample,
+# to validate the NAT -> scagent -> evaluator loop end-to-end fast.
+workflow:
+  _type: scagent_analyze
+  scagent_bin: /usersoftware/peerd/ibrahih3/envs/scagent/bin/scagent
+  scagent_repo: /data1/peerd/ibrahih3/cs_agent
+  provider: openai
+  model: Qwen3.6-27B
+  base_url: http://localhost:8000/v1
+  output_root: /data1/peerd/ibrahih3/cs_agent/nat_runs
+  max_iterations: 75
+
+eval:
+  general:
+    output_dir: /data1/peerd/ibrahih3/cs_agent/nat_eval_out_smoke
+    max_concurrency: 1
+    dataset:
+      _type: jsonl
+      file_path: /data1/peerd/ibrahih3/cs_agent/nat_integration/data/annotation_eval_smoke.jsonl
+  evaluators:
+    annotation_ari:
+      _type: annotation_ari
+      cluster_key: leiden
+      fallback_key: cell_type
