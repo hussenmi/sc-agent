@@ -98,3 +98,7 @@ sc-agent-490721-01596696572f.json
 *.bin
 openai_client.py
 agent_demo.py
+*.h5ad
+*.rd
+*_truth.csv
+LUNG_*

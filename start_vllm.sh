@@ -360,6 +360,16 @@ if [[ ! -d "$MODEL_CACHE" ]]; then
   exit 1
 fi
 
+# Fail fast if the port is already taken. Otherwise the new server can't bind it,
+# but the readiness probe below gets answered by WHATEVER already owns the port
+# (e.g. a stale vLLM or a TRT-LLM server) and we'd falsely report "ready".
+if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -q ":$PORT "; then
+  echo "ERROR: port $PORT is already in use — another server is bound to it."
+  echo "       Health checks would be answered by that server and mask this one."
+  echo "       Free it (find it via:  ss -ltnp | grep :$PORT) or pick a different PORT."
+  exit 1
+fi
+
 # Persistent compile cache — keyed by model AND hardware class so A100/H100 caches
 # don't collide. Without this, a cache hit from a different GPU class can cause a
 # crash during CUDA graph capture (compiled kernels reference unavailable instructions).

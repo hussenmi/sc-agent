@@ -885,7 +885,9 @@ class SCAgent:
           SCAGENT_THINKING_EFFORT=minimal|low|medium|high.
           SCAGENT_THINKING_BUDGET=N  → legacy budget mapped to an effort level.
 
-        vLLM local models (Qwen/Gemma): thinking OFF by default (server default).
+        vLLM / TensorRT-LLM local models (Qwen/Gemma): thinking OFF by default,
+        sent explicitly via chat_template_kwargs (not relying on a server-side
+        default, which TensorRT-LLM's trtllm-serve does not provide).
           SCAGENT_THINKING=1  → enable via chat_template_kwargs.
         """
         if not self._is_thinking_model():
@@ -908,10 +910,15 @@ class SCAgent:
                     effort = "low" if budget <= 1024 else "medium" if budget <= 8192 else "high"
                 return {"reasoning_effort": effort}
             return {}
-        # vLLM local models (Qwen/Gemma)
-        if os.environ.get("SCAGENT_THINKING", "0") == "1":
-            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
-        return {}
+        # vLLM / TensorRT-LLM local models (Qwen/Gemma): send enable_thinking
+        # EXPLICITLY in both directions. vLLM can default this server-side
+        # (start_vllm.sh --default-chat-template-kwargs), but TensorRT-LLM's
+        # trtllm-serve has no such flag — relying on a server default leaves
+        # thinking ON, which leaks chain-of-thought into content and starves the
+        # tool call of tokens. Being explicit is backend-agnostic and matches the
+        # vLLM behavior either way.
+        enable_thinking = os.environ.get("SCAGENT_THINKING", "0") == "1"
+        return {"extra_body": {"chat_template_kwargs": {"enable_thinking": enable_thinking}}}
 
     def _is_action_tool(self, tool_name: str) -> bool:
         # MCP tools never mutate adata — treat them as inspection tools
@@ -4156,6 +4163,13 @@ class SCAgent:
         # Legacy aliases (deepseek-chat / deepseek-reasoner) point at v4-flash.
         if "deepseek" in model:
             return _known(1_000_000, self.model)
+        # Qwen3.5 / Qwen3.6 family: 262,144 (256K) native window
+        # (max_position_embeddings). Sits below the vLLM probe (priority 2) on
+        # purpose — vLLM still reports the exact GPU-constrained limit; this only
+        # fires for OpenAI-compatible servers that don't advertise max_model_len
+        # (e.g. TensorRT-LLM's trtllm-serve, which serves it at max_seq_len=262144).
+        if "qwen3.6" in model or "qwen3.5" in model or "qwen3_5" in model:
+            return _known(262_144, self.model)
 
         # --- Priority 5: generic Qwen fallback ---
         if "qwen" in model:
