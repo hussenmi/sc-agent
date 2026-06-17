@@ -1,5 +1,13 @@
 # Smoke variant: same as annotation_eval.yml but on the ~8.6k-cell subsample,
 # to validate the NAT -> scagent -> evaluator loop end-to-end fast.
+general:
+  telemetry:
+    tracing:
+      phoenix:
+        _type: phoenix
+        endpoint: http://localhost:6006/v1/traces
+        project: scagent-nat-eval
+
 workflow:
   _type: scagent_analyze
   scagent_bin: /usersoftware/peerd/ibrahih3/envs/scagent/bin/scagent
@@ -9,6 +17,9 @@ workflow:
   base_url: http://localhost:8000/v1
   output_root: /data1/peerd/ibrahih3/cs_agent/nat_runs
   max_iterations: 75
+  trace: true
+  otlp_endpoint: http://localhost:6006
+  trace_project: scagent-nat-eval
 
 eval:
   general:

@@ -342,6 +342,10 @@ class SCAgent:
         self._vertex_token_expiry: float = 0.0
         self._last_estimated_tokens: int = 0
         self._last_actual_tokens: int = 0   # exact count from API response usage field
+        # Per-response output cap, applied to every LLM call AND used as the context
+        # completion reserve (kept in sync). 4096 truncated long report/finalize
+        # outputs; raise via SCAGENT_MAX_OUTPUT_TOKENS for heavier write workloads.
+        self._max_output_tokens: int = int(os.environ.get("SCAGENT_MAX_OUTPUT_TOKENS", "8192"))
         self._context_display_tokens: int = 0
         self._context_display_source: str = ""
         self._context_display_trim_target: int = 0
@@ -3858,7 +3862,7 @@ class SCAgent:
                     response = self._with_llm_status(
                         lambda: self.client.messages.create(
                             model=self.model,
-                            max_tokens=4096,
+                            max_tokens=self._max_output_tokens,
                             system=system_prompt,
                             tools=self.tools,
                             messages=messages,
@@ -3871,7 +3875,7 @@ class SCAgent:
                             response = self._with_llm_status(
                                 lambda: self.client.messages.create(
                                     model=self.model,
-                                    max_tokens=4096,
+                                    max_tokens=self._max_output_tokens,
                                     system=self._build_system_prompt(),
                                     tools=self.tools,
                                     messages=messages,
@@ -4241,7 +4245,7 @@ class SCAgent:
         history_messages = self._history_messages_for_budget(messages or [], anthropic=anthropic)
         history_estimate = self._calibrated_estimate(history_messages)
         overhead = tool_schema_tokens + system_tokens
-        completion_reserve = 4096
+        completion_reserve = self._max_output_tokens  # in sync with the per-call output cap
         safety_margin = max(2000, int(self._context_limit * 0.03))
         hard_prompt_limit = max(0, self._context_limit - completion_reserve - safety_margin)
 
@@ -4299,7 +4303,7 @@ class SCAgent:
           trim_target  — aim to be below this before the API call (proactive trim)
           hard_limit   — absolute ceiling; triggers emergency trim if exceeded
         """
-        COMPLETION_RESERVE = 4096
+        COMPLETION_RESERVE = self._max_output_tokens  # in sync with the per-call output cap
         system_tokens = int((len(system_prompt) // 4) * self._token_estimate_calibration)
         tool_schema_tokens = int(self._tool_schema_tokens * self._token_estimate_calibration)
         safety_margin = max(2000, int(self._context_limit * 0.03))
@@ -4826,7 +4830,7 @@ class SCAgent:
                     response = self._with_llm_status(
                         lambda: self.client.chat.completions.create(
                             model=self.model,
-                            max_completion_tokens=4096,
+                            max_completion_tokens=self._max_output_tokens,
                             tools=self.tools,
                             messages=messages,
                             **thinking_extra,
@@ -4841,7 +4845,7 @@ class SCAgent:
                             response = self._with_llm_status(
                                 lambda: self.client.chat.completions.create(
                                     model=self.model,
-                                    max_completion_tokens=4096,
+                                    max_completion_tokens=self._max_output_tokens,
                                     tools=self.tools,
                                     messages=messages,
                                     **thinking_extra,
@@ -6469,7 +6473,7 @@ class SCAgent:
             response = self._with_llm_status(
                 lambda: self.client.messages.create(
                     model=self.model,
-                    max_tokens=4096,
+                    max_tokens=self._max_output_tokens,
                     system=self._build_system_prompt(),
                     messages=[{"role": "user", "content": message}],
                 )
@@ -6483,7 +6487,7 @@ class SCAgent:
             response = self._with_llm_status(
                 lambda: self.client.chat.completions.create(
                     model=self.model,
-                    max_completion_tokens=4096,
+                    max_completion_tokens=self._max_output_tokens,
                     messages=[
                         {"role": "system", "content": self._build_system_prompt()},
                         {"role": "user", "content": message},

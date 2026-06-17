@@ -2,7 +2,18 @@ general:
   use_uvloop: null
   telemetry:
     logging: {}
-    tracing: {}
+    tracing:
+      phoenix:
+        type: phoenix
+        project: scagent-nat-eval
+        endpoint: http://localhost:6006/v1/traces
+        batch_size: 100
+        flush_interval: 5.0
+        max_queue_size: 1000
+        drop_on_overflow: false
+        shutdown_timeout: 10.0
+        timeout: 30.0
+        api_key: ''
   per_user_workflow_timeout: PT30M
   per_user_workflow_cleanup_interval: PT5M
   enable_per_user_monitoring: false
@@ -120,6 +131,9 @@ workflow:
   output_root: /data1/peerd/ibrahih3/cs_agent/nat_runs
   max_iterations: 75
   timeout_s: 5400
+  trace: true
+  otlp_endpoint: http://localhost:6006
+  trace_project: scagent-nat-eval
 authentication: {}
 eval:
   general:

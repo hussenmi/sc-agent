@@ -27,6 +27,14 @@ _tracer = None
 _provider = None
 _root = None  # current root span
 
+# Per-run token accumulators, stamped onto the root span at end_root so the
+# whole-run input/output split is visible in the UI without querying. Reset when
+# the run changes (detected via the propagated TRACEPARENT).
+_run_key = None
+_in_tokens = 0
+_out_tokens = 0
+_llm_calls = 0
+
 
 def _truthy(v) -> bool:
     return str(v).lower() in {"1", "true", "yes", "on"}
@@ -87,16 +95,29 @@ def _parent_context():
 
 
 def start_root(name: str, attributes: dict | None = None) -> None:
-    global _root
+    global _root, _run_key, _in_tokens, _out_tokens, _llm_calls
     _init()
     if _tracer is None:
         return
-    _root = _tracer.start_span(name, context=_parent_context(), attributes=attributes or {})
+    run_key = os.environ.get("TRACEPARENT") or "local"
+    if run_key != _run_key:  # new run -> reset the per-run token accumulators
+        _run_key, _in_tokens, _out_tokens, _llm_calls = run_key, 0, 0, 0
+    attrs = {"openinference.span.kind": "AGENT"}  # so Phoenix labels the root 'AGENT', not 'unknown'
+    if attributes:
+        attrs.update(attributes)
+    _root = _tracer.start_span(name, context=_parent_context(), attributes=attrs)
 
 
 def end_root() -> None:
     global _root
     if _root is not None:
+        # Stamp run-level token totals so the input/output split shows on the root
+        # span in the UI (custom scagent.run.* keys — Phoenix won't double-count them
+        # against its llm.token_count rollup). Cumulative across the run's turns.
+        _root.set_attribute("scagent.run.llm_calls", _llm_calls)
+        _root.set_attribute("scagent.run.input_tokens", _in_tokens)
+        _root.set_attribute("scagent.run.output_tokens", _out_tokens)
+        _root.set_attribute("scagent.run.total_tokens", _in_tokens + _out_tokens)
         _root.end()
         _root = None
     if _provider is not None:
@@ -116,8 +137,14 @@ def _child(name: str, t0_ns: int, attributes: dict) -> None:
 
 
 def record_llm(iteration, model, input_tokens, output_tokens, t0_ns) -> None:
+    global _in_tokens, _out_tokens, _llm_calls
     if _tracer is None or _root is None:
         return
+    _llm_calls += 1
+    if input_tokens is not None:
+        _in_tokens += int(input_tokens)
+    if output_tokens is not None:
+        _out_tokens += int(output_tokens)
     attrs = {
         "scagent.iteration": iteration,
         "openinference.span.kind": "LLM",
