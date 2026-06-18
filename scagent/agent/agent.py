@@ -1385,6 +1385,9 @@ class SCAgent:
         verdict = diagnostic.get("verdict")
         if verdict:
             evidence_bits.append(f"Diagnostic verdict: {verdict}.")
+        recommendation = diagnostic.get("recommendation")
+        if recommendation:
+            evidence_bits.append(f"Recommendation: {recommendation}")
         support = diagnostic.get("support_reasons") or []
         if support:
             evidence_bits.append("Support: " + "; ".join(map(str, support[:4])) + ".")
@@ -1414,6 +1417,7 @@ class SCAgent:
             "recommendation": diagnostic.get("recommendation"),
             "support_reasons": support[:6],
             "caution_reasons": cautions[:6],
+            "evidence_limits": (diagnostic.get("evidence_limits") or [])[:6],
             "artifacts_created": diagnostic.get("artifacts_created") or [],
         }
         if diagnostic.get("verdict") == "batch_effect_supported":
@@ -5305,6 +5309,7 @@ class SCAgent:
         "prepare_annotation",     # runs rank_genes_groups, can be slow
         "stage_annotation_evidence",
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
+        "diagnose_batch_effect",  # multi-step diagnostic; leave a durable done line
         "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets
         "score_integration",
@@ -6351,6 +6356,31 @@ class SCAgent:
         question = tool_input.get("question", "")
         context = tool_input.get("context", "")
         options = tool_input.get("options") or []
+        post_investigation = self._post_investigation_strategy_checkpoint()
+        if post_investigation is not None:
+            decision_text = " ".join(
+                [str(question), str(context)]
+                + [str(option) for option in options]
+                + [str(action) for action in (tool_input.get("option_actions") or [])]
+            ).lower()
+            if re.search(r"\b(scvi|integrat|batch[- ]?correct|uncorrected|keep)\b", decision_text):
+                self._set_pending_checkpoint(post_investigation)
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "pause_and_ask",
+                    "paused": True,
+                    "question": post_investigation.get("question", question),
+                    "context": post_investigation.get("context", context),
+                    "options": post_investigation.get("options", options),
+                    "option_actions": post_investigation.get("option_actions", []),
+                    "decision_key": post_investigation.get("decision_key", "multi_sample_strategy"),
+                    "kind": post_investigation.get("kind", "multi_sample_strategy"),
+                    "action_inputs": post_investigation.get("action_inputs", {}),
+                    "message": (
+                        "Using the structured post-diagnostic multi-sample strategy "
+                        "checkpoint instead of an ad hoc integration pause."
+                    ),
+                }, indent=2)
         cleanup_text = " ".join([str(question), str(context)] + [str(option) for option in options]).lower()
         if (
             re.search(r"\b(remove|drop|filter|exclude|subset)\b", cleanup_text)

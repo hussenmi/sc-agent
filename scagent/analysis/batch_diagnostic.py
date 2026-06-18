@@ -392,10 +392,6 @@ def diagnose_batch_effect(
     cells_in_dominated = sum(row["n_cells"] for row in sample_dominated)
     dominated_cell_fraction = cells_in_dominated / max(int(adata.n_obs), 1)
 
-    condition_cols = _candidate_condition_keys(adata, batch_key, condition_keys)
-    confounding = _confounding_summary(adata, batch_key, condition_cols)
-    any_confounded = any(row["confounded_with_batch"] for row in confounding)
-
     separation = _umap_state_separation(adata, state_by_cluster, batch_key, cluster_key)
     shift_payload = _state_expression_shifts(
         adata,
@@ -411,6 +407,21 @@ def diagnose_batch_effect(
 
     support_reasons: List[str] = []
     caution_reasons: List[str] = []
+    condition_cols = _candidate_condition_keys(adata, batch_key, condition_keys)
+    confounding = _confounding_summary(adata, batch_key, condition_cols)
+    any_confounded = any(row["confounded_with_batch"] for row in confounding)
+    if not condition_cols:
+        caution_reasons.append(
+            "no condition-like metadata columns were available, so sample-condition confounding was not tested"
+        )
+
+    sample_prefixes = sorted({str(batch).split("_", 1)[0] for batch in batches if "_" in str(batch)})
+    mixed_source_like_samples = len(sample_prefixes) >= 3
+    if mixed_source_like_samples:
+        caution_reasons.append(
+            "sample names suggest multiple source/procedure groups; sample effects may include real tissue or collection-method biology"
+        )
+
     if dominated_cell_fraction >= 0.30 or (n_clusters and len(sample_dominated) / n_clusters >= 0.30):
         support_reasons.append("many clusters are sample-dominated")
     if sample_exclusive:
@@ -431,7 +442,13 @@ def diagnose_batch_effect(
         )
     elif support_reasons:
         verdict = "batch_effect_supported"
-        recommendation = "Offer scVI integration, but wait for the user's confirmation."
+        if mixed_source_like_samples or not condition_cols:
+            recommendation = (
+                "Offer scVI integration, but frame the evidence as sample/source/procedure effects "
+                "and ask the user to confirm whether to integrate all samples together or within comparable groups."
+            )
+        else:
+            recommendation = "Offer scVI integration, but wait for the user's confirmation."
     elif n_clusters < 2 or not shift_payload["state_sample_expression_shifts"]:
         verdict = "insufficient_evidence"
         recommendation = "Ask the user; descriptive evidence is limited for this dataset."
@@ -485,6 +502,7 @@ def diagnose_batch_effect(
         "evidence_limits": [
             "This is a descriptive diagnostic, not proof that sample-associated differences are technical.",
             "One-sample-per-condition or sample-condition confounding cannot distinguish batch from biology.",
+            "If sample names encode tissue, procedure, site, or disease state, sample-exclusive clusters may reflect real biology as well as technical effects.",
             "Broad labels are provisional and must not be reused as final annotation.",
         ],
         "artifacts_created": artifacts,

@@ -718,6 +718,45 @@ def test_post_investigation_checkpoint_waits_for_diagnostic():
     assert "Diagnostic verdict: batch_effect_supported" in checkpoint["context"]
 
 
+def test_post_diagnostic_pause_is_normalized_to_runtime_checkpoint():
+    agent = _bare_agent()
+    agent.world_state.user_preferences["multi_sample_strategy"] = "investigate_integration"
+    agent.world_state.data_summary = {"batch_key": "sample", "n_batches": 2}
+    agent.adata = ad.AnnData(
+        np.ones((4, 2)),
+        obs=pd.DataFrame(
+            {"sample": ["s1", "s1", "s2", "s2"]},
+            index=[f"cell_{index}" for index in range(4)],
+        ),
+    )
+    agent.adata.uns["batch_effect_diagnostic"] = {
+        "status": "ok",
+        "batch_key": "sample",
+        "n_batches": 2,
+        "verdict": "batch_effect_supported",
+        "recommendation": "Offer scVI integration, but wait for confirmation.",
+        "support_reasons": ["many clusters are sample-dominated"],
+    }
+
+    result = json.loads(agent._handle_pause_and_ask({
+        "question": "Integrate with scVI?",
+        "context": "The diagnostic found sample effects.",
+        "options": ["Integrate with scVI", "Keep uncorrected"],
+        "option_actions": ["integrate_scvi", "keep_unintegrated"],
+        "decision_key": "integration_decision",
+    }))
+
+    assert result["kind"] == "multi_sample_strategy"
+    assert result["decision_key"] == "multi_sample_strategy"
+    assert agent._pending_checkpoint["kind"] == "multi_sample_strategy"
+    assert agent._pending_checkpoint["option_actions"] == [
+        "integrate_scvi",
+        "keep_unintegrated",
+        "analyze_separately",
+        "describe_experiment",
+    ]
+
+
 def test_package_install_defaults_to_denial(monkeypatch):
     agent = _bare_agent()
     monkeypatch.setattr(

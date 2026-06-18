@@ -51,6 +51,15 @@ conda activate "${GPU_ENV}" || {
 # regardless of any leftover entries from the shell snapshot.
 export PATH="${GPU_ENV}/bin:${PATH}"
 
+# Two conda libs must load before the older pip-wheel CUDA/runtime libs that
+# torch pulls into the process, or imports fail:
+#   - libstdc++.so.6  : numpy needs GLIBCXX_3.4.29; the system /lib64 one is older.
+#   - libnvJitLink.so.13 : cuml's libcuvs needs __nvJitLinkComplete_13_2, which the
+#     pip nvidia-nvjitlink-cu13 that torch bundles lacks (torch loads it first, so
+#     cuml binds to the wrong one -> "undefined symbol").
+# Preload the conda copies so they win regardless of import order.
+export LD_PRELOAD="${GPU_ENV}/lib/libstdc++.so.6:${GPU_ENV}/lib/libnvJitLink.so.13${LD_PRELOAD:+:${LD_PRELOAD}}"
+
 # Same environment variables as setup.sh.
 export SCAGENT_HOME="${SCAGENT_DIR}"
 export SCIMILARITY_MODEL_PATH="/data1/peerd/ibrahih3/scimilarity/docs/notebooks/models/model_v1.1"

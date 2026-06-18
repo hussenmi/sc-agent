@@ -39,6 +39,31 @@ logger = logging.getLogger(__name__)
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
+def _import_rapids_singlecell_quietly():
+    """Import rapids_singlecell without letting it hijack the root logger.
+
+    rapids_singlecell (``decoupler_gpu/_helper/_log.py``) runs
+    ``logging.basicConfig(level=INFO, format="%(asctime)s | [%(levelname)s] ...")``
+    on first import, which attaches an INFO console handler to the *root* logger.
+    That makes every library's — and scagent's own — INFO records print to the
+    terminal in that timestamped format, cluttering the clean spinner UI. We
+    snapshot the root logger and undo any handler/level it adds, so scagent keeps
+    its quiet console policy (step detail still flows to the run manifest /
+    agent.log). Only handlers rapids_singlecell newly added are removed; any
+    pre-existing root handlers are preserved.
+    """
+    root = logging.getLogger()
+    handlers_before = root.handlers[:]
+    level_before = root.level
+    import rapids_singlecell  # noqa: F401  (triggers the basicConfig side effect)
+
+    for handler in root.handlers[:]:
+        if handler not in handlers_before:
+            root.removeHandler(handler)
+    root.setLevel(level_before)
+    return rapids_singlecell
+
+
 @functools.lru_cache(maxsize=1)
 def gpu_available() -> bool:
     """Whether GPU acceleration is enabled and usable.
@@ -52,8 +77,8 @@ def gpu_available() -> bool:
         return False
     try:
         import cupy  # noqa: F401
-        import rapids_singlecell  # noqa: F401
 
+        _import_rapids_singlecell_quietly()
         n_devices = cupy.cuda.runtime.getDeviceCount()
     except Exception as exc:  # pragma: no cover - depends on GPU stack
         logger.warning(

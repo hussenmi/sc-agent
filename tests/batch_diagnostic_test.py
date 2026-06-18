@@ -59,3 +59,37 @@ def test_batch_diagnostic_finds_shared_signature_and_confounding(tmp_path):
     )
     assert result["condition_confounding"][0]["confounded_with_batch"] is True
     assert (tmp_path / "batch_diagnostic_cluster_sample_composition.csv").exists()
+
+
+def test_batch_diagnostic_cautions_when_condition_metadata_missing():
+    genes = ["CD3D", "CD3E", "LYZ", "LST1", "IFIT1", "ISG15", "IFIT2", "MX1", "OAS1"]
+    rows = []
+    obs = []
+    for cluster, marker_pair in [("0", ("CD3D", "CD3E")), ("1", ("LYZ", "LST1"))]:
+        for sample in ["LUNG_T01", "EBUS_02"]:
+            for i in range(18):
+                expr = np.ones(len(genes))
+                expr[genes.index(marker_pair[0])] = 8
+                expr[genes.index(marker_pair[1])] = 7
+                if sample == "EBUS_02":
+                    for gene in ["IFIT1", "ISG15", "IFIT2", "MX1", "OAS1"]:
+                        expr[genes.index(gene)] = 8
+                rows.append(expr)
+                obs.append({"sample": sample, "leiden": cluster})
+    adata = ad.AnnData(
+        np.asarray(rows, dtype=float),
+        obs=pd.DataFrame(obs, index=[f"cell_{i}" for i in range(len(rows))]),
+        var=pd.DataFrame(index=genes),
+    )
+    adata.raw = adata.copy()
+
+    result = diagnose_batch_effect(
+        adata,
+        batch_key="sample",
+        cluster_key="leiden",
+        min_cells_per_cluster_sample=10,
+    )
+
+    assert result["verdict"] == "batch_effect_supported"
+    assert any("confounding was not tested" in reason for reason in result["caution_reasons"])
+    assert "sample/source/procedure effects" in result["recommendation"]
