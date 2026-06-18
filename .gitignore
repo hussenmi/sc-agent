@@ -64,6 +64,8 @@ skills/
 runs/
 run*
 analysis/
+!scagent/analysis/
+!scagent/analysis/batch_diagnostic.py
 test_data/
 pbmc_auto/
 logs/
@@ -76,6 +78,7 @@ tests/*
 !tests/loading_regression_test.py
 !tests/annotation_save_escape_test.py
 !tests/batch_strategy_trigger_test.py
+!tests/batch_diagnostic_test.py
 !tests/annotation_adjudication_soft_test.py
 !tests/write_json_robustness_test.py
 !tests/concat_datasets_robustness_test.py

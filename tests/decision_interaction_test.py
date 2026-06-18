@@ -648,6 +648,76 @@ def test_batch_correction_honors_nonintegration_strategy():
     assert "not integration" in result["message"]
 
 
+def test_batch_diagnostic_tool_is_advertised():
+    schema = next(
+        tool for tool in get_tools()
+        if tool["name"] == "diagnose_batch_effect"
+    )
+    description = schema["description"]
+    assert "shared cross-cell-type signatures" in description
+    assert "user confirmation before scVI" in description
+
+
+def test_batch_diagnostic_refuses_without_investigation_strategy():
+    adata = ad.AnnData(
+        np.ones((6, 3)),
+        obs=pd.DataFrame(
+            {
+                "sample": ["s1", "s1", "s1", "s2", "s2", "s2"],
+                "leiden": ["0", "0", "1", "0", "1", "1"],
+            },
+            index=[f"cell_{index}" for index in range(6)],
+        ),
+        var=pd.DataFrame(index=["CD3D", "CD3E", "IFIT1"]),
+    )
+    result_json, _ = process_tool_call(
+        "diagnose_batch_effect",
+        {"batch_key": "sample", "cluster_key": "leiden"},
+        adata,
+        world_state=FakeWorldState(),
+    )
+    result = json.loads(result_json)
+    assert result["status"] == "error"
+    assert result["requires_user_strategy"] is True
+
+
+def test_post_investigation_checkpoint_waits_for_diagnostic():
+    agent = _bare_agent()
+    agent.world_state.user_preferences["multi_sample_strategy"] = "investigate_integration"
+    agent.world_state.data_summary = {"batch_key": "sample", "n_batches": 2}
+    agent.adata = ad.AnnData(
+        np.ones((4, 2)),
+        obs=pd.DataFrame(
+            {"sample": ["s1", "s1", "s2", "s2"]},
+            index=[f"cell_{index}" for index in range(4)],
+        ),
+    )
+
+    assert agent._post_investigation_strategy_checkpoint() is None
+
+    agent.adata.uns["batch_effect_diagnostic"] = {
+        "status": "ok",
+        "batch_key": "sample",
+        "n_batches": 2,
+        "verdict": "batch_effect_supported",
+        "recommendation": "Offer scVI integration.",
+        "support_reasons": ["sample-associated expression shifts recur across broad cell types"],
+        "cluster_sample_summary": {
+            "n_sample_dominated_clusters": 2,
+            "fraction_cells_in_sample_dominated_clusters": 0.75,
+        },
+    }
+    checkpoint = agent._post_investigation_strategy_checkpoint()
+    assert checkpoint["kind"] == "multi_sample_strategy"
+    assert checkpoint["option_actions"] == [
+        "integrate_scvi",
+        "keep_unintegrated",
+        "analyze_separately",
+        "describe_experiment",
+    ]
+    assert "Diagnostic verdict: batch_effect_supported" in checkpoint["context"]
+
+
 def test_package_install_defaults_to_denial(monkeypatch):
     agent = _bare_agent()
     monkeypatch.setattr(

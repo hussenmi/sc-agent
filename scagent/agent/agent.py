@@ -169,6 +169,7 @@ ACTION_TOOL_NAMES = {
     "prepare_annotation",
     "stage_annotation_evidence",
     "finalize_annotation",
+    "diagnose_batch_effect",
     "run_batch_correction",
     "score_integration",
     "benchmark_integration",
@@ -1339,11 +1340,11 @@ class SCAgent:
         """Re-ask the integration decision once the investigation first pass is done.
 
         Fires when the recorded ``multi_sample_strategy`` is
-        ``investigate_integration`` and the uncorrected first pass has produced a
-        clustering without any batch correction applied. Returning the user to a
-        concrete integrate / keep / separate choice is what stops the agent from
-        treating "I investigated and concluded integration is needed" as
-        self-authorization to integrate on its own.
+        ``investigate_integration`` and the uncorrected first pass has produced
+        a structured batch-effect diagnostic without applying correction.
+        Returning the user to a concrete integrate / keep / separate choice is
+        what stops the agent from treating "I investigated and concluded
+        integration is needed" as self-authorization to integrate on its own.
         """
         selected_strategy = self.world_state.get_confirmed_value("multi_sample_strategy")
         strategy_action = (
@@ -1356,11 +1357,22 @@ class SCAgent:
         ds = self.world_state.data_summary or {}
         if ds.get("batch_correction_applied"):
             return None
+        diagnostic = {}
+        if getattr(self, "adata", None) is not None:
+            try:
+                diagnostic = dict(self.adata.uns.get("batch_effect_diagnostic") or {})
+            except Exception:
+                diagnostic = {}
+        if diagnostic.get("status") != "ok":
+            return None
         column = ds.get("batch_key") or ds.get("recommended_batch_key")
+        column = column or diagnostic.get("batch_key")
         n_groups = int(ds.get("n_batches") or 0)
+        if not n_groups:
+            n_groups = int(diagnostic.get("n_batches") or 0)
         if not column or n_groups < 2:
             return None
-        return self._multi_sample_strategy_checkpoint(
+        checkpoint = self._multi_sample_strategy_checkpoint(
             {
                 "column": str(column),
                 "n_groups": n_groups,
@@ -1369,6 +1381,48 @@ class SCAgent:
             },
             post_investigation=True,
         )
+        evidence_bits = []
+        verdict = diagnostic.get("verdict")
+        if verdict:
+            evidence_bits.append(f"Diagnostic verdict: {verdict}.")
+        support = diagnostic.get("support_reasons") or []
+        if support:
+            evidence_bits.append("Support: " + "; ".join(map(str, support[:4])) + ".")
+        cautions = diagnostic.get("caution_reasons") or []
+        if cautions:
+            evidence_bits.append("Cautions: " + "; ".join(map(str, cautions[:4])) + ".")
+        shared = diagnostic.get("shared_cross_cell_type_signatures") or []
+        if shared:
+            evidence_bits.append(
+                f"Shared sample-associated signatures: {len(shared)} recurring gene/direction entries."
+            )
+        cluster_summary = diagnostic.get("cluster_sample_summary") or {}
+        if cluster_summary:
+            evidence_bits.append(
+                "Sample-dominated clusters: "
+                f"{cluster_summary.get('n_sample_dominated_clusters', 0)} "
+                f"({cluster_summary.get('fraction_cells_in_sample_dominated_clusters', 0)} of cells)."
+            )
+        if evidence_bits:
+            context = checkpoint.get("context") or ""
+            checkpoint["context"] = context + "\n\nBatch-effect diagnostic evidence:\n" + "\n".join(
+                f"- {bit}" for bit in evidence_bits
+            )
+            checkpoint["summary"] = checkpoint["context"]
+        checkpoint["diagnostic"] = {
+            "verdict": diagnostic.get("verdict"),
+            "recommendation": diagnostic.get("recommendation"),
+            "support_reasons": support[:6],
+            "caution_reasons": cautions[:6],
+            "artifacts_created": diagnostic.get("artifacts_created") or [],
+        }
+        if diagnostic.get("verdict") == "batch_effect_supported":
+            checkpoint["recommendation"] = checkpoint["options"][0]
+        elif diagnostic.get("verdict") == "no_correction_needed" and len(checkpoint["options"]) > 1:
+            checkpoint["recommendation"] = checkpoint["options"][1]
+        else:
+            checkpoint["recommendation"] = checkpoint["options"][0]
+        return checkpoint
 
     def _build_post_concatenation_strategy_checkpoint(
         self,
@@ -1669,11 +1723,21 @@ class SCAgent:
     def structured_decision_request(self, selection) -> str:
         """Turn a selector result into an unambiguous model-facing user message."""
         payload = self.resolve_pending_decision(selection)
+        instruction = (
+            "Treat selected_action as authoritative. Carry out that choice, using "
+            "selected_value as the user's text only when custom is true."
+        )
+        if payload.get("selected_action") == "investigate_integration":
+            instruction += (
+                " For investigate_integration, run the uncorrected first pass only "
+                "(PCA, neighbors, UMAP, clustering), then call diagnose_batch_effect "
+                "with the selected batch_key. Do not run batch correction until the "
+                "post-diagnostic selector records a new integration decision."
+            )
         return (
             "[Structured user decision]\n"
             f"{json.dumps(payload, indent=2, default=str)}\n\n"
-            "Treat selected_action as authoritative. Carry out that choice, using "
-            "selected_value as the user's text only when custom is true."
+            f"{instruction}"
         )
 
     def _run_nested_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
@@ -1851,6 +1915,7 @@ class SCAgent:
         "review_figure",
         "review_artifact",
         "run_cluster_structure_qc",  # Refines an existing cleanup checkpoint.
+        "diagnose_batch_effect",  # Produces evidence before the post-investigation selector.
         "generate_figure",  # Visualization doesn't change state
         "write_report",  # Writing a report doesn't change state
         "write_json",  # Writing a JSON file doesn't change state
@@ -2124,6 +2189,22 @@ class SCAgent:
                     "artifacts": artifacts,
                 }
             else:
+                selected_strategy = self.world_state.get_confirmed_value("multi_sample_strategy")
+                strategy_action = (
+                    selected_strategy.get("action")
+                    if isinstance(selected_strategy, dict)
+                    else selected_strategy
+                )
+                if strategy_action == "investigate_integration":
+                    try:
+                        diagnostic_done = bool(
+                            getattr(self, "adata", None) is not None
+                            and self.adata.uns.get("batch_effect_diagnostic", {}).get("status") == "ok"
+                        )
+                    except Exception:
+                        diagnostic_done = False
+                    if not diagnostic_done:
+                        return None
                 post_investigation = self._post_investigation_strategy_checkpoint()
                 if post_investigation is not None:
                     return post_investigation
@@ -2180,6 +2261,12 @@ class SCAgent:
                     },
                     "artifacts": artifacts,
                 }
+
+        elif tool_name == "diagnose_batch_effect":
+            post_investigation = self._post_investigation_strategy_checkpoint()
+            if post_investigation is not None:
+                post_investigation["artifacts"] = artifacts
+                return post_investigation
 
         elif tool_name in {"run_celltypist", "run_scimilarity"}:
             n_types = result_data.get("n_types", "?")

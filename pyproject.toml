@@ -37,6 +37,7 @@ dependencies = [
     "mygene>=3.2",  # Gene symbol <-> Ensembl ID conversion via mygene.info
     "adjustText>=1.0",  # Non-overlapping labels for scatter/volcano/UMAP plots
     "cytopus>=1.3",  # Local curated immune cell-type gene sets; primary marker adjudicator (annotation/cytopus_markers.py)
+    "nvidia-ml-py>=12.0",  # NVML bindings (pynvml): query per-GPU free memory for scVI device selection without creating a CUDA context (batch/scvi.py)
 ]
 
 [project.optional-dependencies]

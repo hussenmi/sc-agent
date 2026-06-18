@@ -15,7 +15,6 @@ Advantages over Harmony/Scanorama:
 Requirement: raw integer counts must be available in adata.layers['raw_counts']
 """
 
-from typing import Optional
 import logging
 
 from anndata import AnnData
@@ -36,7 +35,10 @@ def _preload_nvrtc_builtins() -> None:
     dynamic linker to satisfy the subsequent bare-name dlopen from the already-loaded
     handle, bypassing the LD_LIBRARY_PATH lookup entirely.
     """
-    import ctypes, glob, os, sys
+    import ctypes
+    import glob
+    import os
+    import sys
 
     searched = []
     for sp in sys.path:
@@ -65,10 +67,44 @@ def _select_gpu_device() -> int:
     Lightning otherwise defaults scVI training to ``cuda:0``, which on a shared
     HPC node is frequently the busiest GPU (e.g. colocated with the vLLM server
     backing the agent's own LLM). Selecting by free memory steers training onto
-    an idle GPU when one exists. Indices are relative to the visible devices, so
-    this honors ``CUDA_VISIBLE_DEVICES``. Falls back to device 0 if the per-device
-    query is unavailable.
+    an idle GPU when one exists.
+
+    Free memory is read via NVML (``pynvml``), which queries the driver directly
+    and does *not* allocate a CUDA context — unlike ``torch.cuda.mem_get_info``,
+    which leaves a ~0.5 GB context on every device it probes. NVML enumerates
+    physical GPUs, so we map them onto the CUDA-visible ordering to honor
+    ``CUDA_VISIBLE_DEVICES``; the returned index is what Lightning's
+    ``devices=[idx]`` expects. Falls back to torch (and finally device 0) when
+    NVML is unavailable or the visible set uses non-integer (UUID) tokens.
     """
+    import os
+
+    visible = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            if visible:
+                # Map each visible CUDA ordinal to its physical NVML index.
+                # UUID tokens aren't integer indices -> ValueError -> torch fallback.
+                physical = [int(token) for token in visible.split(",") if token.strip()]
+            else:
+                physical = list(range(pynvml.nvmlDeviceGetCount()))
+
+            best_index, best_free = 0, -1
+            for cuda_index, physical_index in enumerate(physical):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(physical_index)
+                free = pynvml.nvmlDeviceGetMemoryInfo(handle).free
+                if free > best_free:
+                    best_index, best_free = cuda_index, free
+            return best_index
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
+    # Fallback: torch query (creates a CUDA context per probed device).
     import torch
 
     best_index, best_free = 0, -1
@@ -94,7 +130,7 @@ def run_scvi(
     use_hvg: bool = True,
     early_stopping: bool = True,
     inplace: bool = True,
-) -> Optional[AnnData]:
+) -> AnnData | None:
     """
     Run scVI batch correction.
 
@@ -154,10 +190,10 @@ def run_scvi(
     """
     try:
         import scvi as scvi_tools
-    except ImportError:
+    except ImportError as exc:
         raise ImportError(
             "scvi-tools is not installed. Install with: pip install scvi-tools"
-        )
+        ) from exc
 
     if not inplace:
         adata = adata.copy()

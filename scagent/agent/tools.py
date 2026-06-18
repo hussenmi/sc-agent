@@ -2630,18 +2630,58 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "diagnose_batch_effect",
+            "description": (
+                "Run the lightweight uncorrected multi-sample diagnostic after PCA/neighbors/UMAP/clustering "
+                "when the user selected investigate_integration. It checks cluster-by-sample composition, "
+                "provisional broad cluster labels from marker DEGs, sample-associated expression shifts within "
+                "broad states, shared cross-cell-type signatures, UMAP state separation, and confounding between "
+                "sample/batch and condition-like metadata. This is descriptive evidence only; it must be followed "
+                "by a user confirmation before scVI integration."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "batch_key": {
+                        "type": "string",
+                        "description": "obs column identifying samples/batches to investigate."
+                    },
+                    "cluster_key": {
+                        "type": "string",
+                        "description": "obs column with uncorrected clusters (default: leiden)."
+                    },
+                    "condition_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional condition/design columns to test for sample confounding. If omitted, condition-like columns are auto-detected."
+                    },
+                    "min_cells_per_cluster_sample": {
+                        "type": "integer",
+                        "description": "Minimum cells per broad state × sample for descriptive sample-vs-rest expression shifts (default: 30)."
+                    },
+                    "n_top_genes": {
+                        "type": "integer",
+                        "description": "Number of marker/shift genes to inspect per cluster or state (default: 25)."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory for diagnostic CSV artifacts (optional; defaults to the run artifact directory)."
+                    }
+                },
+                "required": ["batch_key"]
+            }
+        },
+        {
             "name": "run_batch_correction",
             "description": (
-                "Correct batch effects using scVI, Harmony, BBKNN, or Scanorama. "
+                "Correct batch effects after the user explicitly chose integration. "
                 "Correction is opt-in and must follow an explicit user strategy; metadata names alone are not sufficient. "
                 "scVI is the default when the user chooses integration. "
-                "Harmony: fast, corrects PCA embeddings, good for mild-to-moderate batch effects. "
-                "BBKNN: fast, builds a batch-balanced k-NN graph in PCA space; correction lives in "
-                "the neighbor graph (not a separate embedding). Run UMAP/clustering separately unless explicitly requested. "
-                "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
                 "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
                 "but requires raw_counts layer and takes longer to train. It trains on the highly variable "
                 "genes and stops early once the validation ELBO plateaus, picking the least-busy GPU automatically. "
+                "Harmony, BBKNN, and Scanorama remain available only when the user or a source workflow explicitly "
+                "selects them. "
                 "This tool only performs batch correction. Run run_neighbors and run_umap as separate steps afterwards."
             ),
             "input_schema": {
@@ -3949,7 +3989,7 @@ def process_tool_call(
                     "n_batches": state.n_batches,
                     "selected_strategy": selected_strategy,
                     "next_action": {
-                        "investigate_integration": "Run the progressive uncorrected integration diagnostic.",
+                        "investigate_integration": "Run the uncorrected first pass, then diagnose_batch_effect.",
                         "integrate_scvi": "Integrate with scVI using the confirmed sample key.",
                         "keep_unintegrated": "Proceed with one combined uncorrected representation.",
                         "analyze_separately": "Run separate sample-specific analyses.",
@@ -9889,6 +9929,99 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "diagnose_batch_effect":
+            from ..analysis.batch_diagnostic import diagnose_batch_effect
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+            strategy_action = (
+                selected_strategy.get("action")
+                if isinstance(selected_strategy, dict)
+                else selected_strategy
+            )
+            if strategy_action != "investigate_integration":
+                return _error_result(
+                    tool="diagnose_batch_effect",
+                    message=(
+                        "Batch-effect investigation is user-selected. The recorded "
+                        f"multi-sample strategy is '{strategy_action}', not investigate_integration."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ask the user whether to investigate integration need, integrate with scVI, keep unintegrated, or analyze separately.",
+                    ],
+                    extra={"requires_user_strategy": True, "selected_strategy": strategy_action},
+                )
+
+            batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
+            if not batch_key:
+                return _error_result(
+                    tool="diagnose_batch_effect",
+                    message="No batch_key was provided and no confirmed batch_key exists in session state.",
+                    adata_obj=adata,
+                    recovery_options=["Confirm the sample/batch column before running the diagnostic."],
+                )
+            warnings = []
+            batch_key = _validate_obs_column(adata, batch_key, warnings, required=True, context="batch_key")
+            cluster_key = tool_input.get("cluster_key") or "leiden"
+            cluster_key = _validate_obs_column(adata, cluster_key, warnings, required=True, context="cluster_key")
+            output_dir = tool_input.get("output_dir")
+            if not output_dir and run_manager is not None:
+                output_dir = str(Path(run_manager.run_dir) / "artifacts" / "batch_diagnostic")
+
+            try:
+                diagnostic = diagnose_batch_effect(
+                    adata,
+                    batch_key=batch_key,
+                    cluster_key=cluster_key,
+                    condition_keys=tool_input.get("condition_keys"),
+                    min_cells_per_cluster_sample=int(tool_input.get("min_cells_per_cluster_sample") or 30),
+                    n_top_genes=int(tool_input.get("n_top_genes") or 25),
+                    output_dir=output_dir,
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="diagnose_batch_effect",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify the batch and cluster columns exist.",
+                        "Run the uncorrected PCA/neighbors/UMAP/clustering first.",
+                    ],
+                )
+
+            artifacts_created = []
+            for artifact in diagnostic.get("artifacts_created") or []:
+                payload = _artifact_payload(
+                    artifact.get("path"),
+                    role=artifact.get("role", "artifact"),
+                    metadata=artifact.get("metadata") or {"kind": "batch_diagnostic"},
+                )
+                if payload:
+                    artifacts_created.append(payload)
+            diagnostic["artifacts_created"] = artifacts_created
+            diagnostic["warnings"] = warnings
+            diagnostic["state"] = make_state(adata)
+            return _finalize_result(
+                diagnostic,
+                adata,
+                dataset_changed=False,
+                summary=(
+                    f"Batch-effect diagnostic verdict: {diagnostic.get('verdict')}. "
+                    f"{diagnostic.get('recommendation')}"
+                ),
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "Batch-effect diagnostic completed without applying correction.",
+                    [
+                        _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists."),
+                        _check("cluster_key_present", cluster_key in adata.obs.columns, f"Cluster key '{cluster_key}' exists."),
+                        _check("no_correction_applied", not _batch_correction_present(adata), "No batch correction was applied by the diagnostic."),
+                    ],
+                ),
+            )
+
         elif tool_name == "run_batch_correction":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
@@ -10075,7 +10208,7 @@ def process_tool_call(
                 "corrected_embedding": corrected_embedding_label,
                 "neighbors_recomputed": neighbors_recomputed,
                 "umap_recomputed": False,
-                "note": "Batch correction complete. Run run_umap next (and run_neighbors first for Harmony/Scanorama/scVI).",
+                "note": "Batch correction complete. Run run_neighbors and run_umap next on the corrected representation.",
                 "warnings": warnings,
                 "state": make_state(adata),
                 **extra,
