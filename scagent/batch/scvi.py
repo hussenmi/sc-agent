@@ -188,12 +188,14 @@ def run_scvi(
     ValueError
         If required layer or batch_key is missing.
     """
-    try:
-        import scvi as scvi_tools
-    except ImportError as exc:
+    # Availability check only — do NOT `import scvi` here, as that imports torch
+    # into the parent process. Training happens in the _scvi_worker subprocess.
+    import importlib.util
+
+    if importlib.util.find_spec("scvi") is None:
         raise ImportError(
             "scvi-tools is not installed. Install with: pip install scvi-tools"
-        ) from exc
+        )
 
     if not inplace:
         adata = adata.copy()
@@ -236,103 +238,86 @@ def run_scvi(
                 n_hvg, adata.n_vars,
             )
 
-    # Determine accelerator
-    accelerator = "cpu"
-    if use_gpu:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                accelerator = "gpu"
-                logger.info("GPU detected — using GPU acceleration for scVI training")
-            else:
-                logger.info("No GPU detected — using CPU for scVI training")
-        except ImportError:
-            logger.info("torch not importable — using CPU for scVI training")
+    # Train scVI in a SEPARATE PROCESS. scVI/torch creates a CUDA context that, in
+    # one process, poisons a subsequent RAPIDS/cuML (rapids_singlecell) session with
+    # a sticky CUDA_ERROR_ILLEGAL_ADDRESS. Isolating torch in a child process means
+    # its CUDA context is torn down on exit and never coexists with cuML here. We
+    # therefore never import torch in this (parent) process — even a
+    # torch.cuda.is_available() check would create a contaminating context.
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
 
-    # Pick the least-busy GPU (devices=1 would force cuda:0, often the busiest).
-    train_devices: object = 1
-    if accelerator == "gpu":
-        device_index = _select_gpu_device()
-        train_devices = [device_index]
-        logger.info("Selected GPU %d (most free memory) for scVI training", device_index)
+    import anndata as ad
+    import numpy as np
 
-    # Setup AnnData for scVI (registers the dataset with the model).
-    # batch_key triggers scVI's proper batch integration (batch-specific decoder
-    # parameters + batch-conditioned ELBO). Using categorical_covariate_keys instead
-    # would treat batch as a weak covariate and produce worse correction.
-    scvi_tools.model.SCVI.setup_anndata(
-        train_adata,
-        layer=layer,
-        batch_key=batch_key,
-    )
+    # Hand the worker a minimal AnnData: counts (HVG subset) in X + the batch column.
+    counts = train_adata.layers[layer]
+    child = ad.AnnData(X=counts.copy())
+    child.obs[batch_key] = train_adata.obs[batch_key].to_numpy()
+    child.var_names = train_adata.var_names.copy()
 
-    # Pre-load nvrtc builtins so GPU JIT compilation can find them by name
-    if accelerator == "gpu":
-        _preload_nvrtc_builtins()
-        import torch
-        torch.set_float32_matmul_precision("medium")  # use Tensor Cores on A100/H100
-
-    # Build and train the model
-    model = scvi_tools.model.SCVI(train_adata, n_latent=n_latent)
+    work_dir = tempfile.mkdtemp(prefix="scagent_scvi_")
     try:
-        model.train(
-            max_epochs=max_epochs,
-            accelerator=accelerator,
-            devices=train_devices,
-            early_stopping=early_stopping,
-        )
-    except Exception as e:
-        # NVRTC / CUDA JIT compilation errors happen when the PyTorch build's
-        # bundled CUDA runtime is mismatched with the system's libnvrtc-builtins
-        # library (e.g. "failed to open libnvrtc-builtins.so.X").  Retry on CPU.
-        err_str = str(e)
-        if accelerator == "gpu" and (
-            "nvrtc" in err_str.lower()
-            or "libnvrtc" in err_str.lower()
-            or "cuda error" in err_str.lower()
-        ):
-            logger.warning(
-                "GPU training failed due to CUDA JIT error (%s). "
-                "Retrying on CPU — this will be slower.",
-                err_str[:200],
+        input_h5ad = os.path.join(work_dir, "train.h5ad")
+        latent_out = os.path.join(work_dir, "latent.npy")
+        normalized_out = os.path.join(work_dir, "normalized.npy")
+        columns_out = os.path.join(work_dir, "columns.json")
+        error_out = os.path.join(work_dir, "error.txt")
+        spec_path = os.path.join(work_dir, "spec.json")
+        child.write(input_h5ad)
+        with open(spec_path, "w") as f:
+            json.dump(
+                {
+                    "input_h5ad": input_h5ad,
+                    "batch_key": batch_key,
+                    "n_latent": n_latent,
+                    "max_epochs": max_epochs,
+                    "early_stopping": early_stopping,
+                    "use_gpu": use_gpu,
+                    "store_normalized": store_normalized,
+                    "latent_out": latent_out,
+                    "normalized_out": normalized_out,
+                    "columns_out": columns_out,
+                    "error_out": error_out,
+                },
+                f,
             )
-            # Re-build the model (training state is corrupt after a CUDA crash).
-            # Use the same batch_key setup as the GPU path — see comment above
-            # setup_anndata call; categorical_covariate_keys would silently
-            # produce weaker batch correction.
-            scvi_tools.model.SCVI.setup_anndata(
-                train_adata,
-                layer=layer,
-                batch_key=batch_key,
+
+        logger.info("Launching scVI training subprocess (isolated CUDA context)")
+        # Inherit the parent's stdout/stderr (do NOT capture) so scVI's live
+        # training progress bar renders in the terminal. The worker writes any
+        # fatal traceback to error_out, which we surface on a non-zero exit.
+        proc = subprocess.run([sys.executable, "-m", "scagent.batch._scvi_worker", spec_path])
+        if proc.returncode != 0:
+            detail = ""
+            if os.path.exists(error_out):
+                with open(error_out) as f:
+                    detail = f.read()[-2000:]
+            raise RuntimeError(
+                f"scVI training subprocess failed (exit {proc.returncode}).\n{detail}"
             )
-            model = scvi_tools.model.SCVI(train_adata, n_latent=n_latent)
-            model.train(
-                max_epochs=max_epochs,
-                accelerator="cpu",
-                devices=1,
-                early_stopping=early_stopping,
-            )
-        else:
-            raise
 
-    # Extract latent representation (one row per cell — store on the full adata
-    # even when training used the HVG subset, since cell order is unchanged).
-    adata.obsm[latent_key] = model.get_latent_representation()
-    logger.info(f"scVI latent representation stored in adata.obsm['{latent_key}']")
+        # Latent maps straight onto the full adata (cell order unchanged).
+        adata.obsm[latent_key] = np.load(latent_out)
+        logger.info(f"scVI latent representation stored in adata.obsm['{latent_key}']")
 
-    # Optionally store normalized expression
-    if store_normalized:
-        import numpy as np
-
-        norm = model.get_normalized_expression(library_size=10_000)
-        # When trained on the HVG subset, map the modeled genes back onto the
-        # full var axis (genes scVI did not model stay zero) so the layer aligns
-        # with adata.
-        full = np.zeros((adata.n_obs, adata.n_vars), dtype=np.float32)
-        col_idx = adata.var_names.get_indexer(norm.columns)
-        full[:, col_idx] = np.asarray(norm, dtype=np.float32)
-        adata.layers["scvi_normalized"] = full
-        logger.info("scVI normalized expression stored in adata.layers['scvi_normalized']")
+        if store_normalized:
+            norm = np.load(normalized_out)
+            with open(columns_out) as f:
+                norm_columns = json.load(f)
+            # Map the modeled (HVG) genes back onto the full var axis; genes scVI
+            # did not model stay zero so the layer aligns with adata.
+            full = np.zeros((adata.n_obs, adata.n_vars), dtype=np.float32)
+            col_idx = adata.var_names.get_indexer(norm_columns)
+            full[:, col_idx] = norm
+            adata.layers["scvi_normalized"] = full
+            logger.info("scVI normalized expression stored in adata.layers['scvi_normalized']")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     logger.info("scVI batch correction complete")
 

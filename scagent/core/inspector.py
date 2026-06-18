@@ -439,6 +439,19 @@ def _is_integer_matrix(X) -> bool:
     if dtype is not None and np.issubdtype(dtype, np.integer):
         return True
 
+    # Defensive: a cupy/cupyx array (e.g. left in a layer by an interrupted GPU
+    # step) is not recognised by scipy's issparse and has no .ravel(), so bring a
+    # small sample to the host first. Only triggers when X is actually on-GPU.
+    if type(X).__module__.split(".", 1)[0] in ("cupy", "cupyx"):
+        try:
+            sample_gpu = X.data[:10000] if hasattr(X, "data") else X.reshape(-1)[:10000]
+            sample = sample_gpu.get()
+            if len(sample) == 0:
+                return True
+            return bool(np.allclose(sample, np.round(sample)))
+        except Exception:
+            return True  # can't decide -> treat as counts (conservative, non-fatal)
+
     if sp.issparse(X):
         data = X.data
     else:
