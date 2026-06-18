@@ -59,6 +59,29 @@ def _preload_nvrtc_builtins() -> None:
                  "GPU training may fail if the library is not on LD_LIBRARY_PATH.", len(searched))
 
 
+def _select_gpu_device() -> int:
+    """Pick the visible CUDA device with the most free memory.
+
+    Lightning otherwise defaults scVI training to ``cuda:0``, which on a shared
+    HPC node is frequently the busiest GPU (e.g. colocated with the vLLM server
+    backing the agent's own LLM). Selecting by free memory steers training onto
+    an idle GPU when one exists. Indices are relative to the visible devices, so
+    this honors ``CUDA_VISIBLE_DEVICES``. Falls back to device 0 if the per-device
+    query is unavailable.
+    """
+    import torch
+
+    best_index, best_free = 0, -1
+    for index in range(torch.cuda.device_count()):
+        try:
+            free, _total = torch.cuda.mem_get_info(index)
+        except Exception:
+            continue
+        if free > best_free:
+            best_index, best_free = index, free
+    return best_index
+
+
 def run_scvi(
     adata: AnnData,
     batch_key: str,
@@ -68,6 +91,8 @@ def run_scvi(
     latent_key: str = "X_scVI",
     store_normalized: bool = False,
     use_gpu: bool = True,
+    use_hvg: bool = True,
+    early_stopping: bool = True,
     inplace: bool = True,
 ) -> Optional[AnnData]:
     """
@@ -100,7 +125,18 @@ def run_scvi(
         Useful for downstream DEG but adds memory overhead.
     use_gpu : bool, default True
         Use GPU if available. Falls back to CPU automatically if no GPU found
-        or if a CUDA JIT/NVRTC error occurs during training.
+        or if a CUDA JIT/NVRTC error occurs during training. When using GPU,
+        the device with the most free memory is selected to avoid colliding
+        with a busy GPU (e.g. one hosting an LLM inference server).
+    use_hvg : bool, default True
+        Train only on highly variable genes (``adata.var['highly_variable']``)
+        when that flag is present. scVI on the HVG subset is several-fold
+        faster than on the full gene set and is standard practice. The latent
+        representation is still stored back on the full ``adata``. Falls back to
+        all genes if the flag is missing or selects too few genes.
+    early_stopping : bool, default True
+        Stop training once the validation ELBO plateaus instead of always
+        running the full ``max_epochs``.
     inplace : bool, default True
         Modify adata in place.
 
@@ -144,6 +180,26 @@ def run_scvi(
         f"n_latent={n_latent}, max_epochs={max_epochs}"
     )
 
+    # Train on the HVG subset when available — scVI on a few thousand HVGs is
+    # several-fold faster than on the full ~30k-gene matrix, and is the standard
+    # workflow. We train on a gene-subset copy but keep all cells in order, so
+    # the per-cell latent maps straight back onto the full adata.
+    train_adata = adata
+    if use_hvg and "highly_variable" in adata.var.columns:
+        hvg_mask = adata.var["highly_variable"].to_numpy(dtype=bool)
+        n_hvg = int(hvg_mask.sum())
+        if n_hvg >= 100:
+            train_adata = adata[:, hvg_mask].copy()
+            logger.info(
+                "Training scVI on %d highly variable genes (of %d total)",
+                n_hvg, adata.n_vars,
+            )
+        else:
+            logger.info(
+                "Only %d highly variable genes flagged; training scVI on all %d genes",
+                n_hvg, adata.n_vars,
+            )
+
     # Determine accelerator
     accelerator = "cpu"
     if use_gpu:
@@ -157,12 +213,19 @@ def run_scvi(
         except ImportError:
             logger.info("torch not importable — using CPU for scVI training")
 
+    # Pick the least-busy GPU (devices=1 would force cuda:0, often the busiest).
+    train_devices: object = 1
+    if accelerator == "gpu":
+        device_index = _select_gpu_device()
+        train_devices = [device_index]
+        logger.info("Selected GPU %d (most free memory) for scVI training", device_index)
+
     # Setup AnnData for scVI (registers the dataset with the model).
     # batch_key triggers scVI's proper batch integration (batch-specific decoder
     # parameters + batch-conditioned ELBO). Using categorical_covariate_keys instead
     # would treat batch as a weak covariate and produce worse correction.
     scvi_tools.model.SCVI.setup_anndata(
-        adata,
+        train_adata,
         layer=layer,
         batch_key=batch_key,
     )
@@ -174,9 +237,14 @@ def run_scvi(
         torch.set_float32_matmul_precision("medium")  # use Tensor Cores on A100/H100
 
     # Build and train the model
-    model = scvi_tools.model.SCVI(adata, n_latent=n_latent)
+    model = scvi_tools.model.SCVI(train_adata, n_latent=n_latent)
     try:
-        model.train(max_epochs=max_epochs, accelerator=accelerator, devices=1)
+        model.train(
+            max_epochs=max_epochs,
+            accelerator=accelerator,
+            devices=train_devices,
+            early_stopping=early_stopping,
+        )
     except Exception as e:
         # NVRTC / CUDA JIT compilation errors happen when the PyTorch build's
         # bundled CUDA runtime is mismatched with the system's libnvrtc-builtins
@@ -197,24 +265,37 @@ def run_scvi(
             # setup_anndata call; categorical_covariate_keys would silently
             # produce weaker batch correction.
             scvi_tools.model.SCVI.setup_anndata(
-                adata,
+                train_adata,
                 layer=layer,
                 batch_key=batch_key,
             )
-            model = scvi_tools.model.SCVI(adata, n_latent=n_latent)
-            model.train(max_epochs=max_epochs, accelerator="cpu", devices=1)
+            model = scvi_tools.model.SCVI(train_adata, n_latent=n_latent)
+            model.train(
+                max_epochs=max_epochs,
+                accelerator="cpu",
+                devices=1,
+                early_stopping=early_stopping,
+            )
         else:
             raise
 
-    # Extract latent representation
+    # Extract latent representation (one row per cell — store on the full adata
+    # even when training used the HVG subset, since cell order is unchanged).
     adata.obsm[latent_key] = model.get_latent_representation()
     logger.info(f"scVI latent representation stored in adata.obsm['{latent_key}']")
 
     # Optionally store normalized expression
     if store_normalized:
-        adata.layers["scvi_normalized"] = model.get_normalized_expression(
-            library_size=10_000
-        )
+        import numpy as np
+
+        norm = model.get_normalized_expression(library_size=10_000)
+        # When trained on the HVG subset, map the modeled genes back onto the
+        # full var axis (genes scVI did not model stay zero) so the layer aligns
+        # with adata.
+        full = np.zeros((adata.n_obs, adata.n_vars), dtype=np.float32)
+        col_idx = adata.var_names.get_indexer(norm.columns)
+        full[:, col_idx] = np.asarray(norm, dtype=np.float32)
+        adata.layers["scvi_normalized"] = full
         logger.info("scVI normalized expression stored in adata.layers['scvi_normalized']")
 
     logger.info("scVI batch correction complete")

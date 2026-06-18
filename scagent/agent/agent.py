@@ -1224,30 +1224,63 @@ class SCAgent:
     def _multi_sample_strategy_checkpoint(
         self,
         partition: Dict[str, Any],
+        *,
+        post_investigation: bool = False,
     ) -> Dict[str, Any]:
-        """Build the initial user-owned strategy decision for multi-sample data."""
+        """Build the user-owned strategy decision for multi-sample data.
+
+        With ``post_investigation=True`` this re-asks the same
+        ``multi_sample_strategy`` decision after the uncorrected first pass is
+        complete: the ``investigate_integration`` option is dropped (the
+        investigation has already run) and the framing asks the user to commit
+        to integrate / keep / separate based on the diagnostic. Because it
+        reuses ``decision_key="multi_sample_strategy"``, the user's answer
+        overwrites the recorded strategy so the downstream guards take over.
+        """
         column = partition["column"]
         n_groups = partition["n_groups"]
         experiment_design = self.world_state.get_confirmed_value("experiment_design")
-        context = (
-            f"I found {n_groups} groups in the {partition.get('role', 'sample')}-like "
-            f"column `{column}`. Their presence does not by itself justify batch correction, "
-            "so I will not integrate them automatically."
-        )
+        if post_investigation:
+            context = (
+                "I finished the uncorrected first pass (PCA → neighbors → UMAP → "
+                "clustering) you asked for to investigate whether integration is "
+                f"needed for the {n_groups} groups in `{column}`. Review the "
+                "sample-colored UMAP and per-cluster sample composition: if clusters "
+                "separate by sample beyond the biology you expect, integration is "
+                "justified; if the samples already mix, keep them combined. Metadata "
+                "alone does not justify correction — this is your call."
+            )
+        else:
+            context = (
+                f"I found {n_groups} groups in the {partition.get('role', 'sample')}-like "
+                f"column `{column}`. Their presence does not by itself justify batch correction, "
+                "so I will not integrate them automatically."
+            )
         if experiment_design:
             context += f"\n\nExperiment context you provided:\n{experiment_design}"
 
-        options, option_actions = self._checkpoint_options([
-            ("Investigate whether integration is needed (recommended)", "investigate_integration"),
-            ("Integrate the samples with scVI", "integrate_scvi"),
-            ("Keep samples combined without integration", "keep_unintegrated"),
-            ("Analyze samples separately", "analyze_separately"),
-            ("Describe the experiment first", "describe_experiment"),
-        ])
+        if post_investigation:
+            option_specs = [
+                ("Integrate the samples with scVI", "integrate_scvi"),
+                ("Keep samples combined without integration", "keep_unintegrated"),
+                ("Analyze samples separately", "analyze_separately"),
+                ("Describe the experiment first", "describe_experiment"),
+            ]
+            question = "Investigation complete — how should I handle the samples now?"
+        else:
+            option_specs = [
+                ("Investigate whether integration is needed (recommended)", "investigate_integration"),
+                ("Integrate the samples with scVI", "integrate_scvi"),
+                ("Keep samples combined without integration", "keep_unintegrated"),
+                ("Analyze samples separately", "analyze_separately"),
+                ("Describe the experiment first", "describe_experiment"),
+            ]
+            question = "How should I handle these samples?"
+        options, option_actions = self._checkpoint_options(option_specs)
         return {
             "kind": "multi_sample_strategy",
             "decision_key": "multi_sample_strategy",
-            "question": "How should I handle these samples?",
+            "question": question,
             "context": context,
             "summary": context,
             "options": options,
@@ -1301,6 +1334,41 @@ class SCAgent:
         if partition is None:
             return None
         return self._multi_sample_strategy_checkpoint(partition)
+
+    def _post_investigation_strategy_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Re-ask the integration decision once the investigation first pass is done.
+
+        Fires when the recorded ``multi_sample_strategy`` is
+        ``investigate_integration`` and the uncorrected first pass has produced a
+        clustering without any batch correction applied. Returning the user to a
+        concrete integrate / keep / separate choice is what stops the agent from
+        treating "I investigated and concluded integration is needed" as
+        self-authorization to integrate on its own.
+        """
+        selected_strategy = self.world_state.get_confirmed_value("multi_sample_strategy")
+        strategy_action = (
+            selected_strategy.get("action")
+            if isinstance(selected_strategy, dict)
+            else selected_strategy
+        )
+        if strategy_action != "investigate_integration":
+            return None
+        ds = self.world_state.data_summary or {}
+        if ds.get("batch_correction_applied"):
+            return None
+        column = ds.get("batch_key") or ds.get("recommended_batch_key")
+        n_groups = int(ds.get("n_batches") or 0)
+        if not column or n_groups < 2:
+            return None
+        return self._multi_sample_strategy_checkpoint(
+            {
+                "column": str(column),
+                "n_groups": n_groups,
+                "role": "sample",
+                "needs_key_confirmation": False,
+            },
+            post_investigation=True,
+        )
 
     def _build_post_concatenation_strategy_checkpoint(
         self,
@@ -2056,6 +2124,9 @@ class SCAgent:
                     "artifacts": artifacts,
                 }
             else:
+                post_investigation = self._post_investigation_strategy_checkpoint()
+                if post_investigation is not None:
+                    return post_investigation
                 cluster_key = result_data.get("cluster_key", "clustering")
                 n_clusters = result_data.get("n_clusters", "?")
                 summary = f"Clustering produced {n_clusters} clusters in '{cluster_key}'."

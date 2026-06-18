@@ -411,7 +411,10 @@ class AgentWorldState:
             strategy_summaries = {
                 "investigate_integration": (
                     "investigate_requested",
-                    "Run an uncorrected first pass and progressively assess whether integration is justified.",
+                    "Run an uncorrected first pass (PCA, neighbors, UMAP, clustering) and assess "
+                    "batch mixing. Do not integrate yet: once the first pass produces a clustering, "
+                    "the runtime re-opens the multi_sample_strategy decision so the user picks "
+                    "integrate/keep/separate based on the diagnostic.",
                 ),
                 "integrate_scvi": (
                     "scvi_requested",

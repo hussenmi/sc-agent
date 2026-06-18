@@ -2640,7 +2640,8 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "the neighbor graph (not a separate embedding). Run UMAP/clustering separately unless explicitly requested. "
                 "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
                 "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
-                "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
+                "but requires raw_counts layer and takes longer to train. It trains on the highly variable "
+                "genes and stops early once the validation ELBO plateaus, picking the least-busy GPU automatically. "
                 "This tool only performs batch correction. Run run_neighbors and run_umap as separate steps afterwards."
             ),
             "input_schema": {
@@ -2660,7 +2661,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "n_pcs": {"type": "integer", "description": "BBKNN only: number of PCA components to use (default: 30)"},
                     "neighbors_within_batch": {"type": "integer", "description": "BBKNN only: neighbors contributed per batch per cell (default: 3; total = n_batches × this value)"},
                     "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
-                    "max_epochs": {"type": "integer", "description": "scVI only: training epochs (default: 200; use fewer only for quick tests)"},
+                    "max_epochs": {"type": "integer", "description": "scVI only: upper bound on training epochs (default: 200; early stopping usually halts sooner). Use fewer only for quick tests."},
                     "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
                 },
                 "required": []
