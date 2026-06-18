@@ -15,6 +15,7 @@ from anndata import AnnData
 import logging
 
 from ..config.defaults import QC_DEFAULTS
+from .gpu import gpu_available, on_gpu
 from .inspector import resolve_batch_metadata
 
 logger = logging.getLogger(__name__)
@@ -333,6 +334,16 @@ def detect_doublets(
     IMPORTANT: Must be run on raw counts, before normalization.
     If batch_key is provided, runs Scrublet per batch.
 
+    GPU note: when ``SCAGENT_GPU`` is enabled, doublet detection runs through
+    rapids_singlecell's Scrublet on the GPU (much faster on large data). This is
+    an *approximation* of the CPU path, not a bit-for-bit match: rapids_singlecell
+    does its own internal gene selection and does not expose
+    ``min_counts``/``min_cells``/``min_gene_variability_pctl``, so it typically
+    flags somewhat fewer doublets (per-cell score rank correlation ~0.45 in
+    testing). It uses adata.X (assumed raw counts per the contract above) and
+    handles ``batch_key`` internally without the obs-label fragility of
+    ``sc.pp.scrublet``. If the GPU run fails it falls back to the CPU path.
+
     Parameters
     ----------
     adata : AnnData
@@ -392,7 +403,37 @@ def detect_doublets(
             safe_n_prin_comps,
         )
 
-    if batch_key and batch_key in adata.obs.columns:
+    # GPU path (SCAGENT_GPU): rapids_singlecell Scrublet. Approximate vs CPU — see
+    # the GPU note in this function's docstring. rsc handles batch_key internally
+    # (no obs-label fragility) and does not accept the min_*/variability params.
+    gpu_done = False
+    if gpu_available():
+        try:
+            import rapids_singlecell as rsc
+
+            logger.info("Running GPU Scrublet via rapids_singlecell (approximate; see docstring).")
+            gpu_batch_key = batch_key if (batch_key and batch_key in adata.obs.columns) else None
+            with on_gpu(adata):
+                rsc.pp.scrublet(
+                    adata,
+                    batch_key=gpu_batch_key,
+                    sim_doublet_ratio=sim_doublet_ratio,
+                    expected_doublet_rate=expected_doublet_rate,
+                    n_prin_comps=safe_n_prin_comps,
+                    log_transform=True,
+                    random_state=random_state,
+                    verbose=False,
+                )
+            # Normalize dtypes to match the CPU path (float64 score, bool flag).
+            adata.obs["doublet_score"] = np.asarray(adata.obs["doublet_score"], dtype=np.float64)
+            adata.obs["predicted_doublet"] = np.asarray(adata.obs["predicted_doublet"], dtype=bool)
+            gpu_done = True
+        except Exception as e:
+            logger.warning("GPU Scrublet failed (%s); falling back to CPU Scrublet.", e)
+
+    if gpu_done:
+        pass
+    elif batch_key and batch_key in adata.obs.columns:
         # Run Scrublet per-batch using a manual loop instead of sc.pp.scrublet(batch_key=...).
         # sc.pp.scrublet's batch_key implementation reassigns scores via adata.obs.loc[sub.obs_names],
         # which fails with a KeyError when obs_names contain non-standard separators (e.g.
