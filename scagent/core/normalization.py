@@ -14,6 +14,8 @@ import scanpy as sc
 from anndata import AnnData
 import logging
 
+from .gpu import on_gpu
+
 logger = logging.getLogger(__name__)
 
 
@@ -214,11 +216,18 @@ def normalize_data(
     else:
         logger.info("Normalizing to median library size")
 
-    sc.pp.normalize_total(adata, target_sum=target_sum, inplace=True)
+    with on_gpu(adata) as gpu:
+        if gpu:
+            import rapids_singlecell as rsc
 
-    # Log transform
+            rsc.pp.normalize_total(adata, target_sum=target_sum)
+            if log_transform:
+                rsc.pp.log1p(adata)
+        else:
+            sc.pp.normalize_total(adata, target_sum=target_sum, inplace=True)
+            if log_transform:
+                sc.pp.log1p(adata)
     if log_transform:
-        sc.pp.log1p(adata)
         logger.info("Applied log1p transformation")
 
     adata.uns["normalization"] = {
@@ -365,7 +374,13 @@ def select_hvg(
     if n_excluded and exclusion_mode == "pre":
         allowed_mask = ~exclude_mask
         work = adata[:, allowed_mask].copy()
-        sc.pp.highly_variable_genes(work, **hvg_kwargs)
+        with on_gpu(work) as gpu:
+            if gpu:
+                import rapids_singlecell as rsc
+
+                rsc.pp.highly_variable_genes(work, **hvg_kwargs)
+            else:
+                sc.pp.highly_variable_genes(work, **hvg_kwargs)
 
         hvg_columns = [
             "highly_variable",
@@ -391,7 +406,13 @@ def select_hvg(
         adata.var.loc[exclude_mask, "highly_variable"] = False
         adata.uns["hvg"] = dict(work.uns.get("hvg", {}))
     else:
-        sc.pp.highly_variable_genes(adata, **hvg_kwargs)
+        with on_gpu(adata) as gpu:
+            if gpu:
+                import rapids_singlecell as rsc
+
+                rsc.pp.highly_variable_genes(adata, **hvg_kwargs)
+            else:
+                sc.pp.highly_variable_genes(adata, **hvg_kwargs)
         if n_excluded and "highly_variable" in adata.var.columns:
             excluded_hvg_before = int(adata.var.loc[exclude_mask, "highly_variable"].sum())
             adata.var.loc[exclude_mask, "highly_variable"] = False
