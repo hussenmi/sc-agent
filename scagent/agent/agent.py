@@ -6,23 +6,32 @@ Returns structured JSON from tools for reliable LLM reasoning.
 Creates run directories with manifests for reproducibility.
 """
 
-import os
-import sys
 import json
-import random
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Literal
 import logging
-from datetime import datetime
+import os
+import random
 import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
 
+from . import (
+    tracing as _tracing,  # optional OpenTelemetry per-step tracing (no-op unless SCAGENT_TRACE)
+)
 from .codex_bridge import CODEX_DECISION_SCHEMA, CodexCLIClient, CodexCLIError
-from .tools import get_tools, get_openai_tools, process_tool_call, encode_image_base64, get_image_mime_type
-from . import tracing as _tracing  # optional OpenTelemetry per-step tracing (no-op unless SCAGENT_TRACE)
-from .prompts import SYSTEM_PROMPT
-from .run_manager import RunManager, create_run
 from .decision_policy import (
     decision_for_clustering_selection,
+)
+from .prompts import SYSTEM_PROMPT
+from .run_manager import RunManager, create_run
+from .tools import (
+    encode_image_base64,
+    get_image_mime_type,
+    get_openai_tools,
+    get_tools,
+    process_tool_call,
+    write_h5ad_safe,
 )
 from .vision_sidecar import VisionSidecar
 from .world_state import AgentWorldState, artifact_id_from_path
@@ -234,6 +243,64 @@ def _load_dotenv():
     return False
 
 _load_dotenv()
+
+
+def _model_get(obj, name):
+    """Read a single field from a /v1/models entry, backend- and SDK-agnostically.
+
+    The OpenAI Python SDK parses each model into a pydantic object with
+    ``extra="allow"``, so server-specific fields (``max_model_len``, ``meta``,
+    ``aliases``, …) are reachable both as attributes and via ``model_extra``.
+    Tests and some servers hand us plain dicts instead. Handle all three:
+    plain dict, attribute, and ``model_extra`` fallback. Returns None if absent.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    val = getattr(obj, name, None)
+    if val is not None:
+        return val
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(name)
+    return None
+
+
+def _coerce_positive_int(value):
+    """Coerce to a positive int, or return None.
+
+    Servers report these limits as ints, but be tolerant of strings ("262144")
+    and floats — and reject zero/negative/garbage so a bogus advertisement can
+    never widen the context window past what the server actually allocated.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _server_context_limit(model):
+    """Resolve the per-request context limit a serving backend advertises.
+
+    Returns ``(limit, source)`` or ``(None, None)``. Two backends, two fields:
+
+      * vLLM advertises top-level ``max_model_len`` — the GPU-constrained limit.
+      * llama.cpp advertises ``meta.n_ctx`` — the *per-slot* context, i.e.
+        already divided by ``--parallel``, which is exactly the per-request cap.
+
+    Both are the real, memory-bound per-request limit. ``max_model_len`` wins
+    when both are present (vLLM never sets ``meta``; this just makes precedence
+    explicit and order-independent).
+    """
+    limit = _coerce_positive_int(_model_get(model, "max_model_len"))
+    if limit:
+        return limit, "max_model_len"
+    n_ctx = _coerce_positive_int(_model_get(_model_get(model, "meta"), "n_ctx"))
+    if n_ctx:
+        return n_ctx, "meta.n_ctx"
+    return None, None
 
 
 class SCAgent:
@@ -4189,7 +4256,8 @@ class SCAgent:
           3. Bare JSON: {"name": ..., "arguments": ...}  (no wrapper)
         Returns list of dicts with 'id', 'name', 'arguments' keys, or empty list.
         """
-        import re, uuid
+        import re
+        import uuid
 
         def _extract(raw):
             try:
@@ -4234,7 +4302,9 @@ class SCAgent:
 
         Priority order (highest wins):
           1. SCAGENT_CONTEXT_LIMIT env var — user override
-          2. vLLM /v1/models max_model_len — actual GPU-constrained limit
+          2. Self-hosted /v1/models limit — the actual GPU-constrained, per-request
+             window reported by the serving backend (vLLM `max_model_len` or
+             llama.cpp `meta.n_ctx`). See _server_context_limit.
           3. K-size parsed from model name (e.g. "262k", "128k")
           4. Cloud model name dict — known limits by provider
           5. Generic Qwen fallback — 32K with a visible warning
@@ -4257,7 +4327,7 @@ class SCAgent:
 
         model = (self.model or "").lower()
 
-        # --- Priority 2: vLLM /v1/models max_model_len ---
+        # --- Priority 2: self-hosted /v1/models limit (vLLM or llama.cpp) ---
         try:
             base_url = str(getattr(self.client, 'base_url', ''))
             cloud_hosts = (
@@ -4271,19 +4341,22 @@ class SCAgent:
             is_cloud = any(h in base_url for h in cloud_hosts)
             if not is_cloud and base_url:
                 for m in self.client.models.list().data:
-                    if m.id == self.model:
-                        limit = getattr(m, 'max_model_len', None)
-                        if limit and int(limit) > 0:
-                            logger.info(
-                                f"Context limit from vLLM (max_model_len): {int(limit):,} tokens"
-                            )
-                            self._print(
-                                f"[dim]Context limit from vLLM: {int(limit):,} tokens[/dim]"
-                            )
-                            return int(limit)
+                    if _model_get(m, "id") != self.model:
+                        continue
+                    limit, source = _server_context_limit(m)
+                    if limit:
+                        backend = "vLLM" if source == "max_model_len" else "llama.cpp"
+                        logger.info(
+                            f"Context limit from {backend} ({source}): {limit:,} tokens"
+                        )
+                        self._print(
+                            f"[dim]Context limit from {backend}: {limit:,} tokens[/dim]"
+                        )
+                        return limit
+                    break  # matched our model, but it advertised no usable limit
         except Exception as e:
             logger.warning(
-                f"vLLM model query failed ({e}); falling through to name-based detection"
+                f"Self-hosted model query failed ({e}); falling through to name-based detection"
             )
 
         # --- Priority 3: parse K-size from model name ---
@@ -5358,11 +5431,69 @@ class SCAgent:
             return True
         return bool(self._mcp_client and self._mcp_client.has_tool(tool_name))
 
+    def _print_terminal_summary(self, tool_name: str, result_data: dict) -> None:
+        """Surface a reasoning/diagnostic tool's own findings to the terminal.
+
+        Tools opt in by returning ``terminal_summary`` (a list of short strings,
+        or a single string) in their result — e.g. diagnose_batch_effect's
+        verdict + evidence + recommendation, or run_cluster_structure_qc's
+        per-cluster decisions. This lets the user see the analytical reasoning
+        rather than only a spinner and a checkmark. No-op if the field is absent.
+        """
+        summary = result_data.get("terminal_summary")
+        if not summary:
+            return
+        if isinstance(summary, str):
+            summary = [summary]
+        from rich.console import Console
+
+        console = Console()
+        try:
+            console.print(f"[dim]  ⤷ {tool_name}:[/dim]")
+            for line in summary:
+                # markup=False: finding text may contain brackets/markup chars.
+                console.print(f"    {line}", style="dim", markup=False)
+        except Exception:  # pragma: no cover - display must never break a run
+            pass
+
+    @staticmethod
+    def _cluster_qc_terminal_summary(result_data: dict) -> list[str] | None:
+        """Compose terminal findings for the cluster-QC tools from their already
+        post-processed result (per-cluster decisions + the synthesized cleanup
+        recommendation). Returns None when there is nothing meaningful to show."""
+        decisions = result_data.get("cluster_decisions") or {}
+        lines: list[str] = []
+        if decisions:
+            from collections import Counter
+
+            actions = Counter(str(d.get("recommended_action", "keep")) for d in decisions.values())
+            lines.append(
+                f"{len(decisions)} clusters reviewed: "
+                + ", ".join(f"{n} {a}" for a, n in actions.items())
+            )
+            for clu, d in decisions.items():
+                action = str(d.get("recommended_action", "keep"))
+                if action == "keep":
+                    continue
+                reasons = d.get("reasons") or []
+                detail = "; ".join(str(r) for r in reasons[:2]) if reasons else str(d.get("severity", ""))
+                lines.append(f"cluster {clu}: {action} ({detail})")
+        rec = (
+            result_data.get("recommended_next_action")
+            or result_data.get("metric_qc_interpretation")
+        )
+        if result_data.get("cleanup_resolved"):
+            lines.append(f"resolved: {result_data['cleanup_resolved']}")
+        if rec:
+            lines.append(f"→ {rec}")
+        return lines[:25] or None
+
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Execute a tool and return JSON result."""
+        from pathlib import Path
+
         from rich.console import Console
         from rich.status import Status
-        from pathlib import Path
 
         console = Console()
         logger.debug("Tool call: %s with %s", tool_name, tool_input)
@@ -5770,6 +5901,21 @@ class SCAgent:
                 result_data["checkpoint"] = checkpoint
                 self._set_pending_checkpoint(checkpoint)
             self.world_state.apply_tool_result(tool_name, result_data, adata=self.adata)
+
+            # Surface a reasoning/diagnostic tool's own findings to the terminal.
+            # diagnose_batch_effect emits result["terminal_summary"] itself; the
+            # cluster-QC tools' decisions are composed here from post-processed
+            # fields. Any tool that sets terminal_summary gets printed.
+            if (
+                tool_name in ("run_cluster_qc", "run_cluster_structure_qc")
+                and "terminal_summary" not in result_data
+            ):
+                cqc = self._cluster_qc_terminal_summary(result_data)
+                if cqc:
+                    result_data["terminal_summary"] = cqc
+            if self.verbose:
+                self._print_terminal_summary(tool_name, result_data)
+
             result_json = json.dumps(result_data, indent=2)
 
             if self.run_manager:
@@ -6451,9 +6597,11 @@ class SCAgent:
 
             if self.verbose:
                 print(f"▶ Saving checkpoint {label}...")
-            self.adata.write_h5ad(out_path)
+            save_details = write_h5ad_safe(self.adata, out_path)
             if self.verbose:
                 print(f"✓ Checkpoint saved: {out_path}")
+                for warning in save_details.get("warnings", []):
+                    print(f"  {warning}")
             return out_path
         except Exception as exc:
             logger.warning("Auto-checkpoint save failed for %s: %s", label, exc)

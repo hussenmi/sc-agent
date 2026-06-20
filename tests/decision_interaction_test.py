@@ -6,11 +6,12 @@ import json
 from types import SimpleNamespace
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 
 from scagent.agent.agent import SCAgent
-from scagent.agent.tools import get_tools, process_tool_call
+from scagent.agent.tools import get_tools, process_tool_call, write_h5ad_safe
 from scagent.cli import _analyze_with_decisions, _maybe_save_on_exit
 from scagent.terminal import (
     DecisionChoice,
@@ -18,7 +19,6 @@ from scagent.terminal import (
     prompt_for_decision,
     resolve_decision_response,
 )
-
 
 CHOICES = [
     DecisionChoice("Integrate with scVI", "integrate_scvi"),
@@ -52,6 +52,20 @@ def _bare_agent(checkpoint=None):
     agent._active_cleanup_authorization = None
     agent.world_state = FakeWorldState()
     return agent
+
+
+def _null_encoded_paths(path):
+    paths = []
+    with h5py.File(path, "r") as handle:
+        def visit(name, obj):
+            encoding = obj.attrs.get("encoding-type")
+            if isinstance(encoding, bytes):
+                encoding = encoding.decode()
+            if encoding == "null":
+                paths.append(name)
+
+        handle.visititems(visit)
+    return paths
 
 
 def test_resolves_numeric_and_numbered_text():
@@ -796,3 +810,42 @@ def test_exit_save_can_be_skipped(monkeypatch, tmp_path):
         ),
     )
     _maybe_save_on_exit(agent, console)
+
+
+def test_write_h5ad_safe_sanitizes_uns_null_values(tmp_path):
+    adata = ad.AnnData(np.ones((3, 2)))
+    adata.obs["mixed"] = ["a", None, {"bad": "object"}]
+    adata.uns["nested"] = {"skip_reason": None, "items": [1, None, {"x": None}]}
+    output_path = tmp_path / "safe.h5ad"
+
+    details = write_h5ad_safe(adata, str(output_path))
+
+    assert details["save_mode"] == "clean_obs_var_uns_preflight"
+    assert _null_encoded_paths(output_path) == []
+    restored = ad.read_h5ad(output_path, backed="r")
+    try:
+        assert restored.shape == (3, 2)
+    finally:
+        restored.file.close()
+
+
+def test_auto_checkpoint_uses_safe_h5ad_writer(tmp_path):
+    adata = ad.AnnData(np.ones((3, 2)))
+    adata.uns["checkpoint_metadata"] = {"source": None}
+    agent = SimpleNamespace(
+        smart_autonomous=True,
+        adata=adata,
+        run_manager=None,
+        output_dir=tmp_path,
+        verbose=False,
+    )
+
+    output_path = SCAgent._maybe_auto_checkpoint(agent, "run_batch_correction", {})
+
+    assert output_path == str(tmp_path / "checkpoint_pre_batch_correction.h5ad")
+    assert _null_encoded_paths(output_path) == []
+    restored = ad.read_h5ad(output_path, backed="r")
+    try:
+        assert restored.shape == (3, 2)
+    finally:
+        restored.file.close()

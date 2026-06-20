@@ -59,6 +59,10 @@ def test_batch_diagnostic_finds_shared_signature_and_confounding(tmp_path):
     )
     assert result["condition_confounding"][0]["confounded_with_batch"] is True
     assert (tmp_path / "batch_diagnostic_cluster_sample_composition.csv").exists()
+    # terminal_summary: human-readable findings the agent prints to the terminal.
+    summary = result["terminal_summary"]
+    assert summary[0] == "verdict: confounded_with_condition"
+    assert summary[-1].startswith("→ ")  # recommendation line
 
 
 def test_batch_diagnostic_cautions_when_condition_metadata_missing():

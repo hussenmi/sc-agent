@@ -24,6 +24,172 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def _stringify_dataframe_columns(df):
+    if df is None:
+        return df
+    for col in df.columns:
+        try:
+            dtype_str = str(df[col].dtype)
+        except Exception:
+            dtype_str = ""
+        if dtype_str in {"object", "category"}:
+            df[col] = df[col].astype(str)
+    return df
+
+
+def _sanitize_uns_value(value, *, preserve_none: bool = True):
+    import numpy as _np
+    import pandas as _pd
+    try:
+        import scipy.sparse as _sp
+    except Exception:
+        _sp = None
+
+    if value is None:
+        return None if preserve_none else ""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (_np.integer, _np.floating, _np.bool_)):
+        return value.item()
+    if _sp is not None and _sp.issparse(value):
+        return value.toarray().tolist()
+    if isinstance(value, _np.ndarray):
+        if value.dtype.names is not None:
+            return {
+                str(name): _sanitize_uns_value(value[name], preserve_none=preserve_none)
+                for name in value.dtype.names
+            }
+        if value.dtype.kind in "biufc":
+            return value.tolist()
+        if value.dtype.kind in "SU":
+            return value.astype(str).tolist()
+        return [
+            _sanitize_uns_value(v, preserve_none=preserve_none)
+            for v in value.tolist()
+        ]
+    if isinstance(value, (_pd.Series, _pd.Index)):
+        return [
+            _sanitize_uns_value(v, preserve_none=preserve_none)
+            for v in value.tolist()
+        ]
+    if isinstance(value, _pd.DataFrame):
+        safe_df = value.copy()
+        _stringify_dataframe_columns(safe_df)
+        return {
+            str(col): [
+                _sanitize_uns_value(v, preserve_none=preserve_none)
+                for v in safe_df[col].tolist()
+            ]
+            for col in safe_df.columns
+        }
+    if isinstance(value, dict):
+        return {
+            str(k): _sanitize_uns_value(v, preserve_none=preserve_none)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        sanitized_items = [
+            _sanitize_uns_value(v, preserve_none=preserve_none)
+            for v in value
+        ]
+        normalized_items = []
+        for item in sanitized_items:
+            if isinstance(item, (dict, list, tuple, set)):
+                try:
+                    normalized_items.append(json.dumps(item, default=str, sort_keys=True))
+                except Exception:
+                    normalized_items.append(str(item))
+            else:
+                normalized_items.append(item)
+        return normalized_items
+    return str(value)
+
+
+def _contains_none_value(value) -> bool:
+    import numpy as _np
+    import pandas as _pd
+
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return any(_contains_none_value(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_none_value(v) for v in value)
+    if isinstance(value, _np.ndarray):
+        if value.dtype.names is not None:
+            return any(_contains_none_value(value[name]) for name in value.dtype.names)
+        if value.dtype.kind == "O":
+            return any(_contains_none_value(v) for v in value.ravel().tolist())
+        return False
+    if isinstance(value, (_pd.Series, _pd.Index)):
+        return any(v is None for v in value.tolist())
+    if isinstance(value, _pd.DataFrame):
+        return any(v is None for v in value.to_numpy(dtype=object).ravel().tolist())
+    return False
+
+
+def _make_serializable_copy(current_adata, aggressive_uns: bool = False):
+    sanitized = current_adata.copy()
+    _stringify_dataframe_columns(sanitized.obs)
+    _stringify_dataframe_columns(sanitized.var)
+    if sanitized.raw is not None:
+        _stringify_dataframe_columns(sanitized.raw.var)
+    if aggressive_uns:
+        sanitized.uns = {
+            str(k): _sanitize_uns_value(v, preserve_none=False)
+            for k, v in sanitized.uns.items()
+        }
+    return sanitized
+
+
+def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
+    details = {"save_mode": "direct", "warnings": []}
+    first_error_msg = None
+    second_error_msg = None
+
+    uns_has_nulls = _contains_none_value(getattr(current_adata, "uns", {}))
+    if uns_has_nulls:
+        try:
+            sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
+            sanitized.write_h5ad(output_path)
+            details["save_mode"] = "clean_obs_var_uns_preflight"
+            details["warnings"].append("Null values in .uns were stringified before saving.")
+            return details
+        except Exception as preflight_error:
+            first_error_msg = str(preflight_error)
+            details["warnings"].append(
+                "Preflight serialization cleanup failed; retrying direct save: "
+                f"{first_error_msg}"
+            )
+
+    try:
+        current_adata.write_h5ad(output_path)
+        return details
+    except Exception as first_error:
+        first_error_msg = str(first_error)
+        details["warnings"].append(f"Direct save failed; retrying with obs/var cleanup: {first_error_msg}")
+
+    try:
+        sanitized = _make_serializable_copy(current_adata, aggressive_uns=False)
+        sanitized.write_h5ad(output_path)
+        details["save_mode"] = "clean_obs_var"
+        return details
+    except Exception as second_error:
+        second_error_msg = str(second_error)
+        details["warnings"].append(f"Obs/var cleanup save failed; retrying with uns cleanup: {second_error_msg}")
+
+    try:
+        sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
+        sanitized.write_h5ad(output_path)
+        details["save_mode"] = "clean_obs_var_uns"
+        return details
+    except Exception as third_error:
+        raise RuntimeError(
+            "Unable to save AnnData after serialization cleanup. "
+            f"Direct error: {first_error_msg}; obs/var cleanup error: {second_error_msg}; uns cleanup error: {third_error}"
+        )
+
+
 def _make_annotation_proposal_fingerprint(
     cluster_key: str,
     cluster_ids,
@@ -4545,103 +4711,6 @@ def process_tool_call(
         fig.savefig(grid_path, dpi=150, bbox_inches="tight", facecolor="white")
         _mplt.close(fig)
         return grid_path
-
-    def _stringify_dataframe_columns(df):
-        if df is None:
-            return df
-        for col in df.columns:
-            try:
-                dtype_str = str(df[col].dtype)
-            except Exception:
-                dtype_str = ""
-            if dtype_str in {"object", "category"}:
-                df[col] = df[col].astype(str)
-        return df
-
-    def _sanitize_uns_value(value):
-        import numpy as _np
-        import pandas as _pd
-        try:
-            import scipy.sparse as _sp
-        except Exception:
-            _sp = None
-
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, (_np.integer, _np.floating, _np.bool_)):
-            return value.item()
-        if _sp is not None and _sp.issparse(value):
-            return value.toarray().tolist()
-        if isinstance(value, _np.ndarray):
-            if value.dtype.names is not None:
-                return {str(name): _sanitize_uns_value(value[name]) for name in value.dtype.names}
-            if value.dtype.kind in "biufc":
-                return value.tolist()
-            if value.dtype.kind in "SU":
-                return value.astype(str).tolist()
-            return [_sanitize_uns_value(v) for v in value.tolist()]
-        if isinstance(value, (_pd.Series, _pd.Index)):
-            return [_sanitize_uns_value(v) for v in value.tolist()]
-        if isinstance(value, _pd.DataFrame):
-            safe_df = value.copy()
-            _stringify_dataframe_columns(safe_df)
-            return {str(col): [_sanitize_uns_value(v) for v in safe_df[col].tolist()] for col in safe_df.columns}
-        if isinstance(value, dict):
-            return {str(k): _sanitize_uns_value(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            sanitized_items = [_sanitize_uns_value(v) for v in value]
-            normalized_items = []
-            for item in sanitized_items:
-                if isinstance(item, (dict, list, tuple, set)):
-                    try:
-                        normalized_items.append(json.dumps(item, default=str, sort_keys=True))
-                    except Exception:
-                        normalized_items.append(str(item))
-                else:
-                    normalized_items.append(item)
-            return normalized_items
-        return str(value)
-
-    def _make_serializable_copy(current_adata, aggressive_uns: bool = False):
-        sanitized = current_adata.copy()
-        _stringify_dataframe_columns(sanitized.obs)
-        _stringify_dataframe_columns(sanitized.var)
-        if sanitized.raw is not None:
-            _stringify_dataframe_columns(sanitized.raw.var)
-        if aggressive_uns:
-            sanitized.uns = {str(k): _sanitize_uns_value(v) for k, v in sanitized.uns.items()}
-        return sanitized
-
-    def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
-        details = {"save_mode": "direct", "warnings": []}
-        first_error_msg = None
-        second_error_msg = None
-        try:
-            current_adata.write_h5ad(output_path)
-            return details
-        except Exception as first_error:
-            first_error_msg = str(first_error)
-            details["warnings"].append(f"Direct save failed; retrying with obs/var cleanup: {first_error_msg}")
-
-        try:
-            sanitized = _make_serializable_copy(current_adata, aggressive_uns=False)
-            sanitized.write_h5ad(output_path)
-            details["save_mode"] = "clean_obs_var"
-            return details
-        except Exception as second_error:
-            second_error_msg = str(second_error)
-            details["warnings"].append(f"Obs/var cleanup save failed; retrying with uns cleanup: {second_error_msg}")
-
-        try:
-            sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
-            sanitized.write_h5ad(output_path)
-            details["save_mode"] = "clean_obs_var_uns"
-            return details
-        except Exception as third_error:
-            raise RuntimeError(
-                "Unable to save AnnData after serialization cleanup. "
-                f"Direct error: {first_error_msg}; obs/var cleanup error: {second_error_msg}; uns cleanup error: {third_error}"
-            )
 
     def search_web(query: str, site: str = "", max_results: int = 5) -> Dict[str, Any]:
         """Search web/docs using Tavily (primary), DuckDuckGo (secondary), or Google CSE (last fallback)."""

@@ -476,6 +476,18 @@ def diagnose_batch_effect(
         },
     )
 
+    # Human-readable findings shown in the terminal (the agent prints
+    # result["terminal_summary"] for reasoning tools). Keep it concise.
+    terminal_summary = [f"verdict: {verdict}"]
+    terminal_summary += [f"• {r}" for r in support_reasons]
+    terminal_summary += [f"⚠ {r}" for r in caution_reasons]
+    if sample_dominated:
+        terminal_summary.append(
+            f"{len(sample_dominated)} sample-dominated cluster(s); "
+            f"{dominated_cell_fraction * 100:.0f}% of cells in them"
+        )
+    terminal_summary.append(f"→ {recommendation}")
+
     result = {
         "status": "ok",
         "tool": "diagnose_batch_effect",
@@ -487,6 +499,7 @@ def diagnose_batch_effect(
         "recommendation": recommendation,
         "support_reasons": support_reasons,
         "caution_reasons": caution_reasons,
+        "terminal_summary": terminal_summary,
         "cluster_sample_summary": {
             "n_sample_dominated_clusters": int(len(sample_dominated)),
             "n_sample_exclusive_clusters": int(len(sample_exclusive)),
