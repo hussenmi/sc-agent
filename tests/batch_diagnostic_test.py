@@ -97,3 +97,149 @@ def test_batch_diagnostic_cautions_when_condition_metadata_missing():
     assert result["verdict"] == "batch_effect_supported"
     assert any("confounding was not tested" in reason for reason in result["caution_reasons"])
     assert "sample/source/procedure effects" in result["recommendation"]
+    # No X_pca on this dataset -> the entropy check degrades gracefully, not crashes.
+    assert result["neighborhood_batch_entropy"] is None
+    assert any("batch-mixing entropy was skipped" in reason for reason in result["caution_reasons"])
+
+
+def _two_cluster_two_sample_adata():
+    genes = ["CD3D", "CD3E", "TRAC", "LYZ", "LST1", "S100A8"]
+    rows = []
+    obs = []
+    for cluster, markers in [("0", ("CD3D", "CD3E", "TRAC")), ("1", ("LYZ", "LST1", "S100A8"))]:
+        for sample in ["s1", "s2"]:
+            for _ in range(40):
+                expr = np.ones(len(genes))
+                for marker in markers:
+                    expr[genes.index(marker)] = 8
+                rows.append(expr)
+                obs.append({"sample": sample, "leiden": cluster})
+    adata = ad.AnnData(
+        np.asarray(rows, dtype=float),
+        obs=pd.DataFrame(obs, index=[f"cell_{i}" for i in range(len(rows))]),
+        var=pd.DataFrame(index=genes),
+    )
+    adata.raw = adata.copy()
+    return adata
+
+
+def test_neighborhood_entropy_flags_pca_segregated_samples(tmp_path):
+    adata = _two_cluster_two_sample_adata()
+    # X_pca: each sample sits in a far-apart region, so a cell's nearest neighbors
+    # are all from its own sample -> neighborhood entropy ~0 -> low mixing ratio.
+    sample_offset = np.where(adata.obs["sample"].values == "s2", 100.0, 0.0)
+    rng = np.random.default_rng(0)
+    adata.obsm["X_pca"] = np.column_stack([sample_offset, rng.normal(scale=0.01, size=adata.n_obs)])
+
+    result = diagnose_batch_effect(
+        adata,
+        batch_key="sample",
+        cluster_key="leiden",
+        min_cells_per_cluster_sample=10,
+        entropy_n_neighbors=10,
+        output_dir=str(tmp_path),
+    )
+
+    entropy = result["neighborhood_batch_entropy"]
+    assert entropy is not None and entropy["skipped"] is False
+    assert entropy["global_ceiling"] == 1.0  # balanced 50/50 samples -> ceiling is log2(2)
+    assert entropy["mixing_ratio"] <= 0.5
+    assert entropy["entropy_per_broad_label"]  # per-cell-type breakdown present
+    assert any(
+        "batch-mixing entropy" in reason for reason in result["support_reasons"]
+    )
+    # Per-cell entropy is exposed on obs so a downstream UMAP can paint it.
+    assert "batch_diagnostic_neighborhood_entropy" in adata.obs.columns
+    assert (tmp_path / "batch_diagnostic_neighborhood_entropy.csv").exists()
+    assert any(
+        "Neighborhood batch-mixing entropy reflects mixing" in limit
+        for limit in result["evidence_limits"]
+    )
+
+
+def test_neighborhood_entropy_quiet_when_samples_well_mixed():
+    adata = _two_cluster_two_sample_adata()
+    # X_pca: clusters separate (x = cluster) but samples interleave within each
+    # cluster -> neighborhoods are sample-mixed -> high entropy, no support reason.
+    cluster_offset = np.where(adata.obs["leiden"].values == "1", 10.0, 0.0)
+    rng = np.random.default_rng(1)
+    adata.obsm["X_pca"] = np.column_stack(
+        [cluster_offset, rng.normal(scale=0.5, size=adata.n_obs)]
+    )
+
+    result = diagnose_batch_effect(
+        adata,
+        batch_key="sample",
+        cluster_key="leiden",
+        min_cells_per_cluster_sample=10,
+        entropy_n_neighbors=10,
+    )
+
+    entropy = result["neighborhood_batch_entropy"]
+    assert entropy is not None and entropy["skipped"] is False
+    assert entropy["mixing_ratio"] >= 0.8  # well mixed
+    assert not any(
+        "batch-mixing entropy" in reason for reason in result["support_reasons"]
+    )
+    # Clusters here are cell types with both samples evenly present -> independent of
+    # sample -> ARI/NMI ~0, no concordance support reason.
+    concordance = result["cluster_batch_concordance"]
+    assert concordance["tracks_sample"] is False
+    assert concordance["ari"] < 0.2
+    assert not any("ARI" in reason for reason in result["support_reasons"])
+
+
+def test_cluster_batch_concordance_and_epithelial_caveat(tmp_path):
+    # Each sample contributes its own clusters (sample-exclusive), and the s2 clusters
+    # are epithelial -> clusters track sample (high ARI/NMI) AND the epithelial caveat
+    # should name the driving markers (EPCAM/KRT).
+    genes = ["CD3D", "CD3E", "TRAC", "IL7R", "EPCAM", "KRT8", "KRT18", "KRT19"]
+    t_markers = ("CD3D", "CD3E", "TRAC", "IL7R")
+    epi_markers = ("EPCAM", "KRT8", "KRT18", "KRT19")
+    rows = []
+    obs = []
+    plan = [
+        ("0", "s1", t_markers),
+        ("1", "s1", t_markers),
+        ("2", "s2", epi_markers),
+        ("3", "s2", epi_markers),
+    ]
+    for cluster, sample, markers in plan:
+        for _ in range(30):
+            expr = np.ones(len(genes))
+            for marker in markers:
+                expr[genes.index(marker)] = 8
+            rows.append(expr)
+            obs.append({"sample": sample, "leiden": cluster})
+    adata = ad.AnnData(
+        np.asarray(rows, dtype=float),
+        obs=pd.DataFrame(obs, index=[f"cell_{i}" for i in range(len(rows))]),
+        var=pd.DataFrame(index=genes),
+    )
+    adata.raw = adata.copy()
+
+    result = diagnose_batch_effect(
+        adata,
+        batch_key="sample",
+        cluster_key="leiden",
+        min_cells_per_cluster_sample=10,
+        output_dir=str(tmp_path),
+    )
+
+    concordance = result["cluster_batch_concordance"]
+    assert concordance["tracks_sample"] is True
+    assert concordance["ari"] >= 0.2
+    assert concordance["nmi"] >= 0.3
+    assert any(
+        "track sample" in reason and "ARI" in reason for reason in result["support_reasons"]
+    )
+    # Epithelial caveat names the markers driving the call and stays tissue-agnostic
+    # (must not assume malignancy/tumor as the explanation).
+    epi_caution = [r for r in result["caution_reasons"] if "Epithelial" in r]
+    assert epi_caution
+    assert "EPCAM" in epi_caution[0]
+    assert "donor/patient-private" in epi_caution[0]
+    assert "malignant epithelium" not in epi_caution[0]  # no tumor assumption
+    # ARI/NMI appears in the terminal summary and the (tissue-agnostic) caveat in limits.
+    assert any("ARI" in line for line in result["terminal_summary"])
+    assert any("donor/patient-private" in limit for limit in result["evidence_limits"])

@@ -62,7 +62,7 @@ test_output/
 workshop_slides/
 skills/
 runs/
-run*
+run*/
 analysis/
 !scagent/analysis/
 !scagent/analysis/batch_diagnostic.py
@@ -83,6 +83,7 @@ tests/*
 !tests/write_json_robustness_test.py
 !tests/concat_datasets_robustness_test.py
 !tests/gemini_provider_test.py
+!tests/dotenv_precedence_test.py
 cellbender_test/
 results/
 article_figures/

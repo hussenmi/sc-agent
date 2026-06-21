@@ -2801,9 +2801,13 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "Run the lightweight uncorrected multi-sample diagnostic after PCA/neighbors/UMAP/clustering "
                 "when the user selected investigate_integration. It checks cluster-by-sample composition, "
                 "provisional broad cluster labels from marker DEGs, sample-associated expression shifts within "
-                "broad states, shared cross-cell-type signatures, UMAP state separation, and confounding between "
-                "sample/batch and condition-like metadata. This is descriptive evidence only; it must be followed "
-                "by a user confirmation before scVI integration."
+                "broad states, shared cross-cell-type signatures, UMAP state separation, neighborhood "
+                "batch-mixing entropy in PCA space (a continuous check that also catches batches that smear "
+                "through shared regions without forming their own clusters), cluster-vs-sample ARI/NMI (a "
+                "global scalar for how strongly clusters track samples), and confounding between "
+                "sample/batch and condition-like metadata. It also flags sample-segregated epithelial clusters "
+                "(by their markers, e.g. EPCAM/KRT) as possibly donor/patient-private epithelial biology rather than batch. "
+                "This is descriptive evidence only; it must be followed by a user confirmation before scVI integration."
             ),
             "input_schema": {
                 "type": "object",
@@ -2828,6 +2832,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "n_top_genes": {
                         "type": "integer",
                         "description": "Number of marker/shift genes to inspect per cluster or state (default: 25)."
+                    },
+                    "entropy_use_rep": {
+                        "type": "string",
+                        "description": "Embedding used for the neighborhood batch-mixing entropy check (default: X_pca, the uncorrected representation). The check is skipped gracefully if absent."
+                    },
+                    "entropy_n_neighbors": {
+                        "type": "integer",
+                        "description": "Neighborhood size for the batch-mixing entropy check (default: 50)."
                     },
                     "output_dir": {
                         "type": "string",
@@ -2881,8 +2893,11 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "computes the Shannon entropy of batch labels — high entropy means batches are "
                 "well-mixed. The score is normalized to [0, 1] where 1 = perfect mixing. "
                 "Call this after run_batch_correction to quantify whether integration worked. "
-                "Can also be called on uncorrected embeddings (use_rep='X_pca') as a baseline "
-                "to compare before/after. Stores per-cell scores in obs['integration_entropy']."
+                "For a defensible before/after, score like-for-like latent spaces: pass "
+                "use_rep='X_pca' for the pre-integration baseline and the corrected latent "
+                "embedding (use_rep='X_scVI', or 'X_pca_harmony' for Harmony) for the post-integration "
+                "score — not 'X_umap', whose 2-D distortion conflates the integration effect with the "
+                "representation change. Stores per-cell scores in obs['integration_entropy']."
             ),
             "input_schema": {
                 "type": "object",
@@ -2893,7 +2908,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     },
                     "use_rep": {
                         "type": "string",
-                        "description": "Embedding to evaluate (default: 'X_umap'). Use the corrected embedding for post-integration score, or 'X_pca' for pre-integration baseline."
+                        "description": "Embedding to evaluate (default: 'X_umap'). For a like-for-like before/after, use the corrected latent embedding ('X_scVI' / 'X_pca_harmony') for the post-integration score and 'X_pca' for the pre-integration baseline. Avoid 'X_umap' for before/after comparison — its 2-D distortion conflates the integration effect with the representation change."
                     },
                     "n_neighbors": {
                         "type": "integer",
@@ -10046,6 +10061,8 @@ def process_tool_call(
                     condition_keys=tool_input.get("condition_keys"),
                     min_cells_per_cluster_sample=int(tool_input.get("min_cells_per_cluster_sample") or 30),
                     n_top_genes=int(tool_input.get("n_top_genes") or 25),
+                    entropy_use_rep=tool_input.get("entropy_use_rep") or "X_pca",
+                    entropy_n_neighbors=int(tool_input.get("entropy_n_neighbors") or 50),
                     output_dir=output_dir,
                 )
             except Exception as e:

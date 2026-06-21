@@ -1,0 +1,78 @@
+#%Module 1.0
+#
+#  scagent module  (GPU / RAPIDS conda env)
+#
+#  Mirrors `source setup_gpu.sh`: makes the frozen scagent_rapids env active,
+#  preloads the two conda CUDA libs, reproduces the conda activate.d env, and
+#  exports scagent's runtime vars. Lab members just `module load scagent` then
+#  run `scagent start`. Nothing is installed on their end.
+#
+module-whatis "scagent"
+module-whatis "Version: 0.1.0"
+module-whatis "Description: single-cell analysis agent (GPU/RAPIDS)"
+
+set prefix /usersoftware/collab002/sail/tools/Modules/lib/scagent-0.1.0
+
+# --- Detect a CUDA GPU (not required. scagent falls back to CPU/scanpy) ---
+# GPU only accelerates the heavy steps; the code runs fine CPU-only. So we don't
+# block the load. We just record whether a GPU is here and configure accordingly.
+set has_gpu 0
+if { ![catch { exec nvidia-smi } out] &&
+     [regexp {CUDA Version:\s+(1[23]\.\d+)} $out] } {
+    set has_gpu 1
+}
+
+# --- conda env activation, baked from the env's etc/conda/activate.d/*.sh ---
+# This Lmod's TCL interpreter has no `source-sh`, so we set the activate.d deltas
+# directly. All values are prefix-derived constants (GDAL/PROJ/glib/XML); libarrow
+# and ucx set nothing. Recapture these if the env's activate.d hooks change.
+setenv CONDA_PREFIX           $prefix
+setenv CPL_ZIP_ENCODING       UTF-8
+setenv GDAL_DATA              $prefix/share/gdal
+setenv GDAL_DRIVER_PATH       $prefix/lib/gdalplugins
+setenv GSETTINGS_SCHEMA_DIR   $prefix/share/glib-2.0/schemas
+setenv PROJ_DATA              $prefix/share/proj
+setenv PROJ_NETWORK           ON
+setenv XML_CATALOG_FILES      "file://$prefix/etc/xml/catalog file:///etc/xml/catalog"
+
+# Two conda libs must load *before* the pip-wheel CUDA libs torch bundles, or
+# numpy/cuml imports fail (see the long comment in setup_gpu.sh). prepend-path
+# puts the last one first, so the final order is libstdc++ : libnvJitLink.
+# libnvJitLink is CUDA-only, so preload it only when a GPU is present; libstdc++
+# is a general numpy GLIBCXX fix, so preload it always.
+if { $has_gpu } {
+    prepend-path LD_PRELOAD $prefix/lib/libnvJitLink.so.13
+}
+prepend-path LD_PRELOAD $prefix/lib/libstdc++.so.6
+
+# scagent runtime config (counterpart to the exports in setup_gpu.sh).
+# SCAGENT_HOME points at the install dir so scagent finds the shared .env there.
+setenv SCAGENT_HOME $prefix
+# Only enable GPU acceleration when a GPU is actually here. On CPU nodes we leave
+# SCAGENT_GPU unset so scagent uses scanpy without emitting "GPU unavailable" noise.
+if { $has_gpu } {
+    setenv SCAGENT_GPU 1
+}
+
+# NOTE: these two still point at Hussen's personal dirs for now (relocate to a
+# shared, group-readable location later. See README "Follow-ups".
+setenv SCIMILARITY_MODEL_PATH /data1/peerd/ibrahih3/scimilarity/docs/notebooks/models/model_v1.1
+setenv SCAGENT_CELLBENDER /usersoftware/peerd/ibrahih3/envs/cellbender/bin/cellbender
+
+# Put the env's bin on PATH last so its python / scagent script win.
+prepend-path PATH $prefix/bin
+
+if { [module-info mode load] } {
+    if { $has_gpu } {
+        set mode "GPU acceleration ON"
+    } else {
+        set mode "CPU only (no CUDA GPU detected)"
+    }
+    puts stderr ""
+    puts stderr "    scagent 0.1.0 loaded  -  $mode"
+    puts stderr "  ============================================================"
+    puts stderr "    Start:      scagent start"
+    puts stderr "    Help:       scagent --help"
+    puts stderr "    When done:  module unload scagent"
+    puts stderr ""
+}

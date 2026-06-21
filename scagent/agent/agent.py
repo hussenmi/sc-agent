@@ -224,23 +224,44 @@ INSPECTION_TOOL_NAMES = {
 
 # Load .env file if present
 def _load_dotenv():
-    """Load .env file from current directory or package root."""
+    """Load .env config, merging from lowest to highest precedence.
+
+    Order: the package/repo root, then the current working directory, then
+    ``$SCAGENT_HOME/.env`` last. Every existing file is loaded (not first-wins)
+    with ``override=True``, so the one read last wins. ``$SCAGENT_HOME/.env`` is
+    last on purpose: when scagent is installed as a shared module, that is the
+    centrally-managed lab config, and editing it must control every user's setup
+    regardless of which directory they run from. A local ``./.env`` can still add
+    vars the shared file doesn't set, but cannot override it.
+    """
     try:
         from dotenv import load_dotenv
-        # Try multiple locations
-        search_paths = [
-            Path.cwd() / ".env",
-            Path(__file__).parent.parent.parent / ".env",  # scagent/agent -> scagent -> project root
-            Path(os.environ.get("SCAGENT_HOME", "")) / ".env",
-        ]
-        for path in search_paths:
-            if path.exists():
-                load_dotenv(path, override=True)
-                logger.info(f"Loaded config from {path}")
-                return True
     except ImportError:
-        pass  # python-dotenv not installed
-    return False
+        return False  # python-dotenv not installed
+
+    scagent_home = os.environ.get("SCAGENT_HOME", "").strip()
+    # Lowest precedence first; $SCAGENT_HOME/.env last so it wins.
+    candidates = [
+        Path(__file__).parent.parent.parent / ".env",  # scagent/agent -> scagent -> project root
+        Path.cwd() / ".env",
+    ]
+    if scagent_home:
+        candidates.append(Path(scagent_home) / ".env")
+
+    loaded = False
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not path.exists():
+            continue  # skip duplicates (e.g. cwd == SCAGENT_HOME in dev)
+        seen.add(resolved)
+        load_dotenv(path, override=True)
+        logger.info(f"Loaded config from {path}")
+        loaded = True
+    return loaded
 
 _load_dotenv()
 

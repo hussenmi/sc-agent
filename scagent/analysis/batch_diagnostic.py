@@ -49,6 +49,27 @@ BROAD_MARKER_MODULES: Dict[str, set[str]] = {
     "Erythroid": {"HBA1", "HBA2", "HBB", "GYPA", "ALAS2"},
 }
 
+# Neighborhood batch-mixing entropy thresholds. Entropy is normalized against the
+# *global* batch-proportion ceiling (the value a neighborhood would have if it
+# mirrored the dataset-wide batch mix), so these ratios are robust to batch-size
+# imbalance. A cell is "segregated" when its neighborhood reaches less than half
+# the achievable mixing; the dataset reads as poorly mixed when the mean does.
+ENTROPY_DEFAULT_USE_REP = "X_pca"
+ENTROPY_DEFAULT_N_NEIGHBORS = 50
+ENTROPY_SEGREGATED_CELL_FRACTION = 0.5  # per-cell threshold, as a fraction of the ceiling
+ENTROPY_LOW_MIXING_RATIO = 0.5  # dataset-level mean/ceiling below which mixing is "low"
+
+# Cluster<->sample agreement (ARI / NMI). Both are ~0 when clusters are independent of
+# sample (well mixed) and rise as clusters come to correspond to individual samples.
+# ARI is chance-adjusted; NMI is information-theoretic and tends to read higher, so we
+# fire on either. A "high" tier only sharpens the wording. These are advisory: a high
+# score can reflect donor/patient-private biology (e.g. donor-specific epithelial states,
+# or malignant clones in tumors) as much as a technical batch effect.
+CLUSTER_BATCH_ARI_SUPPORT = 0.2
+CLUSTER_BATCH_NMI_SUPPORT = 0.3
+CLUSTER_BATCH_ARI_HIGH = 0.5
+CLUSTER_BATCH_NMI_HIGH = 0.6
+
 
 def _is_nuisance_gene(gene: str) -> bool:
     return any(re.search(pattern, gene) for pattern in NUISANCE_PATTERNS)
@@ -242,6 +263,151 @@ def _umap_state_separation(adata, state_by_cluster: Dict[str, str], batch_key: s
     return rows
 
 
+def _neighborhood_batch_mixing(
+    adata,
+    batch_key: str,
+    cluster_key: str,
+    state_by_cluster: Dict[str, str],
+    *,
+    use_rep: str,
+    n_neighbors: int,
+    obs_key: str = "batch_diagnostic_neighborhood_entropy",
+) -> Optional[Dict[str, Any]]:
+    """Per-cell neighborhood batch-mixing entropy on a low-dimensional embedding.
+
+    This is the *continuous* complement to the cluster-composition and UMAP
+    centroid checks. Those only register a batch effect that forms discrete
+    clusters or pulls a cell type's per-sample centroids apart; they are blind to
+    a batch that smears continuously through a shared region without splitting it.
+    For every cell we take the Shannon entropy of the batch labels among its k
+    nearest neighbors in ``use_rep`` (uncorrected PCA by default) and normalize by
+    ``log2(n_batches)`` to land in [0, 1].
+
+    A raw entropy is hard to read because imbalanced batches cannot reach 1.0 even
+    when perfectly mixed. So we also compute the *global* ceiling — the entropy a
+    neighborhood would have if it mirrored the dataset-wide batch proportions — and
+    report ``mixing_ratio = mean / ceiling``. Ratio near 1 means neighborhoods look
+    like the whole dataset (well mixed); near 0 means each cell sits among its own
+    sample (segregated). Per-cell entropy is also written to ``adata.obs[obs_key]``
+    so the agent can paint it on the UMAP and show *where* mixing fails.
+
+    Returns ``None`` when ``use_rep`` is absent (so the diagnostic degrades to its
+    discrete checks instead of failing), or a ``{"skipped": True, ...}`` dict when
+    the embedding exists but entropy could not be computed.
+    """
+    if use_rep not in adata.obsm:
+        return None
+    try:
+        from ..batch.entropy import compute_batch_entropy
+
+        ent = compute_batch_entropy(
+            adata,
+            batch_key=batch_key,
+            use_rep=use_rep,
+            n_neighbors=n_neighbors,
+        )
+    except Exception as exc:  # keep the diagnostic alive; entropy is one signal among many
+        return {"skipped": True, "reason": str(exc), "use_rep": use_rep}
+
+    per_cell = np.asarray(ent["per_cell_entropy"], dtype=float)
+    # Per-cell value kept in obs so a downstream UMAP can show where batches fail to mix.
+    adata.obs[obs_key] = per_cell
+
+    # Global ceiling: normalized entropy of the dataset-wide batch proportions. This is
+    # the most mixing achievable, so dividing by it corrects for batch-size imbalance.
+    batch_labels = adata.obs[batch_key].astype(str).values
+    _, global_counts = np.unique(batch_labels, return_counts=True)
+    n_batches = len(global_counts)
+    global_probs = global_counts / global_counts.sum()
+    global_probs = global_probs[global_probs > 0]
+    max_entropy = math.log2(n_batches) if n_batches > 1 else 1.0
+    global_ceiling = float(-np.sum(global_probs * np.log2(global_probs)) / max_entropy)
+
+    mean_entropy = float(ent["entropy_mean"])
+    mixing_ratio = float(mean_entropy / global_ceiling) if global_ceiling > 0 else None
+
+    # Fraction of cells whose neighborhood reaches < half the achievable mixing.
+    seg_threshold = ENTROPY_SEGREGATED_CELL_FRACTION * global_ceiling
+    fraction_segregated = float(np.mean(per_cell < seg_threshold)) if global_ceiling > 0 else 0.0
+
+    # Per-broad-label means corroborate the UMAP centroid-separation check: a cell type
+    # that is both centroid-separated and low-entropy is segregating by sample.
+    states = adata.obs[cluster_key].astype(str).map(state_by_cluster).fillna("Unknown")
+    batch_series = adata.obs[batch_key].astype(str)
+    per_label: List[Dict[str, Any]] = []
+    for state in sorted(set(states) - {"Unknown"}):
+        mask = (states == state).values
+        if not mask.any():
+            continue
+        per_label.append(
+            {
+                "broad_label": str(state),
+                "n_cells": int(mask.sum()),
+                "n_batches_present": int(batch_series[mask].nunique()),
+                "mean_entropy": round(float(np.mean(per_cell[mask])), 4),
+            }
+        )
+    per_label.sort(key=lambda row: row["mean_entropy"])  # most segregated first
+
+    return {
+        "skipped": False,
+        "use_rep": use_rep,
+        "n_neighbors": int(ent["n_neighbors"]),
+        "n_batches": int(n_batches),
+        "obs_key": obs_key,
+        "mean_entropy": round(mean_entropy, 4),
+        "median_entropy": round(float(ent["entropy_median"]), 4),
+        "global_ceiling": round(global_ceiling, 4),
+        "mixing_ratio": round(mixing_ratio, 4) if mixing_ratio is not None else None,
+        "fraction_segregated_cells": round(fraction_segregated, 4),
+        "entropy_per_batch": {
+            str(k): round(float(v), 4) for k, v in ent["entropy_per_batch"].items()
+        },
+        "entropy_per_broad_label": per_label,
+    }
+
+
+def _cluster_batch_concordance(adata, batch_key: str, cluster_key: str) -> Dict[str, Any]:
+    """Global agreement between the clustering and the sample labels (ARI + NMI).
+
+    ARI and NMI compress, into a single number, how strongly the uncorrected clusters
+    line up with sample identity — the global counterpart to the per-cluster dominance
+    and per-cell entropy checks:
+
+    - ~0   -> clusters are independent of sample; cells from different samples share the
+              same clusters (well mixed).
+    - high -> clusters largely correspond to individual samples (strong sample structure).
+
+    ARI (adjusted Rand index) is corrected for chance; NMI (normalized mutual information)
+    is information-theoretic and tends to read higher, so we report both and act on
+    either. A high value is *not* proof of a technical batch effect: donor/patient-private
+    biology also drives clusters to track sample. Epithelial cells are a common example
+    in any tissue — donor-specific epithelial states and genetic background in normal
+    tissue, or malignant clones and CNVs in tumors. Treat it as advisory; do not assume
+    the tissue is a tumor.
+    """
+    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+    batch = adata.obs[batch_key].astype(str).to_numpy()
+    cluster = adata.obs[cluster_key].astype(str).to_numpy()
+    ari = float(adjusted_rand_score(batch, cluster))
+    nmi = float(normalized_mutual_info_score(batch, cluster))
+    if ari >= CLUSTER_BATCH_ARI_HIGH or nmi >= CLUSTER_BATCH_NMI_HIGH:
+        interpretation = "clusters largely correspond to individual samples"
+    elif ari >= CLUSTER_BATCH_ARI_SUPPORT or nmi >= CLUSTER_BATCH_NMI_SUPPORT:
+        interpretation = "clusters partly track sample labels"
+    else:
+        interpretation = "clusters are largely independent of sample (well mixed)"
+    return {
+        "cluster_key": cluster_key,
+        "batch_key": batch_key,
+        "ari": round(ari, 4),
+        "nmi": round(nmi, 4),
+        "tracks_sample": bool(ari >= CLUSTER_BATCH_ARI_SUPPORT or nmi >= CLUSTER_BATCH_NMI_SUPPORT),
+        "interpretation": interpretation,
+    }
+
+
 def _state_expression_shifts(
     adata,
     batch_key: str,
@@ -353,6 +519,8 @@ def diagnose_batch_effect(
     condition_keys: Optional[List[str]] = None,
     min_cells_per_cluster_sample: int = 30,
     n_top_genes: int = 25,
+    entropy_use_rep: str = ENTROPY_DEFAULT_USE_REP,
+    entropy_n_neighbors: int = ENTROPY_DEFAULT_N_NEIGHBORS,
     output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     if batch_key not in adata.obs.columns:
@@ -393,6 +561,14 @@ def diagnose_batch_effect(
     dominated_cell_fraction = cells_in_dominated / max(int(adata.n_obs), 1)
 
     separation = _umap_state_separation(adata, state_by_cluster, batch_key, cluster_key)
+    entropy_mixing = _neighborhood_batch_mixing(
+        adata,
+        batch_key,
+        cluster_key,
+        state_by_cluster,
+        use_rep=entropy_use_rep,
+        n_neighbors=entropy_n_neighbors,
+    )
     shift_payload = _state_expression_shifts(
         adata,
         batch_key,
@@ -422,6 +598,8 @@ def diagnose_batch_effect(
             "sample names suggest multiple source/procedure groups; sample effects may include real tissue or collection-method biology"
         )
 
+    concordance = _cluster_batch_concordance(adata, batch_key, cluster_key)
+
     if dominated_cell_fraction >= 0.30 or (n_clusters and len(sample_dominated) / n_clusters >= 0.30):
         support_reasons.append("many clusters are sample-dominated")
     if sample_exclusive:
@@ -430,6 +608,57 @@ def diagnose_batch_effect(
         support_reasons.append("sample-associated expression shifts recur across broad cell types")
     if separation and max(row["mean_distance_over_global_umap_scale"] for row in separation) >= 0.35:
         support_reasons.append("broad cell types have separated sample centroids on the UMAP")
+    if concordance["tracks_sample"]:
+        support_reasons.append(
+            f"clusters track sample labels (ARI {concordance['ari']:.2f}, NMI {concordance['nmi']:.2f} "
+            f"between {cluster_key} and {batch_key}): {cluster_key} clusters largely correspond to "
+            "individual samples rather than shared cell states"
+        )
+
+    # Name the markers behind sample-segregated Epithelial clusters and caveat them: the
+    # epithelial compartment is frequently donor/patient-private regardless of tissue
+    # (donor-specific epithelial states and genetic background in normal tissue; malignant
+    # clones and CNVs in tumors), so this pattern is often real biology rather than a
+    # technical batch effect — and integrating it across samples can erase genuine
+    # per-sample differences. Do not assume the tissue is a tumor.
+    segregated_clusters: Dict[str, Dict[str, Any]] = {row["cluster"]: row for row in sample_dominated}
+    for row in sample_exclusive:
+        segregated_clusters.setdefault(row["cluster"], row)
+    epithelial_private_markers: List[str] = []
+    epithelial_private_clusters: List[str] = []
+    for cluster_id in segregated_clusters:
+        info = broad_by_cluster.get(str(cluster_id))
+        if info and info.get("broad_label") == "Epithelial":
+            epithelial_private_clusters.append(str(cluster_id))
+            markers = info.get("supporting_markers") or info.get("top_markers") or []
+            epithelial_private_markers.extend(str(gene) for gene in markers[:4])
+    if epithelial_private_clusters:
+        marker_str = ", ".join(dict.fromkeys(epithelial_private_markers)) or "epithelial markers"
+        caution_reasons.append(
+            f"sample-segregated Epithelial cluster(s) {', '.join(epithelial_private_clusters)} "
+            f"(driven by {marker_str}) may be donor/patient-private epithelial biology rather than a "
+            "technical batch effect; epithelium is often sample-specific (donor-specific epithelial "
+            "states in normal tissue, or malignant clones/CNVs in tumors), and integrating it across "
+            "samples can erase real per-sample differences"
+        )
+    if entropy_mixing is None:
+        caution_reasons.append(
+            f"neighborhood batch-mixing entropy was skipped because '{entropy_use_rep}' is not in "
+            "adata.obsm — run the uncorrected PCA first to enable this continuous check"
+        )
+    elif entropy_mixing.get("skipped"):
+        caution_reasons.append(
+            "neighborhood batch-mixing entropy could not be computed "
+            f"({entropy_mixing.get('reason')})"
+        )
+    else:
+        ratio = entropy_mixing["mixing_ratio"]
+        if ratio is not None and ratio <= ENTROPY_LOW_MIXING_RATIO:
+            support_reasons.append(
+                f"neighborhood batch-mixing entropy in {entropy_mixing['use_rep']} is low "
+                f"(mean {entropy_mixing['mean_entropy']:.2f} vs achievable {entropy_mixing['global_ceiling']:.2f}, "
+                f"ratio {ratio:.2f}): cells tend to neighbor their own sample even within shared regions"
+            )
     if marker_error:
         caution_reasons.append(f"cluster marker calculation failed: {marker_error}")
     if any_confounded:
@@ -466,6 +695,18 @@ def diagnose_batch_effect(
     broad_df = pd.DataFrame(list(broad_by_cluster.values()))
     confounding_df = pd.DataFrame(confounding)
     shared_df = pd.DataFrame(shared)
+    # Narrow to a non-None dict only when entropy was actually computed, so the
+    # downstream summary/result blocks can index it safely.
+    entropy_ok: Optional[Dict[str, Any]] = (
+        entropy_mixing
+        if entropy_mixing is not None and not entropy_mixing.get("skipped")
+        else None
+    )
+    entropy_df = (
+        pd.DataFrame(entropy_ok["entropy_per_broad_label"])
+        if entropy_ok is not None
+        else pd.DataFrame()
+    )
     artifacts = _write_outputs(
         output_dir,
         {
@@ -473,6 +714,7 @@ def diagnose_batch_effect(
             "batch_diagnostic_broad_cluster_labels": broad_df,
             "batch_diagnostic_condition_confounding": confounding_df,
             "batch_diagnostic_shared_signatures": shared_df,
+            "batch_diagnostic_neighborhood_entropy": entropy_df,
         },
     )
 
@@ -486,6 +728,22 @@ def diagnose_batch_effect(
             f"{len(sample_dominated)} sample-dominated cluster(s); "
             f"{dominated_cell_fraction * 100:.0f}% of cells in them"
         )
+    if entropy_ok is not None:
+        if entropy_ok["mixing_ratio"] is not None:
+            terminal_summary.append(
+                f"neighborhood batch entropy {entropy_ok['mean_entropy']:.2f} / "
+                f"ceiling {entropy_ok['global_ceiling']:.2f} "
+                f"(ratio {entropy_ok['mixing_ratio']:.2f}) in {entropy_ok['use_rep']}"
+            )
+        else:
+            terminal_summary.append(
+                f"neighborhood batch entropy {entropy_ok['mean_entropy']:.2f} in "
+                f"{entropy_ok['use_rep']}"
+            )
+    terminal_summary.append(
+        f"cluster↔sample ARI {concordance['ari']:.2f}, NMI {concordance['nmi']:.2f} "
+        f"({concordance['interpretation']})"
+    )
     terminal_summary.append(f"→ {recommendation}")
 
     result = {
@@ -509,6 +767,8 @@ def diagnose_batch_effect(
         },
         "broad_cluster_labels": list(broad_by_cluster.values()),
         "umap_broad_label_sample_separation": separation[:30],
+        "neighborhood_batch_entropy": entropy_mixing,
+        "cluster_batch_concordance": concordance,
         "condition_confounding": confounding,
         "state_sample_expression_shifts": shift_payload["state_sample_expression_shifts"][:50],
         "shared_cross_cell_type_signatures": shared[:30],
@@ -516,9 +776,17 @@ def diagnose_batch_effect(
             "This is a descriptive diagnostic, not proof that sample-associated differences are technical.",
             "One-sample-per-condition or sample-condition confounding cannot distinguish batch from biology.",
             "If sample names encode tissue, procedure, site, or disease state, sample-exclusive clusters may reflect real biology as well as technical effects.",
+            "Cluster–sample ARI/NMI measure how strongly clusters correspond to samples; high values can reflect donor/patient-private biology (e.g. donor-specific epithelial states, or malignant clones in tumors) as much as a technical batch effect.",
             "Broad labels are provisional and must not be reused as final annotation.",
         ],
         "artifacts_created": artifacts,
     }
+    if entropy_ok is not None:
+        result["evidence_limits"].append(
+            f"Neighborhood batch-mixing entropy reflects mixing in {entropy_ok['use_rep']} and, "
+            "like the cluster and centroid evidence, cannot prove a sample-associated difference is "
+            "technical rather than real per-sample biology; it is normalized against the batch-size "
+            "ceiling but very small or rare batches can still depress the score."
+        )
     adata.uns["batch_effect_diagnostic"] = result
     return result
