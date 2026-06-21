@@ -365,6 +365,25 @@ def run_start(args):
     # Welcome panel
     cwd = os.path.abspath(args.output)
     data_line = f"  Data:     {os.path.abspath(args.data)}" if args.data else "  Data:     none loaded yet"
+    # Vision line — make it obvious whether figures will actually be analyzed,
+    # since a text-only main model silently depends on the sidecar.
+    if agent._supports_vision():
+        vision_desc, vision_style = "native (main model is multimodal)", "white"
+    elif agent._use_sidecar_for_images():
+        _sc = agent._vision_sidecar
+        vision_desc = f"sidecar -> {_sc.model} @ {_sc.cfg.base_url or '<openai default>'}"
+        vision_style = "white"
+    else:
+        vision_desc = "none - text-only model; figures will NOT be analyzed (set SCAGENT_VISION_MODEL)"
+        vision_style = "yellow"
+    # Show the main model's endpoint too when it's a local/self-hosted server,
+    # matching the Vision line. Cloud providers have no useful host:port to show.
+    _main_base = str(getattr(agent.client, "base_url", "") or "")
+    _cloud_hosts = (
+        "api.openai.com", "api.anthropic.com", "api.groq.com", "api.deepseek.com",
+        "generativelanguage.googleapis.com", "aiplatform.googleapis.com",
+    )
+    main_loc = "" if (not _main_base or any(h in _main_base for h in _cloud_hosts)) else f"  @ {_main_base}"
     welcome_text = Text.assemble(
         ("scagent", "bold cyan"),
         " — single-cell RNA-seq analysis agent\n\n",
@@ -372,7 +391,10 @@ def run_start(args):
         (cwd, "white"),
         "\n",
         ("  Provider:   ", "dim"),
-        (f"{agent.provider}:{agent.model}", "white"),
+        (f"{agent.provider}:{agent.model}{main_loc}", "white"),
+        "\n",
+        ("  Vision:     ", "dim"),
+        (vision_desc, vision_style),
         "\n",
         ("  Data:       ", "dim"),
         (os.path.abspath(args.data) if args.data else "none loaded yet", "white"),

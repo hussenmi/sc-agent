@@ -50,15 +50,26 @@ echo "=================================================="
 export SINGULARITYENV_NGC_API_KEY="$KEY"
 export SINGULARITYENV_NIM_HTTP_API_PORT="$PORT"
 export SINGULARITYENV_CUDA_VISIBLE_DEVICES="$GPU"
+# VLM NIMs ship a NIM_MEDIA_IO_KWARGS default whose JSON quotes get mangled into
+# literal \" when the NIM SDK assembles the vLLM subprocess via shell=True, so the
+# backend's json.loads rejects it and the server dies at startup (a NIM-under-
+# Singularity quoting bug; works under `docker run`). An empty object has no quotes
+# or spaces to mis-escape, parses cleanly, and is fine because we only send images,
+# never video. Harmless for text-only NIMs, which ignore it.
+export SINGULARITYENV_NIM_MEDIA_IO_KWARGS='{}'
 # NIM builds a workspace VFS under TMPDIR. By default the container inherits the
 # host TMPDIR (e.g. /data1/.../tmp), which is NOT bound into the container, so it
 # can't be created -> "Error constructing Workspace VFS ... No such file or
 # directory". Pin it inside the bound, writable cache instead.
 export SINGULARITYENV_TMPDIR=/opt/nim/.cache/tmp
 
-# --writable-tmpfs: gives NIM a small writable overlay for scratch paths outside
-# the bound cache (rootfs is read-only under Singularity).
-exec singularity run --nv \
+# --no-eval: Singularity's default `run` re-evaluates the container's
+# ENTRYPOINT/CMD/ARGS through a shell, which mangles quoting — VLM NIMs pass a
+# JSON --media-io-kwargs that gets corrupted into literal {\"video\":...} and the
+# vLLM backend's json.loads then rejects it, killing startup. --no-eval uses
+# OCI-compatible behavior that preserves quoting (per the SIF's own runscript).
+# --writable-tmpfs: writable overlay for scratch paths outside the bound cache.
+exec singularity run --no-eval --nv \
   --writable-tmpfs \
   --bind "$NIM_CACHE":/opt/nim/.cache \
   "$SIF"

@@ -1078,17 +1078,34 @@ class SCAgent:
         }
 
     def _supports_vision(self) -> bool:
-        """Return False for models whose API doesn't accept image_url content (e.g. DeepSeek v4).
+        """True iff the main model's API accepts image_url content.
 
-        Honors SCAGENT_FORCE_TEXT_VISION=1 as a testing override so the sidecar
-        path can be exercised against a multimodal main model.
+        Resolution order (first match wins):
+          1. SCAGENT_FORCE_TEXT_VISION=1 — test override, always text-only.
+          2. SCAGENT_MAIN_HAS_VISION (0/1) — authoritative per-model override.
+             This is the reliable knob: a served model name does NOT encode
+             modality, so set it in .env whenever the heuristic can't be trusted.
+          3. Name allowlist of known-multimodal families. Default is text-only
+             (route to the sidecar) when unknown — that degrades gracefully,
+             whereas wrongly sending image_url to a text-only server hard-errors.
+
+        Text-only main models (Nemotron, GLM-5.2, DeepSeek, Llama-3.x, most Qwen
+        text variants, …) therefore correctly return False and use the sidecar.
         """
         if os.environ.get("SCAGENT_FORCE_TEXT_VISION", "").lower() in ("1", "true", "yes"):
             return False
+        override = (os.environ.get("SCAGENT_MAIN_HAS_VISION") or "").strip().lower()
+        if override:
+            return override in ("1", "true", "yes")
         m = (self.model or "").lower()
-        if "deepseek" in m:
-            return False
-        return True
+        # Known multimodal families (cloud + self-hosted). "-vl" catches the
+        # Qwen/Intern *-VL variants generically.
+        VISION_FAMILIES = (
+            "gpt-4o", "gpt-4-turbo", "gpt-5", "claude", "gemini",
+            "gemma-4", "qwen3.6", "qwen3.5", "-vl", "qwen2.5-vl",
+            "internvl", "pixtral", "llama-4", "molmo",
+        )
+        return any(k in m for k in VISION_FAMILIES)
 
     def _use_sidecar_for_images(self) -> bool:
         """True iff main model is text-only AND a vision sidecar is configured."""
