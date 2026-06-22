@@ -1,8 +1,13 @@
 # scagent as an Lmod module — reference
 
-How `module load scagent` is built and operated on the Iris HPC. Deployed +
-verified on a GPU node (iscb007, CUDA 13.1) on 2026-06-21. Status: testing phase
-for select members (not announced lab-wide yet).
+How `module load scagent` is built and operated on the Iris HPC. Status: testing
+phase for select members (not announced lab-wide yet).
+
+**The live module is now the pixi build** (lockfile-reproducible; deployed +
+verified on a GPU node with 8x H200 / CUDA 13.1 on 2026-06-21). The original
+conda-pack build is the predecessor — its scripts (`install_scagent_module.sh`,
+`update_scagent_code.sh`) are kept for reference, but the current path is
+`install_pixi_module.sh` / `update_pixi_code.sh`. Differences called out inline.
 
 ```bash
 module load scagent      # GPU node = accelerated; CPU node = scanpy fallback
@@ -27,16 +32,26 @@ Shared module tree (owned by group `grp_hpc_collab002`, on `$MODULEPATH` cluster
 ```
 /usersoftware/collab002/sail/tools/Modules/
 ├── modulefiles/scagent/
-│   ├── 0.1.0            # the TCL modulefile (what `module load` runs)
-│   └── .version         # "0.1.0" — the default version
-└── lib/scagent-0.1.0/   # the frozen ~15G env (relocated conda env)
-    ├── bin/scagent      # console script (shebang -> this env's python)
-    ├── lib/python3.14/site-packages/scagent/   # the frozen package
-    └── .env             # the shared lab config (640, group-readable)
+│   ├── 0.1.0                  # the TCL modulefile (what `module load` runs; pixi build)
+│   └── .version               # "0.1.0" — the default version
+├── lib/scagent-0.1.0-pixi/    # CURRENT: the pixi project dir
+│   ├── pixi.toml              # frozen deploy manifest (scagent non-editable)
+│   ├── pixi.lock              # exact solved pins (the reproducible record)
+│   ├── .env                   # the shared lab config (640, group-readable)
+│   └── .pixi/envs/default/    # the ~17G solved env
+│       ├── bin/scagent        #   console script (shebang -> this env's python)
+│       └── lib/python3.14/site-packages/scagent/   # the frozen package
+└── lib/scagent-0.1.0/         # PREDECESSOR: the conda-pack env (kept as fallback)
 ```
 
 Source of truth for the deploy artifacts (this directory, version-controlled):
-`deploy/scagent-module/` — installer, update script, modulefile, `.env.template`.
+`deploy/scagent-module/` — `pixi/` (manifest + lock), `install_pixi_module.sh`,
+`update_pixi_code.sh`, `_freeze_scagent.sh`, `modulefile/0.1.0-pixi`,
+`.env.template`, plus the predecessor conda scripts + `modulefile/0.1.0`.
+
+Note: the modulefile points `prefix` at `.pixi/envs/default` and sets
+`SCAGENT_HOME` to the project dir (`scagent-0.1.0-pixi`) so the shared `.env`,
+which sits next to the manifest rather than inside the pixi-managed env, is found.
 
 ---
 
@@ -47,29 +62,42 @@ pattern (see `…/Modules/modulefiles/AGENTS.md`): install software in
 `lib/<tool>-<ver>/`, write a modulefile that puts it on `PATH`, set `.version`.
 `cellranger` is a one-line `PATH` prepend; `segger` is the richer GPU precedent.
 
-scagent ships the **GPU/RAPIDS conda env** (the one `setup_gpu.sh` uses), so the
-build is more involved than a single binary:
+scagent ships the **GPU/RAPIDS env** (the same stack `setup_gpu.sh` uses), so the
+build is more involved than a single binary.
 
-1. **Relocate the env with conda-pack.** The env is pip-built (everything
-   `=pypi_0`), so `conda create --clone` can't reproduce it — it fails outright.
-   `conda-pack` tars the whole prefix and `conda-unpack` rewrites the baked-in
-   absolute paths at the new location. Result: a frozen ~15G copy.
-2. **Freeze scagent itself.** The dev env has scagent installed *editable*
-   (tracks the repo). The installer replaces that with a **non-editable wheel**
-   built from the repo, so `module load` is a stable snapshot that does NOT shift
-   when you edit your working tree.
-3. **The modulefile** (`deploy/scagent-module/modulefile/0.1.0`) reproduces
-   `setup_gpu.sh` in TCL:
-   - a `nvidia-smi` **GPU detection** (sets `SCAGENT_GPU=1` + preloads
-     `libnvJitLink` only when a CUDA 12/13 GPU is present; loads in CPU mode
-     otherwise — does NOT block the load);
-   - the env's `activate.d` deltas (GDAL/PROJ/glib/XML) **baked in as `setenv`**
-     — this Lmod's TCL has no `source-sh`, so they're set directly;
-   - the two `LD_PRELOAD` libs (`libstdc++`, `libnvJitLink`) in the right order;
-   - `SCAGENT_HOME` (→ install dir, so the shared `.env` is found), `SCAGENT_GPU=1`,
-     `SCIMILARITY_MODEL_PATH`, `SCAGENT_CELLBENDER`;
-   - `prepend-path PATH <prefix>/bin`.
-4. **Shared `.env`** placed at the install root, `chmod 640` group-readable.
+### Current: pixi (`install_pixi_module.sh`)
+
+1. **Build the env from a lockfile.** `pixi/pixi.toml` declares the RAPIDS 26.04 /
+   CUDA 13 stack as conda deps (channels `rapidsai/nvidia/conda-forge/bioconda`,
+   `channel-priority = "disabled"` — RAPIDS can't use strict) plus the PyPI side
+   (`scagent[all]`, `rapids-singlecell-cu13`, `gdown`). `pixi install` solves it
+   into `pixi.lock` (committed) and a ~17G env. **No conda-pack, no relocation** —
+   the env is built in place, so its paths are already correct.
+2. **Freeze scagent itself.** The deploy manifest installs scagent **non-editable**
+   from the repo, and the installer then **overwrites it with a fresh wheel**
+   (`_freeze_scagent.sh`) so the deployed code always matches the repo — pixi/uv
+   caches the built scagent wheel by version and would otherwise serve a stale copy
+   on a code change without a version bump (see Gotchas).
+3. **The modulefile** (`modulefile/0.1.0-pixi`) is much simpler than the conda one:
+   - `nvidia-smi` **GPU detection** (sets `SCAGENT_GPU=1` when a CUDA 12/13 GPU is
+     present; loads in CPU mode otherwise — does NOT block the load);
+   - the env's `activate.d` deltas (GDAL/PROJ/glib/XML) **baked in as `setenv`** —
+     this Lmod's TCL has no `source-sh`;
+   - **NO `LD_PRELOAD`** — pixi's real conda solve gives consistent libs, so the
+     `libstdc++` / `libnvJitLink` preload hack the conda build needed is gone
+     (verified: cupy/cuml/rapids_singlecell + torch + scvi-tools all run GPU ops in
+     one process without it);
+   - `SCAGENT_HOME` (→ the project dir, where the shared `.env` lives),
+     `SCAGENT_GPU=1`, `SCIMILARITY_MODEL_PATH`, `SCAGENT_CELLBENDER`;
+   - `prepend-path PATH <env>/bin`.
+4. **Shared `.env`** placed in the project dir, `chmod 640` group-readable.
+
+### Predecessor: conda-pack (`install_scagent_module.sh`)
+
+The first build relocated the pip-built `scagent_rapids` conda env with
+**conda-pack** + `conda-unpack` (`conda create --clone` fails on an all-`pypi_0`
+env), froze scagent via a non-editable wheel, and used `modulefile/0.1.0` with the
+two `LD_PRELOAD` libs. Kept as a fallback while the pixi build is in testing.
 
 ### Config / API keys — how the `.env` is found
 
@@ -87,7 +115,7 @@ add vars but cannot override it. **Editing the shared `.env` controls every user
 Edit the shared `.env` in place. The install dir is locked read-only, so:
 
 ```bash
-DIR=/usersoftware/collab002/sail/tools/Modules/lib/scagent-0.1.0
+DIR=/usersoftware/collab002/sail/tools/Modules/lib/scagent-0.1.0-pixi
 chmod u+w "$DIR"
 vi "$DIR/.env"            # e.g. point SCAGENT_BASE_URL at the running server
 chmod u-w "$DIR"; chmod 640 "$DIR/.env"
@@ -102,15 +130,18 @@ default.
 
 ### Push working-tree CODE changes into the module (in place)
 ```bash
-bash deploy/scagent-module/update_scagent_code.sh
+bash deploy/scagent-module/update_pixi_code.sh
 ```
 Rebuilds the wheel from the repo, **verifies every tracked source file is in the
-wheel** (guards the `.gitignore` trap below), reinstalls into the prefix, re-locks.
-Overwrites `0.1.0` in place — ideal for the test phase. Testers get it next launch.
+wheel** (guards the `.gitignore` trap below), force-reinstalls scagent into the
+pixi env, re-locks permissions. Overwrites `0.1.0` in place — ideal for the test
+phase. Testers get it next launch. (Force-reinstall is required: `pixi install`
+alone would NOT pick up a same-version code change — see Gotchas.)
 
-### New dependency or conda-env change
-Not covered by the code update. Either `pip install` the dep into
-`$PREFIX/bin/python`, or re-pack the whole env via `install_scagent_module.sh`.
+### New dependency or env change
+Not covered by the code update. Edit `pixi/pixi.toml` (add the dep), run
+`pixi install` to refresh `pixi/pixi.lock`, commit the lock, then re-run
+`install_pixi_module.sh` to rebuild the shared env from it.
 
 ### Cut a new, immutable version (for stable release later)
 See **§3a Versioning** below.
@@ -123,7 +154,7 @@ There are **two independent "versions"** and it helps to keep them straight:
 
 | Version | Where it's set | What it controls |
 |---|---|---|
-| **Module version** | `VERSION=` in `install_scagent_module.sh`; mirrored by the install dir name `lib/scagent-<ver>/`, the modulefile path `modulefiles/scagent/<ver>`, and `.version` | What users type: `module load scagent/<ver>`. The `.version` file picks the default when they just type `module load scagent`. |
+| **Module version** | `VERSION=` in `install_pixi_module.sh`; mirrored by the install dir name `lib/scagent-<ver>-pixi/`, the modulefile path `modulefiles/scagent/<ver>`, and `.version` | What users type: `module load scagent/<ver>`. The `.version` file picks the default when they just type `module load scagent`. |
 | **Package version** | `version = "x.y.z"` in `pyproject.toml` (`[project]`) | The wheel's own version (`scagent --version`, what pip records). Independent of the module version, though usually kept in sync. |
 
 ### What a version change physically looks like
@@ -139,25 +170,25 @@ Both stay loadable; `.version` only decides the default. Users pin explicitly wi
 
 ### To cut a new version
 1. (Usually) bump `version` in `pyproject.toml` so `scagent --version` reflects it.
-2. Set `VERSION=` to the new value in `install_scagent_module.sh`.
-3. Re-run `bash install_scagent_module.sh` → builds `lib/scagent-<new>/`, writes
+2. Set `VERSION=` to the new value in `install_pixi_module.sh`.
+3. Re-run `bash install_pixi_module.sh` → builds `lib/scagent-<new>-pixi/`, writes
    `modulefiles/scagent/<new>`, and updates `.version` to the new default.
-4. Set the lab key/config in the new `<prefix>/.env` (a fresh deploy starts from
-   `.env.template`; or copy the old version's `.env`).
+4. Set the lab key/config in the new `<dir>/.env` (a fresh deploy copies the
+   predecessor's `.env` if present, else seeds from `.env.template`).
 
-> Note: step 3 re-packs the **whole conda env** (~15G, minutes). Only do this when
-> the environment or dependencies changed, or when you genuinely want a frozen,
-> immutable snapshot users can pin.
+> Note: step 3 builds the **whole env** via `pixi install` (~17G, minutes). Only do
+> this when the environment/deps changed (refresh `pixi/pixi.lock` first), or when
+> you want a frozen, immutable snapshot users can pin.
 
 ### Which method for which change
 
 | Kind of change | Method | Bump version? |
 |---|---|---|
 | API key / model / `base_url` | edit shared `.env` in place | no |
-| scagent **Python code** (testing phase) | `update_scagent_code.sh` — overwrites `0.1.0` in place | no (stay on 0.1.0) |
-| scagent code, **stable release** people pin | bump version → `install_scagent_module.sh` | yes |
-| **New pip dependency** | `pip install` into `$PREFIX/bin/python` (quick), or re-pack via installer | only if releasing |
-| **conda-env / RAPIDS changes** | re-pack via `install_scagent_module.sh` | yes (new env = new version) |
+| scagent **Python code** (testing phase) | `update_pixi_code.sh` — overwrites `0.1.0` in place | no (stay on 0.1.0) |
+| scagent code, **stable release** people pin | bump version → `install_pixi_module.sh` | yes |
+| **New pip / conda dependency** | edit `pixi/pixi.toml`, `pixi install` to refresh the lock, commit, then `install_pixi_module.sh` | only if releasing |
+| **RAPIDS / CUDA bump** | edit pins in `pixi/pixi.toml`, re-lock, re-deploy | yes (new env = new version) |
 
 Rule of thumb: **overwrite `0.1.0` in place while iterating with testers**
 (everyone always wants your latest); **bump to a new version once others depend on
@@ -165,9 +196,9 @@ a stable build** and you don't want to move it under them.
 
 ### First-time full deploy (already done; for reference / a fresh version)
 ```bash
-bash deploy/scagent-module/install_scagent_module.sh --dry-run   # validate, write nothing
-bash deploy/scagent-module/install_scagent_module.sh             # conda-pack + freeze + install
-# then set the lab key in <prefix>/.env
+bash deploy/scagent-module/install_pixi_module.sh --dry-run   # validate, write nothing
+bash deploy/scagent-module/install_pixi_module.sh             # pixi install + freeze + modulefile
+# then set the lab key in <dir>/.env
 ```
 Run on a GPU node, as a `grp_hpc_collab002` member, with PyPI access.
 
@@ -175,6 +206,26 @@ Run on a GPU node, as a `grp_hpc_collab002` member, with PyPI access.
 
 ## 4. Gotchas (so they don't bite again)
 
+- **pixi defaults to strict channel priority; RAPIDS needs it off.** Without
+  `channel-priority = "disabled"` in `[workspace]`, the RAPIDS solve fails. This is
+  the single most important line in `pixi.toml`.
+- **`pixi install` won't pick up a same-version code change.** pixi/uv caches the
+  built scagent wheel by version; if you edit code but leave `version = "0.1.0"`,
+  `pixi install` sees the lock satisfied and no-ops, serving the stale build
+  (verified). That's why both `install_pixi_module.sh` and `update_pixi_code.sh`
+  force-reinstall scagent from a freshly built wheel (`_freeze_scagent.sh`).
+- **Don't pin torch to the cu13 wheel.** It seems right (the driver is cu13), but
+  `download.pytorch.org/whl/cu130` torch conflicts with the conda-pinned
+  `cuda-bindings==13.3.1` and makes the solve unsatisfiable. The default `+cu128`
+  torch runs fine on the cu13 driver.
+- **`PYTHONPATH` shadows the frozen env.** A dev shell that sourced `setup*.sh`
+  exports `PYTHONPATH=<repo>`, so `import scagent` resolves to the repo, not the
+  frozen env — which can look like the freeze failed. `module load` sets no
+  PYTHONPATH, so users are unaffected; the deploy/update scripts verify with
+  `env -u PYTHONPATH` from `/tmp` to avoid the false alarm.
+- **`scvi-tools` was an undeclared dependency.** scagent's scVI batch correction
+  imports it but it was missing from `pyproject.toml` (hand-installed in the old
+  conda env). Now declared as the `scvi` extra and pulled in via `scagent[all]`.
 - **`source-sh` is unavailable in this Lmod's TCL** → modulefile errored with
   `invalid command name "source-sh"`. We bake the `activate.d` env vars as `setenv`
   instead. (A `.lua` modulefile with `source_sh` would also work.)
@@ -183,7 +234,8 @@ Run on a GPU node, as a `grp_hpc_collab002` member, with PyPI access.
   and **silently dropped it from every wheel** (git itself didn't, since it's
   tracked — only `git check-ignore --no-index` flags it). Broke `scagent --help`
   with `ModuleNotFoundError: scagent.agent.run_manager`. Fixed: `run*` → `run*/`.
-  `update_scagent_code.sh` now hard-checks wheel completeness to catch a recurrence.
+  The wheel-freeze step (`_freeze_scagent.sh`) hard-checks wheel completeness to
+  catch a recurrence.
 - **conda `--clone` can't relocate a pip-built env** — use conda-pack.
 - **The wheel build needs PyPI access** (the hatchling backend isn't in the env);
   installing the built wheel does not.
@@ -192,12 +244,26 @@ Run on a GPU node, as a `grp_hpc_collab002` member, with PyPI access.
 
 ## 5. Follow-ups (deferred)
 
-1. **`SCIMILARITY_MODEL_PATH` (41G) + `SCAGENT_CELLBENDER` still point at personal
-   `ibrahih3` dirs.** `/data1/peerd` is full; relocate to shared group storage and
-   update the two `setenv` lines in the modulefile.
-2. **Migrate the env to pixi** (house convention, like `segger`; lockfile-
-   reproducible) instead of the opaque conda-pack blob. Seed `pixi.toml` with exact
-   pins from the current env to de-risk the resolve.
-3. **Stable default provider:** decide whether the lab `.env` should point at the
+1. ~~SCIMILARITY_MODEL_PATH + SCAGENT_CELLBENDER point at personal dirs.~~ **DONE
+   (2026-06-22).** Both now live in the shared sail tree, world-readable:
+   - SCimilarity v2 models at `/data1/collab002/sail/shared/models/sci/{human_v2,
+     mouse_v1}` (the module sets `SCIMILARITY_MODEL_PATH` + `SCIMILARITY_MODEL_PATH_MOUSE`;
+     scagent auto-picks by organism). Opened with `chmod -R o+rX` on just those two
+     model dirs — siblings (`human_v2_old`, `immune_cd8_nk_finetuned`) stay locked;
+     the `sci`/`models` parents keep traverse-only (`o+x`), so nothing else is exposed.
+   - CellBender rebuilt as a shared pixi env at
+     `/data1/collab002/sail/shared/tools/cellbender` (manifest+lock in repo at
+     `cellbender-pixi/`). Now torch 2.10+cu128 → **GPU-capable** (the old personal
+     env's torch 1.13/cu117 predated Hopper, so it was CPU-only on the H200s).
+2. **Retire the conda-pack predecessor.** Once the pixi build has had enough test
+   mileage, remove `lib/scagent-0.1.0/` (~15G) and the conda scripts
+   (`install_scagent_module.sh`, `update_scagent_code.sh`, `modulefile/0.1.0`).
+   Reclaim with: `chmod -R u+w lib/scagent-0.1.0 && rm -rf lib/scagent-0.1.0`.
+3. **pixi binary is in a personal dir.** It's at
+   `/usersoftware/peerd/ibrahih3/.pixi/bin/pixi` (cache at
+   `$PIXI_CACHE_DIR=/usersoftware/peerd/ibrahih3/.pixi/cache`). The lab tree already
+   ships a shared `pixi` module (`lib/pixi`); consider standardizing on it so deploys
+   don't depend on a personal install.
+4. **Stable default provider:** decide whether the lab `.env` should point at the
    self-hosted endpoint (current) or Anthropic (robust) before wider rollout.
 ```

@@ -1,0 +1,63 @@
+# =============================================================================
+# scagent GPU/RAPIDS environment — pixi manifest  (DRAFT / experimental)
+# =============================================================================
+# Goal: a lockfile-reproducible replacement for the conda-pack blob that the
+# Lmod module currently ships (see ../README.md "Follow-ups"). The current
+# scagent_rapids env is pip-built on top of conda, so it can only be relocated
+# with conda-pack and has no lockfile. pixi gives us `pixi.lock` (exact, solved
+# pins) and a single `pixi install` that any lab member can reproduce.
+#
+# This mirrors setup_gpu.sh's `scagent_rapids` env, which is itself the
+# rapids_singlecell recipe (conda/rsc_rapids_26.04_cuda13.yml):
+#   channels: rapidsai, nvidia, conda-forge, bioconda
+#   conda:    rapids=26.04, python=3.14, cuda-version=13.1, cudnn, cutensor,
+#             cusparselt
+#   pip:      rapids-singlecell-cu13, gdown, scikit-misc  (+ scagent itself)
+#
+# STATUS: not yet validated with a real `pixi install`. /data1/peerd is full,
+# and a RAPIDS solve pulls ~15G, so the env must NOT live next to this manifest
+# on /data1. Resolve/build it on /usersoftware (which has space), e.g.:
+#   export PIXI_CACHE_DIR=/usersoftware/peerd/ibrahih3/.pixi/cache
+#   pixi install --manifest-path deploy/scagent-module/pixi/pixi.toml
+# (or run pixi from a working copy that lives on /usersoftware).
+# =============================================================================
+
+[workspace]
+name = "scagent-rapids"
+channels = ["rapidsai", "nvidia", "conda-forge", "bioconda"]
+platforms = ["linux-64"]
+# RAPIDS does not support strict channel priority (its packages are spread
+# across rapidsai/nvidia/conda-forge). pixi defaults to "strict"; the conda
+# recipe uses channel_priority: flexible. "disabled" is pixi's equivalent.
+channel-priority = "disabled"
+
+# --- conda packages: the CUDA / RAPIDS core (everything that needs a compiled,
+#     ABI-matched build). Same pins as the rapids_singlecell CUDA 13 recipe. ---
+[dependencies]
+rapids = "26.04.*"
+python = "3.14.*"
+cuda-version = "13.1.*"
+cudnn = "*"
+cutensor = "*"
+cusparselt = "*"
+pip = "*"
+
+# --- PyPI packages: scagent + the rsc wheel, resolved by uv against the conda
+#     env. scagent (editable, extras=all) drags in scanpy/numpy/anndata/etc.,
+#     matching setup_gpu.sh's `pip install -e .[all]`. scikit-misc already comes
+#     in via scagent's deps; gdown is only for rsc example data. ---
+[pypi-dependencies]
+# scagent[all] now pulls scvi-tools too (declared as the `scvi` extra in
+# pyproject.toml), so it no longer needs listing here.
+scagent = { path = "../../..", editable = true, extras = ["all"] }
+rapids-singlecell-cu13 = "*"
+gdown = "*"
+# torch is left at the PyPI default (resolves a +cu128 wheel). We tried pinning the
+# cu130 build (download.pytorch.org/whl/cu130) for driver parity, but it makes the
+# solve UNSATISFIABLE — the cu130 wheel conflicts with the conda-pinned
+# cuda-bindings==13.3.1. The +cu128 torch runs fine on the cu13 driver (verified:
+# torch + cuml + cupy + scvi-tools all do GPU ops in one process), so we keep it.
+
+[tasks]
+start = "scagent start"
+gpu-check = "python -c 'import cupy, rapids_singlecell as r; print(\"rsc\", r.__version__, \"| GPUs\", cupy.cuda.runtime.getDeviceCount())'"

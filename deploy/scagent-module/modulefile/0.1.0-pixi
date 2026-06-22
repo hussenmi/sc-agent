@@ -1,0 +1,78 @@
+#%Module 1.0
+#
+#  scagent module  (pixi / RAPIDS env)
+#
+#  Activates the frozen, lockfile-reproducible scagent GPU env built by pixi
+#  (deploy/scagent-module/install_pixi_module.sh). Lab members just
+#  `module load scagent` then run `scagent start`. Nothing is installed on their
+#  end.
+#
+#  Unlike the old conda-pack build, this needs NO LD_PRELOAD: pixi does a proper
+#  conda solve, so cupy/cuml/rapids_singlecell + torch + scvi-tools all coexist
+#  without the libstdc++ / libnvJitLink preload hack. See the README.
+#
+module-whatis "scagent"
+module-whatis "Version: 0.1.0"
+module-whatis "Description: single-cell analysis agent (GPU/RAPIDS, pixi)"
+
+# $base is the pixi project dir (holds pixi.toml/pixi.lock + the shared .env);
+# $prefix is the solved env inside it (the conda-style prefix on PATH).
+set base   /usersoftware/collab002/sail/tools/Modules/lib/scagent-0.1.0-pixi
+set prefix $base/.pixi/envs/default
+
+# --- Detect a CUDA GPU (not required. scagent falls back to CPU/scanpy) ---
+# GPU only accelerates the heavy steps; the code runs fine CPU-only, so we don't
+# block the load. We just record whether a GPU is here and configure accordingly.
+set has_gpu 0
+if { ![catch { exec nvidia-smi } out] &&
+     [regexp {CUDA Version:\s+(1[23]\.\d+)} $out] } {
+    set has_gpu 1
+}
+
+# --- conda activate.d deltas, baked as setenv (this Lmod's TCL has no source-sh) ---
+# Same hooks as the env's etc/conda/activate.d/*.sh (gdal/proj/glib/xml). All are
+# prefix-derived constants. Recapture if the env's activate.d hooks change.
+# We deliberately do NOT set CONDA_PREFIX (avoids the conda-on-conda footgun);
+# the values below are absolute, so they don't need it.
+setenv CPL_ZIP_ENCODING       UTF-8
+setenv GDAL_DATA              $prefix/share/gdal
+setenv GDAL_DRIVER_PATH       $prefix/lib/gdalplugins
+setenv GSETTINGS_SCHEMA_DIR   $prefix/share/glib-2.0/schemas
+setenv PROJ_DATA              $prefix/share/proj
+setenv PROJ_NETWORK           ON
+setenv XML_CATALOG_FILES      "file://$prefix/etc/xml/catalog file:///etc/xml/catalog"
+
+# scagent runtime config. SCAGENT_HOME points at $base (NOT $prefix) so scagent's
+# _load_dotenv finds the shared .env, which lives next to the manifest rather than
+# inside the pixi-managed env dir.
+setenv SCAGENT_HOME $base
+# Only enable GPU acceleration when a GPU is actually here. On CPU nodes we leave
+# SCAGENT_GPU unset so scagent uses scanpy without emitting "GPU unavailable" noise.
+if { $has_gpu } {
+    setenv SCAGENT_GPU 1
+}
+
+# SCimilarity reference models + CellBender, in the shared sail tree (group/world
+# readable) so every module user can reach them. SCimilarity picks human vs mouse
+# by detected organism (scagent/annotation/scimilarity.py reads both vars).
+# CellBender is a separate pixi env (its deps conflict with the RAPIDS stack).
+setenv SCIMILARITY_MODEL_PATH       /data1/collab002/sail/shared/models/sci/human_v2
+setenv SCIMILARITY_MODEL_PATH_MOUSE /data1/collab002/sail/shared/models/sci/mouse_v1
+setenv SCAGENT_CELLBENDER           /data1/collab002/sail/shared/tools/cellbender/.pixi/envs/default/bin/cellbender
+
+# Put the env's bin on PATH first so its python / scagent script win.
+prepend-path PATH $prefix/bin
+
+if { [module-info mode load] } {
+    if { $has_gpu } {
+        set mode "GPU acceleration ON"
+    } else {
+        set mode "CPU only (no CUDA GPU detected)"
+    }
+    puts stderr ""
+    puts stderr "    scagent 0.1.0 loaded  -  $mode"
+    puts stderr "  ============================================================"
+    puts stderr "    Start:      scagent start"
+    puts stderr "    When done:  module unload scagent"
+    puts stderr ""
+}

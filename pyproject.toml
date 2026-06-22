@@ -53,6 +53,9 @@ agent = [
 scimilarity = [
     "scimilarity>=0.4",  # Embedding-based cell type annotation
 ]
+scvi = [
+    "scvi-tools>=1.0",  # scVI deep-learning batch correction (batch/_scvi_worker.py)
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
@@ -67,7 +70,7 @@ tracing = [
     "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 all = [
-    "scagent[agent,scimilarity,dev,tracing]",
+    "scagent[agent,scimilarity,scvi,dev,tracing]",
 ]
 
 [project.scripts]

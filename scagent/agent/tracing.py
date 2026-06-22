@@ -13,13 +13,22 @@ If a W3C ``traceparent`` is present in the environment (propagated from NAT's
 eval workflow span into the scagent subprocess), the root nests under it, so the
 whole run renders as one trace in Phoenix alongside NAT's eval score.
 
+A second, independent sink exists for the NAT integration: if ``SCAGENT_STEP_LOG``
+points at a path, every LLM and tool step is also appended there as one JSON line
+(``{type, iteration, tokens..., start_ns, end_ns}``). This works even when OTel
+tracing is OFF, because the NAT eval wrapper replays these steps into NAT's
+intermediate-step event bus (so NAT's profiler/trajectory eval see per-LLM tokens
+and per-tool timings even though scagent runs as an opaque subprocess).
+
 Env:
   SCAGENT_TRACE=1            enable tracing
   SCAGENT_OTLP_ENDPOINT=...  OTLP/HTTP collector (e.g. http://localhost:6006 for Phoenix)
   SCAGENT_TRACE_CONSOLE=1    also print spans to stderr (handy for validation)
+  SCAGENT_STEP_LOG=...       append per-step JSONL here (for the NAT event bridge)
   TRACEPARENT / TRACESTATE   W3C context to nest under (set by the NAT wrapper)
 """
 
+import json
 import os
 import time
 
@@ -42,6 +51,31 @@ def _truthy(v) -> bool:
 
 def now_ns() -> int:
     return time.time_ns()
+
+
+_step_log_inited = False
+_step_log_path: str | None = None
+
+
+def _step_log() -> str | None:
+    """Resolve SCAGENT_STEP_LOG once (independent of OTel tracing)."""
+    global _step_log_inited, _step_log_path
+    if not _step_log_inited:
+        _step_log_inited = True
+        _step_log_path = os.environ.get("SCAGENT_STEP_LOG") or None
+    return _step_log_path
+
+
+def _emit_step(record: dict) -> None:
+    """Append one step as a JSON line for the NAT event bridge (best-effort)."""
+    path = _step_log()
+    if not path:
+        return
+    try:
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # step logging must never break a run
 
 
 def enabled() -> bool:
@@ -138,6 +172,15 @@ def _child(name: str, t0_ns: int, attributes: dict) -> None:
 
 def record_llm(iteration, model, input_tokens, output_tokens, t0_ns) -> None:
     global _in_tokens, _out_tokens, _llm_calls
+    _emit_step({
+        "type": "llm",
+        "iteration": iteration,
+        "model": str(model),
+        "prompt_tokens": int(input_tokens) if input_tokens is not None else 0,
+        "completion_tokens": int(output_tokens) if output_tokens is not None else 0,
+        "start_ns": int(t0_ns),
+        "end_ns": now_ns(),
+    })
     if _tracer is None or _root is None:
         return
     _llm_calls += 1
@@ -161,6 +204,13 @@ def record_llm(iteration, model, input_tokens, output_tokens, t0_ns) -> None:
 
 
 def record_tool(name, iteration, t0_ns) -> None:
+    _emit_step({
+        "type": "tool",
+        "name": str(name),
+        "iteration": iteration,
+        "start_ns": int(t0_ns),
+        "end_ns": now_ns(),
+    })
     if _tracer is None or _root is None:
         return
     _child(f"tool.{name}", t0_ns,

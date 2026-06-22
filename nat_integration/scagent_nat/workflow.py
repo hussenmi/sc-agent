@@ -15,11 +15,18 @@ import hashlib
 import json
 import os
 import time
+import uuid as _uuid
 
 from nat.builder.builder import Builder
 from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function
 from nat.data_models.function import FunctionBaseConfig
+from nat.data_models.intermediate_step import (
+    IntermediateStepPayload,
+    IntermediateStepType,
+    UsageInfo,
+)
+from nat.data_models.token_usage import TokenUsageBaseModel
 
 # h5ad files that are NOT the final annotated object.
 _NON_FINAL = ("checkpoint", "pre_cleanup", "pre_batch", "intermediate")
@@ -68,6 +75,61 @@ def _find_annotated_h5ad(run_dir: str) -> str | None:
         return None
     real.sort(key=lambda c: ("annot" not in os.path.basename(c).lower(), -os.path.getmtime(c)))
     return real[0]
+
+
+def _replay_steps_into_nat(step_log: str) -> int:
+    """Replay scagent's per-step JSONL into NAT's intermediate-step event bus.
+
+    scagent runs as an opaque subprocess, so NAT's profiler/trajectory eval see no
+    per-LLM or per-tool events on their own. scagent writes one JSON line per step
+    (LLM token counts + start/end ns, tool name + start/end ns) to SCAGENT_STEP_LOG;
+    here we push a matched START/END pair per step (sharing a UUID, carrying the
+    *recorded* timestamps) so the profiler computes real per-call durations and
+    token metrics. Best-effort: never raise into the eval loop.
+
+    Returns the number of steps replayed.
+    """
+    if not step_log or not os.path.exists(step_log):
+        return 0
+    try:
+        from nat.builder.context import Context
+        ism = Context.get().intermediate_step_manager
+    except Exception:
+        return 0
+
+    n = 0
+    try:
+        with open(step_log) as fh:
+            steps = [json.loads(line) for line in fh if line.strip()]
+    except Exception:
+        return 0
+    steps.sort(key=lambda s: s.get("start_ns", 0))
+
+    for s in steps:
+        is_llm = s.get("type") == "llm"
+        start_t = s.get("start_ns", 0) / 1e9
+        end_t = s.get("end_ns", 0) / 1e9
+        name = s.get("model") if is_llm else s.get("name")
+        usage = None
+        if is_llm:
+            pt = int(s.get("prompt_tokens", 0))
+            ct = int(s.get("completion_tokens", 0))
+            usage = UsageInfo(token_usage=TokenUsageBaseModel(
+                prompt_tokens=pt, completion_tokens=ct, total_tokens=pt + ct),
+                num_llm_calls=1)
+        uid = _uuid.uuid4().hex  # shared across the START/END pair so durations pair up
+        start_type = IntermediateStepType.LLM_START if is_llm else IntermediateStepType.TOOL_START
+        end_type = IntermediateStepType.LLM_END if is_llm else IntermediateStepType.TOOL_END
+        try:
+            ism.push_intermediate_step(IntermediateStepPayload(
+                event_type=start_type, event_timestamp=start_t, name=name, UUID=uid))
+            ism.push_intermediate_step(IntermediateStepPayload(
+                event_type=end_type, event_timestamp=end_t, name=name,
+                usage_info=usage, UUID=uid))
+            n += 1
+        except Exception:
+            continue
+    return n
 
 
 _NAT_PROVIDER = None
@@ -154,6 +216,9 @@ async def scagent_analyze(config: SCAgentAnalyzeConfig, builder: Builder):
                     pass
 
         run_name = "nat_%s_%d" % (hashlib.sha1(request.encode()).hexdigest()[:8], int(time.time()))
+        # Per-step JSONL scagent appends to; we replay it into NAT's event bus after
+        # the run so the profiler/trajectory eval see per-LLM tokens + per-tool timings.
+        step_log = os.path.join(config.output_root, "%s.steps.jsonl" % run_name)
         env = {
             **os.environ,
             "SCAGENT_PROVIDER": config.provider,
@@ -161,6 +226,7 @@ async def scagent_analyze(config: SCAgentAnalyzeConfig, builder: Builder):
             "SCAGENT_BASE_URL": config.base_url,
             "SCAGENT_API_KEY": config.api_key,
             "OPENAI_API_KEY": config.api_key,
+            "SCAGENT_STEP_LOG": step_log,
         }
         if config.trace:
             env["SCAGENT_TRACE"] = "1"
@@ -209,6 +275,10 @@ async def scagent_analyze(config: SCAgentAnalyzeConfig, builder: Builder):
         run_dir = max(pool, key=os.path.getmtime) if pool else None
         annotated = _find_annotated_h5ad(run_dir) if run_dir else None
 
+        # Replay scagent's recorded steps into NAT so the profiler/trajectory eval
+        # see per-LLM tokens + per-tool timings (subprocess is otherwise opaque).
+        steps_replayed = _replay_steps_into_nat(step_log)
+
         _finalize(rc=proc.returncode if proc.returncode is not None else -1,
                   elapsed=round(time.time() - t0, 1), run_dir=run_dir, annotated=annotated)
         return json.dumps({
@@ -216,6 +286,7 @@ async def scagent_analyze(config: SCAgentAnalyzeConfig, builder: Builder):
             "annotated_h5ad": annotated,
             "returncode": proc.returncode,
             "elapsed_s": round(time.time() - t0, 1),
+            "steps_replayed": steps_replayed,
             "stdout_tail": tail,
         })
 
