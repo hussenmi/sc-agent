@@ -2879,7 +2879,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "n_pcs": {"type": "integer", "description": "BBKNN only: number of PCA components to use (default: 30)"},
                     "neighbors_within_batch": {"type": "integer", "description": "BBKNN only: neighbors contributed per batch per cell (default: 3; total = n_batches × this value)"},
                     "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
-                    "max_epochs": {"type": "integer", "description": "scVI only: upper bound on training epochs (default: 200; early stopping usually halts sooner). Use fewer only for quick tests."},
+                    "max_epochs": {"type": "integer", "description": "scVI only: upper bound on training epochs. Leave unset to use scVI's cell-count heuristic (400 for <=20k cells, decaying above); early stopping halts sooner once the validation ELBO plateaus. A train/validation ELBO convergence plot (scvi_training_loss.png) and per-epoch history CSV are saved, and the result reports epochs_trained / early_stopped / final ELBOs. Set a small value (e.g. 10) only for quick tests."},
                     "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
                 },
                 "required": []
@@ -10208,7 +10208,10 @@ def process_tool_call(
                 corrected_rep = None
             elif method == "scvi":
                 n_latent = int(tool_input.get("n_latent") or 30)
-                max_epochs = int(tool_input.get("max_epochs") or 200)
+                # Leave max_epochs unset (None) unless the user gave one, so run_scvi
+                # falls back to scVI's cell-count heuristic rather than a fixed cap.
+                _raw_max_epochs = tool_input.get("max_epochs")
+                max_epochs = int(_raw_max_epochs) if _raw_max_epochs else None
                 store_normalized = bool(tool_input.get("store_normalized", False))
                 # scVI requires raw integer counts — validate before training
                 try:
@@ -10225,12 +10228,16 @@ def process_tool_call(
                         ],
                         extra={"method": "scvi"},
                     )
+                scvi_diag_dir = (
+                    str(Path(run_manager.run_dir) / "figures") if run_manager is not None else None
+                )
                 run_scvi(
                     adata,
                     batch_key=batch_key,
                     n_latent=n_latent,
                     max_epochs=max_epochs,
                     store_normalized=store_normalized,
+                    diagnostics_dir=scvi_diag_dir,
                 )
                 corrected_rep = "X_scVI"
             else:
@@ -10269,8 +10276,40 @@ def process_tool_call(
             extra = {}
             if method == "scvi":
                 extra["n_latent"] = int(tool_input.get("n_latent") or 30)
-                extra["max_epochs"] = int(tool_input.get("max_epochs") or 200)
                 extra["scvi_normalized_stored"] = bool(tool_input.get("store_normalized", False))
+                # Surface what actually happened during training (epochs run vs cap,
+                # convergence, loss-curve artifact) rather than just the requested cap.
+                training = adata.uns.get("scvi_training") or {}
+                extra["max_epochs"] = training.get("resolved_max_epochs") or max_epochs
+                for key in (
+                    "epochs_trained",
+                    "early_stopped",
+                    "final_elbo_train",
+                    "final_elbo_validation",
+                    "best_val_epoch",
+                    "overfitting_warning",
+                ):
+                    if training.get(key) is not None:
+                        extra[key] = training[key]
+                loss_plot = training.get("loss_plot")
+                if loss_plot and os.path.exists(loss_plot):
+                    extra["training_loss_plot"] = loss_plot
+                    plot_artifact = _artifact_payload(
+                        loss_plot,
+                        role="figure",
+                        metadata={"kind": "scvi_training_loss"},
+                    )
+                    if plot_artifact is not None:
+                        artifacts_created.append(plot_artifact)
+                history_csv = training.get("history_csv")
+                if history_csv and os.path.exists(history_csv):
+                    csv_artifact = _artifact_payload(
+                        history_csv,
+                        role="artifact",
+                        metadata={"kind": "scvi_training_history"},
+                    )
+                    if csv_artifact is not None:
+                        artifacts_created.append(csv_artifact)
             elif method == "bbknn":
                 extra["n_pcs"] = int(tool_input.get("n_pcs") or 30)
                 extra["neighbors_within_batch"] = int(tool_input.get("neighbors_within_batch") or 3)

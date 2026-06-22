@@ -122,13 +122,14 @@ def run_scvi(
     adata: AnnData,
     batch_key: str,
     n_latent: int = 30,
-    max_epochs: int = 200,
+    max_epochs: int | None = None,
     layer: str = "raw_counts",
     latent_key: str = "X_scVI",
     store_normalized: bool = False,
     use_gpu: bool = True,
     use_hvg: bool = True,
     early_stopping: bool = True,
+    diagnostics_dir: str | None = None,
     inplace: bool = True,
 ) -> AnnData | None:
     """
@@ -148,9 +149,12 @@ def run_scvi(
     n_latent : int, default 30
         Dimensionality of the latent space. 30 matches PCA dims used
         for Harmony/Scanorama for comparability.
-    max_epochs : int, default 200
-        Training epochs. 200 is recommended for real data; use fewer
-        only for quick tests (notebook demo used 10).
+    max_epochs : int or None, default None
+        Upper bound on training epochs. When None, scVI's own cell-count
+        heuristic is used (``get_max_epochs_heuristic``: 400 for <=20k cells,
+        decaying above) — the library's recommended default. Early stopping
+        still halts sooner once the validation ELBO plateaus, so this is only a
+        cap. Pass an explicit integer for a quick test (e.g. 10) or to override.
     layer : str, default 'raw_counts'
         Layer containing raw integer counts. scVI requires non-normalized
         counts — it models the count generating process directly.
@@ -173,6 +177,13 @@ def run_scvi(
     early_stopping : bool, default True
         Stop training once the validation ELBO plateaus instead of always
         running the full ``max_epochs``.
+    diagnostics_dir : str or None, default None
+        If given, the training worker writes a per-epoch loss history CSV
+        (``scvi_training_history.csv``) and a train-vs-validation ELBO
+        convergence plot (``scvi_training_loss.png``) here. Training metrics
+        (resolved epoch cap, epochs actually trained, early-stop flag, final
+        ELBOs, overfitting warning, artifact paths) are stored on
+        ``adata.uns['scvi_training']`` regardless.
     inplace : bool, default True
         Modify adata in place.
 
@@ -213,9 +224,10 @@ def run_scvi(
         )
 
     n_batches = adata.obs[batch_key].nunique()
+    epochs_label = max_epochs if max_epochs is not None else "auto (scVI heuristic)"
     logger.info(
         f"Running scVI batch correction: {n_batches} batches, "
-        f"n_latent={n_latent}, max_epochs={max_epochs}"
+        f"n_latent={n_latent}, max_epochs={epochs_label}"
     )
 
     # Train on the HVG subset when available — scVI on a few thousand HVGs is
@@ -267,6 +279,7 @@ def run_scvi(
         normalized_out = os.path.join(work_dir, "normalized.npy")
         columns_out = os.path.join(work_dir, "columns.json")
         error_out = os.path.join(work_dir, "error.txt")
+        metrics_out = os.path.join(work_dir, "metrics.json")
         spec_path = os.path.join(work_dir, "spec.json")
         child.write(input_h5ad)
         with open(spec_path, "w") as f:
@@ -283,6 +296,8 @@ def run_scvi(
                     "normalized_out": normalized_out,
                     "columns_out": columns_out,
                     "error_out": error_out,
+                    "metrics_out": metrics_out,
+                    "diagnostics_dir": diagnostics_dir,
                 },
                 f,
             )
@@ -304,6 +319,22 @@ def run_scvi(
         # Latent maps straight onto the full adata (cell order unchanged).
         adata.obsm[latent_key] = np.load(latent_out)
         logger.info(f"scVI latent representation stored in adata.obsm['{latent_key}']")
+
+        # Surface training diagnostics (epochs trained, convergence, artifact paths).
+        if os.path.exists(metrics_out):
+            with open(metrics_out) as f:
+                training_metrics = json.load(f)
+            adata.uns["scvi_training"] = training_metrics
+            if training_metrics.get("epochs_trained") is not None:
+                logger.info(
+                    "scVI trained %s/%s epochs (early_stopped=%s)%s",
+                    training_metrics.get("epochs_trained"),
+                    training_metrics.get("resolved_max_epochs"),
+                    training_metrics.get("early_stopped"),
+                    "; " + training_metrics["overfitting_warning"]
+                    if training_metrics.get("overfitting_warning")
+                    else "",
+                )
 
         if store_normalized:
             norm = np.load(normalized_out)

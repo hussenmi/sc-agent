@@ -72,7 +72,6 @@ if { [module-info mode load] } {
     puts stderr "    scagent 0.1.0 loaded  -  $mode"
     puts stderr "  ============================================================"
     puts stderr "    Start:      scagent start"
-    puts stderr "    Help:       scagent --help"
     puts stderr "    When done:  module unload scagent"
     puts stderr ""
 }
