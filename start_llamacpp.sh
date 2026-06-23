@@ -49,6 +49,11 @@ THINKING=${THINKING:-0}
 SERVED_NAME=${SERVED_NAME:-"GLM-5.2"}
 GPU_IDS=${GPU_IDS:-""}          # explicit GPU index list, e.g. "0,1,5,7" — overrides
                                 # autoselect. Use on shared nodes to skip GPUs others use.
+# Multi-GPU split mode: layer (default; pools VRAM, ~1 GPU's compute) or tensor
+# (real tensor parallelism — splits weights AND KV, parallelizes compute). `tensor`
+# needs build 9737+ and fast interconnect (NVLink/NVSwitch). Try tensor for MoE
+# speed on a full node; falls back to layer if the model/arch isn't supported.
+SPLIT_MODE=${SPLIT_MODE:-layer}
 
 HF_DIR="/data1/peerd/ibrahih3/hf"
 LLAMACPP_SIF=${LLAMACPP_SIF:-"/data1/peerd/ibrahih3/llamacpp-server-cuda.sif"}
@@ -151,7 +156,7 @@ FLAGS=(
   --model "$GGUF_CONTAINER"
   --alias "$SERVED_NAME"
   -ngl 999
-  -sm layer
+  -sm "$SPLIT_MODE"
   --jinja
   -c "$TOTAL_CTX"
   --parallel "$PARALLEL"
@@ -164,7 +169,7 @@ if [[ -n "$KV_TYPE" ]]; then
   FLAGS+=(--cache-type-k "$KV_TYPE" --cache-type-v "$KV_TYPE" -fa on)
   echo "Config:   layer-split, KV=$KV_TYPE (flash-attn on)"
 else
-  echo "Config:   layer-split, KV=f16"
+  echo "Config:   ${SPLIT_MODE}-split, KV=f16"
 fi
 
 # Thinking off by default for fast tool-calling turns. If your llama.cpp build

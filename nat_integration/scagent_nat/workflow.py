@@ -48,6 +48,10 @@ class SCAgentAnalyzeConfig(FunctionBaseConfig, name="scagent_analyze"):
     trace: bool = False
     otlp_endpoint: str = ""               # e.g. http://localhost:6006 (Phoenix)
     trace_project: str = "scagent-nat-eval"
+    # Collect each run's full LLM I/O (input messages -> assistant action) to a
+    # per-run JSONL for trajectory/distillation data. Off by default; "collect now
+    # or lose it" — must be on BEFORE a run to capture it.
+    collect_trajectory: bool = False
 
 
 def _subdirs(root: str) -> set[str]:
@@ -228,6 +232,9 @@ async def scagent_analyze(config: SCAgentAnalyzeConfig, builder: Builder):
             "OPENAI_API_KEY": config.api_key,
             "SCAGENT_STEP_LOG": step_log,
         }
+        if config.collect_trajectory:
+            env["SCAGENT_TRAJECTORY_LOG"] = os.path.join(
+                config.output_root, "%s.trajectory.jsonl" % run_name)
         if config.trace:
             env["SCAGENT_TRACE"] = "1"
             if config.otlp_endpoint:

@@ -30,6 +30,7 @@ Env:
 
 import json
 import os
+import re
 import time
 
 _tracer = None
@@ -201,6 +202,55 @@ def record_llm(iteration, model, input_tokens, output_tokens, t0_ns) -> None:
         attrs["gen_ai.usage.output_tokens"] = int(output_tokens)
         attrs["llm.token_count.completion"] = int(output_tokens)
     _child("llm.generate", t0_ns, attrs)
+
+
+_traj_log_inited = False
+_traj_log_path: str | None = None
+_B64_RE = re.compile(r'data:[^;"\s]+;base64,[A-Za-z0-9+/=]+')
+
+
+def _traj_log() -> str | None:
+    """Resolve SCAGENT_TRAJECTORY_LOG once (independent of OTel + step log)."""
+    global _traj_log_inited, _traj_log_path
+    if not _traj_log_inited:
+        _traj_log_inited = True
+        _traj_log_path = os.environ.get("SCAGENT_TRAJECTORY_LOG") or None
+    return _traj_log_path
+
+
+def _sanitize(obj):
+    """JSON-safe deep copy with base64 image blobs replaced (keeps files small)."""
+    def enc(o):
+        if hasattr(o, "model_dump"):
+            try:
+                return o.model_dump()
+            except Exception:
+                return str(o)
+        return str(o)
+    s = _B64_RE.sub('data:<image_stripped>', json.dumps(obj, default=enc))
+    return json.loads(s)
+
+
+def record_llm_io(iteration, model, messages, assistant, t0_ns) -> None:
+    """Append one LLM call's full I/O (input messages -> assistant output) as JSONL,
+    for trajectory collection / distillation. No-op unless SCAGENT_TRAJECTORY_LOG is
+    set. Base64 image blobs are stripped so files stay manageable."""
+    path = _traj_log()
+    if not path:
+        return
+    try:
+        rec = {
+            "iteration": iteration,
+            "model": str(model),
+            "start_ns": int(t0_ns),
+            "end_ns": now_ns(),
+            "messages": _sanitize(messages),
+            "assistant": _sanitize(assistant),
+        }
+        with open(path, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass  # trajectory logging must never break a run
 
 
 def record_tool(name, iteration, t0_ns) -> None:

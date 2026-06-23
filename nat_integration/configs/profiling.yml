@@ -1,0 +1,59 @@
+# NAT PROFILING run (no accuracy evaluator — accuracy is scored separately by our
+# own compare_run_to_atlas.py against the LuCA truth CSVs; NAT's job here is the
+# per-step profiling / serving / trajectory layer).
+#
+# Run from the nvidia-nat venv (point base_url at the live backend's node):
+#   /usersoftware/peerd/ibrahih3/envs/nvidia-nat/bin/nat eval \
+#     --config_file /data1/peerd/ibrahih3/cs_agent/nat_integration/configs/profiling.yml \
+#     --override workflow.base_url http://iscp001:8000/v1 --reps 1
+#
+# Per-step LLM tokens + tool timings reach the profiler via scagent's step log
+# (SCAGENT_STEP_LOG) replayed into NAT's event bus by the workflow.
+
+general:
+  telemetry:
+    tracing:
+      # Weave only (cloud, shareable for the NVIDIA collab; no SSH tunnel like Phoenix).
+      # Needs WANDB_API_KEY exported into the nat eval process env.
+      weave:
+        _type: weave
+        project: scagent-nat-profiling
+
+workflow:
+  _type: scagent_analyze
+  scagent_bin: /usersoftware/peerd/ibrahih3/envs/scagent/bin/scagent
+  scagent_repo: /data1/peerd/ibrahih3/cs_agent
+  provider: openai
+  model: Qwen3.6-27B
+  base_url: http://localhost:8000/v1
+  output_root: /data1/peerd/ibrahih3/cs_agent/nat_runs
+  max_iterations: 75
+  trace: false   # Weave-only via NAT telemetry; no Phoenix/OTLP sink running
+  otlp_endpoint: http://localhost:6006
+  trace_project: scagent-nat-profiling
+
+eval:
+  general:
+    output_dir: /data1/peerd/ibrahih3/cs_agent/nat_profiling_out
+    max_concurrency: 1
+    dataset:
+      _type: jsonl
+      file_path: /data1/peerd/ibrahih3/cs_agent/nat_integration/data/luca_profiling.jsonl
+    profiler:
+      base_metrics: true
+      workflow_runtime_forecast: true
+      # Now meaningful: per-LLM tokens arrive via the step-log bridge.
+      compute_llm_metrics: true
+      token_usage_forecast: true
+      token_uniqueness_forecast: true
+      csv_exclude_io_text: true
+      bottleneck_analysis:
+        enable_simple_stack: true
+        enable_nested_stack: true
+      concurrency_spike_analysis:
+        enable: true
+        spike_threshold: 1
+      prefix_span_analysis:
+        enable: true
+        min_support: 2
+  # No evaluators block: profiling-only. Accuracy is scored by our own scorer.

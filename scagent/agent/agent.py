@@ -4195,6 +4195,7 @@ class SCAgent:
                     getattr(_usage, "output_tokens", None) if _usage else None,
                     _t0_llm,
                 )
+                _tracing.record_llm_io(iteration, self.model, messages, response.content, _t0_llm)
 
                 if response.stop_reason == "tool_use":
                     tool_results = []
@@ -5182,16 +5183,23 @@ class SCAgent:
                     getattr(_usage, "completion_tokens", None) if _usage else None,
                     _t0_llm,
                 )
+                _tracing.record_llm_io(iteration, self.model, messages, message, _t0_llm)
 
                 if choice.finish_reason == "tool_calls" and message.tool_calls:
                     # Add assistant message with tool calls
                     messages.append(message)
 
-                    # Print any reasoning/text content from the agent.
-                    # reasoning_content is a non-standard field used by Gemini and DeepSeek
-                    # via their OpenAI-compatible APIs to expose thinking tokens.
+                    # Print any reasoning/text content from the agent. Different
+                    # OpenAI-compatible backends expose thinking tokens under
+                    # different field names: Gemini/DeepSeek use `reasoning_content`,
+                    # while vLLM reasoning parsers (nemotron_v3, glm45, …) use
+                    # `reasoning`. Without this, reasoning models narrate into a
+                    # field we ignore and tool-calling turns print nothing.
+                    _extra = getattr(message, "model_extra", None) or {}
                     _reasoning = (
-                        (getattr(message, "model_extra", None) or {}).get("reasoning_content")
+                        _extra.get("reasoning_content")
+                        or _extra.get("reasoning")
+                        or getattr(message, "reasoning", None)
                         or message.content
                     )
                     if _reasoning:

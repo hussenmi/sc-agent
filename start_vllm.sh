@@ -76,6 +76,7 @@ MODEL_TABLE=(
   "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-32B     |  64 | 256  | hermes      | 128 |"
   "THUDM/glm-4-9b-chat                      | glm-4-9b-chat               |  18 |  64  | glm45       | 128 |"
   "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 | Nemotron-3-Ultra      | 328 | 128  | qwen3_coder | 256 | nvfp4 | nemotron_v3"
+  "zai-org/GLM-5.2-FP8                      | glm-5.2-fp8                 | 704 |  89  | glm47       | 400  | fp8 | glm45"
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -124,6 +125,20 @@ case "$MODEL" in
       --max-num-batched-tokens 32768
     )
     SKIP_THINKING_KWARG=1   # reasoning-budget model; enable_thinking kwarg doesn't apply
+    ;;
+  zai-org/GLM-5.2-FP8|zai-org/GLM-5.2)
+    # GLM-5.2 (744B/40B MoE) FP8 — needs vLLM>=0.23 (GLM-5 arch + glm47/glm45 parsers).
+    SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_v0.23.0.sif"}
+    SKIP_THINKING_KWARG=1   # GLM reasoning is template-native; enable_thinking kwarg N/A
+    # GLM-5.2 large MoE on multi-GPU (vLLM 0.23, 8xH200):
+    #  - WITHOUT --enable-expert-parallel: expert/DSA collectives deadlock (ranks
+    #    spin at 100% during warmup; the "only N of 8 GPUs" hang). EP is required.
+    #  - --disable-custom-all-reduce: NCCL all-reduce is the stable path here.
+    #  - --enforce-eager: CUDA-graph capture ALSO deadlocks on glm_moe_dsa even with
+    #    EP (hangs at capture). Eager is the only working mode today — but it's slow
+    #    (~21 tok/s vs ~250+ expected with graphs). REMOVE --enforce-eager once a
+    #    newer vLLM fixes glm_moe_dsa graph capture; that should restore full speed.
+    MODEL_EXTRA+=(--enable-expert-parallel --disable-custom-all-reduce --enforce-eager)
     ;;
 esac
 
@@ -328,6 +343,10 @@ if [[ "$THINKING" == "0" && "$SPEC" != "0" ]]; then
     nvidia/NVIDIA-Nemotron-3-Ultra-*)
       EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":5}')
       echo "Speculative: MTP (k=5, native to Nemotron 3 Ultra)"
+      ;;
+    zai-org/GLM-5.2-FP8|zai-org/GLM-5.2)
+      EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":5}')
+      echo "Speculative: MTP (k=5, native to GLM-5.2)"
       ;;
     *)
       if [[ "$SPEC" == "1" ]]; then
