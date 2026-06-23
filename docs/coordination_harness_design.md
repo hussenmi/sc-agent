@@ -17,12 +17,25 @@ prompting harder:
   `finalize_annotation`**. The run ended on a no-tool-call "stop" turn while
   annotation was staged-but-unfinalized; the harness completed silently
   (`annotated_h5ad: null`, `rc=0`). 3/4 GLM reps; 0/4 for Qwen and Nemotron.
-- **Entry failure (2b).** On a multi-donor dataset (Reyfman, 8 donors), Nemotron
-  **never opened the batch-effect decision** — no `diagnose_batch_effect`, no
-  integration choice surfaced — despite the `multi_sample_strategy` protocol being
-  *exhaustively* prompted (`prompts.py` L59/L232). GLM, on the same data and same
-  prompt, surfaced it immediately and correctly. The branch is maximally prompted
-  and still obeyed **model-dependently**.
+- **Entry failure (2b).** On a multi-donor dataset (Reyfman, 8 donors), with a
+  generic "just analyze" prompt, Nemotron **skipped the batch-effect decision in 2 of
+  3 runs** — no `diagnose_batch_effect`, no integration choice surfaced — despite the
+  `multi_sample_strategy` protocol being *exhaustively* prompted (`prompts.py`
+  L59/L232). It is **stochastic for the same model on the same data** (skipped /
+  honored / skipped), which is the strongest argument that advisory prompting cannot
+  guarantee the floor.
+
+  **Root cause (verified, 3/3 correlation): the floor is gated behind an optional
+  step.** The multi-sample checkpoint is surfaced off `state.metadata_candidates`,
+  which **`inspect_data` populates**. The one run that honored batch
+  (`run_2026_06_23_162002`) called `inspect_data` first; both that skipped
+  (`..._235405`, `..._173249`) went straight `load_data → run_qc`, never populating
+  the candidates, so the `multi_sample_strategy` reason never surfaced. The "floor"
+  is currently contingent on the model choosing to inspect. **Fix: detection must run
+  deterministically at `load_data` / `world_state.update`, not depend on
+  `inspect_data`.** (All three runs *did* set `batch_key="donor"` on
+  `normalize_and_hvg` — the model knew it was multi-donor; it just never hit the
+  decision gate.)
 
 Both are coordination-harness gaps, on two directions of the same axis. And both
 prove the load-bearing principle:
@@ -36,28 +49,84 @@ This is the single-cell, control-flow extension of the Anthropic+NCBI
 (accuracy stops depending on the model); we must also make the *coordination* layer
 deterministic (reliability stops depending on the model).
 
-## The codebase already has half the gate
+## The codebase already computes the picture — it just doesn't bind the model to it
 
-`world_state` computes `available_actions` / `blocked_actions` — a **prerequisite
-gate** ("can't `run_deg` before clustering"; "can't `run_pseudobulk_deg` without raw
-counts"). That is *forward* gating. The two bugs live in the missing directions:
+The premise is **not** "forward gate works, two directions missing." Verified against
+the code, scagent already *computes* the full operational picture in all three
+directions and **binds the model to almost none of it**:
 
-| Direction | Question | Exists? | Bug |
-|---|---|---|---|
-| Prerequisite (forward) | "May I start X yet?" | ✅ `blocked_actions` | — |
-| **Entry obligation** (2b) | "Data demands X — has it been opened?" | ❌ | batch skip |
-| **Completion obligation** (2a) | "X was started — was it finished before exit?" | ❌ | annotation non-finalize |
+| Direction | Signal that exists | Enforced? |
+|---|---|---|
+| Prerequisite (forward) | `world_state.blocked_actions` (`run_deg` needs clusters, etc.) | **No** — computed + serialized into the snapshot (`world_state.py:369`), shown to the model, but **no consumer rejects a call**. Advisory. |
+| **Entry** (2b) | `outstanding_decisions`, `multi_sample_strategy: needs_decision`, `next_action` | **No** — only serialized into context (`agent.py:934`). Advisory. *Also* contingent on `inspect_data` (see 2b root cause above). |
+| **Completion** (2a) | `annotation_validation` (staged / finalized) | **Partially YES** — `_annotation_validation_guard` (`agent.py:1024`) fires at tool dispatch (`5715`) and **hard-blocks `save_data`/`write_report` before finalize** (`5740`: returns the block payload instead of executing). |
 
-The fix is the **symmetric other half** of an abstraction the code already trusts —
-not a new parallel subsystem.
+So the harness has exactly **one** hard gate — completion-on-save — and the GLM bug
+slipped through the **one exit that gate doesn't cover**:
+
+> The save/report gate guards the *tool-exit* door. GLM exited via the *prose-stop*
+> door: a no-tool-call `stop` turn → `finish_reason=="stop"` (`agent.py:5266–5290`)
+> calls `_complete_run` **directly, never invoking `_annotation_validation_guard`**.
+> **GLM walked out the one unguarded door.**
+
+This makes the fix smaller and more native than "build the symmetric half":
+
+- **Completion (2a):** we **do not add a new guard** — we route the `stop`/`length`
+  exits through the **existing** `_annotation_validation_guard` (the same check
+  `save_data` already hits). One call site, reusing trusted logic.
+- **Entry (2b) + prerequisites:** genuinely advisory today. Add enforcement here —
+  but **selectively** (see "selective enforcement" below).
+- **Implementation: view-first, not a new registry.** A thin
+  `world_state.unmet_obligations()` **view** aggregates signals that already exist
+  (`outstanding_decisions` open+triggered, `annotation_validation` staged-not-final,
+  the load-time multi-sample detection). It reuses trusted computations and adds no
+  parallel state. Promote to a formal `Obligation` registry (below) only if a
+  3rd/4th obligation makes the aggregation ungainly — a deliberate later call, not
+  the default.
+
+**Selective enforcement.** Bind only **scientific-validity checkpoints** (batch
+decision, annotation finalize; later QC-before-annotation, integration-scoring-after-
+correction). Tool-ordering prerequisites in `blocked_actions` **stay advisory** —
+hard-blocking them would break legitimate `run_code` use and make the spine brittle.
+The spine stays thin and defensible: a few load-bearing scientific floors, not a
+straitjacket on sequencing.
+
+### Prior art: Claude Code / Agent-SDK hooks (we are building scagent's own)
+
+Anthropic's own agent harness implements exactly this principle as **hooks** —
+deterministic lifecycle callbacks: a `Stop` hook (`continue:false`) forces the agent
+to keep going; `PreToolUse` can hard-**deny** a tool; `PostToolUse` injects context.
+They added a deterministic coordination layer because advisory prompting wasn't
+sufficient for their own agent — independent validation of this design.
+
+We do **not** adopt those hooks directly: they ship with the Claude **Agent SDK**,
+whereas scagent is a custom multi-provider loop (`client.chat.completions.create`
+against vLLM / OpenAI / Groq / Gemini). Porting to the SDK would be Anthropic-centric
+and defeat the open-model serving goal. Instead, **the Obligations layer is scagent's
+hook system**, mapped 1:1:
+
+| Claude Code hook | scagent equivalent |
+|---|---|
+| `PreToolUse` (deny) | the **existing** `_annotation_validation_guard` (hard-blocks `save_data`/`write_report` before finalize — the one real gate today). `blocked_actions` is *not* this — it's computed but advisory. |
+| `Stop` (`continue:false`) | terminal obligation gate (Part B.1) — the missing exit |
+| `PostToolUse` (`additionalContext`) | convergence hint after marker budget (Part C / B) |
+| load/SessionStart hook | load-time `batch_decision` entry trigger |
+
+**Design rule — blocking > injecting.** The hooks guidance is explicit that *injected
+context is still model-discretion; only blocking / forced action is deterministic.*
+This matches our data (advisory checkpoint skipped 2/3). Therefore the terminal gate
+must **block the exit and auto-execute the fallback**, and the entry gate in
+autonomous mode must **auto-open the decision** — not merely nudge "please finalize."
+Nudges are the first, bounded attempt; the floor is the block + forced fallback.
 
 ---
 
-## Part A — the Obligations layer (general spine)
+## Part A — the unmet-obligations view (general spine)
 
-One registry in `world_state`. Each obligation is **data-driven** (a predicate over
-world/data state), not hard-coded to a specific tool, so new tools add an obligation
-instead of a bespoke guard.
+**Implementation: view-first.** Start with a thin `world_state.unmet_obligations()`
+that *aggregates signals already computed* — no new parallel state. The conceptual
+`Obligation` shape below is the **target schema** the view returns (and the registry
+we promote to only if a 3rd/4th obligation makes the inline aggregation ungainly):
 
 ```python
 @dataclass
@@ -70,17 +139,18 @@ class Obligation:
     blocks_terminal: bool = True   # may the run complete/save/report while unmet?
 ```
 
-- `world_state.unmet_obligations()` = `[o for o in REGISTRY if o.triggered(ws) and not o.satisfied(ws)]`.
-- The registry is **open**: this pass registers only the two we have evidence for;
-  QC-decision, integration-scoring-after-correction, etc. are fast-follows that
-  *register*, they don't get new plumbing.
+- `unmet_obligations()` returns the obligations whose `triggered` holds and
+  `satisfied` does not — aggregated from existing signals, not a separate store.
+- **Open set**: this pass covers only the two we have evidence for; QC-decision,
+  integration-scoring-after-correction, etc. are fast-follows that slot into the same
+  view (or registry, if promoted) — no new plumbing.
 
 **Registered now:**
 
 | key | kind | triggered when | satisfied when | guidance |
 |---|---|---|---|---|
 | `annotation_finalize` | completion | `annotation_validation.required and entered` | `annotation_validation.finalized` | "You staged annotation but did not finalize. Call `stage_annotation_evidence` → `finalize_annotation` now, or `save_data(allow_unvalidated=true)`. Do not run more marker queries." |
-| `batch_decision` | entry | inspect-time finds ≥2 sample-like groups (low-cardinality `donor`/`sample`/`batch` col) and no `multi_sample_strategy` decision resolved | `multi_sample_strategy` resolved (any option) **or** moot (single sample) | "This dataset has N sample-like groups. Resolve `multi_sample_strategy` (investigate / integrate / keep / separate) before clustering+annotation." |
+| `batch_decision` | entry | **at `load_data` time** (deterministic detection, NOT gated on `inspect_data`): ≥2 sample-like groups (low-cardinality `donor`/`sample`/`batch` col) and no `multi_sample_strategy` decision resolved | `multi_sample_strategy` resolved (any option) **or** moot (single sample) | "This dataset has N sample-like groups. Resolve `multi_sample_strategy` (investigate / integrate / keep / separate) before clustering+annotation." |
 
 Note both `satisfied` predicates enforce that the **decision is made**, not a
 particular *outcome* — so they are floors, never ceilings. GLM (which already
@@ -88,13 +158,16 @@ surfaces batch and finalizes annotation) is never bound by either.
 
 ## Part B — enforcement points (general, not per-case)
 
-1. **Terminal gate** — before `_complete_run` / `save_data` / `write_report`, in the
-   `finish_reason in {"stop","length"}` branches of all three chat loops: if
-   `unmet_obligations()` (with `blocks_terminal`) is non-empty → **re-prompt** with
-   each obligation's `guidance`, bounded by an attempt counter (mirrors
-   `_maybe_continue_after_failure`). After K attempts → **safe fallback**
-   (`save_data(allow_unvalidated=true)` for completion obligations) so the run never
-   returns a silent null. Catches **2a** and any future early-exit.
+1. **Terminal gate** — the genuinely-missing enforcement. In the
+   `finish_reason in {"stop","length"}` branches (all three chat loops), **before**
+   `_complete_run`, consult `unmet_obligations()` (completion kind). This is the same
+   check `save_data`/`write_report` already hit via `_annotation_validation_guard` —
+   we are **closing the one exit (`_complete_run`) that bypasses the existing gate**,
+   not adding a new guard. If unmet → **re-prompt** with `guidance`, bounded by an
+   attempt counter (mirrors `_maybe_continue_after_failure`). After K attempts →
+   **block + safe fallback** (`save_data(allow_unvalidated=true)`) so the run never
+   returns a silent null. (Per "blocking > injecting": the re-prompt is the bounded
+   first attempt; the floor is the block + forced fallback.)
 2. **Entry surfacing** — when an `entry` obligation becomes `triggered` but unentered,
    push it into the model's live context via the existing `next_action` / decision
    channel, so it is *in front of* the model, not buried in a static prompt. In
@@ -136,11 +209,16 @@ value), while still guaranteeing the required decisions happen.
 
 ## File map (per AGENTS.md: annotation logic spans four files; change together)
 
-- **`world_state.py`** — `Obligation` dataclass + `OBLIGATION_REGISTRY`,
-  `unmet_obligations()`, `annotation_unfinalized()` / `marker_query_count()` helpers,
-  multi-sample detection at inspect-time, `next_action` surfacing for entry obligations.
-- **`agent.py`** — `_maybe_continue_for_obligations(messages, attempts)` (mirror of
-  the failure-recovery hook); wire into `stop`/`length` branches of all loops; thread
+- **`world_state.py`** — `unmet_obligations()` **view** aggregating existing signals
+  (`annotation_validation` staged-not-final, `outstanding_decisions`/`multi_sample_strategy`
+  triggered-unresolved); `marker_query_count()` helper; **multi-sample detection moved
+  to load-time** (in `update`/`load_data`, not gated on `inspect_data`); `next_action`
+  surfacing for entry obligations. (No new `Obligation` dataclass/registry yet — view
+  first; promote only if a 3rd/4th obligation makes it ungainly.)
+- **`agent.py`** — route the `stop`/`length` branches through the **existing**
+  `_annotation_validation_guard` logic (the missing exit), via a
+  `_maybe_continue_for_obligations(messages, attempts)` wrapper (mirror of the
+  failure-recovery hook); wire into all loops; thread
   an `obligation_nudge_attempts` counter; safe fallback; emit telemetry events.
 - **`tools.py`** — `convergence_hint` field on the PanglaoDB tool result once
   `marker_query_count()` exceeds a per-required-cluster budget (the soft pressure
@@ -153,7 +231,8 @@ value), while still guaranteeing the required decisions happen.
 - Mock a model that does `prepare_annotation` → no-tool-call stop: assert the
   terminal gate re-prompts, and after K attempts auto-saves `_UNVALIDATED`
   (**never** a silent null).
-- Mock multi-sample data at inspect-time: assert `batch_decision` obligation
+- Mock multi-sample data loaded **without** calling `inspect_data` (the skip path):
+  assert `batch_decision` obligation
   triggers, is surfaced, and blocks the terminal gate until resolved; assert it is
   **moot** (no trigger) on single-sample data (so it can't fire on the LuCA eval).
 - Assert obligations are **floors**: a trajectory that already finalizes / already
