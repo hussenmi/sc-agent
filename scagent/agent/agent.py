@@ -3650,6 +3650,8 @@ class SCAgent:
                 "Run tried to end with unmet spine obligation(s) [%s]; nudge %s/%s",
                 keys, next_attempt, OBLIGATION_NUDGES,
             )
+            if hasattr(ws, "note_spine_intervention"):
+                ws.note_spine_intervention([o.get("key", "?") for o in blocking], "nudge")
             guidance = "\n".join(f"- {o['guidance']}" for o in blocking)
             messages.append({
                 "role": "user",
@@ -3671,6 +3673,11 @@ class SCAgent:
                 "Spine obligation still unmet after %s nudges; forcing "
                 "save_data(allow_unvalidated=true).", OBLIGATION_NUDGES,
             )
+            if hasattr(ws, "note_spine_intervention"):
+                ws.note_spine_intervention(
+                    [o.get("key", "?") for o in blocking if o.get("kind") == "completion"],
+                    "forced_fallback",
+                )
             try:
                 result_json = self._execute_tool("save_data", {"allow_unvalidated": True})
                 messages.append({
@@ -4098,6 +4105,7 @@ class SCAgent:
         final_result = ""
         tool_names = {tool.get("name") for tool in self._codex_tool_specs()}
         auto_recovery_attempts = 0
+        obligation_nudge_attempts = 0
 
         try:
             for _iteration in range(max_iterations):
@@ -4162,6 +4170,11 @@ class SCAgent:
                     )
                     if should_continue:
                         continue
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
+                    )
+                    if should_continue:
+                        continue
                     self._conversation_history = messages
                     if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
@@ -4193,6 +4206,7 @@ class SCAgent:
             messages = [{"role": "user", "content": user_message}]
         final_result = ""
         auto_recovery_attempts = 0
+        obligation_nudge_attempts = 0
 
         try:
             for iteration in range(max_iterations):
@@ -4323,6 +4337,12 @@ class SCAgent:
                         messages,
                         auto_recovery_attempts,
                         suggestions=["Provide additional instructions", "Try a different approach"],
+                    )
+                    if should_continue:
+                        continue
+
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
                     )
                     if should_continue:
                         continue

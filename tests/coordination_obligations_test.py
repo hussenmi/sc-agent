@@ -17,9 +17,8 @@ from __future__ import annotations
 
 import json
 
-from scagent.agent.agent import SCAgent, OBLIGATION_NUDGES
+from scagent.agent.agent import OBLIGATION_NUDGES, SCAgent
 from scagent.agent.world_state import AgentWorldState
-
 
 # --------------------------------------------------------------------------- #
 # 1. unmet_obligations: annotation completion
@@ -99,7 +98,7 @@ def test_terminal_gate_nudges_then_forces_fallback():
     messages: list = []
     attempts = 0
     # First OBLIGATION_NUDGES calls should re-prompt (continue), no save yet.
-    for i in range(OBLIGATION_NUDGES):
+    for _ in range(OBLIGATION_NUDGES):
         cont, attempts = agent._maybe_continue_for_obligations(messages, attempts)
         assert cont is True
         assert "tool" not in saved  # not yet forced
@@ -108,6 +107,9 @@ def test_terminal_gate_nudges_then_forces_fallback():
     assert cont is False
     assert saved.get("tool") == "save_data"
     assert saved["input"].get("allow_unvalidated") is True
+    # Telemetry: the intervention is recorded for spine-adherence measurement.
+    statuses = [e.get("status") for e in ws.recent_events if e.get("tool") == "spine_obligation_gate"]
+    assert "nudge" in statuses and "forced_fallback" in statuses
 
 
 def test_terminal_gate_noop_when_finalized():

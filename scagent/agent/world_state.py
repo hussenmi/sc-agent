@@ -1016,6 +1016,22 @@ class AgentWorldState:
 
         return out
 
+    def note_spine_intervention(self, keys: List[str], action: str) -> None:
+        """Record a coordination-harness intervention for telemetry/audit.
+
+        Lands in `recent_events` (→ snapshot → manifest), so spine adherence —
+        how often the floor had to nudge or force a fallback, and on which
+        obligations — is measurable post-hoc (e.g. by the NAT eval) rather than
+        only in agent.log.
+        """
+        self.recent_events.append({
+            "tool": "spine_obligation_gate",
+            "status": action,  # "nudge" | "forced_fallback"
+            "timestamp": _utc_now_iso(),
+            "summary": f"unmet obligations: {', '.join(keys)}",
+        })
+        self.recent_events = self.recent_events[-25:]
+
     def _multi_sample_group_count(self) -> int:
         """Largest detected sample-like group count (batch_key or top candidate)."""
         ds = self.data_summary or {}
