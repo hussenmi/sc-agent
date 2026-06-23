@@ -521,6 +521,11 @@ class AgentWorldState:
             "annotation_validation": self.annotation_validation,
             "latest_verification": self.latest_verification,
             "last_action": self.last_action,
+            # Scientific-spine obligations that are triggered-but-unmet. Surfaced
+            # every turn (not just in the inspect_data tool result) so a required
+            # decision/step is in front of the model from the first turn, regardless
+            # of which tools it has called. Empty list = nothing pending.
+            "unmet_obligations": self.unmet_obligations(),
             # Cap in the system-prompt snapshot to keep context small on long
             # sessions. The full step_log is still available via to_dict() for
             # notebook generation and reporting.
