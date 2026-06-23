@@ -162,6 +162,10 @@ SUCCESS_OVERRIDE_PATTERNS = [
     r"\b1[\.\)]\s+\w+\b.*\b2[\.\)]\s+\w+\b",
 ]
 AUTO_RECOVERY_ATTEMPTS = 2
+# Bounded re-prompts when the run tries to END with a scientific-spine obligation
+# unmet (e.g. annotation staged-but-not-finalized). After these, the terminal gate
+# stops nudging and forces a safe fallback so the run never ends silently incomplete.
+OBLIGATION_NUDGES = 2
 
 ACTION_TOOL_NAMES = {
     "load_data",
@@ -3614,6 +3618,73 @@ class SCAgent:
 
         return False, auto_recovery_attempts
 
+    def _maybe_continue_for_obligations(
+        self,
+        messages: List[Dict[str, Any]],
+        obligation_attempts: int,
+    ):
+        """Floor: don't let the run END while a scientific-spine obligation is unmet.
+
+        The save/report guard (`_annotation_validation_guard`) already hard-blocks
+        the *tool-exit* door (save_data/write_report before finalize). This closes the
+        other door — a no-tool-call ``stop``/``length`` turn that calls `_complete_run`
+        directly and bypasses that guard (the verified GLM non-convergence exit).
+
+        Mechanism mirrors `_maybe_continue_after_failure`: re-prompt with the unmet
+        obligation's guidance, bounded by `OBLIGATION_NUDGES`. Per "blocking > nudging",
+        the bound is enforced: once exhausted, a *completion* obligation triggers a
+        forced safe fallback (`save_data(allow_unvalidated=true)`) so the run never
+        ends silently incomplete. Returns (should_continue, next_attempt).
+        """
+        ws = getattr(self, "world_state", None)
+        if ws is None or not hasattr(ws, "unmet_obligations"):
+            return False, obligation_attempts
+        blocking = [o for o in ws.unmet_obligations() if o.get("blocks_terminal")]
+        if not blocking:
+            return False, obligation_attempts
+
+        if obligation_attempts < OBLIGATION_NUDGES:
+            next_attempt = obligation_attempts + 1
+            keys = ", ".join(o.get("key", "?") for o in blocking)
+            logger.warning(
+                "Run tried to end with unmet spine obligation(s) [%s]; nudge %s/%s",
+                keys, next_attempt, OBLIGATION_NUDGES,
+            )
+            guidance = "\n".join(f"- {o['guidance']}" for o in blocking)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You are ending the run, but a required step is not complete:\n"
+                    f"{guidance}\n\n"
+                    "Do not stop here. Take the action above now (emit the tool call)."
+                ),
+            })
+            self._conversation_history = messages
+            return True, next_attempt
+
+        # Bound exhausted: force a safe fallback for completion obligations so the
+        # analysis is never silently lost (worst case: an explicit UNVALIDATED save,
+        # never a null result). Entry obligations have no harness-side fallback here.
+        completion_unmet = any(o.get("kind") == "completion" for o in blocking)
+        if completion_unmet:
+            logger.warning(
+                "Spine obligation still unmet after %s nudges; forcing "
+                "save_data(allow_unvalidated=true).", OBLIGATION_NUDGES,
+            )
+            try:
+                result_json = self._execute_tool("save_data", {"allow_unvalidated": True})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Auto-saved an UNVALIDATED dataset because a required step was "
+                        "not completed after repeated prompts:\n" + result_json
+                    ),
+                })
+                self._conversation_history = messages
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Forced unvalidated save failed: %s", exc)
+        return False, obligation_attempts
+
     def _ask_continue(self, error_msg: str, suggestions: list = None) -> str:
         """Ask user how to proceed after automatic recovery was not enough."""
         from rich.console import Console
@@ -5102,6 +5173,7 @@ class SCAgent:
             ]
         final_result = ""
         auto_recovery_attempts = 0
+        obligation_nudge_attempts = 0
         thinking_extra = self._thinking_extra()
 
         try:
@@ -5280,6 +5352,14 @@ class SCAgent:
                     if should_continue:
                         continue
 
+                    # Spine floor: don't end with a scientific obligation unmet (the
+                    # no-tool-call exit that bypasses the save/report guard).
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
+                    )
+                    if should_continue:
+                        continue
+
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
@@ -5295,6 +5375,14 @@ class SCAgent:
                     final_result = message.content or ""
                     messages.append({"role": "assistant", "content": final_result})
                     self._print(final_result)
+
+                    # Same spine floor on the length-truncation exit.
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
+                    )
+                    if should_continue:
+                        continue
+
                     self._conversation_history = messages
                     if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)

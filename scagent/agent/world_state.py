@@ -945,6 +945,94 @@ class AgentWorldState:
                     self.data_summary.get("processing", {}),
                 )
 
+    def unmet_obligations(self) -> List[Dict[str, Any]]:
+        """Scientific-spine obligations that are *triggered but not satisfied*.
+
+        A read-only **view** over state this object already computes — it adds no
+        new tracking. Each entry is a plain dict describing a floor the harness
+        should bind the model to (vs. the advisory `blocked_actions`/decisions it
+        only serializes). The enforcement (re-prompt → block + fallback, or entry
+        gating) lives in the agent loop; this method only *reports* what is unmet.
+
+        Obligations are deliberately limited to load-bearing **scientific-validity**
+        checkpoints, not tool-ordering prerequisites:
+
+        - ``annotation_finalize`` (completion): annotation was entered
+          (``prepare_annotation`` set ``required``) but never finalized. This is the
+          same predicate the save/report guard uses; surfacing it here lets the
+          *terminal* exit (a no-tool-call stop) be guarded too, not just save/report.
+        - ``batch_decision`` (entry): a multi-sample dataset needs the
+          ``multi_sample_strategy`` decision resolved before clustering/annotation.
+
+        Both are **floors, not ceilings** — `satisfied` means *a decision was made /
+        annotation was finalized*, never a particular outcome. A model that already
+        does the right thing is never bound.
+        """
+        out: List[Dict[str, Any]] = []
+
+        av = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
+        if (
+            av.get("required")
+            and not av.get("finalized")
+            and av.get("status") != "validated_and_finalized"
+        ):
+            out.append({
+                "key": "annotation_finalize",
+                "kind": "completion",
+                "blocks_terminal": True,
+                "finalize_attempts": int(av.get("finalize_attempts", 0) or 0),
+                "status": av.get("status"),
+                "guidance": (
+                    "Annotation was started (prepare_annotation) but not finalized "
+                    f"(annotation_validation.status={av.get('status')!r}). Do not end the "
+                    "run with prose. Either: (1) call stage_annotation_evidence for any "
+                    "uncovered clusters, then finalize_annotation; (2) if a cluster cannot "
+                    "be resolved, stage it with confidence=low and finalize anyway "
+                    "(PanglaoDB is optional, not a gate); or (3) as a last resort, call "
+                    "save_data(allow_unvalidated=true) to persist a clearly-marked "
+                    "incomplete result. Emit the tool call now — do not run more queries."
+                ),
+            })
+
+        if self.multi_sample_decision_unresolved():
+            n = self._multi_sample_group_count()
+            out.append({
+                "key": "batch_decision",
+                "kind": "entry",
+                "blocks_terminal": True,
+                "guidance": (
+                    f"This dataset has {n} sample-like groups but the multi_sample_strategy "
+                    "decision is unresolved. Before clustering/annotation is treated as final, "
+                    "resolve it: investigate (uncorrected first pass → diagnose_batch_effect), "
+                    "integrate, keep one combined uncorrected analysis, or analyze separately. "
+                    "Surface the choice — do not silently proceed on uncorrected data."
+                ),
+            })
+
+        return out
+
+    def _multi_sample_group_count(self) -> int:
+        """Largest detected sample-like group count (batch_key or top candidate)."""
+        ds = self.data_summary or {}
+        n = int(ds.get("n_batches") or 0)
+        for cand in (self.metadata_candidates or []):
+            try:
+                n = max(n, int(getattr(cand, "n_unique", None) or (cand.get("n_unique") if isinstance(cand, dict) else 0) or 0))
+            except (TypeError, ValueError):
+                continue
+        return n
+
+    def multi_sample_decision_unresolved(self) -> bool:
+        """True iff the data is multi-sample and no multi_sample_strategy is set.
+
+        Floor predicate for the batch entry obligation. ``satisfied`` = a strategy
+        was chosen (any option); ``moot`` (returns False) when the data is
+        single-sample, so it can never fire on a single-sample dataset.
+        """
+        if self.get_confirmed_value("multi_sample_strategy"):
+            return False
+        return self._multi_sample_group_count() >= 2
+
     def _update_annotation_validation(self, tool_name: str, result: Dict[str, Any]) -> None:
         """Track whether automated annotation has external marker validation."""
         status = result.get("status")
