@@ -239,6 +239,33 @@ value), while still guaranteeing the required decisions happen.
   surfaces batch sees **no** nudge (GLM-equivalent path unaffected).
 - Assert the `convergence_hint` fires only past budget.
 
+## Implementation status (2026-06-23, branch `harness-coordination-fix`)
+
+**Done + tested** (`tests/coordination_obligations_test.py`, full suite 187 passing):
+- **A** — `world_state.unmet_obligations()` view (annotation completion + batch entry),
+  with `multi_sample_decision_unresolved()` floor predicate.
+- **B1** — terminal completion gate wired into **all three** chat loops (OpenAI stop +
+  length, Anthropic, Codex): re-prompt bounded by `OBLIGATION_NUDGES`, then forced
+  `save_data(allow_unvalidated=true)` fallback for completion obligations. Reuses the
+  same predicate as the existing `_annotation_validation_guard`; closes the prose-stop
+  exit that bypassed it.
+- **B2 (partial)** — entry surfacing: `unmet_obligations` is emitted in the per-turn
+  snapshot, so the batch decision is in front of the model from turn one regardless of
+  `inspect_data`. Detection confirmed already at load (`sync_from_adata`). The terminal
+  gate also lists `batch_decision` as blocking.
+- **B3** — telemetry: `note_spine_intervention()` records nudges / forced fallbacks
+  into `recent_events` (→ manifest) for spine-adherence measurement.
+- **C** — spine + agency contract added as a top-level prompt principle; the existing
+  QC anti-busywork rule was verified already reasoned-exception (left as-is).
+
+**Deliberately deferred** (judgment calls, not omissions):
+- **Hard finalize/save block for `batch_decision`** + autonomous auto-open of
+  `multi_sample_strategy`. Batch entry currently relies on early surfacing + prompt
+  directive + terminal nudge (no forced fallback for *entry* obligations). Add the hard
+  block only if the validation run shows surfacing is insufficient — avoids over-rigidity
+  near the investigate-first flow.
+- **End-to-end validation runs** (below).
+
 ## Scope & sequencing
 
 - **This pass:** Part A (2 obligations) + Part B (terminal gate + entry surfacing +
