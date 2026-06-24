@@ -3636,6 +3636,14 @@ class SCAgent:
         forced safe fallback (`save_data(allow_unvalidated=true)`) so the run never
         ends silently incomplete. Returns (should_continue, next_attempt).
         """
+        # If the agent is correctly paused at a collaborative checkpoint, it has
+        # SURFACED a decision (e.g. pause_and_ask for multi_sample_strategy) and is
+        # awaiting the user — ending the turn to wait is the right behavior, not a
+        # silent exit. Do not override it (this is the interactive case; in
+        # autonomous mode pause_and_ask auto-resolves so no checkpoint lingers).
+        # The GLM completion bug had NO pending checkpoint, so it is still caught.
+        if getattr(self, "_pending_checkpoint", None):
+            return False, obligation_attempts
         ws = getattr(self, "world_state", None)
         if ws is None or not hasattr(ws, "unmet_obligations"):
             return False, obligation_attempts

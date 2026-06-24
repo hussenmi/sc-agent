@@ -78,7 +78,24 @@ def _agent_with(ws) -> SCAgent:
     agent = object.__new__(SCAgent)
     agent.world_state = ws
     agent._conversation_history = []
+    agent._pending_checkpoint = None
     return agent
+
+
+def test_terminal_gate_noop_while_paused_at_checkpoint():
+    # Interactive case: the agent surfaced a decision via pause_and_ask and is
+    # awaiting the user (pending checkpoint). The gate must NOT nudge/force —
+    # ending the turn to wait is correct, even though batch_decision is unmet.
+    ws = AgentWorldState()
+    ws.data_summary = {"n_batches": 8}  # batch_decision unmet
+    assert any(o["key"] == "batch_decision" for o in ws.unmet_obligations())
+    agent = _agent_with(ws)
+    agent._pending_checkpoint = {"kind": "llm_pause"}
+    agent._execute_tool = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not act while paused"))  # type: ignore
+    messages: list = []
+    cont, attempts = agent._maybe_continue_for_obligations(messages, 0)
+    assert cont is False and attempts == 0
+    assert messages == []  # no nudge injected
 
 
 def test_terminal_gate_nudges_then_forces_fallback():
