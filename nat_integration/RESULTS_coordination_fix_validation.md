@@ -82,56 +82,93 @@ and runs the investigate-first diagnostic every time.
   false floor; no regression on the LuCA annotation eval path.
 - **Floor doesn't bind Qwen** (already 4/4): completion **4/4 → 4/4**; accuracy
   0.833 → 0.803 = **n=4 noise** (both runs FP8).
+- **Nemotron LuCA reps=4** (same serving pre/post, iscp001 TP=8): scoreable
+  **4/4 → 3/4**, mean major **0.844 → 0.852** (3 scored, held). The one miss (rep0)
+  is **not a regression**: it *attempted* `finalize_annotation`, validation failed,
+  and the **pre-existing** escape hatch saved `..._UNVALIDATED.h5ad` (scorer then
+  returns no atlas accuracy — the *same* error Nemotron's pre-fix n=3 rep0 threw).
+  My completion gate **did not fire** (`spine interventions: []`) because finalize
+  *was* attempted — this is a different, stochastic "finalize-validation-fails →
+  unvalidated" mode, outside the floor's scope, not caused by the fix.
 
 ## 4. Agency — does the contract add exploration, and for whom?
 
-Trajectory proxies (`nat_integration/agency_compare.py`), pre vs post:
+Trajectory proxies (`nat_integration/agency_compare.py`), pre vs post, **all 3 models**:
 
-| proxy (mean over reps) | GLM-744B pre→post | Qwen-27B pre→post |
-|---|---|---|
-| investigative `run_code` | 5.25 → **7.0** (+1.75) | 10 → 7 (−3) |
-| `generate_figure` | 1.25 → **2.25** (+1.0) | 2.0 → 2.25 |
-| n_tools | 32.75 → 40.5 | 38.25 → 36 |
-| finalized | 0.25 → **1.0** | 1.0 → 1.0 |
+| proxy (mean over reps) | GLM-744B | Qwen-27B | Nemotron-550B |
+|---|---|---|---|
+| investigative `run_code` | 5.25 → **7.0** ↑ | 10 → 7 ↓ | 14.25 → 9.75 ↓ |
+| `generate_figure` | 1.25 → **2.25** ↑ | 2.0 → 2.25 | 1.0 → 1.0 |
+| `panglaodb_queries` | 11 → 11.75 | 6.5 → 6 | 12 → **15.75** ↑ |
+| n_tools | 32.75 → 40.5 | 38.25 → 36 | 48.75 → 47 |
+| finalized (scoreable) | 0.25 → **1.0** | 1.0 → 1.0 | 1.0 → 0.75* |
 
-**Reading:** the contract raises *grounded* agency for the model that was
-over-deliberating/under-finishing — **GLM redirected from bail into completion + more
-investigation + more plots, with accuracy held.** The already-exploratory small model
-(Qwen, already 4/4 and high run_code) didn't gain. So **"bigger models show more agency
-in the right places" is supported** *once the floor stops them bailing*: the harness
-both (a) brings the weaker-on-this-axis model up to par (1/4 → 4/4) and (b) lets the
-capable model express productive agency rather than spin.
-
-(GLM agency deltas are clean — same serving. Qwen's small `run_code` dip is minor /
-within noise; Qwen was never the model this targeted.)
+**Honest reading — this refines the hypothesis rather than confirming the naive version:**
+- **The contract clearly helped only GLM** — the model that was over-deliberating
+  *without finishing*. It gained grounded exploration (`run_code` +1.75, figures +1.0)
+  **and** completion (1/4 → 4/4), accuracy held. Clean (same serving).
+- **For the already-exploratory models (Qwen, Nemotron), it did NOT add agency** —
+  `run_code` went *down* for both, and Nemotron shifted toward *more* marker-querying
+  (`panglaodb` 12 → 15.75). The "converge hard on required steps" half of the contract
+  appears to **dominate** the "explore freely" half for models already exploring plenty.
+- So it is **not** a general "bigger ⇒ more agency" effect. It is: *the contract
+  rescues the model that was failing; it slightly tightens models that were already
+  fine.* Mechanism: GLM was the only one whose capability was leaking into
+  non-convergence — the floor converts that leak into completion + investigation.
+- **Confound:** the contract also *lengthened* the system prompt, which itself shifts
+  behavior; the `run_code` dip for Qwen/Nemotron may be partly that, not the wording.
+- (\* Nemotron's 0.75 is the unvalidated-finalize miss in §3 controls, not a bail.)
 
 ## 5. What worked / takeaways
 
+**Solid (the floors — the core fix):**
 - **Floors work and are model-agnostic.** The two verified failures are fixed; the
   fix never fires when it shouldn't (single-sample, already-finalized, Qwen).
-- **Floor, not ceiling.** GLM accuracy unchanged (0.810 → 0.808); the gate only
-  recovers lost completions, it doesn't constrain the analysis.
-- **Spine + agency compose.** Same change that *forces* completion also *frees* the
-  big model to explore more — the two halves of the contract are not in tension when
-  the floor handles the "must finish" part.
+- **Floor, not ceiling.** GLM accuracy unchanged (0.810 → 0.808); Nemotron held
+  (0.844 → 0.852 on scored). The gate only recovers lost completions.
 - **Thesis, by intervention.** Pre-fix, completion diverged by model (GLM 1/4 vs
-  Qwen/Nemotron 4/4). Post-fix, all converge to 4/4 — *good harness → the model
-  matters less* — while accuracy stays model-independent (~0.81–0.84) as before.
+  Qwen/Nemotron 4/4). Post-fix, GLM converges to 4/4 — *good harness → the model
+  matters less* — accuracy stays model-independent (~0.81–0.85) as before.
+
+**Equivocal (the agency contract):**
+- It **helps the failing model** (GLM) but does **not broadly increase exploration**;
+  `run_code` dropped for both already-exploratory models (Qwen, Nemotron). The
+  "explore freely" half is being out-weighed by the "converge hard" half + the longer
+  prompt. **Not** a clean "bigger ⇒ more agency" result — needs rebalancing or is
+  model-dependent. This is the part of the design still open.
+
+## 6. Bug fixes found via interactive testing (committed)
+Two issues surfaced when running `scagent start` interactively (not in autonomous eval):
+- **Interactive pause-guard.** The obligation terminal gate fired *while the agent
+  was correctly paused* at a `pause_and_ask` checkpoint (awaiting the user), causing a
+  thrash loop. Fix: the gate no-ops when `_pending_checkpoint` is set (the GLM
+  completion bug had no checkpoint, so it's still caught). Regression test added.
+- **Raw-counts surfacing.** `has_raw_counts` was wired to `has_raw_layer` (separate
+  raw layer only), so a raw-count X with no layer (e.g. `*_raw.h5ad`) reported
+  `has_raw_counts: false` — confusing the model (it burned reasoning figuring out the
+  data state) and wrongly flagging `normalize` as blocked. Fix: `has_raw_counts` =
+  available anywhere (layer / `adata.raw` / X-is-counts) + new explicit
+  `x_is_raw_counts`. 3 regression tests added. Full suite **191 passing**.
 
 ## Caveats / next
-- n=4 per cell; completion is now a clear move (GLM 1/4 → 4/4) but rates are still
-  modest-n. More reps would tighten the agency means.
-- Batch entry floor is enforced via early surfacing + terminal nudge (no forced
-  fallback for *entry*); a hard finalize-block for unresolved batch + autonomous
-  auto-open of `multi_sample_strategy` remain deferred (add only if surfacing proves
-  insufficient — it didn't here: 3/3).
-- Re-run Nemotron LuCA reps=4 post-fix (needs iscp001 back from GLM) to complete the
-  3-model post-fix accuracy/agency matrix on the annotation task.
+- n=4 per cell; completion is a clear move for GLM (1/4 → 4/4) but rates/agency means
+  are modest-n — more reps would tighten them.
+- **Agency contract needs rebalancing** (or is model-dependent): it didn't increase
+  exploration for already-exploratory models. Consider strengthening the "explore"
+  half, or accept it as "rescues the failing model" only.
+- **Nemotron's stochastic "finalize-validation-fails → unvalidated" mode** is separate
+  from the floor (the gate doesn't fire — finalize *was* attempted). Fixing it means
+  investigating *why* finalize validation fails on that rep, not the coordination layer.
+- Batch entry floor uses early surfacing + terminal nudge (no forced fallback for
+  *entry*); a hard finalize-block for unresolved batch + autonomous auto-open of
+  `multi_sample_strategy` remain deferred (surfacing was sufficient here: 3/3).
 
 ## Artifacts
-- Configs: `luca_eval_glm_postfix.yml`, `luca_eval_qwen_postfix.yml`; launchers
-  `run_glm_postfix_eval.sh`, `run_qwen_postfix_eval.sh`, `run_nemotron_batchprobe.sh`,
+- Configs: `luca_eval_{glm,qwen,nemotron}_postfix.yml`; launchers
+  `run_{glm,qwen,nemotron}_postfix_eval.sh`, `run_nemotron_batchprobe.sh`,
   `run_nemotron_singlesample.sh`.
-- Eval outputs: `nat_luca_out_{glm,qwen}_postfix/`, `nat_luca_out_glm_prefix/` (backup),
-  per-rep run dirs in `nat_runs/`.
+- Eval outputs: `nat_luca_out_{glm,qwen,nemotron}_postfix/`, `nat_luca_out_glm_prefix/`
+  (backup), per-rep run dirs in `nat_runs/`.
 - Analysis: `nat_integration/agency_compare.py`.
+- Tests: `tests/coordination_obligations_test.py` (incl. paused-checkpoint guard),
+  `tests/raw_counts_detection_test.py`.
