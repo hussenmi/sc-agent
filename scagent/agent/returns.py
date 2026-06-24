@@ -80,7 +80,10 @@ class InspectReturn(ToolReturn):
 def make_state_dict(state: DataState) -> Dict[str, bool]:
     """Convert DataState to compact dict for LLM."""
     return {
-        "has_raw_counts": state.has_raw_layer,
+        # raw counts available anywhere (layer / adata.raw / X-is-counts), not just
+        # a separate raw layer — see world_state.sync_from_adata for rationale.
+        "has_raw_counts": bool(state.has_raw_layer or state.has_raw or state.is_counts),
+        "x_is_raw_counts": bool(state.is_counts),
         "has_qc_metrics": state.has_qc_metrics,
         "has_doublets": state.has_doublet_scores,
         "is_normalized": state.is_normalized,

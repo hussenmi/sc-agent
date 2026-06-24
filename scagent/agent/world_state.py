@@ -660,7 +660,14 @@ class AgentWorldState:
             self._inspect_cache_key = fingerprint
             self._inspect_cache_state = state
         processing = {
-            "has_raw_counts": state.has_raw_layer,
+            # "raw counts are available" — in a layer, adata.raw, OR the X matrix
+            # itself (X is integer counts, even when stored as float32). Previously
+            # this was has_raw_layer only, so a raw-count X with no separate layer
+            # (e.g. *_raw.h5ad files) misreported as has_raw_counts=false and
+            # confused the model into thinking X wasn't raw.
+            "has_raw_counts": bool(state.has_raw_layer or state.has_raw or state.is_counts),
+            # Explicit: does the live X matrix contain raw integer counts right now.
+            "x_is_raw_counts": bool(state.is_counts),
             "has_qc_metrics": state.has_qc_metrics,
             "has_doublets": state.has_doublet_scores,
             "is_normalized": state.is_normalized,

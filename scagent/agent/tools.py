@@ -3956,7 +3956,8 @@ def process_tool_call(
         """Create compact state dict."""
         state = inspect_data(adata)
         return {
-            "has_raw_counts": state.has_raw_layer or state.has_raw,
+            "has_raw_counts": bool(state.has_raw_layer or state.has_raw or state.is_counts),
+            "x_is_raw_counts": bool(state.is_counts),
             "raw_in_adata_raw": state.has_raw,
             "raw_in_layer": state.has_raw_layer,
             "raw_layer_name": state.raw_layer_name if state.has_raw_layer else None,
