@@ -224,6 +224,7 @@ INSPECTION_TOOL_NAMES = {
     "web_search",
     "research_findings",
     "describe_image",
+    "record_inspection",
 }
 
 # Load .env file if present
@@ -2069,6 +2070,7 @@ class SCAgent:
     CHECKPOINT_EXEMPT_TOOLS = {
         "run_code",  # Flexible fallback - always allow
         "inspect_data",
+        "record_inspection",  # Read-only judgment record; never mutates adata.
         "inspect_data_inputs",
         "inspect_session",
         "list_artifacts",
@@ -2706,6 +2708,9 @@ class SCAgent:
             )
         if self.smart_autonomous:
             prompt += _SMART_AUTONOMOUS_PROMPT
+        if os.environ.get("SCAGENT_MODEL_INSPECTION") == "1":
+            from .prompts import MODEL_INSPECTION_PROMPT
+            prompt += MODEL_INSPECTION_PROMPT
         if self._use_sidecar_for_images():
             sidecar_model = self._vision_sidecar.model if self._vision_sidecar else "(unconfigured)"
             prompt += (
@@ -5539,6 +5544,7 @@ class SCAgent:
         "install_package":      "Installing package",
         "generate_figure":      "Generating figure",
         "inspect_data":         "Inspecting data",
+        "record_inspection":    "Recording data interpretation",
         "inspect_data_inputs":  "Inspecting data inputs",
         "search_papers":        "Searching papers",
         "research_findings":    "Searching literature",

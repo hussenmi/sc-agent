@@ -686,6 +686,21 @@ class AgentWorldState:
             text_context=context_text,
             _precomputed_state=state,
         ).to_dict()
+
+        # A model-recorded inspection decision (see record_inspection) overrides
+        # the heuristic *judgments* — which column is the cell type, the species.
+        # Facts (obs_columns_detail, shape, is_counts, …) stay heuristic and are
+        # recomputed every sync; only the judgment layer defers to the model.
+        # Absent a recorded decision, behavior is exactly as before.
+        inspection = self.get_confirmed_value("inspection")
+        cell_type_key = state.cell_type_key
+        if inspection:
+            cell_type_key = inspection.get("cell_type_col")
+            processing["has_celltypes"] = cell_type_key is not None
+            if inspection.get("species"):
+                biological_context["species"] = inspection["species"]
+                biological_context["species_source"] = "model_inspection"
+
         self.analysis_stage = _stage_from_processing(processing)
         self.data_summary = {
             "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
@@ -698,7 +713,7 @@ class AgentWorldState:
             "batch_correction_method": state.batch_correction_method,
             "cluster_key": state.cluster_key,
             "n_clusters": state.n_clusters,
-            "cell_type_key": state.cell_type_key,
+            "cell_type_key": cell_type_key,
             "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
             "obs_columns_detail": obs_columns_detail(adata.obs, adata.n_obs),
             "biological_context": biological_context,
@@ -722,9 +737,22 @@ class AgentWorldState:
             annotation_sources.append("celltypist")
         if state.has_scimilarity:
             annotation_sources.append("scimilarity")
-        if state.cell_type_candidates and not (state.has_celltypist or state.has_scimilarity):
+        # "external_or_manual" is a judgment (is some obs column a real label?).
+        # When the model has recorded an inspection, trust its cell_type_col call
+        # over the heuristic candidate — so a barcode column ruled out as labels
+        # does not keep surfacing as an annotation source.
+        if inspection:
+            has_manual_labels = inspection.get("cell_type_col") is not None
+        else:
+            has_manual_labels = bool(state.cell_type_candidates)
+        if has_manual_labels and not (state.has_celltypist or state.has_scimilarity):
             annotation_sources.append("external_or_manual")
         self.annotation_sources = annotation_sources
+
+        # Surface the recorded inspection so the model sees its own settled
+        # decision in the snapshot instead of re-deriving roles every turn.
+        if inspection:
+            self.data_summary["inspection"] = inspection
 
         self.data_summary["capabilities"] = self._derive_capabilities(adata)
 
@@ -795,6 +823,55 @@ class AgentWorldState:
 
     def get_confirmed_value(self, key: str) -> Any:
         return self.user_preferences.get(key)
+
+    def record_inspection(self, payload: Dict[str, Any], adata=None) -> Dict[str, Any]:
+        """Record the model's inspection judgment (column roles + species).
+
+        This is the judgment layer of the facts/judgment split: the model reads
+        the deterministic fact sheet and reports which obs column is the cell
+        type / batch / donor / sample and the species. We validate the claim
+        (named columns must exist; species constrained), then store it as a
+        resolved decision so it (a) overrides the heuristic in sync_from_adata,
+        (b) surfaces in the snapshot, and (c) flows to the manifest. batch_col is
+        routed through the existing ``batch_key`` slot the pipeline already reads.
+
+        Returns ``{"status": "ok", "inspection": {...}}`` or
+        ``{"status": "error", "errors": [...]}``; on error nothing is stored.
+        """
+        obs_cols = set(adata.obs.columns) if adata is not None else set()
+        errors: List[str] = []
+        for field_name in ("cell_type_col", "batch_col", "donor_col", "sample_col"):
+            value = payload.get(field_name)
+            if value is not None and adata is not None and value not in obs_cols:
+                errors.append(
+                    f"{field_name}={value!r} is not an obs column. "
+                    f"Available: {sorted(obs_cols)}"
+                )
+        species = payload.get("species")
+        species_norm = str(species).lower() if species is not None else None
+        if species_norm is not None and species_norm not in {"human", "mouse", "unknown"}:
+            errors.append(f"species={species!r} must be one of human, mouse, unknown.")
+        if errors:
+            return {"status": "error", "errors": errors}
+
+        inspection = {
+            "cell_type_col": payload.get("cell_type_col"),
+            "batch_col": payload.get("batch_col"),
+            "donor_col": payload.get("donor_col"),
+            "sample_col": payload.get("sample_col"),
+            "species": species_norm,
+            "rationale": str(payload.get("rationale", "")),
+            "recorded_at": _utc_now_iso(),
+        }
+        self.resolve_decision("inspection", inspection, source="model_inspection")
+        if species_norm:
+            self.resolve_decision("species", species_norm, source="model_inspection")
+        if inspection["batch_col"]:
+            self.resolve_decision("batch_key", inspection["batch_col"], source="model_inspection")
+        # Re-sync so data_summary reflects the new decision immediately.
+        if adata is not None:
+            self.sync_from_adata(adata, request_text=self.active_request)
+        return {"status": "ok", "inspection": inspection}
 
     def apply_tool_result(self, tool_name: str, result: Dict[str, Any], adata=None) -> None:
         if adata is not None:

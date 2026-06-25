@@ -682,6 +682,30 @@ What next?
 ```
 """
 
+MODEL_INSPECTION_PROMPT = """
+
+## Record your data interpretation (model-driven inspection)
+`inspect_data` returns a `facts` block: a comprehensive, judgment-free fact sheet
+(per-column dtype, cardinality, `unique_fraction`, value distributions; X
+characteristics; gene-namespace counts). The runtime no longer guesses which
+column is the cell type / batch / donor / sample or the species — that judgment
+is yours.
+
+Right after `inspect_data` (and before any analysis), call `record_inspection`
+with your interpretation, reasoning from the facts:
+- `cell_type_col`: the obs column holding cell-type labels. OMIT it when none
+  qualifies — a column that is ~unique per cell (high `unique_fraction`) is a
+  barcode / per-cell id, NOT labels.
+- `batch_col` / `donor_col` / `sample_col`: the grouping columns, when present.
+- `species`: from gene symbols / IDs / the namespace counts (e.g. ENSG vs
+  ENSMUSG; human symbols + MT- prefix).
+- `rationale`: cite the specific facts you used.
+
+The runtime validates the columns exist and records the decision; it then
+overrides the heuristic guesses for the rest of the run and shows your decision
+back to you in the data summary. Record it once — do not re-litigate it each turn.
+"""
+
 # Legacy prompts kept for compatibility
 QC_PROMPT = """Run quality control on this single-cell dataset."""
 CLUSTERING_PROMPT = """Cluster this dataset and identify cell populations."""

@@ -3817,6 +3817,37 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             },
         })
 
+    # Model-driven inspection (opt-in via SCAGENT_MODEL_INSPECTION=1): the model
+    # reads the deterministic fact sheet from inspect_data and records its own
+    # role/species interpretation, which overrides the heuristic. Exposed only
+    # under the flag so default behavior is unchanged.
+    if os.environ.get("SCAGENT_MODEL_INSPECTION") == "1":
+        tools.append({
+            "name": "record_inspection",
+            "description": (
+                "Record your interpretation of the dataset after reading the fact sheet "
+                "from inspect_data. Report which obs column (if any) holds cell-type "
+                "labels, which holds the batch / donor / sample grouping, and the species. "
+                "OMIT a field when no column qualifies — e.g. a per-cell barcode column is "
+                "NOT cell-type labels, so leave cell_type_col unset. The runtime validates "
+                "that named columns exist and records the decision, which overrides the "
+                "heuristic guesses for the rest of the run. Call this once, right after "
+                "inspect_data, before proceeding with the analysis."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cell_type_col": {"type": "string", "description": "obs column holding cell-type labels. Omit if none — barcodes/per-cell IDs are not labels."},
+                    "batch_col": {"type": "string", "description": "obs column to use as the batch key for correction/stratification. Omit if single-batch."},
+                    "donor_col": {"type": "string", "description": "obs column identifying the donor/patient. Omit if absent."},
+                    "sample_col": {"type": "string", "description": "obs column identifying the sample/library. Omit if absent."},
+                    "species": {"type": "string", "enum": ["human", "mouse", "unknown"], "description": "Species inferred from gene symbols / IDs / namespace counts."},
+                    "rationale": {"type": "string", "description": "Brief justification citing the facts you used (cardinality, unique_fraction, example values, gene namespace)."},
+                },
+                "required": [],
+            },
+        })
+
     return tools
 
 
@@ -6655,6 +6686,11 @@ def process_tool_call(
                 "var_preview": _dataframe_preview(working_adata.var),
                 "obs_columns_detail": _obs_columns_detail(working_adata.obs, working_adata.n_obs),
             }
+            # Under model-driven inspection, attach the comprehensive judgment-free
+            # fact sheet so the model can record_inspection from it.
+            if os.environ.get("SCAGENT_MODEL_INSPECTION") == "1":
+                from ..core.inspector import dataset_facts
+                result["facts"] = dataset_facts(working_adata)
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)
             decisions = []
@@ -6685,6 +6721,50 @@ def process_tool_call(
                         ),
                     ],
                 ),
+            )
+
+        elif tool_name == "record_inspection":
+            if world_state is None:
+                return _finalize_result(
+                    {
+                        "status": "error",
+                        "tool": "record_inspection",
+                        "message": "No world_state available to record the inspection.",
+                    },
+                    adata,
+                    dataset_changed=False,
+                    summary="record_inspection failed: no world_state.",
+                )
+            outcome = world_state.record_inspection(tool_input, adata=adata)
+            if outcome.get("status") != "ok":
+                return _finalize_result(
+                    {
+                        "status": "error",
+                        "tool": "record_inspection",
+                        "errors": outcome.get("errors", []),
+                        "message": (
+                            "Inspection not recorded. Use obs column names from "
+                            "obs_columns_detail, or omit a field when no column qualifies, "
+                            "then call record_inspection again."
+                        ),
+                    },
+                    adata,
+                    dataset_changed=False,
+                    summary="record_inspection rejected: invalid fields.",
+                )
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "record_inspection",
+                    "inspection": outcome["inspection"],
+                    "message": (
+                        "Recorded. This overrides the heuristic role/species guesses "
+                        "for the rest of the run and is now reflected in the data summary."
+                    ),
+                },
+                adata,
+                dataset_changed=False,
+                summary="Recorded inspection interpretation (column roles + species).",
             )
 
         elif tool_name == "inspect_session":
