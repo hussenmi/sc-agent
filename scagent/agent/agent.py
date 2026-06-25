@@ -870,8 +870,53 @@ class SCAgent:
             else:
                 console.print(message)
 
-    def _print_thinking(self, message: str):
-        """Print agent narration before a tool call."""
+    def _split_reasoning_channels(self, message):
+        """Split a tool-calling assistant message into (narration, chain_of_thought).
+
+        Reasoning models emit two separate channels per turn: the user-facing
+        narration in `content`, and the raw chain-of-thought under
+        `reasoning_content` (Gemini/DeepSeek) or `reasoning` (vLLM parsers like
+        nemotron_v3/glm45). Both raw values are returned (narration/CoT, or None
+        when empty); display and persistence decisions are left to the caller.
+        """
+        extra = getattr(message, "model_extra", None) or {}
+        cot = (
+            extra.get("reasoning_content")
+            or extra.get("reasoning")
+            or getattr(message, "reasoning", None)
+        )
+        content = getattr(message, "content", None)
+        narration = content if (content and content.strip()) else None
+        return narration, (cot if (cot and cot.strip()) else None)
+
+    def _save_thinking(self, cot: str, iteration: int):
+        """Append a chain-of-thought trace to <run_dir>/reasoning.log.
+
+        Returns the log path if written, else None. Gated by SCAGENT_SAVE_THINKING
+        (default on); a no-op when saving is disabled, there is no run directory,
+        or the trace is empty after artifact stripping.
+        """
+        if os.environ.get("SCAGENT_SAVE_THINKING", "1") != "1":
+            return None
+        rm = getattr(self, "run_manager", None)
+        run_dir = getattr(rm, "run_dir", None) if rm is not None else None
+        if run_dir is None:
+            return None
+        cot = self._strip_model_artifacts(cot)
+        if not cot or not cot.strip():
+            return None
+        log_path = run_dir / "reasoning.log"
+        header = f"\n{'=' * 60}\n# iteration {iteration} · {self.model}\n{'=' * 60}\n"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(header + cot.rstrip() + "\n")
+        return log_path
+
+    def _print_thinking(self, message: str, dim: bool = False):
+        """Print agent narration before a tool call.
+
+        dim=True greys the text out — used for raw chain-of-thought
+        (reasoning_content), shown only when SCAGENT_SHOW_THINKING=1.
+        """
         if not message or not message.strip():
             return
         from rich.console import Console
@@ -881,13 +926,20 @@ class SCAgent:
         message = self._delatex(message)
         if not message.strip():
             return
+        marker = "[dim]…[/dim]" if dim else "[cyan]…[/cyan]"
         # Render as markdown if it contains markdown patterns, otherwise inline
         md_patterns = ["**", "##", "```", "- ", "1. "]
         if any(p in message for p in md_patterns):
-            console.print("[cyan]…[/cyan]")
-            console.print(Markdown(message))
+            console.print(marker)
+            if dim:
+                console.print(Markdown(message), style="dim")
+            else:
+                console.print(Markdown(message))
         else:
-            console.print(f"[cyan]…[/cyan] {message}")
+            if dim:
+                console.print(f"{marker} [dim]{message}[/dim]")
+            else:
+                console.print(f"{marker} {message}")
 
     def _print_error(self, message: str):
         """Print error message."""
@@ -5289,21 +5341,33 @@ class SCAgent:
                     # Add assistant message with tool calls
                     messages.append(message)
 
-                    # Print any reasoning/text content from the agent. Different
-                    # OpenAI-compatible backends expose thinking tokens under
-                    # different field names: Gemini/DeepSeek use `reasoning_content`,
-                    # while vLLM reasoning parsers (nemotron_v3, glm45, …) use
-                    # `reasoning`. Without this, reasoning models narrate into a
-                    # field we ignore and tool-calling turns print nothing.
-                    _extra = getattr(message, "model_extra", None) or {}
-                    _reasoning = (
-                        _extra.get("reasoning_content")
-                        or _extra.get("reasoning")
-                        or getattr(message, "reasoning", None)
-                        or message.content
-                    )
-                    if _reasoning:
-                        self._print_thinking(_reasoning)
+                    # Reasoning models emit two separate channels per turn:
+                    #   reasoning_content / reasoning → raw chain-of-thought
+                    #   content                       → user-facing narration
+                    # OpenAI-compatible backends name the CoT field differently:
+                    # Gemini/DeepSeek use `reasoning_content`, vLLM reasoning
+                    # parsers (nemotron_v3, glm45, …) use `reasoning`.
+                    #
+                    # Print the narration (content) always; the chain-of-thought
+                    # is noisy and hidden unless SCAGENT_SHOW_THINKING=1, in which
+                    # case it's rendered dimmed. Previously these were collapsed
+                    # with `or`, so the CoT was dumped verbatim AND the real
+                    # narration was dropped on tool-calling turns.
+                    _narration, _cot = self._split_reasoning_channels(message)
+                    # Causal order: the model reasons first, then states intent,
+                    # then acts. Print/persist the chain-of-thought BEFORE the
+                    # narration so the transcript reads top-to-bottom as it happened.
+                    if _cot:
+                        _cot_log = self._save_thinking(_cot, iteration)
+                        if os.environ.get("SCAGENT_SHOW_THINKING", "0") == "1":
+                            self._print_thinking(_cot, dim=True)
+                        elif _cot_log is not None:
+                            self._print(
+                                f"[dim]… reasoning hidden ({len(_cot)} chars) — "
+                                f"{_cot_log}[/dim]"
+                            )
+                    if _narration:
+                        self._print_thinking(_narration)
 
                     # Process each tool call
                     for tool_call in message.tool_calls:
