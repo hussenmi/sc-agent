@@ -26,6 +26,14 @@
 #   NIM_PASSTHROUGH_ARGS  optional backend flags passed through by NIM
 set -euo pipefail
 
+# NIM does an MPI_Init at startup. Inside a SLURM allocation the inherited
+# SLURM_*/PMI*/PMIX_*/OMPI_* env vars make OpenMPI think it was srun-launched and
+# abort ("OPAL ERROR: Unreachable ... MPI_Init_thread on a NULL communicator").
+# Singularity passes the host env into the container, so clear those vars here;
+# harmless on non-SLURM nodes. (vLLM at TP=1 doesn't MPI_Init, so start_vllm.sh
+# is unaffected — this is NIM-specific.)
+for _v in $(env | grep -E '^(SLURM|PMI|PMIX|OMPI)_' | cut -d= -f1); do unset "$_v"; done
+
 SIF=${1:-/data1/peerd/ibrahih3/nim-qwen3.6-27b_variant.sif}
 PORT=${2:-8002}
 GPU_IDS=${3:-1}
