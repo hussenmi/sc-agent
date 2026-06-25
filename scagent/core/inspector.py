@@ -1757,3 +1757,130 @@ def obs_columns_detail(obs_df, n_obs: int, max_values: int = 8) -> dict:
                 detail[col] = {"dtype": dtype_str, "n_unique": n_unique}
 
     return {"columns": detail, "total_obs_cols": total}
+
+
+def _truncate_value(value: Any, limit: int = 60) -> str:
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _column_facts(series, n_ref: int, max_values: int = 10) -> dict:
+    """Judgment-free factual summary of one obs/var column.
+
+    Reports dtype, cardinality, missingness, and either a value-count
+    distribution (categorical / low-cardinality) or numeric stats. Deliberately
+    makes NO role decision — e.g. a near-unique column reports
+    ``unique_fraction`` close to 1.0 and lets the consumer conclude it is an
+    identifier rather than baking that judgment in here.
+    """
+    import pandas as pd
+
+    dtype_str = str(series.dtype)
+    n_missing = int(series.isna().sum())
+    non_null = series.dropna()
+    n_unique = int(non_null.nunique())
+    facts: dict = {
+        "dtype": dtype_str,
+        "n_unique": n_unique,
+        "n_missing": n_missing,
+        "unique_fraction": round(n_unique / n_ref, 4) if n_ref else 0.0,
+    }
+    if n_unique == 0:
+        return facts
+
+    is_numeric = pd.api.types.is_numeric_dtype(series)
+    if is_numeric and n_unique > max_values:
+        try:
+            vals = non_null.to_numpy(dtype=float)
+            finite = vals[np.isfinite(vals)]
+            if len(finite):
+                facts.update(
+                    {
+                        "min": round(float(finite.min()), 4),
+                        "max": round(float(finite.max()), 4),
+                        "mean": round(float(finite.mean()), 4),
+                        "all_integer": bool(np.allclose(finite, np.round(finite))),
+                    }
+                )
+        except Exception:
+            pass
+        return facts
+
+    # Categorical / low-cardinality: a value-count distribution. For an
+    # identifier column the top values each have count 1, which together with
+    # unique_fraction makes "this is a barcode, not a label" self-evident.
+    try:
+        value_counts = non_null.value_counts()
+        facts["top_values"] = [
+            {"value": _truncate_value(idx), "count": int(count)}
+            for idx, count in value_counts.head(max_values).items()
+        ]
+        if n_unique > max_values:
+            facts["values_truncated"] = True
+    except Exception:
+        pass
+    return facts
+
+
+def _x_facts(X, sample_n: int = 10000) -> dict:
+    """Factual characterization of the X matrix from a cheap sample (no full scan)."""
+    facts: dict = {"dtype": str(getattr(X, "dtype", "unknown")), "is_sparse": bool(sp.issparse(X))}
+    try:
+        if sp.issparse(X):
+            data = X.data
+            sample = data[: min(sample_n, len(data))] if len(data) else np.array([])
+        else:
+            flat = np.asarray(X).ravel()
+            sample = flat[: min(sample_n, len(flat))] if len(flat) else np.array([])
+        if len(sample):
+            facts["sample_min"] = round(float(sample.min()), 4)
+            facts["sample_max"] = round(float(sample.max()), 4)
+            facts["all_integer_sample"] = bool(np.allclose(sample, np.round(sample)))
+            facts["has_negative_sample"] = bool(float(sample.min()) < 0)
+    except Exception:
+        pass
+    return facts
+
+
+def _gene_namespace_facts(adata: AnnData, sample_n: int = 5000) -> dict:
+    """Raw gene-identifier signals (counts only, no species conclusion)."""
+    names = [str(name) for name in adata.var_names[:sample_n]]
+    if not names:
+        return {}
+    return {
+        "n_checked": len(names),
+        "ensembl_human_ensg": sum(1 for n in names if n.startswith("ENSG")),
+        "ensembl_mouse_ensmusg": sum(1 for n in names if n.startswith("ENSMUSG")),
+        "uppercase_symbol_like": sum(1 for n in names if re.match(r"^[A-Z0-9-]{2,}$", n)),
+        "title_symbol_like": sum(1 for n in names if re.match(r"^[A-Z][a-z0-9-]{1,}$", n)),
+        "mt_prefixed": sum(1 for n in names if n.upper().startswith("MT-")),
+    }
+
+
+def dataset_facts(adata: AnnData, max_values: int = 10) -> dict:
+    """Comprehensive, judgment-free fact sheet for an AnnData object.
+
+    Everything observable without interpretation: shape, X characteristics,
+    layers / embeddings / uns keys, raw availability, per-column obs & var facts,
+    gene-namespace signals, and example var names. Contains NO role / species /
+    "is this cell types" decisions — those belong to the judgment layer, which
+    consumes this sheet. Keeping facts and judgments separate is the point:
+    facts are cheap, deterministic, and testable; judgments are not.
+    """
+    n_obs, n_vars = int(adata.n_obs), int(adata.n_vars)
+    return {
+        "shape": {"n_obs": n_obs, "n_vars": n_vars},
+        "X": _x_facts(adata.X),
+        "layers": list(adata.layers.keys()),
+        "obsm_keys": list(adata.obsm.keys()),
+        "varm_keys": list(adata.varm.keys()),
+        "uns_keys": list(adata.uns.keys()),
+        "raw": {
+            "present": adata.raw is not None,
+            "n_vars": int(adata.raw.n_vars) if adata.raw is not None else 0,
+        },
+        "obs_columns": {col: _column_facts(adata.obs[col], n_obs, max_values) for col in adata.obs.columns},
+        "var_columns": {col: _column_facts(adata.var[col], n_vars, max_values) for col in adata.var.columns},
+        "var_names_examples": [str(name) for name in adata.var_names[:8]],
+        "gene_namespace": _gene_namespace_facts(adata),
+    }
