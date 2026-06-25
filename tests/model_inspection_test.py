@@ -64,6 +64,39 @@ def test_record_inspection_with_real_celltype_column():
     assert "external_or_manual" in ws.annotation_sources
 
 
+def test_record_inspection_overrides_all_judgments():
+    # Every semantic judgment — cluster, tissue, condition — comes from the model.
+    adata = _adata()
+    adata.obs["leiden"] = pd.Categorical([str(i % 4) for i in range(adata.n_obs)])
+    ws = _synced_ws(adata)
+    out = ws.record_inspection(
+        {
+            "cell_type_col": "labels",
+            "batch_col": "donor",
+            "cluster_col": "leiden",
+            "species": "human",
+            "tissue": "lung",
+            "condition": "IPF",
+        },
+        adata=adata,
+    )
+    assert out["status"] == "ok"
+    assert ws.data_summary["cluster_key"] == "leiden"
+    bc = ws.data_summary["biological_context"]
+    assert bc["tissue"] == "lung" and bc["tissue_source"] == "model_inspection"
+    assert bc["condition"] == "IPF" and bc["condition_source"] == "model_inspection"
+    assert bc["species"] == "human"
+
+
+def test_record_inspection_rejects_missing_cluster_column():
+    adata = _adata()
+    ws = _synced_ws(adata)
+    out = ws.record_inspection({"cluster_col": "no_such_clusters"}, adata=adata)
+    assert out["status"] == "error"
+    assert any("no_such_clusters" in e for e in out["errors"])
+    assert ws.get_confirmed_value("inspection") is None
+
+
 def test_record_inspection_rejects_missing_column():
     adata = _adata()
     ws = _synced_ws(adata)

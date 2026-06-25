@@ -697,9 +697,18 @@ with your interpretation, reasoning from the facts:
   qualifies — a column that is ~unique per cell (high `unique_fraction`) is a
   barcode / per-cell id, NOT labels.
 - `batch_col` / `donor_col` / `sample_col`: the grouping columns, when present.
+- `cluster_col`: an existing cluster-assignment column (e.g. leiden), if the
+  data already carries one. Omit if not yet clustered.
 - `species`: from gene symbols / IDs / the namespace counts (e.g. ENSG vs
   ENSMUSG; human symbols + MT- prefix).
+- `tissue` / `condition`: the tissue/system and experimental or disease state,
+  drawn from the request text, sample names, or annotation composition. Omit
+  either when there is no real evidence.
 - `rationale`: cite the specific facts you used.
+
+Every semantic interpretation of the dataset comes from you here — the runtime
+no longer guesses any of these. Facts (cardinality, what columns/embeddings
+exist, whether X is integer counts) remain computed for you; judgments are yours.
 
 The runtime validates the columns exist and records the decision; it then
 overrides the heuristic guesses for the rest of the run and shows your decision

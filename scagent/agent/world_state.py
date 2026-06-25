@@ -694,12 +694,25 @@ class AgentWorldState:
         # Absent a recorded decision, behavior is exactly as before.
         inspection = self.get_confirmed_value("inspection")
         cell_type_key = state.cell_type_key
+        cluster_key = state.cluster_key
         if inspection:
             cell_type_key = inspection.get("cell_type_col")
             processing["has_celltypes"] = cell_type_key is not None
+            if inspection.get("cluster_col"):
+                cluster_key = inspection["cluster_col"]
             if inspection.get("species"):
                 biological_context["species"] = inspection["species"]
                 biological_context["species_source"] = "model_inspection"
+            if inspection.get("tissue"):
+                from ..analysis.context import _expected_celltypes_for_tissue
+                biological_context["tissue"] = inspection["tissue"]
+                biological_context["tissue_source"] = "model_inspection"
+                biological_context["expected_celltypes"] = _expected_celltypes_for_tissue(
+                    inspection["tissue"]
+                )
+            if inspection.get("condition"):
+                biological_context["condition"] = inspection["condition"]
+                biological_context["condition_source"] = "model_inspection"
 
         self.analysis_stage = _stage_from_processing(processing)
         self.data_summary = {
@@ -711,7 +724,7 @@ class AgentWorldState:
             "n_batches": state.n_batches,
             "batch_correction_applied": state.batch_correction_applied,
             "batch_correction_method": state.batch_correction_method,
-            "cluster_key": state.cluster_key,
+            "cluster_key": cluster_key,
             "n_clusters": state.n_clusters,
             "cell_type_key": cell_type_key,
             "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
@@ -840,7 +853,7 @@ class AgentWorldState:
         """
         obs_cols = set(adata.obs.columns) if adata is not None else set()
         errors: List[str] = []
-        for field_name in ("cell_type_col", "batch_col", "donor_col", "sample_col"):
+        for field_name in ("cell_type_col", "batch_col", "donor_col", "sample_col", "cluster_col"):
             value = payload.get(field_name)
             if value is not None and adata is not None and value not in obs_cols:
                 errors.append(
@@ -854,12 +867,19 @@ class AgentWorldState:
         if errors:
             return {"status": "error", "errors": errors}
 
+        def _clean_text(value):
+            text = str(value).strip() if value is not None else ""
+            return text or None
+
         inspection = {
             "cell_type_col": payload.get("cell_type_col"),
             "batch_col": payload.get("batch_col"),
             "donor_col": payload.get("donor_col"),
             "sample_col": payload.get("sample_col"),
+            "cluster_col": payload.get("cluster_col"),
             "species": species_norm,
+            "tissue": _clean_text(payload.get("tissue")),
+            "condition": _clean_text(payload.get("condition")),
             "rationale": str(payload.get("rationale", "")),
             "recorded_at": _utc_now_iso(),
         }
