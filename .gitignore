@@ -72,22 +72,17 @@ logs/
 .claude/
 treg_project/
 andrew_data/
-# Keep the large local test workspace ignored, but track focused regression tests.
-tests/*
-!tests/decision_interaction_test.py
-!tests/loading_regression_test.py
-!tests/annotation_save_escape_test.py
-!tests/batch_strategy_trigger_test.py
-!tests/batch_diagnostic_test.py
-!tests/annotation_adjudication_soft_test.py
-!tests/write_json_robustness_test.py
-!tests/concat_datasets_robustness_test.py
-!tests/gemini_provider_test.py
-!tests/dotenv_precedence_test.py
+# Track test code. Compiled cache (__pycache__/) and data fixtures (*.h5ad) are
+# already ignored by the global rules above; keep other large binary fixtures
+# out so tests/ stays code-only.
+tests/**/*.h5
+tests/**/*.loom
+tests/**/*.mtx
 cellbender_test/
 results/
 article_figures/
 two_replicates/
+startup_ideas/
 
 # NAT eval run artifacts (regeneratable; nat_runs is GBs of per-run h5ad).
 # Summarized results live in the committed RESULTS_*.md docs + nat_eval_figs/.
