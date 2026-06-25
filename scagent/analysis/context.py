@@ -149,7 +149,10 @@ def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, Di
     title_symbol_like = sum(1 for name in sample_names if re.match(r"^[A-Z][a-z0-9-]{1,}$", name))
     ensg = sum(1 for value in combined if value.startswith("ENSG"))
     ensmusg = sum(1 for value in combined if value.startswith("ENSMUSG"))
-    h2_genes = sum(1 for name in sample_names if re.match(r"^H2[-A-Za-z0-9]*", name))
+    # Mouse MHC genes are hyphenated (H2-K1, H2-D1, H2-Aa). Require the hyphen so
+    # this does NOT match human histone genes (H2AFZ, H2AC6, H2BC12), which are
+    # abundant and would otherwise collide with HLA to read as "conflicting".
+    h2_genes = sum(1 for name in sample_names if re.match(r"^H2-[A-Za-z0-9]+", name))
     hla_genes = sum(1 for name in sample_names if re.match(r"^HLA[-A-Za-z0-9]*", name))
 
     evidence.update({

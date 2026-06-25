@@ -606,6 +606,13 @@ def _categorical_structure_score(series, n_obs: int, role: str) -> float:
         return 0.0
 
     unique_fraction = n_unique / max(1, n_obs)
+    # Identifier-like columns (cell barcodes, per-cell IDs) are never label
+    # columns, no matter how their name scores. A cell_type/cluster column is a
+    # categorical label with bounded cardinality; a near-unique column is an
+    # identifier. Without this, e.g. `cell_barcode` (≈unique per cell) gets a
+    # cell_type role solely from sharing the token "cell" with the role aliases.
+    if role in {"cell_type", "cluster"} and unique_fraction >= 0.65:
+        return 0.0
     dtype_name = str(series.dtype)
     score = 0.0
     if dtype_name == "category" or dtype_name == "bool" or "string" in dtype_name or dtype_name == "object":
