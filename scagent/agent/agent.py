@@ -3202,6 +3202,15 @@ class SCAgent:
         if not message:
             return
 
+        # Structured decision messages (built by structured_decision_request) echo
+        # the option LABELS — e.g. "Integrate the samples with scVI" — and an
+        # instruction mentioning integration. They are NOT free-form user input:
+        # the authoritative choice was already committed by resolve_pending_decision.
+        # Scraping them re-matches those labels and clobbers the real selection
+        # (Bug A: an "investigate" pick overwritten by integrate_scvi). Skip them.
+        if message.lstrip().startswith("[Structured user decision]"):
+            return
+
         text = " ".join(message.lower().split())
 
         confirm_cleanup_patterns = [
