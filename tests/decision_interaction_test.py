@@ -40,7 +40,7 @@ class FakeWorldState:
     def get_confirmed_value(self, key):
         return self.user_preferences.get(key)
 
-    def add_context_hint(self, hint):
+    def add_context_hint(self, hint, *, source="model"):
         self.context_hints.append(hint)
 
 

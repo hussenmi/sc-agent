@@ -1853,7 +1853,7 @@ class SCAgent:
                 source="user",
                 message=selected_value,
             )
-            self.world_state.add_context_hint(f"Experiment design: {selected_value}")
+            self.world_state.add_context_hint(f"Experiment design: {selected_value}", source="user")
             decision_key = "experiment_design"
             reprompt_checkpoint = self._multi_sample_strategy_checkpoint(
                 checkpoint.get("partition") or {}

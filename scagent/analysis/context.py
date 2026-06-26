@@ -31,6 +31,10 @@ class BiologicalContext:
 
     provenance: Dict[str, str] = field(default_factory=dict)
     user_provided: Dict[str, Any] = field(default_factory=dict)
+    # Derived from a context string the *model/tool* supplied (e.g. the `context`
+    # arg of load_data/inspect_data), NOT from the user. Kept separate so the
+    # model can't mistake its own guessed context for user ground truth.
+    context_supplied: Dict[str, Any] = field(default_factory=dict)
     metadata_derived: Dict[str, Any] = field(default_factory=dict)
     marker_inferred: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
@@ -302,6 +306,7 @@ def infer_biological_context(
     adata: AnnData,
     *,
     text_context: Optional[str] = None,
+    hint_context: Optional[str] = None,
     _precomputed_state=None,
 ) -> BiologicalContext:
     """
@@ -319,7 +324,13 @@ def infer_biological_context(
     state = _precomputed_state if _precomputed_state is not None else inspect_data(adata)
     context = BiologicalContext()
 
+    # `text_context` is genuine user text (the request); `hint_context` is text a
+    # tool/model supplied (e.g. load_data's `context` arg). Species/sample_type
+    # use only the user text, so a model-guessed hint can't masquerade as a
+    # user_provided species. Tissue/condition fall back to the hint text but are
+    # then labeled `context_supplied`, never `user_provided`.
     normalized_text = _normalize_text(text_context)
+    normalized_hint = _normalize_text(hint_context)
 
     species, species_source, species_evidence = _infer_species(adata, normalized_text)
     context.species = species
@@ -346,10 +357,17 @@ def infer_biological_context(
             context.metadata_derived["sample_type"] = sample_type
 
     tissue, tissue_source = _infer_tissue_from_text(normalized_text)
+    if not tissue and normalized_hint:
+        hint_tissue, _ = _infer_tissue_from_text(normalized_hint)
+        if hint_tissue:
+            tissue, tissue_source = hint_tissue, "context_supplied"
     if tissue:
         context.tissue = tissue
         context.provenance["tissue"] = tissue_source or "user_provided"
-        context.user_provided["tissue"] = tissue
+        if tissue_source == "context_supplied":
+            context.context_supplied["tissue"] = tissue
+        else:
+            context.user_provided["tissue"] = tissue
     else:
         inferred_tissue, evidence = _infer_tissue_from_annotations(adata)
         if inferred_tissue:
@@ -361,16 +379,26 @@ def infer_biological_context(
                 context.marker_inferred["tissue_evidence"] = evidence
 
     condition, condition_source = _infer_condition_from_text(normalized_text)
+    if condition_source == "unknown" and normalized_hint:
+        hint_condition, hint_condition_source = _infer_condition_from_text(normalized_hint)
+        if hint_condition_source != "unknown":
+            condition, condition_source = hint_condition, "context_supplied"
     context.condition = condition
     if condition_source != "unknown":
         context.provenance["condition"] = condition_source
-        context.user_provided["condition"] = condition
+        if condition_source == "context_supplied":
+            context.context_supplied["condition"] = condition
+        else:
+            context.user_provided["condition"] = condition
 
     context.expected_celltypes = _expected_celltypes_for_tissue(context.tissue)
 
     confidence = 0.0
     if context.provenance.get("tissue") == "user_provided":
         confidence += 0.35
+    elif context.provenance.get("tissue") == "context_supplied":
+        confidence += 0.15
+        context.notes.append("Tissue came from a supplied context string, not the user — treat as provisional and verify against gene/annotation evidence.")
     elif context.provenance.get("tissue") == "marker_inferred":
         confidence += 0.2
         context.notes.append("Tissue context is inferred from broad annotation composition and should be treated as provisional.")
@@ -380,6 +408,8 @@ def infer_biological_context(
         confidence += 0.15
     if context.provenance.get("condition") == "user_provided":
         confidence += 0.15
+    elif context.provenance.get("condition") == "context_supplied":
+        confidence += 0.07
     if context.tissue == "unknown":
         context.notes.append("Tissue context was not explicit; literature search may be broader than ideal.")
     if context.condition == "unknown":

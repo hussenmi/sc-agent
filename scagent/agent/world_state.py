@@ -163,6 +163,10 @@ class AgentWorldState:
     resolved_decisions: List[DecisionRecord] = field(default_factory=list)
     user_preferences: Dict[str, Any] = field(default_factory=dict)
     context_hints: List[str] = field(default_factory=list)
+    # Subset of context_hints that genuinely came from the user (e.g. a typed
+    # experiment description), as opposed to tool/model-supplied `context` args.
+    # Used to attribute biological-context provenance correctly.
+    user_context_hints: List[str] = field(default_factory=list)
     annotation_validation: Dict[str, Any] = field(default_factory=dict)
     last_action: Dict[str, Any] = field(default_factory=dict)
     recent_events: List[Dict[str, Any]] = field(default_factory=list)
@@ -495,6 +499,7 @@ class AgentWorldState:
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions],
             "user_preferences": self.user_preferences,
             "context_hints": self.context_hints,
+            "user_context_hints": self.user_context_hints,
             "annotation_validation": self.annotation_validation,
             "last_action": self.last_action,
             "recent_events": self.recent_events,
@@ -542,14 +547,22 @@ class AgentWorldState:
     def set_active_request(self, request: str) -> None:
         self.active_request = request
 
-    def add_context_hint(self, hint: str) -> None:
-        """Persist a user/tool-provided biological or workflow hint."""
+    def add_context_hint(self, hint: str, *, source: str = "model") -> None:
+        """Persist a biological or workflow hint.
+
+        source="user" marks text the user actually typed (e.g. an experiment
+        description); the default "model" is for tool/model-supplied `context`
+        args. Only user-origin hints are later treated as user-provided context.
+        """
         normalized = " ".join(str(hint or "").split())
         if not normalized:
             return
         if normalized not in self.context_hints:
             self.context_hints.append(normalized)
             self.context_hints = self.context_hints[-20:]
+        if source == "user" and normalized not in self.user_context_hints:
+            self.user_context_hints.append(normalized)
+            self.user_context_hints = self.user_context_hints[-20:]
 
     @staticmethod
     def _adata_fingerprint(adata) -> tuple:
@@ -682,12 +695,18 @@ class AgentWorldState:
             "has_clusters": state.has_clusters,
             "has_celltypes": state.has_celltype_annotations,
         }
-        context_text = " ".join(
-            part for part in [self.active_request, request_text, *self.context_hints] if part
+        # Genuine user text (request + user-typed hints) vs tool/model-supplied
+        # `context` args. Keeping them separate stops a model-guessed context
+        # (e.g. "PBMC scRNA-seq") from being attributed to the user.
+        user_text = " ".join(
+            part for part in [self.active_request, request_text, *self.user_context_hints] if part
         )
+        model_hints = [h for h in self.context_hints if h not in self.user_context_hints]
+        hint_text = " ".join(model_hints)
         biological_context = infer_biological_context(
             adata,
-            text_context=context_text,
+            text_context=user_text,
+            hint_context=hint_text,
             _precomputed_state=state,
         ).to_dict()
 
