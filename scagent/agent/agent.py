@@ -1842,13 +1842,6 @@ class SCAgent:
             self._authorize_pending_cleanup_from_user(selected_action)
 
         decision_key = checkpoint.get("decision_key", checkpoint.get("kind", "pending_decision"))
-        logger.warning(
-            "[bug-a-trace] resolve_pending_decision kind=%r decision_key=%r "
-            "selected_action=%r selected_value=%r index=%r input_mode=%r option_actions=%r",
-            checkpoint.get("kind"), decision_key, selected_action, selected_value,
-            getattr(selection, "index", None), getattr(selection, "input_mode", None),
-            checkpoint.get("option_actions"),
-        )
         reprompt_checkpoint = None
         if (
             checkpoint.get("kind") == "multi_sample_strategy"
@@ -1902,11 +1895,11 @@ class SCAgent:
         return payload
 
     def _attach_run_log_handler(self) -> None:
-        """Mirror scagent WARNING+ logs (incl. [bug-a-trace]) into the run dir.
+        """Mirror scagent WARNING+ logs into ``<run_dir>/logs/scagent.log``.
 
-        Lets an intermittent issue be captured by a normal run — read
-        ``<run_dir>/logs/scagent.log`` afterward instead of piping stderr.
-        Attaches once per run; a no-op without a run_manager.
+        Persists warnings/errors per run so issues can be diagnosed after the
+        fact without re-running with stderr captured. Attaches once per run; a
+        no-op without a run_manager.
         """
         rm = self.run_manager
         if rm is None or getattr(self, "_run_log_handler", None) is not None:
