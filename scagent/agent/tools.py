@@ -2969,7 +2969,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
                     "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"},
                     "layer": {"type": "string", "description": "Optional expression layer to use for DEG (for example scran_norm)"},
-                    "use_raw": {"type": "boolean", "description": "Whether to use adata.raw for DEG when layer is not set. If omitted, follows Scanpy default (uses adata.raw when present)."},
+                    "use_raw": {"type": "boolean", "description": "Whether to use adata.raw for DEG when layer is not set. Omit (default False) to use adata.X — the log-normalized, full-gene analysis matrix this pipeline maintains. Only set True if you have confirmed adata.X is scaled/z-scored (this pipeline does not scale X in place)."},
                     "key_added": {"type": "string", "description": "Key in adata.uns for DEG results (default: rank_genes_groups)"},
                     "n_genes": {"type": "integer", "description": "Number of ranked genes to store per group (default: 100)"},
                     "target_geneset": {"type": "string", "description": "Target gene set database for compatibility check (default: MSigDB_Hallmark_2020)"}

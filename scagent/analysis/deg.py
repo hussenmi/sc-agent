@@ -343,9 +343,12 @@ def _resolve_expression_source(
     """
     Resolve the exact matrix that rank_genes_groups should use.
 
-    Scanpy defaults to adata.raw when use_raw=None and adata.raw exists. We make
-    that implicit behavior explicit so validation, execution, and reporting all
-    refer to the same matrix.
+    Default (use_raw=None) resolves to adata.X — NOT scanpy's implicit
+    adata.raw. In this workflow X is the log-normalized, full-gene analysis
+    matrix (HVGs are flagged, not subset; X is not scaled in place), so it is the
+    correct and current DEG source. adata.raw is a redundant post-log1p snapshot
+    that can go stale after later filtering/correction. Pass use_raw=True
+    explicitly only when X is known to be scaled and raw holds the log-norm data.
     """
     issues: List[DEGValidityIssue] = []
 
@@ -362,7 +365,7 @@ def _resolve_expression_source(
         return adata.layers[layer], layer, False, f"adata.layers['{layer}']", issues
 
     if use_raw is None:
-        resolved_use_raw = adata.raw is not None
+        resolved_use_raw = False  # default to adata.X (the current log-norm matrix)
     elif use_raw:
         resolved_use_raw = adata.raw is not None
         if not resolved_use_raw:
