@@ -449,14 +449,14 @@ class AgentWorldState:
 
         if processing.get("has_neighbors") or processing.get("has_umap") or processing.get("has_clusters"):
             status = "needs_review"
-            next_action = "Ask the user whether to investigate, integrate with scVI, keep the shared analysis uncorrected, or analyze samples separately."
+            next_action = "Present the sample-handling choice with pause_and_ask (investigate / integrate with scVI / keep uncorrected / analyze separately), then end the turn."
             reason = (
                 "A multi-group batch key is present, but neighbors/UMAP/clustering already exist "
                 "without a user-selected sample-handling strategy."
             )
         elif processing.get("has_pca"):
             status = "needs_decision"
-            next_action = "Ask the user to choose the sample-handling strategy; do not correct automatically."
+            next_action = "Present the sample-handling strategy choice with pause_and_ask; do not correct automatically."
             reason = "A multi-group sample-like key is present after PCA, but no strategy has been selected."
         elif processing.get("is_normalized") or processing.get("has_hvg"):
             status = "pending_pca"
@@ -464,7 +464,7 @@ class AgentWorldState:
             reason = "A multi-group sample-like key is present, but its presence alone does not justify correction."
         else:
             status = "pending_preprocessing"
-            next_action = "Ask how the user wants the samples handled, then carry that decision through preprocessing."
+            next_action = "Present the strategy choice with pause_and_ask before any preprocessing; preprocessing is blocked until a strategy is selected."
             reason = "A multi-group sample-like key is present early in the workflow; correction is opt-in."
 
         return {
@@ -1111,10 +1111,12 @@ class AgentWorldState:
                 "blocks_terminal": True,
                 "guidance": (
                     f"This dataset has {n} sample-like groups but the multi_sample_strategy "
-                    "decision is unresolved. Before clustering/annotation is treated as final, "
-                    "resolve it: investigate (uncorrected first pass → diagnose_batch_effect), "
-                    "integrate, keep one combined uncorrected analysis, or analyze separately. "
-                    "Surface the choice — do not silently proceed on uncorrected data."
+                    "decision is unresolved. Present the choice to the user now with "
+                    "pause_and_ask — investigate (uncorrected first pass → diagnose_batch_effect), "
+                    "integrate, keep one combined uncorrected analysis, or analyze separately — "
+                    "then end your turn. Preprocessing is blocked until a strategy is selected, so "
+                    "do not run QC/normalization first and do not deliberate about proceeding: "
+                    "'investigate' is an option you offer here, not a step you take before asking."
                 ),
             })
 

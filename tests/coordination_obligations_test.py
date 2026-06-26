@@ -56,6 +56,21 @@ def test_batch_decision_unresolved_when_multisample_and_no_strategy():
     assert any(o["key"] == "batch_decision" for o in ws.unmet_obligations())
 
 
+def test_batch_decision_guidance_is_unambiguous():
+    # The guidance must state ONE action (pause_and_ask) and that preprocessing is
+    # blocked — not imply the model may proceed/investigate first. This is the fix
+    # for the model deliberating in circles over the multi-sample fork.
+    ws = AgentWorldState()
+    ws.data_summary = {"n_batches": 8}
+    o = next(o for o in ws.unmet_obligations() if o["key"] == "batch_decision")
+    g = o["guidance"].lower()
+    assert "pause_and_ask" in g
+    assert "blocked" in g
+    assert "option you offer" in g  # 'investigate' is offered, not done first
+    # Must not invite silent proceeding.
+    assert "silently proceed" not in g
+
+
 def test_batch_decision_moot_on_single_sample():
     ws = AgentWorldState()
     ws.data_summary = {"n_batches": 1}

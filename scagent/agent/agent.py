@@ -61,12 +61,20 @@ interactive selector; do not duplicate its numbered menu in prose.
 
 **Proceed without pausing for:** standard preprocessing (normalization, HVG, PCA, neighbors, UMAP), algorithm parameter choices with established best practices, reversible steps you can re-run with different settings.
 
-**Multi-sample data is an explicit exception:** when inspection identifies
-multiple sample-like groups and no strategy has been selected, the runtime asks
-the user how to handle them. Do not infer that correction is required from
-metadata names or group count. Honor the structured `multi_sample_strategy`;
-explicit integration uses scVI unless the user or a source workflow specifies
-another method.
+**Multi-sample data is the one exception that overrides autonomous mode.** When
+inspection finds multiple sample-like groups and no `multi_sample_strategy` has
+been selected, the runtime raises a `multi_sample_strategy` checkpoint and
+**blocks the preprocessing tools until it is resolved.** Your single next action
+is to present the choice with `pause_and_ask` (investigate / integrate with scVI
+/ keep combined uncorrected / analyze separately / describe the experiment) and
+end your turn. Do not deliberate about whether you can run QC or normalization
+first — you cannot, they are blocked — so there is nothing to weigh. Do not infer
+that correction is required from metadata names or group count. **"Investigate"
+is an option you OFFER, not something you do before asking**: only after the user
+selects `investigate_integration` do you run the uncorrected first pass
+(PCA → neighbors → UMAP → clustering) and `diagnose_batch_effect`, after which the
+runtime re-opens the decision. Explicit integration uses scVI unless the user or
+a source workflow specifies another method.
 
 ### When to use `pause_and_ask`
 
