@@ -39,8 +39,15 @@ def _adata():
 # --- gate decision ------------------------------------------------------------
 
 def test_gate_off_when_flag_off(monkeypatch):
-    monkeypatch.delenv("SCAGENT_MODEL_INSPECTION", raising=False)
+    # Model inspection now defaults ON, so OFF must be set explicitly.
+    monkeypatch.setenv("SCAGENT_MODEL_INSPECTION", "0")
     assert _agent()._inspection_gate_action("run_qc") is None
+
+
+def test_gate_on_by_default(monkeypatch):
+    # Default (unset) is ON: an analysis step without a recorded inspection nudges.
+    monkeypatch.delenv("SCAGENT_MODEL_INSPECTION", raising=False)
+    assert _agent()._inspection_gate_action("run_qc") == "nudge"
 
 
 def test_gate_nudges_then_falls_back(monkeypatch):

@@ -3817,11 +3817,11 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             },
         })
 
-    # Model-driven inspection (opt-in via SCAGENT_MODEL_INSPECTION=1): the model
-    # reads the deterministic fact sheet from inspect_data and records its own
-    # role/species interpretation, which overrides the heuristic. Exposed only
-    # under the flag so default behavior is unchanged.
-    if os.environ.get("SCAGENT_MODEL_INSPECTION") == "1":
+    # Model-driven inspection (default ON; disable with SCAGENT_MODEL_INSPECTION=0):
+    # the model reads the deterministic fact sheet from inspect_data and records
+    # its own role/species interpretation, which overrides the heuristic. A safety
+    # net falls back to the heuristic if the model skips record_inspection.
+    if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") != "0":
         tools.append({
             "name": "record_inspection",
             "description": (
@@ -6698,7 +6698,7 @@ def process_tool_call(
             }
             # Under model-driven inspection, attach the comprehensive judgment-free
             # fact sheet so the model can record_inspection from it.
-            if os.environ.get("SCAGENT_MODEL_INSPECTION") == "1":
+            if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") != "0":
                 from ..core.inspector import dataset_facts
                 result["facts"] = dataset_facts(working_adata)
             if goal:

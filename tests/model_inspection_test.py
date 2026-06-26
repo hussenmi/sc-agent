@@ -152,12 +152,14 @@ def test_record_inspection_rejects_bad_species():
     assert ws.get_confirmed_value("inspection") is None
 
 
-def test_tool_exposed_only_under_flag(monkeypatch):
+def test_tool_exposed_by_default_and_gated_off(monkeypatch):
+    # Default ON (unset): record_inspection is exposed in both schema formats.
     monkeypatch.delenv("SCAGENT_MODEL_INSPECTION", raising=False)
-    assert "record_inspection" not in {t["name"] for t in get_tools()}
-
-    monkeypatch.setenv("SCAGENT_MODEL_INSPECTION", "1")
     anthropic_names = {t["name"] for t in get_tools()}
     openai_names = {t["function"]["name"] for t in get_openai_tools()}
     assert "record_inspection" in anthropic_names
     assert "record_inspection" in openai_names
+
+    # Explicit OFF removes it.
+    monkeypatch.setenv("SCAGENT_MODEL_INSPECTION", "0")
+    assert "record_inspection" not in {t["name"] for t in get_tools()}

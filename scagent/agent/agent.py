@@ -2247,11 +2247,11 @@ class SCAgent:
 
         Returns "nudge" (steer to record_inspection once), "fallback" (proceed on
         the heuristic and log the skip once), or None (no gating). A pure
-        decision; the caller performs the side effects. Gating applies only when
-        SCAGENT_MODEL_INSPECTION=1, the tool is an analysis step that should
-        follow inspection, data is loaded, and no inspection has been recorded.
+        decision; the caller performs the side effects. Gating applies unless
+        SCAGENT_MODEL_INSPECTION=0 (default on), the tool is an analysis step that
+        should follow inspection, data is loaded, and no inspection was recorded.
         """
-        if os.environ.get("SCAGENT_MODEL_INSPECTION") != "1":
+        if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") == "0":
             return None
         if tool_name not in INSPECTION_GATED_TOOLS or self.adata is None:
             return None
@@ -2815,7 +2815,7 @@ class SCAgent:
             )
         if self.smart_autonomous:
             prompt += _SMART_AUTONOMOUS_PROMPT
-        if os.environ.get("SCAGENT_MODEL_INSPECTION") == "1":
+        if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") != "0":
             from .prompts import MODEL_INSPECTION_PROMPT
             prompt += MODEL_INSPECTION_PROMPT
         if self._use_sidecar_for_images():
