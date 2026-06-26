@@ -1842,6 +1842,13 @@ class SCAgent:
             self._authorize_pending_cleanup_from_user(selected_action)
 
         decision_key = checkpoint.get("decision_key", checkpoint.get("kind", "pending_decision"))
+        logger.warning(
+            "[bug-a-trace] resolve_pending_decision kind=%r decision_key=%r "
+            "selected_action=%r selected_value=%r index=%r input_mode=%r option_actions=%r",
+            checkpoint.get("kind"), decision_key, selected_action, selected_value,
+            getattr(selection, "index", None), getattr(selection, "input_mode", None),
+            checkpoint.get("option_actions"),
+        )
         reprompt_checkpoint = None
         if (
             checkpoint.get("kind") == "multi_sample_strategy"
@@ -1893,6 +1900,26 @@ class SCAgent:
             payload["reprompt"] = True
             self._set_pending_checkpoint(reprompt_checkpoint)
         return payload
+
+    def _attach_run_log_handler(self) -> None:
+        """Mirror scagent WARNING+ logs (incl. [bug-a-trace]) into the run dir.
+
+        Lets an intermittent issue be captured by a normal run — read
+        ``<run_dir>/logs/scagent.log`` afterward instead of piping stderr.
+        Attaches once per run; a no-op without a run_manager.
+        """
+        rm = self.run_manager
+        if rm is None or getattr(self, "_run_log_handler", None) is not None:
+            return
+        import logging as _logging
+        log_path = rm._ensure(rm.dirs["logs"]) / "scagent.log"
+        handler = _logging.FileHandler(str(log_path))
+        handler.setLevel(_logging.WARNING)
+        handler.setFormatter(
+            _logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        _logging.getLogger("scagent").addHandler(handler)
+        self._run_log_handler = handler
 
     def structured_decision_request(self, selection) -> str:
         """Turn a selector result into an unambiguous model-facing user message."""
@@ -3972,6 +3999,8 @@ class SCAgent:
                 result={"status": "starting"}
             )
             self.run_manager.append_event("follow_up_request", {"request": request})
+
+        self._attach_run_log_handler()
 
         # Resolve text-only clients against the newest pending checkpoint before
         # the request enters the provider conversation.
