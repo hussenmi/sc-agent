@@ -14,7 +14,11 @@ from typing import Any, Dict, List, Optional
 import hashlib
 import importlib.util
 import json
+import logging
 import os
+import traceback
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -805,6 +809,16 @@ class AgentWorldState:
             self.user_preferences[decision.key] = decision.applied_value
 
     def resolve_decision(self, key: str, value: Any, *, source: str = "user", message: str = "") -> None:
+        # Instrumentation: name the exact caller that commits each decision value.
+        # resolve_decision is the single write path for confirmed values, so this
+        # pins which code wrote e.g. multi_sample_strategy=integrate_scvi when the
+        # user selected investigate_integration (Bug A). caller = the frame that
+        # invoked resolve_decision (skip this frame).
+        caller = traceback.extract_stack(limit=2)[0]
+        logger.warning(
+            "[bug-a-trace] resolve_decision key=%r value=%r source=%r caller=%s:%d:%s",
+            key, value, source, caller.filename, caller.lineno, caller.name,
+        )
         rationale = f"User confirmed {key}={value!r}."
         matching = next((decision for decision in reversed(self.outstanding_decisions) if decision.key == key), None)
         if matching is not None:

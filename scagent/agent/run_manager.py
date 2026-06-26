@@ -8,6 +8,7 @@ Creates structured output directories with:
 - Machine-readable manifest for reproducibility
 """
 
+import copy
 import os
 import json
 import socket
@@ -236,11 +237,17 @@ class RunManager:
         self._save_manifest()
 
     def append_world_state_snapshot(self, snapshot: Dict[str, Any]):
-        """Append a compact snapshot of the agent world state."""
+        """Append a compact snapshot of the agent world state.
+
+        Deep-copy the snapshot before storing. ``world_state.snapshot()`` returns
+        live references (e.g. ``user_preferences``), and the whole manifest is
+        re-serialized on every save — so without freezing, every stored snapshot
+        would alias the latest state and the per-step history would be a lie.
+        """
         self.manifest.world_state_snapshots.append(
             {
                 "timestamp": datetime.now().isoformat(),
-                "snapshot": snapshot,
+                "snapshot": copy.deepcopy(snapshot),
             }
         )
         self._save_manifest()
