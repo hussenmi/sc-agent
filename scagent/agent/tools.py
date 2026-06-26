@@ -5956,10 +5956,17 @@ def process_tool_call(
             if _written_artifacts:
                 result["artifacts_created"] = list(_written_artifacts)
             if captured_output:
-                # Truncate if too long
-                result["output"] = captured_output[:2000]
-                if len(captured_output) > 2000:
+                # Cap the stdout returned to the model. The old 2000-char cap was
+                # too tight for inspecting structured data (e.g. annotation
+                # evidence across 18 clusters), forcing the model to page through
+                # the same print in many run_code calls. Configurable via
+                # SCAGENT_RUN_CODE_MAX_OUTPUT; report the true length when cut so
+                # the model knows how much it's missing.
+                _max_out = int(os.environ.get("SCAGENT_RUN_CODE_MAX_OUTPUT", "8000"))
+                result["output"] = captured_output[:_max_out]
+                if len(captured_output) > _max_out:
                     result["output_truncated"] = True
+                    result["output_total_chars"] = len(captured_output)
 
             return json.dumps(result, indent=2), adata
 
