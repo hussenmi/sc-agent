@@ -118,6 +118,40 @@ def _select_gpu_device() -> int:
     return best_index
 
 
+# Default DDP strategy for multi-GPU scVI. ``find_unused_parameters_true`` is what
+# scvi-tools documents for non-interactive (script) multi-GPU runs; our worker is a
+# ``python -m`` subprocess, not a notebook, so this is the right variant. Override
+# with SCAGENT_SCVI_STRATEGY (e.g. ``ddp_notebook_find_unused_parameters_true``).
+_DEFAULT_SCVI_DDP_STRATEGY = "ddp_find_unused_parameters_true"
+
+
+def _resolve_n_devices(n_devices: int | None) -> int:
+    """Resolve how many GPUs scVI should train on.
+
+    Multi-GPU is strictly opt-in. When ``n_devices`` is None we read the
+    ``SCAGENT_SCVI_DEVICES`` environment variable (mirroring how ``SCAGENT_GPU``
+    gates the RAPIDS path): unset/``1`` -> single GPU (the default, picks the
+    least-busy device); ``-1`` or ``all`` -> every visible GPU; ``N`` -> up to N
+    GPUs. An explicit ``n_devices`` argument always wins over the env var.
+    """
+    if n_devices is not None:
+        return n_devices
+
+    import os
+
+    raw = (os.environ.get("SCAGENT_SCVI_DEVICES") or "").strip().lower()
+    if not raw or raw == "1":
+        return 1
+    if raw in ("-1", "all"):
+        return -1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid SCAGENT_SCVI_DEVICES=%r; using a single GPU.", raw)
+        return 1
+    return value if value != 0 else 1
+
+
 def run_scvi(
     adata: AnnData,
     batch_key: str,
@@ -127,6 +161,7 @@ def run_scvi(
     latent_key: str = "X_scVI",
     store_normalized: bool = False,
     use_gpu: bool = True,
+    n_devices: int | None = None,
     use_hvg: bool = True,
     early_stopping: bool = True,
     diagnostics_dir: str | None = None,
@@ -165,9 +200,19 @@ def run_scvi(
         Useful for downstream DEG but adds memory overhead.
     use_gpu : bool, default True
         Use GPU if available. Falls back to CPU automatically if no GPU found
-        or if a CUDA JIT/NVRTC error occurs during training. When using GPU,
-        the device with the most free memory is selected to avoid colliding
+        or if a CUDA JIT/NVRTC error occurs during training. When using a single
+        GPU, the device with the most free memory is selected to avoid colliding
         with a busy GPU (e.g. one hosting an LLM inference server).
+    n_devices : int or None, default None
+        How many GPUs to train on. Multi-GPU training is opt-in. None reads the
+        ``SCAGENT_SCVI_DEVICES`` env var (unset/``1`` -> single GPU; ``-1``/``all``
+        -> every visible GPU; ``N`` -> up to N GPUs). ``1`` keeps the single-GPU
+        path (least-busy device). Values >1 or -1 use scvi-tools' DDP backend
+        (requires scvi-tools >=1.3). DDP shards each minibatch across GPUs; note
+        it **cannot use early stopping** (the worker disables it and runs the full
+        ``max_epochs`` cap) and adds coordination overhead, so it only pays off on
+        large datasets and a dedicated multi-GPU allocation. Restrict which GPUs
+        are eligible with ``CUDA_VISIBLE_DEVICES``.
     use_hvg : bool, default True
         Train only on highly variable genes (``adata.var['highly_variable']``)
         when that flag is present. scVI on the HVG subset is several-fold
@@ -223,12 +268,27 @@ def run_scvi(
             f"adata.layers['raw_counts'] = adata.X.copy()"
         )
 
+    import os
+
     n_batches = adata.obs[batch_key].nunique()
     epochs_label = max_epochs if max_epochs is not None else "auto (scVI heuristic)"
+    resolved_n_devices = _resolve_n_devices(n_devices)
+    scvi_strategy = (
+        os.environ.get("SCAGENT_SCVI_STRATEGY") or _DEFAULT_SCVI_DDP_STRATEGY
+    ).strip()
     logger.info(
         f"Running scVI batch correction: {n_batches} batches, "
         f"n_latent={n_latent}, max_epochs={epochs_label}"
     )
+    if resolved_n_devices != 1:
+        gpu_label = "all visible" if resolved_n_devices < 0 else str(resolved_n_devices)
+        logger.info(
+            "scVI multi-GPU training requested (n_devices=%s -> %s GPUs, strategy=%s). "
+            "Early stopping is disabled under DDP; training will run the full epoch cap.",
+            n_devices if n_devices is not None else f"env:{resolved_n_devices}",
+            gpu_label,
+            scvi_strategy,
+        )
 
     # Train on the HVG subset when available — scVI on a few thousand HVGs is
     # several-fold faster than on the full ~30k-gene matrix, and is the standard
@@ -257,7 +317,6 @@ def run_scvi(
     # therefore never import torch in this (parent) process — even a
     # torch.cuda.is_available() check would create a contaminating context.
     import json
-    import os
     import shutil
     import subprocess
     import sys
@@ -291,6 +350,8 @@ def run_scvi(
                     "max_epochs": max_epochs,
                     "early_stopping": early_stopping,
                     "use_gpu": use_gpu,
+                    "n_devices": resolved_n_devices,
+                    "strategy": scvi_strategy,
                     "store_normalized": store_normalized,
                     "latent_out": latent_out,
                     "normalized_out": normalized_out,

@@ -384,6 +384,28 @@ def run_start(args):
         "generativelanguage.googleapis.com", "aiplatform.googleapis.com",
     )
     main_loc = "" if (not _main_base or any(h in _main_base for h in _cloud_hosts)) else f"  @ {_main_base}"
+    # GPU line — surface the scVI training device config (resolved from env, the
+    # same way run_scvi resolves it) and which physical GPUs are eligible, so it's
+    # obvious at a glance whether training will fan out and onto which devices.
+    # Derived from env vars only — we deliberately do NOT import torch/cupy here, to
+    # keep a CUDA context out of the main process (scVI trains in a subprocess).
+    from scagent.batch.scvi import _resolve_n_devices
+
+    _cvd = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    _visible = _cvd if _cvd else "all"
+    _n_dev = _resolve_n_devices(None)
+    if _n_dev == 1:
+        _scvi_desc = "scVI single GPU (auto least-busy)"
+        gpu_style = "white"
+    elif _n_dev < 0:
+        _scvi_desc = "scVI all GPUs (DDP, multi-GPU)"
+        gpu_style = "green"
+    else:
+        _scvi_desc = f"scVI up to {_n_dev} GPUs (DDP, multi-GPU)"
+        gpu_style = "green"
+    gpu_desc = f"{_scvi_desc}  ·  visible: {_visible}"
+    if (os.environ.get("SCAGENT_GPU") or "").strip().lower() in ("1", "true", "yes", "on"):
+        gpu_desc += "  ·  RAPIDS accel: on"
     welcome_text = Text.assemble(
         ("scagent", "bold cyan"),
         " — single-cell RNA-seq analysis agent\n\n",
@@ -395,6 +417,9 @@ def run_start(args):
         "\n",
         ("  Vision:     ", "dim"),
         (vision_desc, vision_style),
+        "\n",
+        ("  GPU:        ", "dim"),
+        (gpu_desc, gpu_style),
         "\n",
         ("  Data:       ", "dim"),
         (os.path.abspath(args.data) if args.data else "none loaded yet", "white"),

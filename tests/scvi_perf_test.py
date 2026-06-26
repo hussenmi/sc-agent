@@ -124,6 +124,44 @@ def test_early_stopping_can_be_disabled(stub_worker):
     assert stub_worker["spec"]["early_stopping"] is False
 
 
+# --------------------------------------------------------------------------- #
+# multi-GPU opt-in flows through the job spec (n_devices + strategy)
+# --------------------------------------------------------------------------- #
+
+def test_single_gpu_is_the_default(stub_worker, monkeypatch):
+    monkeypatch.delenv("SCAGENT_SCVI_DEVICES", raising=False)
+    a = _adata()
+    scvi_mod.run_scvi(a, batch_key="sample", use_gpu=False)
+    assert stub_worker["spec"]["n_devices"] == 1
+    # The strategy is still recorded but only takes effect when n_devices != 1.
+    assert stub_worker["spec"]["strategy"] == "ddp_find_unused_parameters_true"
+
+
+@pytest.mark.parametrize(
+    "env_value,expected",
+    [("-1", -1), ("all", -1), ("4", 4), ("1", 1), ("0", 1), ("bogus", 1)],
+)
+def test_scagent_scvi_devices_env_resolves(stub_worker, monkeypatch, env_value, expected):
+    monkeypatch.setenv("SCAGENT_SCVI_DEVICES", env_value)
+    a = _adata()
+    scvi_mod.run_scvi(a, batch_key="sample", use_gpu=False)
+    assert stub_worker["spec"]["n_devices"] == expected
+
+
+def test_explicit_n_devices_overrides_env(stub_worker, monkeypatch):
+    monkeypatch.setenv("SCAGENT_SCVI_DEVICES", "4")
+    a = _adata()
+    scvi_mod.run_scvi(a, batch_key="sample", use_gpu=False, n_devices=2)
+    assert stub_worker["spec"]["n_devices"] == 2
+
+
+def test_scvi_strategy_env_override(stub_worker, monkeypatch):
+    monkeypatch.setenv("SCAGENT_SCVI_STRATEGY", "ddp_notebook_find_unused_parameters_true")
+    a = _adata()
+    scvi_mod.run_scvi(a, batch_key="sample", use_gpu=False)
+    assert stub_worker["spec"]["strategy"] == "ddp_notebook_find_unused_parameters_true"
+
+
 def test_subprocess_failure_raises(stub_worker, monkeypatch):
     """A non-zero worker exit must surface as a clear error, not a silent pass."""
     def boom(cmd, capture_output=True, text=True, **kwargs):
@@ -209,3 +247,93 @@ def test_select_gpu_device_defaults_to_zero_on_error(monkeypatch):
     fake_torch.cuda = types.SimpleNamespace(device_count=lambda: 2, mem_get_info=_boom)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     assert scvi_mod._select_gpu_device() == 0
+
+
+# --------------------------------------------------------------------------- #
+# worker-side device planning (_plan_devices) — pure decision logic
+# --------------------------------------------------------------------------- #
+
+from scagent.batch import _scvi_worker as worker  # noqa: E402
+
+
+def _pick7():
+    """Stand-in for _select_gpu_device: claims the least-busy device is index 7."""
+    return 7
+
+
+def test_plan_devices_cpu_when_gpu_disabled():
+    assert worker._plan_devices(False, 1, True, 4, _pick7) == ("cpu", 1, False)
+
+
+def test_plan_devices_cpu_when_no_cuda():
+    assert worker._plan_devices(True, 1, False, 0, _pick7) == ("cpu", 1, False)
+
+
+def test_plan_devices_single_gpu_picks_least_busy():
+    assert worker._plan_devices(True, 1, True, 4, _pick7) == ("gpu", [7], False)
+
+
+def test_plan_devices_all_visible_gpus():
+    # n_devices = -1 -> every visible GPU, DDP.
+    assert worker._plan_devices(True, -1, True, 4, _pick7) == ("gpu", 4, True)
+
+
+def test_plan_devices_caps_request_at_available():
+    # Asked for 8 but only 4 are visible -> use 4.
+    assert worker._plan_devices(True, 8, True, 4, _pick7) == ("gpu", 4, True)
+
+
+def test_plan_devices_multi_request_with_one_gpu_falls_back_to_single():
+    # DDP over a single GPU only adds overhead -> single-GPU path, no DDP.
+    assert worker._plan_devices(True, -1, True, 1, _pick7) == ("gpu", [7], False)
+    assert worker._plan_devices(True, 4, True, 1, _pick7) == ("gpu", [7], False)
+
+
+# --------------------------------------------------------------------------- #
+# worker-side DDP rank guard (_rank_zero_and_teardown)
+# --------------------------------------------------------------------------- #
+
+import logging  # noqa: E402
+
+_log = logging.getLogger("scvi_worker_test")
+
+
+def _install_fake_dist(monkeypatch, *, initialized, rank, calls):
+    """Register a fake torch.distributed (and a torch parent) in sys.modules.
+
+    Stubbing the parent ``torch`` too keeps these unit tests independent of whether
+    torch is importable in the test environment.
+    """
+    dist = types.ModuleType("torch.distributed")
+    dist.is_available = lambda: True
+    dist.is_initialized = lambda: initialized
+    dist.get_rank = lambda: rank
+    dist.barrier = lambda: calls.append("barrier")
+    dist.destroy_process_group = lambda: calls.append("destroy")
+    torch_mod = types.ModuleType("torch")
+    torch_mod.distributed = dist
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+
+
+def test_rank_zero_teardown_rank0_returns_true_and_tears_down(monkeypatch):
+    calls: list = []
+    _install_fake_dist(monkeypatch, initialized=True, rank=0, calls=calls)
+    assert worker._rank_zero_and_teardown(_log) is True
+    assert calls == ["barrier", "destroy"]
+
+
+def test_rank_zero_teardown_nonzero_rank_returns_false(monkeypatch):
+    calls: list = []
+    _install_fake_dist(monkeypatch, initialized=True, rank=3, calls=calls)
+    assert worker._rank_zero_and_teardown(_log) is False
+    assert calls == ["barrier", "destroy"]  # group is torn down on every rank
+
+
+def test_rank_zero_teardown_uninitialized_falls_back_to_env(monkeypatch):
+    # No active process group (e.g. ddp_spawn main process) -> use launcher env var.
+    _install_fake_dist(monkeypatch, initialized=False, rank=0, calls=[])
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    assert worker._rank_zero_and_teardown(_log) is True
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    assert worker._rank_zero_and_teardown(_log) is False

@@ -129,6 +129,58 @@ def _write_diagnostics(model, resolved_max_epochs: int, spec: dict, log) -> dict
     return metrics
 
 
+def _plan_devices(use_gpu, n_devices, cuda_available, device_count, select_single):
+    """Decide ``(accelerator, devices, multi_gpu)`` for an scVI training run.
+
+    Pure decision logic, factored out so it can be unit-tested without torch/scvi.
+
+    - No GPU (disabled or unavailable) -> CPU, single device.
+    - ``n_devices == 1`` -> single GPU; ``select_single()`` picks the least-busy one.
+    - ``n_devices < 0`` -> every visible GPU; ``n_devices > 1`` -> up to that many.
+      Multi-GPU collapses to the single-GPU path when only one device is visible,
+      since DDP over one GPU only adds overhead.
+
+    ``select_single`` is a zero-arg callable returning the chosen single-GPU index;
+    it is only invoked on the single-GPU paths so probing never runs needlessly.
+    """
+    if not (use_gpu and cuda_available):
+        return "cpu", 1, False
+    if n_devices == 1:
+        return "gpu", [select_single()], False
+    want = device_count if n_devices < 0 else min(n_devices, device_count)
+    if want <= 1:
+        return "gpu", [select_single()], False
+    return "gpu", want, True
+
+
+def _rank_zero_and_teardown(log) -> bool:
+    """After DDP training, return True iff this process is global rank 0.
+
+    The ``ddp`` strategy relaunches this worker script once per GPU, so every rank
+    runs the post-training code. Only rank 0 must perform inference and write the
+    output files; the others would race on the same paths. We barrier to let all
+    ranks finish training, tear down the process group so rank 0's single-device
+    inference runs cleanly, and report whether this is rank 0. When no process
+    group is active (e.g. a ``ddp_spawn``/notebook strategy, where only the main
+    process reaches here) we fall back to the launcher's rank env var.
+    """
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            is_zero = dist.get_rank() == 0
+            dist.destroy_process_group()
+            return is_zero
+    except Exception as e:  # noqa: BLE001 - never let teardown sink a finished run
+        log.warning("scVI DDP teardown check failed (%s); assuming rank 0.", e)
+        return True
+
+    import os
+
+    return (os.environ.get("LOCAL_RANK", "0") or "0") == "0"
+
+
 def _train(spec: dict) -> None:
     import logging
 
@@ -148,6 +200,8 @@ def _train(spec: dict) -> None:
     max_epochs_spec = spec.get("max_epochs")
     early_stopping = bool(spec["early_stopping"])
     use_gpu = bool(spec["use_gpu"])
+    n_devices = int(spec.get("n_devices") or 1)
+    strategy = spec.get("strategy") or "ddp_find_unused_parameters_true"
 
     # When max_epochs is left unset, defer to scVI's own cell-count heuristic
     # (400 for <=20k cells, decaying above) instead of a fixed cap. Early stopping
@@ -165,18 +219,28 @@ def _train(spec: dict) -> None:
         resolved_max_epochs = int(max_epochs_spec)
 
     # Decide accelerator here (in the child) so the parent never touches torch.
-    accelerator = "cpu"
-    train_devices: object = 1
+    cuda_available = False
+    device_count = 0
     if use_gpu:
         import torch
 
-        if torch.cuda.is_available():
-            accelerator = "gpu"
-            device_index = _select_gpu_device()
-            train_devices = [device_index]
-            log.info("scVI worker: training on GPU %d", device_index)
-        else:
+        cuda_available = torch.cuda.is_available()
+        device_count = torch.cuda.device_count() if cuda_available else 0
+
+    accelerator, train_devices, multi_gpu = _plan_devices(
+        use_gpu, n_devices, cuda_available, device_count, _select_gpu_device
+    )
+    if accelerator == "cpu":
+        if use_gpu:
             log.info("scVI worker: no GPU available, training on CPU")
+    elif multi_gpu:
+        log.info(
+            "scVI worker: multi-GPU (DDP) training on %d GPUs (strategy=%s)",
+            train_devices,
+            strategy,
+        )
+    else:
+        log.info("scVI worker: training on GPU %d", train_devices[0])
 
     def _setup_and_build():
         # Counts live in X of the minimal AnnData the parent wrote (layer=None).
@@ -189,14 +253,27 @@ def _train(spec: dict) -> None:
 
         torch.set_float32_matmul_precision("medium")
 
+    train_kwargs = {
+        "max_epochs": resolved_max_epochs,
+        "accelerator": accelerator,
+        "devices": train_devices,
+        "early_stopping": early_stopping,
+    }
+    if multi_gpu:
+        train_kwargs["strategy"] = strategy
+        # scvi-tools' DDP path cannot run with early stopping; force it off so the
+        # run doesn't crash, and warn that training will use the full epoch cap.
+        if early_stopping:
+            log.warning(
+                "scVI multi-GPU (DDP) does not support early stopping; disabling it. "
+                "Training will run the full %d-epoch cap.",
+                resolved_max_epochs,
+            )
+            train_kwargs["early_stopping"] = False
+
     model = _setup_and_build()
     try:
-        model.train(
-            max_epochs=resolved_max_epochs,
-            accelerator=accelerator,
-            devices=train_devices,
-            early_stopping=early_stopping,
-        )
+        model.train(**train_kwargs)
     except Exception as e:  # noqa: BLE001 - inspect message to decide CPU retry
         err = str(e)
         if accelerator == "gpu" and (
@@ -210,8 +287,16 @@ def _train(spec: dict) -> None:
                 devices=1,
                 early_stopping=early_stopping,
             )
+            multi_gpu = False  # CPU retry is single-process; no DDP rank guard needed
         else:
             raise
+
+    # Under DDP the worker script is relaunched once per GPU, so every rank reaches
+    # the inference + IO below. Only rank 0 may run it (the others would race on the
+    # same output files); non-zero ranks exit here after training completes.
+    if multi_gpu and not _rank_zero_and_teardown(log):
+        log.info("scVI worker: DDP rank > 0 finished training; exiting (rank 0 writes outputs).")
+        return
 
     np.save(spec["latent_out"], np.asarray(model.get_latent_representation(), dtype=np.float32))
 
