@@ -718,8 +718,18 @@ class AgentWorldState:
         cell_type_key = state.cell_type_key
         cluster_key = state.cluster_key
         if inspection:
-            cell_type_key = inspection.get("cell_type_col")
-            processing["has_celltypes"] = cell_type_key is not None
+            # The inspection's cell_type_col reflects PRE-EXISTING columns at load
+            # (null = no labels, which suppresses heuristic false-positives like a
+            # predicted_doublet QC flag). Once the pipeline produces an annotation,
+            # that real cell_type column must win — so only apply the override
+            # before annotation is finalized; afterward trust the heuristic, which
+            # detects the new column. (Otherwise has_celltypes stays False after a
+            # successful annotation, mis-reporting the run's state.)
+            av = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
+            annotation_done = bool(av.get("finalized")) or av.get("status") == "validated_and_finalized"
+            if not annotation_done:
+                cell_type_key = inspection.get("cell_type_col")
+                processing["has_celltypes"] = cell_type_key is not None
             if inspection.get("cluster_col"):
                 cluster_key = inspection["cluster_col"]
             if inspection.get("species"):

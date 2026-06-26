@@ -88,6 +88,42 @@ def test_record_inspection_overrides_all_judgments():
     assert bc["species"] == "human"
 
 
+def test_inspection_yields_to_post_annotation_celltype():
+    # cell_type_col=null means "no PRE-EXISTING label column at load" (suppresses
+    # the predicted_doublet false-positive). It must NOT clobber the cell_type
+    # column the pipeline creates: once annotation is finalized, the real column
+    # is reported. Regression for has_celltypes=False after a finished annotation.
+    n = 60
+    labels = ["T cell", "B cell", "NK cell"]
+    obs = pd.DataFrame(
+        {
+            "cell_barcode": [f"BC{i}-1" for i in range(n)],
+            "donor": [f"Donor_{i % 8:02d}" for i in range(n)],
+            "cell_type": [labels[i % 3] for i in range(n)],  # produced by the pipeline
+        },
+        index=[f"c{i}" for i in range(n)],
+    )
+    obs["donor"] = obs["donor"].astype("category")
+    obs["cell_type"] = obs["cell_type"].astype("category")
+    adata = AnnData(
+        X=(np.arange(n * 5) % 4).reshape(n, 5).astype(np.int32),
+        obs=obs,
+        var=pd.DataFrame(index=["CD3D", "CD19", "MS4A1", "GAPDH", "ACTB"]),
+    )
+    ws = AgentWorldState()
+    ws.record_inspection({"batch_col": "donor", "species": "human"}, adata=adata)
+
+    # Before annotation finalizes: override holds → no cell types reported.
+    assert ws.data_summary["processing"]["has_celltypes"] is False
+    assert ws.data_summary["cell_type_key"] is None
+
+    # After annotation finalizes: the real cell_type column must be reported.
+    ws.annotation_validation = {"required": True, "finalized": True, "status": "validated_and_finalized"}
+    ws.sync_from_adata(adata)
+    assert ws.data_summary["cell_type_key"] == "cell_type"
+    assert ws.data_summary["processing"]["has_celltypes"] is True
+
+
 def test_record_inspection_rejects_missing_cluster_column():
     adata = _adata()
     ws = _synced_ws(adata)
