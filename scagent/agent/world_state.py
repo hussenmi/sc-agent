@@ -786,8 +786,12 @@ class AgentWorldState:
 
         # Surface the recorded inspection so the model sees its own settled
         # decision in the snapshot instead of re-deriving roles every turn.
+        # inspection_source records which path produced the role/species
+        # judgments — "model" (record_inspection) vs "heuristic" — so flag
+        # compliance is measurable post-hoc from the manifest.
         if inspection:
             self.data_summary["inspection"] = inspection
+        self.data_summary["inspection_source"] = "model" if inspection else "heuristic"
 
         self.data_summary["capabilities"] = self._derive_capabilities(adata)
 

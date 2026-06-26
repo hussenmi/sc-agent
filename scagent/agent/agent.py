@@ -235,6 +235,25 @@ INSPECTION_TOOL_NAMES = {
     "record_inspection",
 }
 
+# Analysis steps that should follow a recorded inspection when model-driven
+# inspection is enabled. The model is nudged to call record_inspection before the
+# first of these; load_data (precedes inspection) and run_code (the inspection
+# escape hatch) are deliberately excluded.
+INSPECTION_GATED_TOOLS = {
+    "run_qc",
+    "run_cellbender",
+    "normalize_and_hvg",
+    "run_pca",
+    "run_neighbors",
+    "run_umap",
+    "run_clustering",
+    "run_batch_correction",
+    "diagnose_batch_effect",
+    "run_celltypist",
+    "run_scimilarity",
+    "run_deg",
+}
+
 # Load .env file if present
 def _load_dotenv():
     """Load .env config, merging from lowest to highest precedence.
@@ -436,6 +455,11 @@ class SCAgent:
             "asked_questions": [],
         }
         self._pending_checkpoint: Optional[Dict[str, Any]] = None
+        # Model-driven-inspection safety net (SCAGENT_MODEL_INSPECTION): nudge the
+        # model to record_inspection once before the first analysis step; if it
+        # still skips, fall back to the heuristic (logged once).
+        self._inspection_nudged: bool = False
+        self._inspection_fallback_logged: bool = False
         self._active_cleanup_authorization: Optional[Dict[str, Any]] = None
         self._context_limit: int = 128_000  # overwritten by _init_* below
         self._vertex_key_file: Optional[str] = None
@@ -2214,6 +2238,47 @@ class SCAgent:
                 ),
                 "pending_checkpoint": checkpoint,
                 "required_next_action": "resolve_pending_decision",
+            },
+            indent=2,
+        )
+
+    def _inspection_gate_action(self, tool_name: str) -> Optional[str]:
+        """Model-inspection safety-net decision for an about-to-run tool.
+
+        Returns "nudge" (steer to record_inspection once), "fallback" (proceed on
+        the heuristic and log the skip once), or None (no gating). A pure
+        decision; the caller performs the side effects. Gating applies only when
+        SCAGENT_MODEL_INSPECTION=1, the tool is an analysis step that should
+        follow inspection, data is loaded, and no inspection has been recorded.
+        """
+        if os.environ.get("SCAGENT_MODEL_INSPECTION") != "1":
+            return None
+        if tool_name not in INSPECTION_GATED_TOOLS or self.adata is None:
+            return None
+        if self.world_state.get_confirmed_value("inspection") is not None:
+            return None
+        return "nudge" if not self._inspection_nudged else "fallback"
+
+    def _inspection_nudge_result(self, tool_name: str) -> str:
+        """One-time steer: record the inspection before the first analysis step.
+
+        Returned in place of executing ``tool_name`` the first time the model
+        reaches an inspection-gated step without having recorded its
+        interpretation. Re-running the step after this (with or without calling
+        record_inspection) proceeds — the heuristic is the fallback.
+        """
+        return json.dumps(
+            {
+                "status": "error",
+                "tool": tool_name,
+                "message": (
+                    "Model-driven inspection is enabled, but you have not recorded your "
+                    "interpretation yet. Call record_inspection first — report the column "
+                    "roles (cell_type/batch/donor/sample/cluster) and species from the "
+                    "inspect_data fact sheet — then re-run this step. If you have not called "
+                    "inspect_data yet, do that first."
+                ),
+                "required_next_action": "record_inspection",
             },
             indent=2,
         )
@@ -5820,6 +5885,18 @@ class SCAgent:
             if tool_name not in self.CHECKPOINT_EXEMPT_TOOLS:
                 return self._blocked_by_checkpoint_result(tool_name)
             # For exempt tools, we'll include checkpoint context in the result later
+
+        # Model-driven-inspection safety net (see _inspection_gate_action): nudge
+        # once toward record_inspection before the first analysis step; if the
+        # model still skips it, fall back to the heuristic (logged once). Enabling
+        # the flag by default can never leave a run worse off than the heuristic.
+        _insp_action = self._inspection_gate_action(tool_name)
+        if _insp_action == "nudge":
+            self._inspection_nudged = True
+            return self._inspection_nudge_result(tool_name)
+        if _insp_action == "fallback" and not self._inspection_fallback_logged:
+            self._inspection_fallback_logged = True
+            self.world_state.note_spine_intervention(["model_inspection"], "heuristic_fallback")
 
         def _sanitize_name(value: str) -> str:
             value = value or tool_name
