@@ -879,6 +879,20 @@ class SCAgent:
             else:
                 console.print(message)
 
+    @staticmethod
+    def _looks_like_partial_tool_call(text: str) -> bool:
+        """Heuristic: did a length-truncated response leave a partial tool-call
+        fragment in the content channel? GLM emits tool calls as
+        ``<tool_call>name<arg_key>…<arg_value>…``; other local models use
+        ``<tool_call>``/``<tools>``. A *complete* call is parsed into structured
+        ``tool_calls``, so seeing these markers in content on a length truncation
+        means the call was cut off mid-emission and should not be printed raw.
+        """
+        if not text:
+            return False
+        markers = ("<tool_call>", "</tool_call>", "<arg_key>", "<arg_value>", "<tools>")
+        return any(marker in text for marker in markers)
+
     def _split_reasoning_channels(self, message):
         """Split a tool-calling assistant message into (narration, chain_of_thought).
 
@@ -3921,7 +3935,7 @@ class SCAgent:
         request: str,
         data_path: Optional[str] = None,
         run_name: Optional[str] = None,
-        max_iterations: int = 75,
+        max_iterations: int = 100,
         continue_conversation: bool = False,
     ) -> str:
         """
@@ -3943,7 +3957,7 @@ class SCAgent:
             If None and self.adata exists, uses already-loaded data.
         run_name : str, optional
             Name for the run directory.
-        max_iterations : int, default 75
+        max_iterations : int, default 100
             Maximum number of tool calls per turn before an explicit resumable pause.
         continue_conversation : bool, default False
             If True, continue from previous conversation history.
@@ -5506,11 +5520,32 @@ class SCAgent:
                     return final_result
 
                 elif choice.finish_reason == "length":
-                    # Response was truncated due to length
-                    self._print("\n[Warning: Response truncated due to length]")
-                    final_result = message.content or ""
-                    messages.append({"role": "assistant", "content": final_result})
-                    self._print(final_result)
+                    # Response truncated at the output-token cap. If it was cut off
+                    # mid-tool-call, message.content holds a partial, unparseable
+                    # tool-call fragment (e.g. "<tool_call>write_json<arg_key>…") —
+                    # a complete call would have been parsed into structured
+                    # tool_calls. Printing it dumps a wall of broken JSON, so detect
+                    # that case, suppress the raw dump, and let the next turn retry.
+                    raw_content = message.content or ""
+                    if self._looks_like_partial_tool_call(raw_content):
+                        self._print(
+                            "\n[Response hit the output-token limit mid-tool-call and was "
+                            "discarded — retrying with a smaller step. If this recurs, raise "
+                            "SCAGENT_MAX_OUTPUT_TOKENS.]"
+                        )
+                        final_result = ""
+                        messages.append({
+                            "role": "assistant",
+                            "content": (
+                                "[Previous response was truncated mid-tool-call and discarded. "
+                                "Re-issue the call, splitting a large argument into smaller pieces.]"
+                            ),
+                        })
+                    else:
+                        self._print("\n[Warning: Response truncated due to length]")
+                        final_result = raw_content
+                        messages.append({"role": "assistant", "content": final_result})
+                        self._print(final_result)
 
                     # Same spine floor on the length-truncation exit.
                     should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(

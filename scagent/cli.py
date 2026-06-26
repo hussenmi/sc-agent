@@ -146,8 +146,8 @@ Examples:
     analyze_parser.add_argument(
         "--max-iterations",
         type=int,
-        default=75,
-        help="Max tool calls per turn before an explicit resumable pause (default: 75)"
+        default=100,
+        help="Max tool calls per turn before an explicit resumable pause (default: 100)"
     )
     analyze_parser.add_argument(
         "--quiet", "-q",
@@ -314,7 +314,7 @@ def _maybe_save_on_exit(agent, console) -> None:
 def _analyze_with_decisions(agent, **analyze_kwargs):
     """Run a turn and immediately resolve any structured checkpoints."""
     result = agent.analyze(**analyze_kwargs)
-    max_iterations = analyze_kwargs.get("max_iterations", 75)
+    max_iterations = analyze_kwargs.get("max_iterations", 100)
     while agent.has_pending_decision:
         selection = agent.prompt_pending_decision()
         if selection is None:
