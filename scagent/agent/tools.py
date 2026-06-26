@@ -3926,6 +3926,60 @@ def _dataframe_preview(df, n: int = 5, max_cols: int = 20) -> dict:
     }
 
 
+def _is_discrete_obs_color(adata_obj, key) -> bool:
+    """True if a UMAP/t-SNE color key is a discrete obs column with a legend.
+
+    Excludes genes (not in obs), continuous numeric columns (colorbar, no
+    legend), and very-high-cardinality columns where no legend helps.
+    """
+    import pandas as _pd
+    if key is None or key not in adata_obj.obs.columns:
+        return False
+    series = adata_obj.obs[key]
+    if _pd.api.types.is_numeric_dtype(series) and not _pd.api.types.is_bool_dtype(series):
+        return False
+    return int(series.nunique(dropna=True)) <= 60
+
+
+def _add_outside_categorical_legend(ax, adata_obj, key: str) -> bool:
+    """Draw a discrete category legend OUTSIDE the data panel (to the right).
+
+    Scanpy's default 'right margin' legend shrinks the axes inside a fixed figure
+    to fit many long labels, squishing the embedding. Drawing our own legend
+    outside (multi-column when there are many categories) keeps the panel's
+    shape. Returns True if a legend was added.
+    """
+    import matplotlib
+    from matplotlib.lines import Line2D
+
+    series = adata_obj.obs[key]
+    if str(series.dtype) != "category":
+        series = series.astype("category")
+    cats = [str(c) for c in series.cat.categories]
+    if not cats:
+        return False
+    raw_colors = adata_obj.uns.get(f"{key}_colors")
+    colors = list(raw_colors) if raw_colors is not None else []
+    if len(colors) < len(cats):
+        try:
+            cmap = matplotlib.colormaps["tab20"].resampled(len(cats))
+        except Exception:  # older matplotlib
+            cmap = matplotlib.cm.get_cmap("tab20", len(cats))
+        colors = [matplotlib.colors.to_hex(cmap(i)) for i in range(len(cats))]
+    handles = [
+        Line2D([0], [0], marker="o", linestyle="", markersize=6,
+               markerfacecolor=colors[i], markeredgecolor="none", label=cats[i])
+        for i in range(len(cats))
+    ]
+    ncol = 2 if len(cats) > 16 else 1
+    ax.legend(
+        handles=handles, loc="center left", bbox_to_anchor=(1.02, 0.5),
+        frameon=False, ncol=ncol, fontsize=8, handletextpad=0.3,
+        columnspacing=1.0, borderaxespad=0.0, markerscale=1.2,
+    )
+    return True
+
+
 def process_tool_call(
     tool_name: str,
     tool_input: Dict[str, Any],
@@ -4624,22 +4678,21 @@ def process_tool_call(
 
         fig, ax = plt.subplots(figsize=(10, 8))
 
-        if plot_type == "umap":
+        added_outside_legend = False
+        if plot_type in ("umap", "tsne"):
+            plotfn = sc.pl.umap if plot_type == "umap" else sc.pl.tsne
             kwargs = dict(ax=ax, show=False)
             if dot_size is not None:
                 kwargs["size"] = dot_size
             if color_by is None:
-                sc.pl.umap(adata_obj, **kwargs)
+                plotfn(adata_obj, **kwargs)
+            elif _is_discrete_obs_color(adata_obj, color_by):
+                # Suppress scanpy's right-margin legend (it squishes the panel to
+                # fit many long labels) and add our own legend OUTSIDE the axes.
+                plotfn(adata_obj, color=color_by, legend_loc="none", **kwargs)
+                added_outside_legend = _add_outside_categorical_legend(ax, adata_obj, color_by)
             else:
-                sc.pl.umap(adata_obj, color=color_by, **kwargs)
-        elif plot_type == "tsne":
-            kwargs = dict(ax=ax, show=False)
-            if dot_size is not None:
-                kwargs["size"] = dot_size
-            if color_by is None:
-                sc.pl.tsne(adata_obj, **kwargs)
-            else:
-                sc.pl.tsne(adata_obj, color=color_by, **kwargs)
+                plotfn(adata_obj, color=color_by, **kwargs)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -4649,7 +4702,10 @@ def process_tool_call(
         else:
             raise ValueError(f"Unsupported plot configuration: plot_type={plot_type}")
 
-        plt.tight_layout()
+        # tight_layout fights an outside legend (it can clip or re-shrink the
+        # panel); bbox_inches="tight" at save time already includes the legend.
+        if not added_outside_legend:
+            plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close()
 
