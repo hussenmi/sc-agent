@@ -24,6 +24,30 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def _default_n_pcs_from_variance(
+    variance_ratios,
+    variance_target: float = 0.75,
+    max_default_n_pcs: int = 50,
+) -> int:
+    """Default number of PCs to feed the neighbor graph.
+
+    Keeps principal components until cumulative explained variance reaches
+    ``variance_target`` (a fraction in [0, 1]), capped at ``max_default_n_pcs`` —
+    whichever bound is reached first. Falls back to the number of available PCs
+    when fewer were computed or the target is never reached.
+    """
+    import numpy as np
+
+    ratios = np.asarray(variance_ratios, dtype=float)
+    n_shown = int(ratios.size)
+    if n_shown == 0:
+        return max_default_n_pcs
+    cumvar = np.cumsum(ratios)
+    above_target = np.where(cumvar >= variance_target)[0]
+    variance_threshold_n_pcs = int(above_target[0]) + 1 if above_target.size else n_shown
+    return min(max_default_n_pcs, variance_threshold_n_pcs, n_shown)
+
+
 def _stringify_dataframe_columns(df):
     if df is None:
         return df
@@ -2480,7 +2504,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"},
-                    "n_pcs": {"type": "integer", "description": "Number of PCs to use from the representation (optional)"},
+                    "n_pcs": {"type": "integer", "description": "Number of PCs to use from the representation. If omitted and use_rep=X_pca, defaults to the PCs needed to reach 75% cumulative variance, capped at 50 (whichever comes first); for non-PCA representations all dimensions are used."},
                     "use_rep": {"type": "string", "description": "Representation in adata.obsm to use (default: X_pca)"},
                     "metric": {"type": "string", "description": "Distance metric (default: euclidean)"},
                     "key_added": {"type": "string", "description": "Optional alternate neighbors key. Omit to write the default graph."}
@@ -8656,19 +8680,30 @@ def process_tool_call(
                 return int(np.argmax(dist)) + 1  # 1-indexed
 
             elbow_pc = _find_pca_elbow(variance_ratios)
-            elbow_buffer_n_pcs = 10
-            elbow_buffered_n_pcs = min(elbow_pc + elbow_buffer_n_pcs, n_shown)
-            conservative_floor_n_pcs = min(30, n_shown)
-            suggested_n_pcs = max(elbow_buffered_n_pcs, conservative_floor_n_pcs)
+            variance_target = 0.75
+            max_default_n_pcs = 50
+            cumvar_frac = np.cumsum(np.asarray(variance_ratios, dtype=float))
+            _above_target = np.where(cumvar_frac >= variance_target)[0]
+            variance_threshold_n_pcs = int(_above_target[0]) + 1 if _above_target.size else n_shown
+            suggested_n_pcs = _default_n_pcs_from_variance(
+                variance_ratios, variance_target, max_default_n_pcs
+            )
+            cumvar_at_suggested = float(cumvar_frac[suggested_n_pcs - 1]) if n_shown else 0.0
+            hit_variance_target = bool(_above_target.size) and variance_threshold_n_pcs <= max_default_n_pcs
             pca_selection_rationale = (
-                f"Elbow detection placed the knee at PC{elbow_pc}. The buffered knee keeps "
-                f"{elbow_buffered_n_pcs} PCs by adding {elbow_buffer_n_pcs} PCs beyond the knee, "
-                "which is a conservative margin meant to retain biological signal that may sit "
-                "just past the sharpest variance drop, not treating the knee as a hard cutoff. "
-                f"The tool recommends {suggested_n_pcs} PCs because single-cell analyses usually "
-                f"benefit from retaining at least {conservative_floor_n_pcs} PCs when available, "
-                "so subtler immune states, rare populations, and technical structure are not "
-                "discarded too early. "
+                f"Default n_pcs keeps principal components until cumulative variance reaches "
+                f"{variance_target:.0%}, capped at {max_default_n_pcs} PCs — whichever is reached "
+                "first. "
+                + (
+                    f"Cumulative variance crosses {variance_target:.0%} at PC{variance_threshold_n_pcs}, "
+                    f"at or below the {max_default_n_pcs}-PC cap, so the default is {suggested_n_pcs} PCs "
+                    f"({cumvar_at_suggested:.0%} cumulative variance)."
+                    if hit_variance_target else
+                    f"Cumulative variance does not reach {variance_target:.0%} within the {n_shown} "
+                    f"computed PCs, so the default falls back to the {suggested_n_pcs}-PC cap "
+                    f"({cumvar_at_suggested:.0%} cumulative variance)."
+                )
+                + f" For reference, elbow detection placed the knee at PC{elbow_pc}. "
                 "The agent should still override this with explicit reasoning if the dataset "
                 "is very small, clearly over-noisy, or the user/source specifies a different value."
             )
@@ -8695,7 +8730,7 @@ def process_tool_call(
                 ax1.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
                             label=f"Elbow PC{elbow_pc}")
                 ax1.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
-                            label=f"Suggested n_pcs={suggested_n_pcs}")
+                            label=f"Default n_pcs={suggested_n_pcs}")
                 ax1.set_xlabel("Principal Component")
                 ax1.set_ylabel("Variance Explained (%)")
                 ax1.set_title("Variance per PC")
@@ -8705,8 +8740,9 @@ def process_tool_call(
                 ax2.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
                             label=f"Elbow PC{elbow_pc}")
                 ax2.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
-                            label=f"Suggested n_pcs={suggested_n_pcs}")
-                ax2.axhline(80, color="gray", linestyle=":", linewidth=1, label="80% threshold")
+                            label=f"Default n_pcs={suggested_n_pcs}")
+                ax2.axhline(variance_target * 100, color="gray", linestyle=":", linewidth=1,
+                            label=f"{variance_target:.0%} threshold")
                 ax2.set_xlabel("Principal Component")
                 ax2.set_ylabel("Cumulative Variance (%)")
                 ax2.set_title("Cumulative Variance Explained")
@@ -8730,9 +8766,10 @@ def process_tool_call(
                 "variance_explained_total": float(variance_ratios.sum()),
                 "variance_ratio_per_pc": [round(float(v), 5) for v in variance_ratios],
                 "elbow_pc": elbow_pc,
-                "elbow_buffer_n_pcs": elbow_buffer_n_pcs,
-                "elbow_buffered_n_pcs": elbow_buffered_n_pcs,
-                "conservative_floor_n_pcs": conservative_floor_n_pcs,
+                "variance_target_pct": round(variance_target * 100, 1),
+                "variance_threshold_n_pcs": variance_threshold_n_pcs,
+                "max_default_n_pcs": max_default_n_pcs,
+                "cumulative_variance_at_suggested": round(cumvar_at_suggested, 4),
                 "suggested_n_pcs": suggested_n_pcs,
                 "pca_selection_rationale": pca_selection_rationale,
                 "scree_plot": scree_path,
@@ -8755,8 +8792,8 @@ def process_tool_call(
                 dataset_changed=True,
                 summary=(
                     f"Ran PCA with n_comps={n_comps}; elbow at PC{elbow_pc}, "
-                    f"elbow+{elbow_buffer_n_pcs}={elbow_buffered_n_pcs}, suggested n_pcs={suggested_n_pcs} "
-                    "for run_neighbors."
+                    f"{variance_target:.0%} cumulative variance at PC{variance_threshold_n_pcs}, "
+                    f"default n_pcs={suggested_n_pcs} (cap {max_default_n_pcs}) for run_neighbors."
                 ),
                 verification=_build_verification(
                     "passed",
@@ -8777,6 +8814,18 @@ def process_tool_call(
             use_rep = tool_input.get("use_rep", "X_pca")
             metric = tool_input.get("metric", "euclidean")
             key_added = tool_input.get("key_added")
+
+            # When the caller doesn't specify n_pcs and we're building the graph on
+            # PCA, fall back to the variance-based default (cumulative variance up to
+            # 75%, capped at 50 PCs — whichever comes first) instead of silently using
+            # all computed PCs.
+            n_pcs_source = "explicit" if n_pcs is not None else "unset"
+            if n_pcs is None and use_rep == "X_pca":
+                pca_uns = adata.uns.get("pca") if hasattr(adata, "uns") else None
+                variance_ratios = pca_uns.get("variance_ratio") if isinstance(pca_uns, dict) else None
+                if variance_ratios is not None and len(variance_ratios) > 0:
+                    n_pcs = _default_n_pcs_from_variance(variance_ratios)
+                    n_pcs_source = "variance_default"
 
             if use_rep not in adata.obsm:
                 available_reps = [k for k in adata.obsm.keys()]
@@ -8836,6 +8885,7 @@ def process_tool_call(
                 "saved": output_path is not None,
                 "n_neighbors": n_neighbors,
                 "n_pcs": n_pcs,
+                "n_pcs_source": n_pcs_source,
                 "use_rep": use_rep,
                 "metric": metric,
                 "neighbors_key": graph_key,
@@ -8853,7 +8903,12 @@ def process_tool_call(
                 result,
                 adata,
                 dataset_changed=True,
-                summary=f"Computed neighbors only using {use_rep} with n_neighbors={n_neighbors}.",
+                summary=(
+                    f"Computed neighbors only using {use_rep} with n_neighbors={n_neighbors}, "
+                    f"n_pcs={n_pcs}"
+                    + (" (variance-based default)" if n_pcs_source == "variance_default" else "")
+                    + "."
+                ),
                 verification=_build_verification(
                     "passed",
                     "Neighbor graph was computed without UMAP or clustering side effects.",

@@ -49,7 +49,7 @@ You are running in smart autonomous mode. **Drive the analysis forward without p
 ### How to work
 
 **Narrate the WHY, not just the WHAT.** Before each tool call, write one sentence that includes your reasoning — not just the action. Examples:
-- "Running PCA on 30 components — standard for this cell count and matches our lab defaults."
+- "Running PCA on 50 components; I'll keep PCs up to 75% cumulative variance (capped at 50) for the neighbor graph."
 - "Using Leiden at resolution 1.0 as a starting point; I'll report cluster count and you can adjust if needed."
 - "Running CellTypist with Immune_All_High — this dataset looks like immune cells based on the marker genes."
 
@@ -100,7 +100,7 @@ load_data
   → inspect_data
   → run_qc                    [narrate: MT% range, doublet rate, n_genes shape — 2 sentences max]
   → normalize_and_hvg         [narrate: "X HVGs selected."]
-  → run_pca                   [narrate: "PCA done, 30 components."]
+  → run_pca                   [narrate: "PCA done, 50 components; default n_pcs from 75% cumulative variance (cap 50)."]
   → run_neighbors             [narrate: "Neighbor graph built."]
   → run_umap                  [narrate: "UMAP computed." → then run_code for QC overlay → then run_clustering]
   → run_clustering(res=1.5)   [narrate: "N clusters."]
