@@ -1180,6 +1180,147 @@ def _format_validation_failures_per_cluster(failures: List[str]) -> str:
     return " | ".join(lines)
 
 
+# Confidence ceiling implied by each validation tier. The evidence validator
+# still auto-caps below this (QC caveats, thin DEG support), so these are the
+# best-case starting confidences the model would otherwise have to type in.
+_ANNOTATION_TIER_CONFIDENCE = {
+    "reference_consensus_plus_deg": "high",
+    "cytopus_plus_deg": "medium",
+    "reference_partial_plus_deg": "medium",
+    "needs_external_adjudication": "low",
+}
+
+
+def _build_annotation_evidence_scaffold(
+    cluster_summaries: List[Dict[str, Any]],
+    reference_keys: List[Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Build a ready-to-edit evidence dict from a ``prepare_annotation`` proposal.
+
+    Every field the annotation-evidence validator can derive mechanically is
+    pre-filled from the proposal so the model only has to write ``reasoning``
+    (and adjust ``label``/``confidence`` where it disagrees). This is exactly the
+    proposal→evidence transform the model previously had to reverse-engineer by
+    hand — the dominant cause of the stage/finalize thrash and the EMERGENCY
+    context compactions in that phase.
+
+    ``reasoning`` and ``source_synthesis.final_decision_basis`` are intentionally
+    left blank: they require the model's judgment and are the natural gate that
+    forces per-cluster review before labels are written.
+    """
+    scaffold: Dict[str, Dict[str, Any]] = {}
+    has_reference = bool(reference_keys)
+    for summary in cluster_summaries:
+        if not isinstance(summary, dict):
+            continue
+        cid = str(summary.get("cluster_id"))
+        proposed = summary.get("proposed_label")
+        label = proposed.strip() if isinstance(proposed, str) and proposed.strip() else ""
+
+        genes = list(summary.get("suggested_supporting_genes") or [])
+        if not genes:
+            genes = list(summary.get("discriminating_degs") or [])[:6]
+
+        tier = summary.get("validation_tier") or "needs_external_adjudication"
+
+        # reference_annotation_support: {annotation_key: top_label} — pure provenance.
+        ref_support: Dict[str, Any] = {}
+        for ref_entry in summary.get("reference_annotations") or []:
+            if not isinstance(ref_entry, dict):
+                continue
+            key = str(ref_entry.get("annotation_key") or "").strip()
+            if key:
+                ref_support[key] = ref_entry.get("top_label") or ""
+
+        # competing_labels_considered: proposal competitors plus any reference
+        # label that differs from the chosen one (this is what was missing for
+        # the reference-ambiguous cluster 17 in run_2026_07_02_002825).
+        competing: List[str] = []
+        for comp in summary.get("competing_labels") or []:
+            comp_label = comp.get("label") if isinstance(comp, dict) else comp
+            if isinstance(comp_label, str) and comp_label.strip() and comp_label.strip() != label:
+                competing.append(comp_label.strip())
+        for ref_entry in summary.get("reference_annotations") or []:
+            if not isinstance(ref_entry, dict):
+                continue
+            ref_label = ref_entry.get("top_label")
+            if isinstance(ref_label, str) and ref_label.strip() and ref_label.strip() != label:
+                competing.append(ref_label.strip())
+        competing = [x for i, x in enumerate(competing) if x not in competing[:i]]
+
+        rc = summary.get("reference_consensus") or {}
+        n_sources = len(ref_support)
+        if n_sources == 0:
+            agreement = "no_reference"
+        elif rc.get("has_consensus"):
+            agreement = "reference_consensus"
+        elif n_sources >= 2:
+            agreement = "reference_sources_disagree"
+        else:
+            agreement = "single_reference_source"
+
+        entry: Dict[str, Any] = {
+            "label": label,
+            "deg_derived_label": label,
+            "supporting_genes": genes,
+            "panglaodb_queried": False,
+            "confidence": _ANNOTATION_TIER_CONFIDENCE.get(tier, "low"),
+            "source_synthesis": {"agreement": agreement, "final_decision_basis": ""},
+            "reasoning": "",
+        }
+        if competing:
+            entry["competing_labels_considered"] = competing
+        if has_reference:
+            entry["reference_annotation_support"] = ref_support
+        scaffold[cid] = entry
+    return scaffold
+
+
+def _merge_evidence_over_scaffold(
+    adata: Any,
+    proposal_fingerprint: Any,
+    model_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Overlay the model's submitted evidence on the stored scaffold.
+
+    The scaffold in ``adata.uns['annotation_evidence_scaffold']`` supplies the
+    mechanically-derivable defaults; the model's ``model_evidence`` overrides
+    them field-by-field (so submitting just ``{cid: {reasoning: ...}}`` is
+    enough). The scaffold is used only when its fingerprint matches the current
+    proposal, so a re-clustering can never leak stale defaults.
+    """
+    merged: Dict[str, Any] = {}
+    scaffold = None
+    try:
+        scaffold = adata.uns.get("annotation_evidence_scaffold")
+        scaffold_fp = adata.uns.get("annotation_evidence_scaffold_fingerprint")
+    except Exception:
+        scaffold, scaffold_fp = None, None
+    fingerprint_ok = (
+        not isinstance(proposal_fingerprint, str)
+        or not proposal_fingerprint
+        or not isinstance(scaffold_fp, str)
+        or scaffold_fp == proposal_fingerprint
+    )
+    if isinstance(scaffold, dict) and scaffold and fingerprint_ok:
+        for cid, entry in scaffold.items():
+            if isinstance(entry, dict):
+                merged[str(cid)] = dict(entry)
+    for cid, entry in (model_evidence or {}).items():
+        key = str(cid)
+        if not isinstance(entry, dict):
+            merged[key] = entry
+            continue
+        base = merged.get(key)
+        if isinstance(base, dict):
+            base = dict(base)
+            base.update(entry)
+            merged[key] = base
+        else:
+            merged[key] = dict(entry)
+    return merged
+
+
 def _validate_annotation_evidence(
     *,
     adata: Any,
@@ -2074,6 +2215,16 @@ def _validate_annotation_evidence(
                         comp_label = comp
                     if isinstance(comp_label, str) and comp_label.strip():
                         inferred_competing.append(comp_label.strip())
+                # Reference-derived ambiguity (e.g. CellTypist vs Scimilarity
+                # disagree) leaves competing_labels empty but the differing
+                # reference label IS the alternative considered — pull it in so
+                # such clusters don't hard-fail (regression: run_2026_07_02, c17).
+                for ref_entry in proposal_entry.get("reference_annotations", []) or []:
+                    if not isinstance(ref_entry, dict):
+                        continue
+                    ref_label = ref_entry.get("top_label")
+                    if isinstance(ref_label, str) and ref_label.strip():
+                        inferred_competing.append(ref_label.strip())
                 label_for_filter = label.strip() if isinstance(label, str) else ""
                 inferred_competing = [
                     x for i, x in enumerate(inferred_competing)
@@ -2104,6 +2255,26 @@ def _validate_annotation_evidence(
                 ref_support_ok = len(ref_support) > 0
             elif isinstance(ref_support, str):
                 ref_support_ok = bool(ref_support.strip())
+            if not ref_support_ok and apply_auto_fixes:
+                # reference_annotation_support is pure provenance (which label
+                # each reference tool assigned this cluster) — fully derivable
+                # from the proposal, so fill it rather than blocking finalize.
+                derived_support: Dict[str, Any] = {}
+                for ref_entry in proposal_entry.get("reference_annotations", []) or []:
+                    if not isinstance(ref_entry, dict):
+                        continue
+                    key = str(ref_entry.get("annotation_key") or "").strip()
+                    if key:
+                        derived_support[key] = ref_entry.get("top_label") or ""
+                if any(v not in (None, "", [], {}) for v in derived_support.values()):
+                    ev = dict(ev)
+                    ev["reference_annotation_support"] = derived_support
+                    evidence_str[cid] = ev
+                    ref_support = derived_support
+                    ref_support_ok = True
+                    auto_fixes.append(
+                        f"Cluster {cid}: filled reference_annotation_support from prepare_annotation reference labels."
+                    )
             if not ref_support_ok:
                 validation_failures.append(
                     f"Cluster {cid}: missing reference_annotation_support for reference columns {reference_keys}."
@@ -2327,9 +2498,29 @@ def _validate_annotation_evidence(
                     "DEG/PanglaoDB support, QC caveats, source agreement/discordance, and the final decision basis."
                 )
             else:
-                checks["source_synthesis"] = source_synthesis
                 agreement = source_synthesis.get("agreement")
                 basis = source_synthesis.get("final_decision_basis")
+                # The scaffold fills source_synthesis.agreement but leaves the
+                # decision basis blank; the model's per-cluster `reasoning` IS
+                # that basis. When basis is blank/thin but reasoning is
+                # substantive, derive it rather than demanding a duplicate field.
+                reasoning_text = ev.get("reasoning")
+                if (
+                    apply_auto_fixes
+                    and (not isinstance(basis, str) or len(basis.strip()) < 20)
+                    and isinstance(reasoning_text, str)
+                    and len(reasoning_text.strip()) >= 20
+                ):
+                    source_synthesis = dict(source_synthesis)
+                    source_synthesis["final_decision_basis"] = reasoning_text.strip()
+                    basis = source_synthesis["final_decision_basis"]
+                    ev = dict(ev)
+                    ev["source_synthesis"] = source_synthesis
+                    evidence_str[cid] = ev
+                    auto_fixes.append(
+                        f"Cluster {cid}: set source_synthesis.final_decision_basis from reasoning."
+                    )
+                checks["source_synthesis"] = source_synthesis
                 if not isinstance(agreement, str) or not agreement.strip():
                     validation_failures.append(
                         f"Cluster {cid}: source_synthesis.agreement is required."
@@ -13475,6 +13666,21 @@ def process_tool_call(
             except Exception:
                 pass
 
+            # Build a ready-to-edit evidence scaffold with every mechanically
+            # derivable field pre-filled (label, supporting_genes, confidence,
+            # reference_annotation_support, competing_labels, source_synthesis).
+            # stage/finalize overlay the model's submissions on top, so the model
+            # only writes `reasoning` instead of reverse-engineering the proposal.
+            evidence_scaffold = _build_annotation_evidence_scaffold(
+                cluster_summaries, valid_reference_keys
+            )
+            try:
+                adata.uns["annotation_evidence_scaffold"] = evidence_scaffold
+                if isinstance(proposal_fingerprint, str) and proposal_fingerprint:
+                    adata.uns["annotation_evidence_scaffold_fingerprint"] = proposal_fingerprint
+            except Exception:
+                pass
+
             # Clear staged evidence when the new proposal does not match what was
             # last staged. Without this, finalize_annotation will silently reuse
             # stale labels from a prior clustering whose cluster ids happen to
@@ -13587,6 +13793,8 @@ def process_tool_call(
                 "reference_annotation_notice": reference_annotation_notice,
                 "clusters": clusters_result_view,
                 "full_proposal_in": "adata.uns['annotation_proposal'] (full per-cluster DEGs/reference detail; the DEG table is also at deg_table_csv)",
+                "evidence_scaffold_ready": True,
+                "evidence_scaffold_in": "adata.uns['annotation_evidence_scaffold'] (label, supporting_genes, confidence, reference_annotation_support, competing_labels, source_synthesis pre-filled; reasoning blank). stage/finalize overlay your submitted fields on top of it.",
                 "panglaodb_queries_required": panglaodb_queries,
                 "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
                 "panglaodb_required_clusters": panglaodb_required_clusters,
@@ -13600,16 +13808,13 @@ def process_tool_call(
                 "n_stale_evidence_entries_cleared": n_evidence_cleared,
                 "prior_evidence_fingerprint": prior_fp,
                 "next_steps": [
-                    "Set each cluster's supporting_genes from its `suggested_supporting_genes` (these are the discriminating DEGs — already non-nuisance and non-broad, so they pass validation on the first try). Add cluster-specific markers from `discriminating_degs` if needed.",
-                    "Do NOT cite genes from `broad_context_degs` (MHC-II like HLA-DRA/CD74, housekeeping, generic myeloid) or `nuisance_degs` (MT/ribosomal/hemoglobin/MALAT1) as the supporting evidence — the validator rejects them as non-discriminating, which is the #1 cause of re-staging loops.",
-                    "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in staged evidence.",
-                    "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate); these are limited to clusters needing external adjudication.",
-                    "For each entry in panglaodb_reverse_marker_queries_required, call bc_get_panglaodb_marker_genes with gene_symbol and species; aggregate returned cell_type values per required cluster across multiple genes.",
-                    "Do not infer alternatives from a single top gene. Treat reverse-lookup labels as candidates only when supported by multiple DEG genes, then query those cell_type labels directly.",
-                    "For panglaodb_optional_clusters, synthesize labels from CellTypist/Scimilarity agreement and submitted DEG support; PanglaoDB can remain false unless validation later flags that cluster.",
-                    "Compare PanglaoDB markers against each required cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
-                    "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
-                    "Stage ALL clusters in ONE stage_annotation_evidence call (pass evidence_summary as a structured object; for >~25 clusters use write_json then evidence_path). Read result.validation, fix only the flagged clusters, and re-stage. Call finalize_annotation only after stage reports validation.status='ok' for every cluster — do not call finalize speculatively while clusters are still failing.",
+                    "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] with every derivable field pre-filled per cluster (label←proposed_label, supporting_genes←suggested_supporting_genes, confidence←validation_tier, reference_annotation_support, competing_labels_considered, source_synthesis). Do NOT rebuild this by hand in run_code — that reverse-engineering is exactly what the scaffold removes.",
+                    "To annotate: call stage_annotation_evidence (or finalize_annotation directly) with evidence_summary containing ONLY the fields you are adding or changing per cluster. At minimum supply a `reasoning` string (>=20 chars) for every cluster; all other fields fall back to the scaffold. Reviewing each cluster and writing its reasoning IS the required judgment step.",
+                    "Change a cluster's `label` (and `deg_derived_label`) only where your reading of the DEGs/references disagrees with the scaffold's proposed_label; cite genes from suggested_supporting_genes / discriminating_degs — never broad_context_degs (MHC-II like HLA-DRA/CD74, housekeeping) or nuisance_degs (MT/ribosomal/hemoglobin/MALAT1).",
+                    "Query bc_get_panglaodb_marker_genes ONLY for panglaodb_required_clusters (and panglaodb_reverse_marker_queries_required for reverse lookups); for those clusters set panglaodb_queried=true and panglaodb_label_used in your submitted evidence. Aggregate reverse hits across multiple DEGs; do not infer a label from a single gene. Everything else keeps panglaodb_queried=false.",
+                    "If a required cluster can't be resolved by PanglaoDB (label uncovered, e.g. CMP/MEP/early-erythroid, or inconclusive), submit panglaodb_queried=false + confidence='low' with a one-line caveat in reasoning — the validator accepts reference+DEG evidence and caps to low. Do not loop.",
+                    "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in submitted evidence.",
+                    "stage_annotation_evidence runs the finalize validator and returns ready_to_finalize + clusters_failing + auto_fixes; correct only the flagged clusters and re-submit. Or skip staging and call finalize_annotation once every cluster has reasoning.",
                 ],
                 "state": make_state(adata),
             }
@@ -13782,6 +13987,10 @@ def process_tool_call(
 
             normalized_incoming = {str(k): v for k, v in incoming.items()}
             staged.update(normalized_incoming)
+            # Overlay the model's submissions on the pre-filled scaffold so a
+            # submission of just {cid: {reasoning: ...}} yields complete evidence.
+            # The scaffold supplies every derivable field; the model's entries win.
+            staged = _merge_evidence_over_scaffold(adata, proposal_fp, staged)
             try:
                 adata.uns["annotation_evidence_summary"] = staged
             except Exception:
@@ -13795,8 +14004,15 @@ def process_tool_call(
                 pass
 
             proposal_clusters = [str(c) for c in proposal.get("cluster_ids", [])]
-            covered = [c for c in proposal_clusters if c in staged]
-            missing = [c for c in proposal_clusters if c not in staged]
+            # With the scaffold as the base, every cluster carries derived fields;
+            # the remaining human judgment is the per-cluster `reasoning`, so
+            # coverage tracks which clusters have a model-authored reasoning.
+            def _has_reasoning(cid: str) -> bool:
+                entry = staged.get(cid)
+                return isinstance(entry, dict) and bool(str(entry.get("reasoning", "")).strip())
+
+            covered = [c for c in proposal_clusters if _has_reasoning(c)]
+            missing = [c for c in proposal_clusters if not _has_reasoning(c)]
             unknown = [c for c in staged.keys() if c not in proposal_clusters]
 
             # Validate the merged evidence so the model sees every issue at
@@ -13837,8 +14053,9 @@ def process_tool_call(
             full_coverage = n_covered_with_evidence == n_proposal and n_proposal > 0
             has_blocking_issues = bool(stage_failures)
             validation_status = "ok" if not has_blocking_issues else "issues"
-            # Unambiguous gate for the model: only finalize when every proposal
-            # cluster is covered AND no cluster has a blocking validation issue.
+            # Unambiguous gate for the model: finalize only when every proposal
+            # cluster has a model-authored reasoning AND no cluster has a blocking
+            # validation issue (missing reasoning also surfaces as a failure).
             ready_to_finalize = full_coverage and not has_blocking_issues
             clusters_failing = sorted({
                 m.group(1)
@@ -13847,21 +14064,45 @@ def process_tool_call(
                 if m
             })
 
+            # Trim the per-cluster payload that re-enters context every round:
+            # full detail only for clusters that need action (failing), a compact
+            # label/confidence/tier line for the rest. The full record lives in
+            # adata.uns after finalize; the model doesn't need 32 detailed blocks
+            # replayed on every staging round (a driver of EMERGENCY compactions).
+            failing_set = set(clusters_failing)
+            if has_blocking_issues:
+                per_cluster_payload = {
+                    cid: pc for cid, pc in stage_per_cluster.items() if cid in failing_set
+                }
+            else:
+                per_cluster_payload = {
+                    cid: {
+                        "label": pc.get("label"),
+                        "confidence": pc.get("confidence"),
+                        "validation_tier": pc.get("validation_tier"),
+                        "panglaodb_queried": pc.get("panglaodb_queried"),
+                    }
+                    for cid, pc in stage_per_cluster.items()
+                }
+
             result = {
                 "status": "ok",
                 "tool": "stage_annotation_evidence",
                 "ready_to_finalize": ready_to_finalize,
                 "clusters_failing": clusters_failing,
+                "clusters_awaiting_reasoning": missing[:50],
                 "n_entries_received": len(normalized_incoming),
                 "n_entries_staged_total": len(staged),
                 "evidence_source": evidence_source,
                 "replace": replace,
                 "coverage": {
                     "n_proposal_clusters": n_proposal,
+                    "n_with_reasoning": n_covered_with_evidence,
                     "n_covered": n_covered_with_evidence,
                     "n_missing": len(missing),
                     "missing_clusters": missing[:50],
                     "unknown_clusters": unknown[:50],
+                    "note": "n_covered counts clusters with a model-authored reasoning; all other evidence fields come from the scaffold.",
                 },
                 "validation": {
                     "status": validation_status,
@@ -13872,31 +14113,32 @@ def process_tool_call(
                         _format_validation_failures_per_cluster(stage_failures)
                         if stage_failures else ""
                     ),
-                    "per_cluster_validation": stage_per_cluster,
+                    "per_cluster_validation": per_cluster_payload,
+                    "per_cluster_detail_scope": "failing_only" if has_blocking_issues else "compact_summary",
                     "panglaodb_required_clusters": stage_panglaodb_required,
                 },
                 "next_steps": (
                     [
-                        f"Fix the {len(stage_failures)} validation issue(s) above before calling finalize_annotation.",
-                        "Resubmit stage_annotation_evidence with the corrected entries (only the failing clusters need to be re-sent).",
+                        f"Fix the {len(stage_failures)} validation issue(s) above (clusters {clusters_failing}) before calling finalize_annotation.",
+                        "Resubmit stage_annotation_evidence with only the failing clusters corrected; already-valid clusters are preserved.",
                     ]
                     if has_blocking_issues
                     else (
                         [
-                            "Call finalize_annotation to write the labels; evidence_summary can be omitted if the staged evidence is complete.",
+                            "Call finalize_annotation to write the labels; evidence_summary can be omitted — the staged evidence is complete.",
                         ]
                         if full_coverage
                         else [
-                            "Continue staging evidence until all proposal clusters are covered.",
-                            "Then call finalize_annotation; evidence_summary can be omitted if staged evidence is complete.",
+                            f"Supply a `reasoning` (>=20 chars) for the {len(missing)} cluster(s) still awaiting it: {missing[:50]}.",
+                            "Then call finalize_annotation; all other fields are already filled from the scaffold.",
                         ]
                     )
                 ),
                 "state": make_state(adata),
             }
             summary = (
-                f"Staged annotation evidence for {len(normalized_incoming)} clusters "
-                f"({n_covered_with_evidence}/{n_proposal} proposal clusters covered)"
+                f"Staged annotation evidence: {n_covered_with_evidence}/{n_proposal} clusters have reasoning "
+                f"({len(normalized_incoming)} entries submitted this call)"
             )
             if stage_auto_fixes:
                 summary += f"; {len(stage_auto_fixes)} auto-fix(es) applied"
@@ -14023,13 +14265,44 @@ def process_tool_call(
                         "Or pass evidence_summary directly in this finalize_annotation call.",
                     ],
                 )
-            evidence: Dict[str, Any] = {}
+            model_evidence: Dict[str, Any] = {}
             used_staged_evidence = False
             if isinstance(staged_evidence, dict) and staged_evidence:
-                evidence.update({str(k): v for k, v in staged_evidence.items() if isinstance(v, dict)})
+                model_evidence.update({str(k): v for k, v in staged_evidence.items() if isinstance(v, dict)})
                 used_staged_evidence = True
             if isinstance(incoming_evidence, dict) and incoming_evidence:
-                evidence.update({str(k): v for k, v in incoming_evidence.items()})
+                model_evidence.update({str(k): v for k, v in incoming_evidence.items()})
+            # Overlay the model's evidence on the pre-filled scaffold so a caller
+            # that only supplied `reasoning` per cluster still finalizes with
+            # complete evidence. If no scaffold matches, this is a no-op passthrough.
+            evidence: Dict[str, Any] = _merge_evidence_over_scaffold(
+                adata, proposal_fp, model_evidence
+            )
+            scaffold_used = bool(evidence) and len(evidence) > len(model_evidence)
+            # `reasoning` is the one field the scaffold leaves blank; it is the
+            # required human judgment. If the model supplied none anywhere, give
+            # the precise next action instead of the old "evidence is required"
+            # message (which a prior run misread as a persistence bug).
+            model_reasoned = any(
+                isinstance(v, dict) and str(v.get("reasoning", "")).strip()
+                for v in model_evidence.values()
+            )
+            if evidence and (scaffold_used or isinstance(adata.uns.get("annotation_evidence_scaffold"), dict)) and not model_reasoned:
+                n_scaffold = len([c for c in evidence if isinstance(evidence.get(c), dict)])
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        f"A pre-filled annotation evidence scaffold covers all {n_scaffold} cluster(s), but no "
+                        "per-cluster `reasoning` has been supplied yet. Every label needs a model-written "
+                        "reasoning (>=20 chars) — that review is the required judgment step, not a persistence issue."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Call finalize_annotation (or stage_annotation_evidence) with evidence_summary={cluster_id: {reasoning: '...'}} for every cluster. label, supporting_genes, confidence, reference_annotation_support, competing_labels_considered and source_synthesis are already filled from the proposal.",
+                        "Override `label` (and deg_derived_label) only for clusters where your reading of the DEGs/references differs from the scaffold's proposed_label.",
+                        "For panglaodb_required_clusters, add panglaodb_queried=true and panglaodb_label_used after querying bc_get_panglaodb_marker_genes.",
+                    ],
+                )
             if not evidence:
                 return _error_result(
                     tool="finalize_annotation",

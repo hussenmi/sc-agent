@@ -1366,21 +1366,26 @@ class AgentWorldState:
                 "deg_required": True,
                 "deg_completed": True,
                 "finalized": False,
+                "evidence_scaffold_available": bool(result.get("evidence_scaffold_ready")),
                 "instruction": (
-                    (
+                    "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] "
+                    "with every derivable field pre-filled; submit only per-cluster `reasoning` (plus any "
+                    "label/confidence overrides) to stage_annotation_evidence/finalize_annotation — do not "
+                    "rebuild the evidence dict by hand in run_code. "
+                    + (
                         "Query PanglaoDB only for clusters in panglaodb_required_clusters using "
                         "panglaodb_queries_required and panglaodb_reverse_marker_queries_required, "
                         "aggregate reverse gene-symbol hits across multiple DEGs, compare markers "
                         "against each required cluster's top_degs, then stage/finalize annotation. "
                         "PanglaoDB is optional, not a gate: if a flagged cluster cannot be resolved "
                         "(label not covered, e.g. CMP/MEP/early-erythroid, or query inconclusive), "
-                        "stage it with panglaodb_queried=false and confidence=low — the validator "
+                        "submit panglaodb_queried=false and confidence=low — the validator "
                         "accepts reference+DEG evidence and will not block finalize. Do not loop."
+                        if required_clusters else
+                        "No cluster was flagged for upfront PanglaoDB adjudication. Submit reasoning from "
+                        "reference labels plus DEG support; query PanglaoDB reactively only if "
+                        "stage_annotation_evidence/finalize_annotation reports a cluster still requires it."
                     )
-                    if required_clusters else
-                    "No cluster was flagged for upfront PanglaoDB adjudication. Stage evidence from "
-                    "reference labels plus submitted DEG support; query PanglaoDB reactively only if "
-                    "stage_annotation_evidence/finalize_annotation reports a cluster still requires it."
                 ),
             }
             return
