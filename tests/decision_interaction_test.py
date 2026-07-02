@@ -576,6 +576,84 @@ def test_describe_experiment_is_stored_then_reprompts_strategy():
     assert "Experiment context you provided" in agent._pending_checkpoint["context"]
 
 
+def _multi_option_checkpoint():
+    return {
+        "kind": "multi_sample_strategy",
+        "decision_key": "multi_sample_strategy",
+        "question": "How should I handle the 8 donors in this dataset?",
+        "options": [
+            "Investigate whether integration is needed (recommended)",
+            "Integrate the samples with scVI",
+            "Keep samples combined without integration",
+            "Analyze samples separately",
+            "Describe the experiment first",
+        ],
+        "option_actions": [
+            "investigate_integration",
+            "integrate_scvi",
+            "keep_unintegrated",
+            "analyze_separately",
+            "describe_experiment",
+        ],
+    }
+
+
+def _custom_selection(text):
+    return DecisionSelection("custom", "Type something else...", 5, text, text, "selector", True)
+
+
+def test_custom_reply_leaves_multi_option_decision_unresolved():
+    # The batch-question bug: a free-text reply ("go ahead but skip scrublet") must
+    # NOT silently close a genuine multiple-choice decision.
+    agent = _bare_agent(_multi_option_checkpoint())
+    payload = agent.resolve_pending_decision(
+        _custom_selection("can you go ahead but not run scrublet")
+    )
+    assert payload["custom_needs_resolution"] is True
+    # Decision stays open; the free text is preserved as a side-instruction hint.
+    assert agent.world_state.get_confirmed_value("multi_sample_strategy") is None
+    assert any("not run scrublet" in h for h in agent.world_state.context_hints)
+
+
+def test_custom_reply_mandates_reask_in_model_message():
+    agent = _bare_agent(_multi_option_checkpoint())
+    request = agent.structured_decision_request(
+        _custom_selection("can you go ahead but not run scrublet")
+    )
+    assert "MUST re-ask" in request
+    assert "Investigate whether integration is needed (recommended)" in request  # options listed
+    assert "custom_needs_resolution" in request
+
+
+def test_custom_reply_to_single_option_checkpoint_still_resolves():
+    # An escape-hatch custom on a checkpoint without a real branch fork is a valid
+    # answer — it should resolve normally, not trigger a re-ask.
+    agent = _bare_agent(
+        {
+            "kind": "free_form",
+            "decision_key": "free_form",
+            "question": "Anything to add?",
+            "options": ["Proceed"],
+            "option_actions": ["proceed"],
+        }
+    )
+    payload = agent.resolve_pending_decision(_custom_selection("use inner join"))
+    assert payload["custom_needs_resolution"] is False
+    resolved = agent.world_state.get_confirmed_value("free_form")
+    assert resolved == {"action": "custom", "details": "use inner join"}
+
+
+def test_branch_selection_is_unaffected_by_the_guard():
+    agent = _bare_agent(_multi_option_checkpoint())
+    selection = DecisionSelection(
+        "keep_unintegrated", "Keep samples combined without integration", 2,
+        "Keep samples combined without integration", "keep_unintegrated", "selector",
+    )
+    payload = agent.resolve_pending_decision(selection)
+    assert payload["custom_needs_resolution"] is False
+    assert agent.world_state.get_confirmed_value("multi_sample_strategy") == "keep_unintegrated"
+
+
 def test_cli_reprompts_without_model_turn_for_context_only_choice():
     describe = DecisionSelection(
         "describe_experiment", "Describe the experiment first", 4,

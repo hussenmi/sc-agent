@@ -386,6 +386,12 @@ def run_scvi(
             with open(metrics_out) as f:
                 training_metrics = json.load(f)
             adata.uns["scvi_training"] = training_metrics
+            # Record the true backend the worker trained on (accounts for a
+            # GPU->CPU retry) so the tool result reports it, not the request.
+            from ..core.gpu import record_backend
+            _accel = training_metrics.get("accelerator")
+            if _accel:
+                record_backend(f"scvi:{_accel}")
             if training_metrics.get("epochs_trained") is not None:
                 logger.info(
                     "scVI trained %s/%s epochs (early_stopped=%s)%s",

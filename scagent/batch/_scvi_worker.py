@@ -45,18 +45,26 @@ def _plot_loss(train_curve, val_curve, metrics: dict, path: str) -> None:
     plt.close(fig)
 
 
-def _write_diagnostics(model, resolved_max_epochs: int, spec: dict, log) -> dict:
+def _write_diagnostics(
+    model, resolved_max_epochs: int, spec: dict, log, accelerator: str, n_devices_used: int
+) -> dict:
     """Extract scVI's per-epoch loss history; save a CSV + convergence plot + metrics.
 
     scVI logs ``model.history`` as a dict of per-epoch DataFrames (``elbo_train``,
     ``elbo_validation``, reconstruction/KL terms). We persist the full table, plot the
     train-vs-validation ELBO so convergence and overfitting are visible, and record how
     many epochs actually ran (vs the cap) so a run that hit the cap — i.e. did *not*
-    converge — is obvious rather than hidden behind the live progress bar.
+    converge — is obvious rather than hidden behind the live progress bar. The final
+    ``accelerator``/``n_devices_used`` (after any GPU→CPU retry) is recorded too, so the
+    parent can report the true compute backend rather than the requested one.
     """
     import os
 
-    metrics: dict = {"resolved_max_epochs": int(resolved_max_epochs)}
+    metrics: dict = {
+        "resolved_max_epochs": int(resolved_max_epochs),
+        "accelerator": accelerator,
+        "n_devices_used": int(n_devices_used),
+    }
     try:
         history = model.history or {}
 
@@ -271,6 +279,10 @@ def _train(spec: dict) -> None:
             )
             train_kwargs["early_stopping"] = False
 
+    # Track the backend training actually ran on (the CPU-retry below changes it),
+    # so diagnostics report the true device rather than the requested one.
+    final_accelerator = accelerator
+    final_n_devices = train_devices if isinstance(train_devices, int) else len(train_devices)
     model = _setup_and_build()
     try:
         model.train(**train_kwargs)
@@ -288,6 +300,7 @@ def _train(spec: dict) -> None:
                 early_stopping=early_stopping,
             )
             multi_gpu = False  # CPU retry is single-process; no DDP rank guard needed
+            final_accelerator, final_n_devices = "cpu", 1
         else:
             raise
 
@@ -302,7 +315,7 @@ def _train(spec: dict) -> None:
 
     # Persist training diagnostics (loss history + convergence plot + metrics). Never
     # let a diagnostics failure sink an otherwise-successful run.
-    _write_diagnostics(model, resolved_max_epochs, spec, log)
+    _write_diagnostics(model, resolved_max_epochs, spec, log, final_accelerator, final_n_devices)
 
     if spec.get("store_normalized"):
         norm = model.get_normalized_expression(library_size=10_000)

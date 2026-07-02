@@ -166,6 +166,28 @@ def _make_serializable_copy(current_adata, aggressive_uns: bool = False):
     return sanitized
 
 
+def unique_output_path(path: str) -> str:
+    """Return a path that does not overwrite an existing file.
+
+    If ``path`` is free (or falsy), return it unchanged. Otherwise insert
+    ``_2``, ``_3``, ... before the extension until a free name is found
+    (``umap_leiden.png`` -> ``umap_leiden_2.png``). This makes figure saves
+    non-destructive: repeated saves that would reuse a name — multi-resolution
+    clustering UMAPs, pre/post-integration UMAPs — preserve every output instead
+    of silently clobbering the previous one. The caller must use the returned
+    path (not the requested one) so provenance points at the file that was written.
+    """
+    import os as _os
+
+    if not path or not _os.path.exists(path):
+        return path
+    base, ext = _os.path.splitext(path)
+    i = 2
+    while _os.path.exists(f"{base}_{i}{ext}"):
+        i += 1
+    return f"{base}_{i}{ext}"
+
+
 def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
     details = {"save_mode": "direct", "warnings": []}
     first_error_msg = None
@@ -1866,6 +1888,44 @@ def _validate_annotation_evidence(
                 "margin": cytopus_adj.get("margin"),
             }
 
+        # --- DEG-first derivation floor (Floor 2): markers have the final say ---
+        # The model must independently state the label this cluster's own top DEGs
+        # indicate (not the reference models); if that differs from the final label
+        # it must justify the override. The harness enforces only that this
+        # reasoning HAPPENED — it does not judge the biology (no marker/lineage
+        # tables in the engine). The model supplies all domain knowledge; the floor
+        # guarantees the cluster's own evidence was confronted, which is what the
+        # reference-dominated failure (a SFTPC/SFTPB cluster labeled a T cell)
+        # skipped.
+        deg_derived_text = str(ev.get("deg_derived_label") or "").strip()
+        if not deg_derived_text:
+            validation_failures.append(
+                f"Cluster {cid}: missing 'deg_derived_label'. State the cell type this "
+                f"cluster's own top DEGs indicate, independent of CellTypist/Scimilarity "
+                f"(top DEGs: {cluster_top_deg_genes[:10]}). Derive from the markers first, "
+                f"then reconcile with the reference labels — the DEGs have the final say."
+            )
+        else:
+            deg_first_matches = _annotation_labels_biologically_compatible(
+                deg_derived_text, final_label_text
+            )
+            checks["deg_first_reconciliation"] = {
+                "deg_derived_label": deg_derived_text,
+                "final_label": final_label_text,
+                "matches_final": deg_first_matches,
+            }
+            if not deg_first_matches and len(
+                str(ev.get("deg_override_justification") or "").strip()
+            ) < 20:
+                validation_failures.append(
+                    f"Cluster {cid}: the DEG-derived label ({deg_derived_text!r}) differs from "
+                    f"the final label ({final_label_text!r}), but no 'deg_override_justification' "
+                    f"was provided. Because the cluster's own markers have the final say, "
+                    f"overriding them requires an explicit, evidence-based justification naming "
+                    f"which DEGs support the final label over the DEG-derived one. If you cannot "
+                    f"justify the override from the DEGs, use the DEG-derived label."
+                )
+
         # A cross-lineage override of a TWO-SOURCE reference consensus keeps the
         # high bar (handled later) — Cytopus alone cannot rescue it.
         crosses_two_source_consensus = bool(
@@ -2627,6 +2687,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "cluster_key": {"type": "string", "description": "obs column with cluster labels (default: leiden)"},
+                    "allow_precorrection_clustering": {"type": "boolean", "description": "Expert override (default false). When the dataset is batch-corrected, prepare_annotation refuses to annotate a clustering that was NOT computed on the integrated embedding (e.g. a stale pre-integration clustering). Set true only to deliberately annotate a pre-integration clustering, with a documented reason."},
                     "marker_dict": {
                         "type": "object",
                         "description": (
@@ -4620,12 +4681,25 @@ def process_tool_call(
                 phenograph_kwargs["use_rep"] = use_rep
             run_phenograph(adata_obj, **phenograph_kwargs)
 
+        # Record the representation this clustering was computed on, so annotation
+        # can verify it ran on the integrated embedding (Floor 1). Leiden clusters
+        # the active neighbor graph, whose rep scagent always records explicitly.
+        if normalized_method == "leiden":
+            _neigh = adata_obj.uns.get("neighbors")
+            _params = _neigh.get("params") if isinstance(_neigh, dict) else None
+            resolved_rep = (
+                _params.get("use_rep") if isinstance(_params, dict) else None
+            )
+        else:
+            resolved_rep = use_rep or "X_pca"
+
         register_clustering(
             adata_obj,
             cluster_key=cluster_key,
             method=normalized_method,
             resolution=resolution,
             created_by="tool",
+            use_rep=resolved_rep,
         )
         primary_alias = default_cluster_key_for_method(normalized_method)
         primary_cluster_key = primary_alias if primary_alias in adata_obj.obs.columns else ""
@@ -4637,6 +4711,7 @@ def process_tool_call(
                 method=normalized_method,
                 resolution=resolution,
                 created_by="tool",
+                use_rep=resolved_rep,
             )
             primary_alias_created = primary_cluster_key in adata_obj.obs.columns
         primary_alias_available = bool(primary_cluster_key and primary_cluster_key in adata_obj.obs.columns)
@@ -4672,6 +4747,11 @@ def process_tool_call(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import scanpy as sc
+
+        # Never overwrite an existing figure — a reused name (e.g. umap_leiden.png
+        # across resolutions, or pre/post integration) gets _2/_3. Callers must use
+        # the returned result["output_path"], which reflects the file written here.
+        output_path = unique_output_path(output_path)
 
         genes = genes or []
         if plot_type == "umap":
@@ -4837,7 +4917,7 @@ def process_tool_call(
         fig.subplots_adjust(hspace=0.25, wspace=0.04)
 
         base, ext = os.path.splitext(output_path)
-        grid_path = f"{base}_grid{ext}"
+        grid_path = unique_output_path(f"{base}_grid{ext}")
         fig.savefig(grid_path, dpi=150, bbox_inches="tight", facecolor="white")
         _mplt.close(fig)
         return grid_path
@@ -9180,7 +9260,14 @@ def process_tool_call(
 
                 if generate_figures and "X_umap" in adata.obsm:
                     path_root = figure_dir or "."
-                    figure_name = f"umap_{cluster_key}.png"
+                    # Name by resolution so each sweep point is distinct and self-
+                    # describing; _render_figure still uniquifies as a backstop.
+                    res_tag = result_payload.get("resolution")
+                    figure_name = (
+                        f"umap_{cluster_key}_res{res_tag}.png"
+                        if res_tag is not None
+                        else f"umap_{cluster_key}.png"
+                    )
                     figure_path = os.path.join(path_root, figure_name)
                     figure_result = _render_figure(
                         adata,
@@ -9189,6 +9276,8 @@ def process_tool_call(
                         color_by=cluster_key,
                         include_image=include_images,
                     )
+                    # Use the path actually written (may have been uniquified).
+                    figure_path = figure_result["output_path"]
                     compare_entry["figure_path"] = figure_path
                     if include_images and "image_base64" in figure_result:
                         image_payloads.append({
@@ -9207,12 +9296,18 @@ def process_tool_call(
                         f"Cannot promote resolution {promote_resolution}; "
                         f"expected clustering key '{promote_key}' was not generated."
                     )
+                _cmp_neigh = adata.uns.get("neighbors")
+                _cmp_params = _cmp_neigh.get("params") if isinstance(_cmp_neigh, dict) else None
+                _promote_rep = (
+                    _cmp_params.get("use_rep") if isinstance(_cmp_params, dict) else None
+                )
                 promote_clustering_to_primary(
                     adata,
                     cluster_key=promote_key,
                     method=method,
                     resolution=float(promote_resolution),
                     created_by="tool",
+                    use_rep=_promote_rep,
                 )
 
             result = {
@@ -11165,6 +11260,9 @@ def process_tool_call(
                 genes=genes,
                 include_image=include_image,
             )
+            # _render_figure may have uniquified the path to avoid overwriting;
+            # use the actual file it wrote for the artifact, grid, and everything below.
+            output_path = result["output_path"]
             result["available_clusterings"] = _clusterings_payload(adata)
             artifact = _artifact_payload(
                 output_path,
@@ -11491,6 +11589,21 @@ def process_tool_call(
             metric_flagged_clusters = list(proposed_removal)
             cells_metric_flagged = cells_proposed
 
+            # When doublet detection was skipped/unavailable, metric QC has no
+            # doublet signal and cannot flag doublet-enriched clusters — and since
+            # structure QC normally only adjudicates metric-flagged/ambiguous
+            # clusters, it would never run, leaving a doublet mixture that looks
+            # metrically normal with NO detection path. In that case nominate a
+            # baseline structure-QC pass over all clusters so cluster coherence is
+            # still checked before annotation. (structure QC filters clusters below
+            # its min_cells, so nominating all is safe.) See prompts.py cluster-QC.
+            doublet_signal_missing = not has_doublet
+            structure_qc_baseline_clusters = (
+                sorted(set(cluster_labels))
+                if (doublet_signal_missing and not metric_flagged_clusters and not ambiguous)
+                else []
+            )
+
             checkpoint_path = None
             if save_checkpoint:
                 import os as _os
@@ -11579,6 +11692,11 @@ def process_tool_call(
                     "Metric QC flagged these clusters as problematic/suspicious and in need of "
                     "structure QC adjudication; this is not a removal decision."
                 ),
+                "doublet_signal_missing": doublet_signal_missing,
+                "structure_qc_baseline_clusters": structure_qc_baseline_clusters,
+                "structure_qc_recommended": bool(
+                    metric_flagged_clusters or ambiguous or structure_qc_baseline_clusters
+                ),
                 "proposed_removal": proposed_removal,
                 "ambiguous": ambiguous,
                 "clean": clean,
@@ -11596,6 +11714,26 @@ def process_tool_call(
                 },
                 "state": make_state(adata),
             }
+            if structure_qc_baseline_clusters:
+                result["next_step"] = (
+                    "Doublet detection was not run, so metric QC could not flag doublet-enriched "
+                    "clusters and nothing was nominated for adjudication. Run "
+                    "run_cluster_structure_qc(clusters_to_analyze=structure_qc_baseline_clusters) "
+                    "as a baseline cluster-coherence check BEFORE annotation, even though no "
+                    "clusters were metric-flagged — this is the only layer that can catch a "
+                    "structurally incoherent (e.g. doublet-mixture) cluster with normal metrics."
+                )
+                summary = (
+                    f"Cluster QC: no metric flags, but doublet detection was unavailable — "
+                    f"run structure QC as a baseline coherence check over all {len(cluster_qc)} "
+                    "clusters before annotation."
+                )
+            else:
+                summary = (
+                    f"Cluster QC: {len(metric_flagged_clusters)} metric-flagged cluster(s) "
+                    f"({cells_metric_flagged} cells, {result['pct_metric_flagged']}%) and "
+                    f"{len(ambiguous)} ambiguous cluster(s) require structure QC adjudication."
+                )
             artifacts = []
             if checkpoint_path:
                 artifacts.append(_artifact_payload(checkpoint_path, role="checkpoint", metadata={"stage": "pre_cluster_qc_cleanup"}))
@@ -11608,11 +11746,7 @@ def process_tool_call(
             return _finalize_result(
                 result, adata,
                 dataset_changed=False,
-                summary=(
-                    f"Cluster QC: {len(metric_flagged_clusters)} metric-flagged cluster(s) "
-                    f"({cells_metric_flagged} cells, {result['pct_metric_flagged']}%) and "
-                    f"{len(ambiguous)} ambiguous cluster(s) require structure QC adjudication."
-                ),
+                summary=summary,
                 artifacts_created=artifacts,
             )
 
@@ -12400,6 +12534,46 @@ def process_tool_call(
                         f"Pass an existing cluster column via cluster_key. Available columns: {list(adata.obs.columns)[:30]}",
                     ],
                 )
+
+            # --- Floor 1: annotation must bind to a post-integration clustering ---
+            # If the dataset was batch-corrected, the clustering being annotated
+            # must have been computed on the integrated embedding. Annotating a
+            # stale pre-integration clustering (the run_2026_06_29_202520 failure,
+            # where annotation ran on a res-1.5 clustering instead of the final
+            # post-scVI res-1.0 one) is refused here, at the point of error. The
+            # set of integrated embeddings lives in core.inspector (single source
+            # of truth, method-convention, not hardcoded here).
+            from ..core.inspector import integrated_embedding_keys
+
+            integrated_present = integrated_embedding_keys(adata)
+            allow_precorrection = bool(tool_input.get("allow_precorrection_clustering", False))
+            if integrated_present and not allow_precorrection:
+                _rec = next(
+                    (c for c in get_clustering_registry(adata) if c.key == cluster_key), None
+                )
+                _rep = _rec.use_rep if _rec is not None else None
+                if _rep not in integrated_present:
+                    return _smart_unavailable_result(
+                        tool="prepare_annotation",
+                        message=(
+                            f"Clustering '{cluster_key}' was computed on "
+                            f"'{_rep or 'an unrecorded/pre-integration'}' representation, but this "
+                            f"dataset was batch-corrected (integrated embedding(s): "
+                            f"{integrated_present}). Annotation must run on a clustering computed "
+                            f"on the integrated embedding — otherwise labels reflect uncorrected, "
+                            f"batch-confounded structure. Re-cluster on the integrated embedding "
+                            f"at your final annotation resolution, then re-run prepare_annotation."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["post_integration_clustering"],
+                        recovery_options=[
+                            f"run_neighbors with use_rep='{integrated_present[0]}', then "
+                            "run_clustering at the final annotation resolution (e.g. 1.0).",
+                            "Annotate that post-integration clustering's cluster_key.",
+                            "Override only with a documented reason: set "
+                            "allow_precorrection_clustering=true.",
+                        ],
+                    )
 
             annotation_key = tool_input.get("annotation_key", "cell_type")
             marker_dict = tool_input.get("marker_dict") or {}

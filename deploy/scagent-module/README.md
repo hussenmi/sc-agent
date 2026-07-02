@@ -18,6 +18,12 @@ module unload scagent
 Nothing is installed per-user — the whole environment lives once in a shared
 tree, and the module just puts it on `PATH` and sets a few env vars.
 
+> **Prerequisite: the module is only discoverable once its modulefiles dir is on
+> `$MODULEPATH`.** This is NOT wired up cluster-wide yet, so a fresh user gets
+> `Lmod ... unknown module: "scagent"`. See **§0** for the one line each user (or,
+> better, the admin) must add. `module --ignore_cache` does NOT fix this — it's a
+> missing MODULEPATH, not a stale cache.
+
 **GPU is optional.** scagent defaults to CPU (scanpy); GPU only accelerates the
 heavy steps (PCA/neighbors/UMAP/Leiden). The module detects a CUDA 12/13 GPU at
 load: if present it sets `SCAGENT_GPU=1` and preloads the CUDA libs; if not, it
@@ -25,9 +31,59 @@ loads anyway in CPU mode (prints "CPU only"). The load message tells you which.
 
 ---
 
+## 0. Making `module load scagent` discoverable (MODULEPATH)
+
+The environment is fully deployed and world-readable, but Lmod can't find it
+unless the modulefiles dir is on the user's `$MODULEPATH`:
+
+```
+/usersoftware/collab002/sail/tools/Modules/modulefiles
+```
+
+There is currently **no system-wide file that adds this path** — not in
+`/etc/profile.d/`, and Iris has no `/etc/lmod/modulepath.d/` mechanism. The only
+reason it works for the initial testers is a hand-added line in their personal
+`~/.bashrc`. So a new user who tries `module load scagent` gets:
+
+```
+Lmod has detected the following error: The following module(s) are unknown: "scagent"
+```
+
+Permissions are NOT the problem: the whole tree is world-traversable and the
+modulefile is world-readable (`o+rX`), so once the path is on MODULEPATH it just
+works for anyone. Two ways to get it there:
+
+### Per-user (immediate, no privileges)
+Each user adds one line to their `~/.bashrc` (or `~/.bash_profile`):
+
+```bash
+module use --append /usersoftware/collab002/sail/tools/Modules/modulefiles
+```
+
+Then start a new shell (or `source ~/.bashrc`). `module avail scagent` should now
+list it, and `module load scagent` works.
+
+### Lab-wide (recommended — requires HPC admin)
+So nobody has to edit their bashrc, ask the HPC admin / the tree owner
+(`krauset`) to drop a one-line snippet in `/etc/profile.d/`, which every login
+shell sources automatically:
+
+```sh
+# /etc/profile.d/z-collab002-modules.sh
+module use --append /usersoftware/collab002/sail/tools/Modules/modulefiles
+```
+
+This is the standard site pattern and the only route to a truly hands-off
+`module load scagent` for the whole cluster. `/etc/profile.d/` is root-owned, so
+it can't be done without admin — until it's in place, distribute the per-user
+line above.
+
+---
+
 ## 1. Where everything lives
 
-Shared module tree (owned by group `grp_hpc_collab002`, on `$MODULEPATH` cluster-wide):
+Shared module tree (owned by group `grp_hpc_collab002`; note the modulefiles dir
+must be on `$MODULEPATH` — see §0):
 
 ```
 /usersoftware/collab002/sail/tools/Modules/

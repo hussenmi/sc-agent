@@ -1881,6 +1881,7 @@ class SCAgent:
 
         decision_key = checkpoint.get("decision_key", checkpoint.get("kind", "pending_decision"))
         reprompt_checkpoint = None
+        custom_needs_resolution = False
         if (
             checkpoint.get("kind") == "multi_sample_strategy"
             and selected_action == "describe_experiment"
@@ -1897,22 +1898,42 @@ class SCAgent:
                 checkpoint.get("partition") or {}
             )
         else:
-            applied_value: Any = selected_action or selected_value
-            if selected_action == "custom":
-                applied_value = {
-                    "action": "custom",
-                    "details": selected_value,
-                }
-            self.world_state.resolve_decision(
-                decision_key,
-                applied_value,
-                source="user",
-                message=selected_value,
-            )
+            real_options = [
+                a for a in (checkpoint.get("option_actions") or []) if a not in ("custom",)
+            ]
+            # A free-text reply to a genuine multiple-choice decision is NOT a branch
+            # selection. Capture it as a side-instruction and leave the decision
+            # UNRESOLVED, so the model must map it to a listed option or re-ask —
+            # never silently fall back to a default (the batch-question bug: a "skip
+            # scrublet" reply was allowed to close the integration decision). General
+            # to every checkpoint with >=2 real options.
+            custom_needs_resolution = selected_action == "custom" and len(real_options) >= 2
+            if custom_needs_resolution:
+                if selected_value:
+                    self.world_state.add_context_hint(
+                        f'User\'s free-text reply to "{checkpoint.get("question", "the decision")}": '
+                        f"{selected_value}",
+                        source="user",
+                    )
+            else:
+                applied_value: Any = selected_action or selected_value
+                if selected_action == "custom":
+                    applied_value = {
+                        "action": "custom",
+                        "details": selected_value,
+                    }
+                self.world_state.resolve_decision(
+                    decision_key,
+                    applied_value,
+                    source="user",
+                    message=selected_value,
+                )
         payload = {
             "decision_key": decision_key,
             "checkpoint_kind": checkpoint.get("kind"),
             "question": checkpoint.get("question", ""),
+            "options": checkpoint.get("options", []),
+            "custom_needs_resolution": custom_needs_resolution,
             "selected_action": selected_action,
             "selected_label": selection.label,
             "selected_index": selection.index,
@@ -1955,6 +1976,30 @@ class SCAgent:
     def structured_decision_request(self, selection) -> str:
         """Turn a selector result into an unambiguous model-facing user message."""
         payload = self.resolve_pending_decision(selection)
+        if payload.get("custom_needs_resolution"):
+            # The user typed a free-text reply instead of picking an option. Don't let
+            # it silently close the decision: apply any side-instruction, then require
+            # the model to either map it to a listed option or re-ask — never default.
+            opts = payload.get("options") or []
+            opt_str = "; ".join(str(o) for o in opts)
+            instruction = (
+                "The user did NOT pick one of the listed options — they wrote a "
+                "free-text reply (see selected_value). Do BOTH, in order:\n"
+                "1. Apply any side-instructions or constraints it states (e.g. a "
+                "parameter preference like skipping a step) to the rest of the run.\n"
+                f'2. Decide whether the reply actually answers THIS question: "{payload.get("question", "")}" '
+                f"(options: {opt_str}). If it clearly selects or specifies one of those "
+                "options, proceed with it and state which option you inferred and why. If "
+                "it does NOT resolve this decision — it is off-topic, only a side-"
+                "instruction, partial, or ambiguous — you MUST re-ask this exact question "
+                "(same options) before proceeding. Do NOT assume a default and do NOT "
+                "skip the decision."
+            )
+            return (
+                "[Structured user decision]\n"
+                f"{json.dumps(payload, indent=2, default=str)}\n\n"
+                f"{instruction}"
+            )
         instruction = (
             "Treat selected_action as authoritative. Carry out that choice, using "
             "selected_value as the user's text only when custom is true."
@@ -2793,6 +2838,12 @@ class SCAgent:
     def _build_system_prompt(self) -> str:
         """Attach runtime state to the static system prompt."""
         prompt = SYSTEM_PROMPT
+        # Ground-truth compute backend (GPU/rapids vs scanpy CPU), the scagent
+        # analog of the environment context a coding agent gets about its own
+        # runtime — so the model states the backend instead of guessing.
+        from ..core.gpu import gpu_capability_report
+        from .prompts import backend_prompt_block
+        prompt += backend_prompt_block(gpu_capability_report())
         if self._is_gemma_model():
             # Gemma 4 puts all output inside thinking blocks and produces no narration
             # text outside them. This instruction mirrors how Claude/GPT behave: brief
@@ -3636,6 +3687,14 @@ class SCAgent:
         before_snapshot: Dict[str, Any],
     ) -> Dict[str, Any]:
         after_snapshot = self.world_state.snapshot()
+
+        # Report the compute backend(s) this tool actually exercised, read from
+        # the ledger the compute layer wrote (on_gpu / run_scvi) — not a guess
+        # from the tool name. A tool that touched no backend gets no field.
+        from ..core.gpu import backends_used
+        used = backends_used()
+        if used and result_data.get("status") == "ok":
+            result_data.setdefault("backend", used[0] if len(used) == 1 else used)
 
         if tool_name == "bc_get_panglaodb_marker_genes":
             result_data.setdefault(
@@ -6097,6 +6156,11 @@ class SCAgent:
                     except Exception:
                         pass
                 return _rj, _ad
+
+            # Clear the compute-backend ledger so what on_gpu/run_scvi record
+            # below reflects only this tool call (read in _ensure_standard_tool_result).
+            from ..core.gpu import reset_backends_used
+            reset_backends_used()
 
             if self.verbose and self._should_print_persistent_tool_progress(tool_name):
                 # Streaming tools produce their own tqdm/progress output. Using

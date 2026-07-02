@@ -311,7 +311,8 @@ class RunManager:
             # Include key metrics, not full result
             step["metrics"] = {
                 k: v for k, v in result.items()
-                if k in ["before", "after", "n_clusters", "n_hvg", "doublet_rate", "status"]
+                if k in ["before", "after", "n_clusters", "n_hvg", "doublet_rate",
+                         "status", "backend"]
             }
 
         self.manifest.steps_completed.append(step)

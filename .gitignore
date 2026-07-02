@@ -72,6 +72,7 @@ logs/
 .claude/
 treg_project/
 andrew_data/
+lightning_logs/
 # Track test code. Compiled cache (__pycache__/) and data fixtures (*.h5ad) are
 # already ignored by the global rules above; keep other large binary fixtures
 # out so tests/ stays code-only.

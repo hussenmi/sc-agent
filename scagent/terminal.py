@@ -411,7 +411,15 @@ def read_user_input(
     """
     session = _get_prompt_session()
     if session is not None:
-        response = session.prompt(prompt, placeholder=placeholder)
+        # Render the placeholder dimmed (grey italic) so it reads as a hint, not
+        # as pre-filled input — prompt_toolkit shows a bare str in the normal
+        # foreground, which looks like text the user already typed.
+        ph: object = placeholder
+        if placeholder:
+            from prompt_toolkit.formatted_text import FormattedText
+
+            ph = FormattedText([("italic fg:ansibrightblack", placeholder)])
+        response = session.prompt(prompt, placeholder=ph)
     else:
         _configure_readline()
         if placeholder:

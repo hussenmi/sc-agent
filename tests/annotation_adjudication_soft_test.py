@@ -54,6 +54,7 @@ def _hard_cluster_proposal():
 def _hard_cluster_evidence(confidence="high", panglaodb_queried=False, panglaodb_label_used=None):
     e = {
         "label": "CMP",
+        "deg_derived_label": "CMP",
         "confidence": confidence,
         "panglaodb_queried": panglaodb_queried,
         "supporting_genes": ["MPO", "PRSS57", "AZU1"],
@@ -143,6 +144,7 @@ def test_resolvable_cluster_unaffected():
     }
     evidence = {"0": {
         "label": "Classical monocyte",
+        "deg_derived_label": "Classical monocyte",
         "confidence": "high",
         "panglaodb_queried": False,
         "supporting_genes": ["LYZ", "CD14", "S100A8"],

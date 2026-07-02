@@ -275,6 +275,9 @@ class ClusteringRecord:
     is_primary: bool = False
     source_key: Optional[str] = None
     created_by: str = "inferred"
+    # Representation the clustering was computed on (e.g. "X_pca", "X_scVI").
+    # Used to enforce that annotation binds to a post-integration clustering.
+    use_rep: Optional[str] = None
 
 
 @dataclass
@@ -380,6 +383,8 @@ def clustering_record_to_dict(record: ClusteringRecord) -> Dict[str, Any]:
         payload["resolution"] = float(record.resolution)
     if record.source_key:
         payload["source_key"] = record.source_key
+    if record.use_rep:
+        payload["use_rep"] = record.use_rep
     return payload
 
 
@@ -1290,6 +1295,7 @@ def get_clustering_registry(adata: AnnData) -> List[ClusteringRecord]:
                 is_primary=(key == default_cluster_key_for_method(method)),
                 source_key=payload.get("source_key"),
                 created_by=str(payload.get("created_by", "tool")),
+                use_rep=payload.get("use_rep"),
             )
 
     for inferred in _infer_obs_clustering_entries(adata):
@@ -1321,6 +1327,7 @@ def register_clustering(
     resolution: Optional[float],
     created_by: str = "tool",
     source_key: Optional[str] = None,
+    use_rep: Optional[str] = None,
 ) -> None:
     """Register a clustering result in adata.uns for later inspection."""
     namespace = _ensure_scagent_uns(adata)
@@ -1330,6 +1337,7 @@ def register_clustering(
         "resolution": float(resolution) if resolution is not None else None,
         "source_key": source_key,
         "created_by": created_by,
+        "use_rep": use_rep,
     }
 
 
@@ -1340,6 +1348,7 @@ def promote_clustering_to_primary(
     method: str,
     resolution: Optional[float],
     created_by: str = "tool",
+    use_rep: Optional[str] = None,
 ) -> str:
     """Promote a clustering result to the compatibility alias for its method."""
     normalized_method = normalize_clustering_method(method)
@@ -1360,6 +1369,7 @@ def promote_clustering_to_primary(
         method=normalized_method,
         resolution=resolution,
         created_by=created_by,
+        use_rep=use_rep,
     )
     register_clustering(
         adata,
@@ -1368,8 +1378,26 @@ def promote_clustering_to_primary(
         resolution=resolution,
         created_by=created_by,
         source_key=cluster_key,
+        use_rep=use_rep,
     )
     return alias
+
+
+# Obsm keys produced by batch-integration methods, in the same precedence
+# inspect_data uses. Single source of truth for "an integrated embedding exists"
+# (method convention, not biology). bbknn corrects the neighbor graph, not an
+# embedding, so it is not listed here.
+_INTEGRATION_EMBEDDING_KEYS = ("X_scanorama", "X_pca_harmony", "X_scVI")
+
+
+def integrated_embedding_keys(adata: AnnData) -> List[str]:
+    """Return the obsm keys of any batch-corrected embeddings present.
+
+    Used to enforce that, once integration has produced a corrected embedding,
+    downstream clustering/annotation binds to it rather than to a stale
+    pre-integration representation.
+    """
+    return [key for key in _INTEGRATION_EMBEDDING_KEYS if key in adata.obsm]
 
 
 def _detect_clustering(
