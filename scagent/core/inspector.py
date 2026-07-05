@@ -452,7 +452,13 @@ def _sample_matrix_values(X, n: int = 20000, seed: int = 0) -> np.ndarray:
     elif sp.issparse(X):
         data = X.data
     else:
-        data = np.asarray(X).ravel()
+        # Dense array, or an exotic/backed matrix type. Guard the conversion so an
+        # object we can't materialise (e.g. a backed _CSRDataset) yields an empty
+        # sample rather than crashing inspection.
+        try:
+            data = np.asarray(X).ravel()
+        except Exception:
+            return np.array([])
 
     m = len(data)
     if m == 0:
@@ -759,6 +765,15 @@ def _score_obs_semantic_candidate(
     else:
         structure_score = _categorical_structure_score(series, n_obs, role)
         value_score = _semantic_value_score(series, role)
+
+    # doublet_label is a small, closed vocabulary (singlet/doublet/true/false/0/1).
+    # Require the VALUES to actually look like doublet calls — not just a fuzzy
+    # name match. Otherwise a cell-type column like 'scanvi_label' matches on the
+    # "label" substring (name_score 0.63) and falsely flips has_doublets=True with
+    # no real doublet call (run_2026_07_02_150701 screenshot). The canonical named
+    # columns ('predicted_doublet', 'doublet_score') are matched exactly elsewhere.
+    if role == "doublet_label" and value_score == 0.0:
+        return None
 
     if structure_score == 0.0 and name_score < 0.9:
         return None
