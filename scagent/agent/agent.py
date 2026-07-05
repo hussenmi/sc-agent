@@ -6671,8 +6671,6 @@ class SCAgent:
             md_lines.append(f"- Species: `{biological_context.get('species', 'unknown')}`")
             md_lines.append(f"- Sample type: `{biological_context.get('sample_type', 'unknown')}`")
             md_lines.append(f"- Condition: `{biological_context.get('condition', 'unknown')}`")
-            if biological_context.get("expected_celltypes"):
-                md_lines.append(f"- Expected cell types: {', '.join(biological_context['expected_celltypes'])}")
             if biological_context.get("confidence") is not None:
                 md_lines.append(f"- Context confidence: {biological_context['confidence']:.2f}")
             provenance = biological_context.get("provenance", {})

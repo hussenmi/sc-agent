@@ -737,12 +737,8 @@ class AgentWorldState:
                 biological_context["species"] = inspection["species"]
                 biological_context["species_source"] = "model_inspection"
             if inspection.get("tissue"):
-                from ..analysis.context import _expected_celltypes_for_tissue
                 biological_context["tissue"] = inspection["tissue"]
                 biological_context["tissue_source"] = "model_inspection"
-                biological_context["expected_celltypes"] = _expected_celltypes_for_tissue(
-                    inspection["tissue"]
-                )
             if inspection.get("condition"):
                 biological_context["condition"] = inspection["condition"]
                 biological_context["condition_source"] = "model_inspection"

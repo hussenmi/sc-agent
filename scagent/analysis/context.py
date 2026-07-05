@@ -24,7 +24,6 @@ class BiologicalContext:
     species: str = "unknown"
     condition: str = "unknown"
     sample_type: str = "unknown"
-    expected_celltypes: list[str] | None = None
 
     confidence: float = 0.0
 
@@ -235,28 +234,6 @@ def _infer_condition_from_text(text_context: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 
-def _expected_celltypes_for_tissue(tissue: str) -> list[str] | None:
-    normalized = (tissue or "").lower()
-    if normalized == "pbmc":
-        return [
-            "T cells",
-            "NK cells",
-            "B cells",
-            "monocytes",
-            "dendritic cells",
-            "platelets",
-        ]
-    if normalized == "tumor":
-        return [
-            "T cells",
-            "NK cells",
-            "myeloid cells",
-            "tumor cells",
-            "stromal cells",
-        ]
-    return None
-
-
 def infer_biological_context(
     adata: AnnData,
     *,
@@ -341,8 +318,6 @@ def infer_biological_context(
             context.context_supplied["condition"] = condition
         else:
             context.user_provided["condition"] = condition
-
-    context.expected_celltypes = _expected_celltypes_for_tissue(context.tissue)
 
     confidence = 0.0
     if context.provenance.get("tissue") == "user_provided":
