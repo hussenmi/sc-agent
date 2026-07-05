@@ -4345,9 +4345,10 @@ def process_tool_call(
         """Create compact state dict."""
         state = inspect_data(adata)
         return {
-            "has_raw_counts": bool(state.has_raw_layer or state.has_raw or state.is_counts),
+            "has_raw_counts": bool(state.has_raw_layer or (state.has_raw and state.raw_is_counts) or state.is_counts),
             "x_is_raw_counts": bool(state.is_counts),
             "raw_in_adata_raw": state.has_raw,
+            "raw_adata_is_counts": bool(state.has_raw and state.raw_is_counts),
             "raw_in_layer": state.has_raw_layer,
             "raw_layer_name": state.raw_layer_name if state.has_raw_layer else None,
             "has_qc_metrics": state.has_qc_metrics,
@@ -4828,6 +4829,61 @@ def process_tool_call(
             "This tool requires raw UMI/read counts. Save them with normalize_and_hvg "
             "which preserves raw counts in layers['raw_counts'] before normalizing."
         )
+
+    def _ensure_raw_counts_layer(adata, raw_layer_name: str = "raw_counts"):
+        """Make adata.layers[raw_layer_name] hold integer counts when X is already
+        processed and counts live only in adata.raw.
+
+        General fix for CELLxGENE-style objects (run_2026_07_02_150701): raw counts
+        sat in adata.raw (float32 but integer-valued), normalize_and_hvg only knew
+        how to reset from a *named layer*, and the model had to hand-copy
+        adata.raw.X into a layer across ~5 failed iterations. Here we do that
+        alignment once, automatically, using the shared counts resolver. Returns a
+        short note describing what was materialized, or None if nothing was needed.
+        adata.raw is aligned to the current var_names (it often carries a superset
+        of genes) so the layer matches adata's shape.
+        """
+        from ..core.inspector import _is_integer_matrix, find_counts_matrix
+
+        # Already have integer counts under the expected name, or X itself is
+        # counts (normalization_source='auto' handles that) — nothing to do.
+        if raw_layer_name in adata.layers and _is_integer_matrix(adata.layers[raw_layer_name]):
+            return None
+        if _is_integer_matrix(adata.X):
+            return None
+
+        found = find_counts_matrix(adata, prefer_layer=raw_layer_name)
+        if found is None:
+            return None  # let normalize_data raise its own clear error
+
+        source = found["source"]
+        if source.startswith("layer:"):
+            src = source.split(":", 1)[1]
+            if src == raw_layer_name:
+                return None
+            adata.layers[raw_layer_name] = adata.layers[src]
+            return f"copied integer counts from layer '{src}' into '{raw_layer_name}'"
+
+        if source == "raw":
+            raw = adata.raw
+            raw_var = list(raw.var_names)
+            cur_var = list(adata.var_names)
+            if raw_var == cur_var:
+                X_aligned = raw.X
+            else:
+                pos = {g: i for i, g in enumerate(raw_var)}
+                if all(g in pos for g in cur_var):
+                    idx = [pos[g] for g in cur_var]
+                    X_aligned = raw.X[:, idx]
+                else:
+                    # Gene sets don't align safely; leave to normalize_data's error.
+                    return None
+            adata.layers[raw_layer_name] = X_aligned.copy() if hasattr(X_aligned, "copy") else X_aligned
+            return (
+                f"materialized raw counts from adata.raw into layer '{raw_layer_name}' "
+                f"(aligned {len(cur_var)} genes)"
+            )
+        return None
 
     def _state_preservation_warning(tool_input, existing_adata):
         if existing_adata is not None and tool_input.get("data_path") not in (None, "memory"):
@@ -6996,7 +7052,13 @@ def process_tool_call(
             if state.has_raw:
                 raw_info["adata_raw"] = {
                     "n_vars": state.raw_n_vars,
-                    "note": "full gene set before HVG subsetting" if state.raw_n_vars > state.n_genes else "same gene set as X",
+                    "is_counts": bool(state.raw_is_counts),
+                    "note": (
+                        ("full gene set before HVG subsetting" if state.raw_n_vars > state.n_genes else "same gene set as X")
+                        + ("; holds integer counts — usable as the raw-counts source (normalize_and_hvg reads it automatically)"
+                           if state.raw_is_counts
+                           else "; non-integer values — NOT raw counts")
+                    ),
                 }
             if state.has_raw_layer:
                 raw_info["layers"].append(state.raw_layer_name)
@@ -8802,6 +8864,11 @@ def process_tool_call(
                 sample = np.asarray(sample)
                 return bool(np.allclose(sample, np.round(sample)))
 
+            # If X is already processed and raw counts live only in adata.raw,
+            # materialize them into the expected layer so normalize_data can reset
+            # from counts without the user hand-copying adata.raw.X first.
+            raw_counts_note = _ensure_raw_counts_layer(adata, raw_layer_name)
+
             try:
                 normalize_data(
                     adata,
@@ -8888,6 +8955,7 @@ def process_tool_call(
                 "reset_reason": adata.uns.get("normalization", {}).get("reset_reason"),
                 "input_x_preserved_layer": adata.uns.get("normalization", {}).get("input_x_preserved_layer"),
                 "raw_layer_name": raw_layer_name,
+                "raw_counts_source_note": raw_counts_note,
                 "raw_counts_present": raw_counts_present,
                 "raw_counts_integer_like": raw_counts_integer_like,
                 "adata_raw_set": adata.raw is not None,

@@ -618,8 +618,8 @@ You are a curious scientist exploring data, not a pipeline that auto-runs QC.
 
 **What to narrate** (check ALL of these):
 - Shape: How many cells × genes?
-- Data state: Is X raw counts or normalized? Check if integers vs floats, check for layers. Report the facts — don't label the dataset as "fresh", "unprocessed", "ready", etc.
-- Raw: Is adata.raw set? If so, how many genes does it carry (often more than adata.X after HVG subsetting)? Is there also a raw layer like 'raw_counts'?
+- Data state: Is X raw counts or normalized? Decide from the VALUES, not the dtype. A `float32`/`float64` matrix can still be raw counts — look at `facts.X.fraction_integer_valued` and `sample_min`/`sample_max`: values that are all integer-valued (e.g. 1.0, 20.0, 5643.0) with `min ≥ 0` are counts even though the dtype is float; decimals like 0.53, 7.19 mean normalized. Report the facts — don't label the dataset as "fresh", "unprocessed", "ready", etc.
+- Raw: Is adata.raw set (`facts.raw.present`)? If so, apply the same value test to `facts.raw.X` (`fraction_integer_valued`, `sample_min/max`) — adata.raw is frequently float32 but integer-valued, i.e. genuine raw counts usable for rebuild/annotation. How many genes does it carry (often more than adata.X after HVG subsetting)? Is there also a raw layer like 'raw_counts' (see `facts.layer_facts`)?
 - obsm: Any embeddings? X_pca? X_umap? What dimensionality?
 - obs columns: Use `obs_columns_detail` (in `data_summary`) to determine what each column represents. Read name + dtype + n_unique + values/stats together. For each column, reason about its role:
   - **Cell type annotation**: categorical, n_unique roughly 2–200, values look like biological labels ("T cell", "AT2", "Fibroblast", "Cluster_CD8")

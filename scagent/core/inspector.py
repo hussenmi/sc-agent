@@ -296,6 +296,7 @@ class DataState:
     has_raw_layer: bool = False
     raw_layer_name: str = ""
     has_raw: bool = False          # True if adata.raw is set
+    raw_is_counts: bool = False    # True if adata.raw.X holds integer-valued counts
     raw_n_vars: int = 0            # Number of genes in adata.raw (often > n_genes after HVG)
     is_counts: bool = False        # True if X contains integer counts
 
@@ -430,43 +431,53 @@ def metadata_resolution_to_dict(resolution: MetadataResolution) -> Dict[str, Any
     }
 
 
-def _is_integer_matrix(X) -> bool:
-    """Check if matrix contains integer values (counts).
+def _sample_matrix_values(X, n: int = 20000, seed: int = 0) -> np.ndarray:
+    """Return a representative sample of a matrix's values as a host numpy array.
 
-    Uses the dtype as a fast shortcut — integer dtypes are definitely counts,
-    float dtypes with a log1p-range max are definitely not.  Only falls back
-    to sampling when the dtype is ambiguous (float that could still be counts).
-    Sampling uses a cheap head-slice instead of np.random.choice to avoid
-    allocating an index array the size of the full NNZ count.
+    Samples RANDOMLY across the full data rather than taking a head slice: the
+    first stored values of a CSR matrix are just the first few cells, so a head
+    slice can misjudge integer-ness / range for the matrix as a whole. For sparse
+    matrices only the stored (nonzero) values are sampled — zeros are trivially
+    integer and irrelevant to "are these counts / are there decimals". Returns an
+    empty array when there is nothing to sample.
     """
-    # Fast dtype shortcut: integer dtypes are always counts
+    # cupy/cupyx arrays (e.g. left in a layer by an interrupted GPU step) are not
+    # recognised by scipy.issparse and have no .ravel(); pull to host first.
+    if type(X).__module__.split(".", 1)[0] in ("cupy", "cupyx"):
+        try:
+            gpu = X.data if hasattr(X, "data") else X.reshape(-1)
+            data = np.asarray(gpu.get())
+        except Exception:
+            return np.array([])
+    elif sp.issparse(X):
+        data = X.data
+    else:
+        data = np.asarray(X).ravel()
+
+    m = len(data)
+    if m == 0:
+        return np.array([])
+    if m <= n:
+        return np.asarray(data)
+    idx = np.sort(np.random.default_rng(seed).choice(m, size=n, replace=False))
+    return np.asarray(data[idx])
+
+
+def _is_integer_matrix(X) -> bool:
+    """Check whether a matrix holds integer-valued counts.
+
+    The decision is made from VALUES, not dtype: float32 that is entirely
+    integer-valued (e.g. 1.0, 20.0, 5643.0 — common for CELLxGENE raw counts) is
+    treated as counts. Only an integer dtype is a fast shortcut; float dtypes are
+    always sampled (representatively) and tested for integer-ness. Empty matrices
+    are treated as counts (conservative, non-fatal).
+    """
     dtype = getattr(X, "dtype", None)
     if dtype is not None and np.issubdtype(dtype, np.integer):
         return True
-
-    # Defensive: a cupy/cupyx array (e.g. left in a layer by an interrupted GPU
-    # step) is not recognised by scipy's issparse and has no .ravel(), so bring a
-    # small sample to the host first. Only triggers when X is actually on-GPU.
-    if type(X).__module__.split(".", 1)[0] in ("cupy", "cupyx"):
-        try:
-            sample_gpu = X.data[:10000] if hasattr(X, "data") else X.reshape(-1)[:10000]
-            sample = sample_gpu.get()
-            if len(sample) == 0:
-                return True
-            return bool(np.allclose(sample, np.round(sample)))
-        except Exception:
-            return True  # can't decide -> treat as counts (conservative, non-fatal)
-
-    if sp.issparse(X):
-        data = X.data
-    else:
-        data = X.ravel()
-
-    if len(data) == 0:
+    sample = _sample_matrix_values(X)
+    if len(sample) == 0:
         return True
-
-    # Cheap head-slice — avoids O(nnz) np.random.choice for large matrices
-    sample = data[:min(10000, len(data))]
     return bool(np.allclose(sample, np.round(sample)))
 
 
@@ -989,22 +1000,19 @@ def resolve_batch_metadata(
 
 
 def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
-    """Detect if a raw counts layer exists in adata.layers.
+    """Detect a genuine raw-counts LAYER in adata.layers.
 
-    Note: adata.raw is checked separately in inspect_data and reported via
-    has_raw / raw_n_vars fields.
+    Only reports real named layers. adata.raw is deliberately NOT reported here:
+    it is tracked separately via has_raw / raw_is_counts / raw_n_vars. Folding
+    adata.raw in as a fake "__raw__" layer used to make inspection claim "raw
+    counts in layer '__raw__'", a layer that does not exist — which sent the model
+    chasing a non-existent layer (run_2026_07_02_150701 burned ~5 iterations).
     """
     common_raw_names = ["raw_counts", "raw_data", "counts", "raw"]
 
     for name in common_raw_names:
         if name in adata.layers and _is_integer_matrix(adata.layers[name]):
             return True, name
-
-    # Check adata.raw — but only if it actually contains integer counts.
-    # adata.raw is often log-normalized data stored before HVG selection,
-    # not true raw counts. Verify before reporting it as a raw counts source.
-    if adata.raw is not None and _is_integer_matrix(adata.raw.X):
-        return True, "__raw__"
 
     return False, ""
 
@@ -1232,19 +1240,13 @@ def _detect_normalization(adata: AnnData) -> Tuple[bool, bool, str]:
     if dtype is not None and np.issubdtype(dtype, np.integer):
         return False, False, ""
 
-    # --- Fallback: sample a small prefix of X.data (cheap head-slice) ---
-    if sp.issparse(adata.X):
-        data = adata.X.data
-        if len(data) == 0:
-            return False, False, ""
-        sample_data = data[:min(10000, len(data))]
-        max_val = float(sample_data.max())
-    else:
-        flat = adata.X.ravel()
-        if len(flat) == 0:
-            return False, False, ""
-        sample_data = flat[:10000]
-        max_val = float(sample_data.max())
+    # --- Fallback: representative value sample (not a head slice) ---
+    # Decide from values, not dtype: float X that is entirely integer-valued is
+    # raw counts, not normalized data.
+    sample_data = _sample_matrix_values(adata.X)
+    if len(sample_data) == 0:
+        return False, False, ""
+    max_val = float(sample_data.max())
 
     has_floats = not np.allclose(sample_data, np.round(sample_data))
     is_log = max_val < 15 and has_floats
@@ -1515,6 +1517,7 @@ def inspect_data(adata: AnnData) -> DataState:
     if adata.raw is not None:
         state.has_raw = True
         state.raw_n_vars = adata.raw.n_vars
+        state.raw_is_counts = _is_integer_matrix(adata.raw.X)
     state.is_counts = _is_integer_matrix(adata.X)
 
     gene_fmt, has_sym, has_ens, sample_genes = _detect_gene_id_format(adata)
@@ -1725,7 +1728,10 @@ def summarize_state(state: DataState) -> str:
     processing = []
     if state.has_raw:
         extra = f", {state.raw_n_vars:,} genes" if state.raw_n_vars != state.n_genes else ""
-        processing.append(f"raw counts in adata.raw{extra}")
+        if state.raw_is_counts:
+            processing.append(f"raw counts in adata.raw{extra}")
+        else:
+            processing.append(f"adata.raw present{extra} (non-integer values — not raw counts)")
     if state.has_raw_layer:
         processing.append(f"raw counts in layer '{state.raw_layer_name}'")
     if state.has_qc_metrics:
@@ -1920,20 +1926,26 @@ def _column_facts(series, n_ref: int, max_values: int = 10) -> dict:
     return facts
 
 
-def _x_facts(X, sample_n: int = 10000) -> dict:
-    """Factual characterization of the X matrix from a cheap sample (no full scan)."""
+def _x_facts(X, sample_n: int = 20000) -> dict:
+    """Factual characterization of a matrix from a representative value sample.
+
+    Reports the VALUE evidence needed to decide "are these raw counts?" without a
+    verdict: the fraction of sampled values that are integer-valued, min/max, and
+    whether any are negative. dtype is reported too, but the fraction is what
+    matters — float32 that is 100% integer-valued (fraction_integer_valued ≈ 1.0,
+    min ≥ 0) is raw counts despite the float dtype. For sparse matrices the sample
+    is over stored (nonzero) values.
+    """
     facts: dict = {"dtype": str(getattr(X, "dtype", "unknown")), "is_sparse": bool(sp.issparse(X))}
     try:
-        if sp.issparse(X):
-            data = X.data
-            sample = data[: min(sample_n, len(data))] if len(data) else np.array([])
-        else:
-            flat = np.asarray(X).ravel()
-            sample = flat[: min(sample_n, len(flat))] if len(flat) else np.array([])
+        sample = _sample_matrix_values(X, n=sample_n)
         if len(sample):
+            integer_valued = np.isclose(sample, np.round(sample))
+            facts["n_sampled"] = int(len(sample))
             facts["sample_min"] = round(float(sample.min()), 4)
             facts["sample_max"] = round(float(sample.max()), 4)
-            facts["all_integer_sample"] = bool(np.allclose(sample, np.round(sample)))
+            facts["fraction_integer_valued"] = round(float(np.mean(integer_valued)), 6)
+            facts["all_integer_sample"] = bool(integer_valued.all())
             facts["has_negative_sample"] = bool(float(sample.min()) < 0)
     except Exception:
         pass
@@ -1970,12 +1982,19 @@ def dataset_facts(adata: AnnData, max_values: int = 10) -> dict:
         "shape": {"n_obs": n_obs, "n_vars": n_vars},
         "X": _x_facts(adata.X),
         "layers": list(adata.layers.keys()),
+        # Per-layer value facts so the model can see which matrix (if any) holds
+        # integer counts, rather than trusting a pre-computed verdict.
+        "layer_facts": {name: _x_facts(adata.layers[name]) for name in adata.layers.keys()},
         "obsm_keys": list(adata.obsm.keys()),
         "varm_keys": list(adata.varm.keys()),
         "uns_keys": list(adata.uns.keys()),
         "raw": {
             "present": adata.raw is not None,
             "n_vars": int(adata.raw.n_vars) if adata.raw is not None else 0,
+            # Value facts for adata.raw.X (min/max/all_integer_sample) — lets the
+            # model tell "float32 but integer-valued counts" from log-normalized
+            # data via the actual values (decimal points), not the dtype alone.
+            "X": _x_facts(adata.raw.X) if adata.raw is not None else {},
         },
         "obs_columns": {col: _column_facts(adata.obs[col], n_obs, max_values) for col in adata.obs.columns},
         "var_columns": {col: _column_facts(adata.var[col], n_vars, max_values) for col in adata.var.columns},
