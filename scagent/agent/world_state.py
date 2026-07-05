@@ -1136,6 +1136,29 @@ class AgentWorldState:
                 ),
             })
 
+        if self.cluster_qc_obligation_unmet():
+            out.append({
+                "key": "cluster_qc",
+                # 'entry' like structure_qc: a bounded nudge that lapses to a
+                # clean exit if the user opted out of QC — never a forced save.
+                "kind": "entry",
+                "blocks_terminal": True,
+                "guidance": (
+                    "Clustering is done and QC metrics are available, but metric "
+                    "cluster QC (run_cluster_qc) has not run on the ACTIVE clustering. "
+                    "Run run_cluster_qc now: it builds the per-cluster QC table "
+                    "(library size, detected genes, MT%, ribosomal%, doublet score) "
+                    "that nominates low-quality / doublet / ambiguous clusters and is "
+                    "the entry to the cluster-QC evidence chain — structure QC then "
+                    "adjudicates coherence. This is required after EACH clustering, "
+                    "including after a removal+recluster, so problematic clusters are "
+                    "not missed even when no doublet signal exists (a coherence check "
+                    "still runs as a baseline). If — and only if — the user explicitly "
+                    "asked to skip cluster QC, you may decline and end; that judgment "
+                    "is yours to make from the conversation."
+                ),
+            })
+
         if self.structure_qc_obligation_unmet():
             out.append({
                 "key": "structure_qc",
@@ -1204,6 +1227,28 @@ class AgentWorldState:
             except (TypeError, ValueError):
                 continue
         return n
+
+    def cluster_qc_obligation_unmet(self) -> bool:
+        """True iff a clustering exists with QC metrics but metric cluster QC has
+        not run on the ACTIVE clustering.
+
+        Floor predicate for the ``cluster_qc`` obligation and the entry to the
+        cluster-QC evidence chain: metric QC nominates suspicious clusters and, by
+        writing the registry, unlocks the ``structure_qc`` floor. It is freshness-
+        tracked per clustering (``_cluster_qc_summary`` returns ``needed`` when the
+        cell set or cluster count changed), so after a removal+recluster it becomes
+        ``needed`` again — which is what drives the iterative QC rounds. Re-running
+        metric QC overwrites the registry entry (dropping its structure_qc marker),
+        so the ``structure_qc`` floor then re-fires for the new round too.
+
+        ``satisfied`` = metric QC ran on the active clustering, never a particular
+        verdict; whether the user opted out of QC is the MODEL's judgment (bounded
+        entry-obligation nudge), not the harness's — no intent pattern-matching.
+        """
+        summary = self.data_summary.get("cluster_qc") if isinstance(self.data_summary, dict) else None
+        if not isinstance(summary, dict):
+            return False
+        return summary.get("status") == "needed"
 
     def structure_qc_obligation_unmet(self) -> bool:
         """True iff metric cluster QC ran but structure QC never did.

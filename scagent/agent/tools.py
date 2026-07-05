@@ -3520,13 +3520,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells; it nominates proposed-removal and ambiguous clusters for structure QC adjudication. Call this after first clustering to identify low-quality, low-complexity, doublet-enriched, or ambiguous clusters before annotation. Also saves a per-cluster QC box-plot figure (one compact multi-panel figure per iteration, metric-flagged clusters highlighted) to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png and returns its path in `qc_metrics_figure` — cite it in the QC reasoning report.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline structure-QC pass over all clusters is nominated so problematic clusters are not missed). Does NOT remove any cells; it nominates proposed-removal and ambiguous clusters for structure QC adjudication. Call this after EACH clustering (including after a removal+recluster) to identify low-quality, low-complexity, doublet-enriched, high-ribosomal, or ambiguous clusters before annotation. Also saves a per-cluster QC box-plot figure (one compact multi-panel figure per iteration, metric-flagged clusters highlighted) to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png and returns its path in `qc_metrics_figure` — cite it in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "cluster_key": {"type": "string", "description": "obs column to group by (default: leiden)"},
                     "doublet_threshold": {"type": "number", "description": "Mean doublet score above which to flag as doublet-enriched (default: 0.3)"},
                     "mt_threshold": {"type": "number", "description": "Mean MT% above which a cluster is flagged as elevated (default: 25)"},
+                    "ribo_threshold": {"type": "number", "description": "Mean ribosomal% above which a cluster is flagged for structure-QC review (default: 50). Only applied when pct_counts_ribo is present in obs."},
                     "low_lib_fraction": {"type": "number", "description": "Fraction of global median library size below which lib size is considered low (default: 0.5)"},
                     "low_genes_fraction": {"type": "number", "description": "Fraction of global median n_genes below which gene count is considered low (default: 0.5)"},
                     "save_checkpoint": {"type": "boolean", "description": "Save an h5ad checkpoint before any removal (default: true)"},
@@ -11867,6 +11868,7 @@ def process_tool_call(
 
             doublet_threshold = float(tool_input.get("doublet_threshold", 0.3))
             mt_threshold = float(tool_input.get("mt_threshold", 25.0))
+            ribo_threshold = float(tool_input.get("ribo_threshold", 50.0))
             low_lib_frac = float(tool_input.get("low_lib_fraction", 0.5))
             low_genes_frac = float(tool_input.get("low_genes_fraction", 0.5))
             save_checkpoint = bool(tool_input.get("save_checkpoint", True))
@@ -11906,19 +11908,29 @@ def process_tool_call(
                 mean_lib = float(row["mean_lib_size"])
                 mean_genes = float(row["mean_n_genes"])
                 mean_doublet = float(row.get("mean_doublet", 0.0))
+                has_ribo_metric = "mean_ribo" in row.index
+                mean_ribo = float(row.get("mean_ribo", 0.0))
 
                 lib_low = mean_lib < low_lib_frac * global_lib
                 genes_low = mean_genes < low_genes_frac * global_genes
                 mt_high = mean_mt > mt_threshold
                 doublet_high = mean_doublet > doublet_threshold and "mean_doublet" in row.index
                 high_library = mean_lib > 1.5 * global_lib
+                # Elevated ribosomal fraction flags low-complexity / stressed cells.
+                # Alone it is suggestive, not definitive, so it routes to structure-QC
+                # review rather than auto-removal.
+                ribo_high = has_ribo_metric and mean_ribo > ribo_threshold
 
                 evidence = {
                     "low_library": bool(lib_low),
                     "low_genes": bool(genes_low),
                     "high_mt": bool(mt_high),
+                    "high_ribo": bool(ribo_high),
                     "high_doublet_score": bool(doublet_high),
                     "high_library": bool(high_library),
+                    "mean_mt_pct": round(mean_mt, 2),
+                    "mean_ribo_pct": round(mean_ribo, 2) if has_ribo_metric else None,
+                    "mean_doublet_score": round(mean_doublet, 3) if "mean_doublet" in row.index else None,
                     "mean_library_fraction_of_global_median": round(mean_lib / global_lib, 2) if global_lib else None,
                     "mean_genes_fraction_of_global_median": round(mean_genes / global_genes, 2) if global_genes else None,
                 }
@@ -11933,6 +11945,8 @@ def process_tool_call(
                     )
                 if mt_high:
                     reasons.append(f"mean MT% is above {mt_threshold:g}%")
+                if ribo_high:
+                    reasons.append(f"mean ribosomal% is above {ribo_threshold:g}%")
                 if doublet_high:
                     reasons.append(f"mean doublet score is above {doublet_threshold:g}")
                 if high_library:
@@ -11954,6 +11968,10 @@ def process_tool_call(
                     recommended_action = "propose_removal"
                     severity = "obvious"
                     proposed_removal.append(str(cluster))
+                elif ribo_high:
+                    recommended_action = "review"
+                    severity = "ambiguous"
+                    ambiguous.append(str(cluster))
                 else:
                     recommended_action = "keep"
                     severity = "clean"
@@ -12094,10 +12112,12 @@ def process_tool_call(
                 "qc_metrics_figure": qc_metrics_figure,
                 "thresholds_used": {
                     "mt_threshold": mt_threshold,
+                    "ribo_threshold": ribo_threshold,
                     "doublet_threshold": doublet_threshold,
                     "low_lib_fraction": low_lib_frac,
                     "low_genes_fraction": low_genes_frac,
                 },
+                "ribo_signal_available": bool("pct_counts_ribo" in adata.obs.columns),
                 "state": make_state(adata),
             }
             if structure_qc_baseline_clusters:
