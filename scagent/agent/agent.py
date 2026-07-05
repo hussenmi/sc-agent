@@ -4332,6 +4332,77 @@ class SCAgent:
             lambda: self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
         )
 
+    # Note appended as the tool_result of a tool aborted mid-run by the user, so
+    # the conversation stays valid and the model knows to re-check state.
+    _INTERRUPT_TOOL_NOTE = (
+        "⚠️ Interrupted by the user before this tool returned. The dataset (adata) "
+        "may be partially modified or unchanged — call inspect_data to check the "
+        "current state before continuing."
+    )
+
+    @staticmethod
+    def _message_tool_calls(message):
+        """tool_calls off an OpenAI message, whether a pydantic object or a dict."""
+        if isinstance(message, dict):
+            return message.get("tool_calls") or []
+        return getattr(message, "tool_calls", None) or []
+
+    @staticmethod
+    def _tool_call_id(tool_call):
+        if isinstance(tool_call, dict):
+            return tool_call.get("id")
+        return getattr(tool_call, "id", None)
+
+    def _repair_openai_dangling_tool_calls(self, messages: List[Dict[str, Any]]) -> None:
+        """Ensure every committed tool_call has a tool result.
+
+        The OpenAI loop appends the assistant `tool_calls` message BEFORE running
+        the tools, so an interrupt mid-tool leaves tool_calls without matching
+        `role: tool` results — which the API rejects on the next turn. Fill any
+        missing results with the interrupt note so `continue` resumes cleanly.
+        """
+        last_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if self._message_tool_calls(messages[i]):
+                last_idx = i
+                break
+        if last_idx is None:
+            return
+        call_ids = [self._tool_call_id(tc) for tc in self._message_tool_calls(messages[last_idx])]
+        answered = {
+            m.get("tool_call_id")
+            for m in messages[last_idx + 1:]
+            if isinstance(m, dict) and m.get("role") == "tool"
+        }
+        for cid in call_ids:
+            if cid and cid not in answered:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": cid,
+                    "content": self._INTERRUPT_TOOL_NOTE,
+                })
+
+    def _preserve_interrupted_turn(self, messages: List[Dict[str, Any]], message_format: str) -> None:
+        """Persist an interrupted turn so `continue` resumes cleanly.
+
+        Repairs a dangling OpenAI tool-call turn (Anthropic/Codex commit the
+        assistant message only after tools finish, so their lists stay valid),
+        saves the live message list as the conversation history, and records an
+        `interrupted` manifest event. Never raises — the caller re-raises the
+        original KeyboardInterrupt.
+        """
+        try:
+            if message_format == "openai":
+                self._repair_openai_dangling_tool_calls(messages)
+        except Exception:
+            pass
+        self._conversation_history = messages
+        if self.run_manager is not None:
+            try:
+                self.run_manager.append_event("interrupted", {"n_messages": len(messages)})
+            except Exception:
+                pass
+
     def _analyze_codex(
         self,
         user_message: str,
@@ -4430,6 +4501,9 @@ class SCAgent:
                 max_iterations,
                 message_format="openai",
             )
+        except KeyboardInterrupt:
+            self._preserve_interrupted_turn(messages, "codex")
+            raise
         except Exception as e:
             if self.run_manager:
                 self.run_manager.fail(str(e))
@@ -4612,6 +4686,9 @@ class SCAgent:
                 message_format="anthropic",
             )
 
+        except KeyboardInterrupt:
+            self._preserve_interrupted_turn(messages, "anthropic")
+            raise
         except Exception as e:
             if self.run_manager:
                 self.run_manager.fail(str(e))
@@ -5699,6 +5776,9 @@ class SCAgent:
                 message_format="openai",
             )
 
+        except KeyboardInterrupt:
+            self._preserve_interrupted_turn(messages, "openai")
+            raise
         except Exception as e:
             if self.run_manager:
                 self.run_manager.fail(str(e))

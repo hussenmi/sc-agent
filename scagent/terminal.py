@@ -2,13 +2,124 @@
 
 from __future__ import annotations
 
+import _thread
+import os
 import re
 import sys
+import threading
 from dataclasses import asdict, dataclass
 from typing import Callable, Sequence
 
 _READLINE_CONFIGURED = False
 _PROMPT_SESSION = None
+
+
+class EscInterruptListener:
+    """Abort the running agent turn when the user presses Esc.
+
+    While active it puts stdin into cbreak mode and watches for a bare ESC key on
+    a daemon thread. On ESC it calls ``_thread.interrupt_main()`` — which raises
+    ``KeyboardInterrupt`` in the main thread, exactly like Ctrl+C — so the current
+    tool is aborted at once and the agent's existing interrupt handling preserves
+    state and returns to the prompt. Ctrl+C keeps working because cbreak leaves
+    ISIG enabled.
+
+    It is a no-op (a do-nothing context manager) when stdin is not an interactive
+    TTY or the platform lacks termios (e.g. Windows), so headless/batch runs and
+    tests are unaffected. Escape SEQUENCES (arrow/function keys send ESC '[' / ESC
+    'O' …) are drained and ignored; only a standalone ESC interrupts. Set
+    ``SCAGENT_NO_ESC_INTERRUPT=1`` to disable.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self._enabled = enabled
+        self._thread: threading.Thread | None = None
+        self._stop: threading.Event | None = None
+        self._fd: int | None = None
+        self._old_attrs = None
+
+    def _supported(self) -> bool:
+        if not self._enabled:
+            return False
+        if os.environ.get("SCAGENT_NO_ESC_INTERRUPT", "").strip().lower() in ("1", "true", "yes", "on"):
+            return False
+        try:
+            return bool(sys.stdin) and sys.stdin.isatty()
+        except Exception:
+            return False
+
+    def __enter__(self) -> "EscInterruptListener":
+        if not self._supported():
+            return self
+        try:
+            import termios
+            import tty
+        except Exception:
+            return self
+        try:
+            self._fd = sys.stdin.fileno()
+            self._old_attrs = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        except Exception:
+            self._fd = None
+            self._old_attrs = None
+            return self
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="scagent-esc-listener", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+        if self._fd is not None and self._old_attrs is not None:
+            try:
+                import termios
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
+            except Exception:
+                pass
+        self._fd = None
+        self._old_attrs = None
+        return False  # never suppress KeyboardInterrupt
+
+    def _run(self) -> None:
+        import select
+
+        ESC = 0x1B
+        assert self._stop is not None and self._fd is not None
+        while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([self._fd], [], [], 0.1)
+            except Exception:
+                return
+            if not ready:
+                continue
+            try:
+                data = os.read(self._fd, 1)
+            except Exception:
+                return
+            if not data or data[0] != ESC:
+                continue
+            # ESC seen. An escape SEQUENCE (arrow/fn keys) has more bytes queued
+            # immediately; a bare ESC does not. Only a bare ESC interrupts.
+            try:
+                more, _, _ = select.select([self._fd], [], [], 0.05)
+            except Exception:
+                more = []
+            if more:
+                try:
+                    os.read(self._fd, 16)  # drain and ignore the sequence
+                except Exception:
+                    pass
+                continue
+            self._stop.set()
+            _thread.interrupt_main()
+            return
 
 
 @dataclass(frozen=True)

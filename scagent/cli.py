@@ -312,9 +312,17 @@ def _maybe_save_on_exit(agent, console) -> None:
 
 
 def _analyze_with_decisions(agent, **analyze_kwargs):
-    """Run a turn and immediately resolve any structured checkpoints."""
-    result = agent.analyze(**analyze_kwargs)
+    """Run a turn and immediately resolve any structured checkpoints.
+
+    The agent turn (model + tool loop) runs under an Esc listener so the user can
+    abort a running tool with Esc — same effect as Ctrl+C. The listener is NOT
+    active around the interactive decision prompt, which needs canonical input.
+    """
+    from scagent.terminal import EscInterruptListener
+
     max_iterations = analyze_kwargs.get("max_iterations", 100)
+    with EscInterruptListener():
+        result = agent.analyze(**analyze_kwargs)
     while agent.has_pending_decision:
         selection = agent.prompt_pending_decision()
         if selection is None:
@@ -325,12 +333,13 @@ def _analyze_with_decisions(agent, **analyze_kwargs):
         # model to interpret an intermediate, non-final strategy selection.
         if agent.has_pending_decision:
             continue
-        result = agent.analyze(
-            request=decision_request,
-            data_path=None,
-            max_iterations=max_iterations,
-            continue_conversation=True,
-        )
+        with EscInterruptListener():
+            result = agent.analyze(
+                request=decision_request,
+                data_path=None,
+                max_iterations=max_iterations,
+                continue_conversation=True,
+            )
     return result
 
 
@@ -445,7 +454,7 @@ def run_start(args):
                 run_name=run_name,
             )
         except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted.[/yellow]")
+            console.print("\n[yellow]Interrupted — state preserved. Continue with a new instruction or type exit.[/yellow]")
         run_name = None  # run dir already created; don't rename on follow-ups
 
     # REPL
@@ -476,7 +485,7 @@ def run_start(args):
                 continue_conversation=True,
             )
         except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted. You can continue or type exit to quit.[/yellow]")
+            console.print("\n[yellow]Interrupted (Esc/Ctrl+C) — state preserved. Continue with a new instruction or type exit to quit.[/yellow]")
         run_name = None  # run dir created after first turn
 
     return 0
