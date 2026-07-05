@@ -192,16 +192,17 @@ class AgentWorldState:
         ]
         annotation_keys = []
         if adata is not None:
+            # Content-validated cell-type candidates only (exact canonical name +
+            # categorical-label structure). No substring name-guessing — matching
+            # tokens like "label" wrongly pulled in non-annotation columns (and is
+            # exactly the fuzzy behavior we removed). Columns the harness does not
+            # recognize are still visible to the model via the per-column facts.
             semantic_roles = self.data_summary.get("semantic_obs_roles", {})
             annotation_keys = [
                 candidate.get("column")
                 for candidate in semantic_roles.get("cell_type", [])
                 if candidate.get("column")
             ]
-            for column in adata.obs.columns:
-                if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label")):
-                    if column not in annotation_keys:
-                        annotation_keys.append(column)
         deg_available = bool(adata is not None and "rank_genes_groups" in adata.uns)
         primary_cluster_key = self.data_summary.get("cluster_key")
         obs_columns = list(adata.obs.columns) if adata is not None else []

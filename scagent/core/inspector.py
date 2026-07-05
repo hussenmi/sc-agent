@@ -6,7 +6,6 @@ and recommends what analysis steps are needed to reach a user's goal.
 """
 
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -209,32 +208,6 @@ NUMERIC_SEMANTIC_ROLES = {
     "qc_pct_ribo",
     "doublet_score",
 }
-
-CELL_TYPE_VALUE_PATTERNS = [
-    r"\bt\s*cell\b",
-    r"\bb\s*cell\b",
-    r"\bnk\b",
-    r"\bcd4\b",
-    r"\bcd8\b",
-    r"\bmonocyte\b",
-    r"\bmacrophage\b",
-    r"\bdendritic\b",
-    r"\bplasma\b",
-    r"\bmast\b",
-    r"\bneutrophil\b",
-    r"\bgranulocyte\b",
-    r"\bepithelial\b",
-    r"\bendothelial\b",
-    r"\bfibroblast\b",
-    r"\bastrocyte\b",
-    r"\bmicroglia\b",
-    r"\bneuron\b",
-    r"\bhepatocyte\b",
-    r"\bkeratinocyte\b",
-    r"\bmyeloid\b",
-    r"\blymphocyte\b",
-]
-
 
 @dataclass
 class MetadataCandidate:
@@ -522,58 +495,32 @@ def _normalize_column_name(column: str) -> str:
 def _column_name_role_scores(
     column: str,
     aliases_by_role: Optional[Dict[str, Iterable[str]]] = None,
-    *,
-    fuzzy: bool = False,
 ) -> Dict[str, float]:
-    """Score how strongly a column name suggests each metadata role."""
+    """Score a column name against known role aliases by EXACT match only.
+
+    Recognizes canonical scanpy/Seurat/CELLxGENE column names (e.g. 'leiden',
+    'pct_counts_mt', 'cell_type', 'batch', 'sample_id') exactly, ignoring only
+    case and punctuation ('percent.mt' == 'percent_mt' == 'percent_MT').
+
+    It deliberately performs NO approximate matching — no shared-token overlap, no
+    edit-distance / fuzzy ratio, no substring containment, no '_id'-token
+    guessing. Approximate name matching was a source of false role verdicts (a
+    cell-type column 'scanvi_label' scored 0.63 for the 'doublet_label' role
+    purely because of the shared 'label' token). A column whose name is not a
+    known alias gets no name signal; its role is then judged from content facts,
+    and ultimately by the model from the facts surfaced to it. To recognize a new
+    canonical name, add it to the relevant alias set — never widen the matcher.
+    """
     aliases_by_role = aliases_by_role or METADATA_ROLE_ALIASES
     normalized = _normalize_column_name(column)
     compact = normalized.replace("_", "")
-    tokens = set(filter(None, normalized.split("_")))
     scores: Dict[str, float] = {}
 
     for role, aliases in aliases_by_role.items():
         normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
         compact_aliases = {alias.replace("_", "") for alias in normalized_aliases}
-        if normalized in normalized_aliases:
+        if normalized in normalized_aliases or (compact and compact in compact_aliases):
             scores[role] = 1.0
-            continue
-        if compact in compact_aliases:
-            scores[role] = max(scores.get(role, 0.0), 0.96)
-            continue
-
-        alias_tokens = {
-            token
-            for alias in normalized_aliases
-            for token in alias.split("_")
-            if token
-        }
-        overlap = len(tokens & alias_tokens)
-        if overlap:
-            scores[role] = min(0.85, 0.45 + 0.18 * overlap)
-
-        if compact and fuzzy:
-            best_ratio = max(
-                (SequenceMatcher(None, compact, alias).ratio() for alias in compact_aliases),
-                default=0.0,
-            )
-            if best_ratio >= 0.88:
-                scores[role] = max(scores.get(role, 0.0), min(0.92, best_ratio))
-            elif best_ratio >= 0.80 and len(compact) >= 5:
-                scores[role] = max(scores.get(role, 0.0), 0.72)
-
-        if len(compact) >= 5:
-            for alias in compact_aliases:
-                if len(alias) >= 5 and (compact in alias or alias in compact):
-                    scores[role] = max(scores.get(role, 0.0), 0.78)
-
-    if normalized.endswith("_id"):
-        if "sample" in normalized or "orig" in normalized:
-            scores["sample"] = max(scores.get("sample", 0.0), 0.85)
-        elif any(token in normalized for token in ("donor", "patient", "subject", "individual")):
-            scores["donor"] = max(scores.get("donor", 0.0), 0.85)
-        elif any(token in normalized for token in ("batch", "library", "lane", "run", "channel")):
-            scores["batch"] = max(scores.get("batch", 0.0), 0.85)
 
     return scores
 
@@ -699,18 +646,11 @@ def _semantic_value_score(series, role: str) -> float:
     if not values:
         return 0.0
 
-    if role == "cell_type":
-        text = " | ".join(values)
-        matches = sum(1 for pattern in CELL_TYPE_VALUE_PATTERNS if re.search(pattern, text))
-        if matches >= 3:
-            return 0.45
-        if matches == 2:
-            return 0.34
-        if matches == 1:
-            return 0.22
-        if any("cell" in value for value in values):
-            return 0.14
-
+    # No hardcoded biology here: the harness does not carry a list of cell-type
+    # names to pattern-match values against (that is domain knowledge that belongs
+    # to the model). cell_type is recognized structurally (categorical label
+    # column of bounded cardinality) plus an exact canonical name; the model reads
+    # the actual label values from the facts and decides.
     if role == "cluster":
         numeric_like = 0
         for value in values:
@@ -725,9 +665,16 @@ def _semantic_value_score(series, role: str) -> float:
 
     if role == "doublet_label":
         normalized_values = {value.replace(" ", "_") for value in values}
-        known = {"true", "false", "0", "1", "doublet", "singlet", "multiplet", "negative", "positive"}
-        if normalized_values and normalized_values <= known:
-            return 0.35
+        doublet_vocab = {"doublet", "singlet", "multiplet"}
+        generic_binary = {"true", "false", "0", "1", "negative", "positive"}
+        # Definitive: the values literally are doublet calls (singlet/doublet/...).
+        # This is a fact read from the data, not a name guess, so it can identify
+        # the role even under a non-canonical column name.
+        if normalized_values & doublet_vocab and normalized_values <= (doublet_vocab | generic_binary):
+            return 1.0
+        # A bare boolean flag (true/false/0/1) is ambiguous — any binary column
+        # looks like this — so it is NOT sufficient on its own.
+        return 0.0
 
     return 0.0
 
@@ -754,7 +701,6 @@ def _score_obs_semantic_candidate(
     name_score = _column_name_role_scores(
         column,
         SEMANTIC_OBS_ROLE_ALIASES,
-        fuzzy=True,
     ).get(role, 0.0)
     if role in NUMERIC_SEMANTIC_ROLES and name_score < 0.7:
         return None
@@ -781,6 +727,11 @@ def _score_obs_semantic_candidate(
     confidence = min(0.99, 0.56 * name_score + 0.27 * structure_score + 0.17 * value_score)
     if name_score == 0.0:
         confidence *= 0.72
+    # Definitive content (value_score ~1.0, e.g. literal singlet/doublet values)
+    # identifies the role by itself — trust the data over a missing canonical
+    # name. Only value scorers that return a definitive 1.0 reach this.
+    if value_score >= 0.99 and structure_score > 0:
+        confidence = max(confidence, 0.9)
     if confidence < _semantic_min_confidence(role):
         return None
 
