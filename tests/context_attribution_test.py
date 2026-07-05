@@ -43,6 +43,20 @@ def test_user_text_wins_over_model_hint():
     assert ctx.provenance["tissue"] == "user_provided"
 
 
+def test_tissue_not_guessed_from_annotation_biology():
+    # A PBMC-like annotation composition with NO explicit tissue context must NOT
+    # be laundered into tissue="PBMC" by a hardcoded cell-type biology vocabulary.
+    # Tissue stays unknown; the model reads the annotation values and decides.
+    a = _adata()
+    a.obs["cell_type"] = pd.Categorical(
+        ["T cell", "NK cell", "B cell", "monocyte", "dendritic cell", "T cell"]
+    )
+    ctx = infer_biological_context(a, text_context="", hint_context="")
+    assert ctx.tissue == "unknown"
+    assert ctx.provenance.get("tissue") in (None, "unknown")
+    assert "marker_inferred" not in ctx.provenance.get("tissue", "")
+
+
 # --- end-to-end through world_state -------------------------------------------
 
 def test_world_state_attributes_model_hint_as_context_supplied():
