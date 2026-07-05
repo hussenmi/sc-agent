@@ -498,6 +498,107 @@ def _state_expression_shifts(
     return {"state_sample_expression_shifts": shifts, "shared_cross_cell_type_signatures": shared[:50]}
 
 
+def _cross_sample_identity_deg(
+    adata,
+    batch_key: str,
+    cluster_key: str,
+    composition: List[Dict[str, Any]],
+    cluster_markers: Dict[str, List[str]],
+    *,
+    min_cells: int,
+    n_top_genes: int,
+    max_pairs: int = 12,
+    marker_overlap_min: float = 0.15,
+    signature_similarity_min: float = 0.30,
+) -> Dict[str, Any]:
+    """Paired within-sample identity DEG — the clean control for a batch effect.
+
+    For two clusters dominated by DIFFERENT samples that nonetheless look like the
+    same cell type (their one-vs-all markers overlap), compute each cluster's DEG
+    against the rest of ITS OWN sample, then compare the two identity signatures.
+
+    Because each DEG is computed entirely *within one sample*, no batch signal can
+    contaminate it. So if the two within-sample "what makes me distinct"
+    signatures match, the clusters are the same biological population separated
+    only by sample — i.e. a batch effect, and they should merge under integration.
+    This is the clean control that comparing the same state ACROSS samples cannot
+    give (that conflates biology and batch); here the batch is held constant
+    inside each DEG, so a match is conclusive.
+    """
+    matrix, genes = _expression_view(adata)
+    gene_array = np.asarray(genes)
+    usable = np.array([not _is_nuisance_gene(g) for g in genes], dtype=bool)
+    cluster_vals = adata.obs[cluster_key].astype(str).values
+    batch_vals = adata.obs[batch_key].astype(str).values
+
+    # Dominant sample per sample-dominated cluster (the batch-split candidates).
+    dom = {row["cluster"]: row["dominant_batch"] for row in composition if row.get("sample_dominated")}
+
+    def _markers(cluster_id: str) -> set:
+        return {g for g in (cluster_markers.get(cluster_id) or [])[:n_top_genes] if not _is_nuisance_gene(g)}
+
+    # Candidate cross-sample same-type pairs, nominated by marker overlap.
+    candidates: List[tuple] = []
+    dom_clusters = sorted(dom)
+    for a_i in range(len(dom_clusters)):
+        for b_i in range(a_i + 1, len(dom_clusters)):
+            ca, cb = dom_clusters[a_i], dom_clusters[b_i]
+            if dom[ca] == dom[cb]:
+                continue  # same dominant sample → not a cross-sample pair
+            ma, mb = _markers(ca), _markers(cb)
+            if not ma or not mb:
+                continue
+            jac = len(ma & mb) / len(ma | mb)
+            if jac >= marker_overlap_min:
+                candidates.append((jac, ca, cb))
+    candidates.sort(reverse=True)
+    candidates = candidates[:max_pairs]
+
+    def _within_sample_signature(cluster_id: str, sample: str):
+        in_mask = (cluster_vals == cluster_id) & (batch_vals == sample)
+        out_mask = (cluster_vals != cluster_id) & (batch_vals == sample)
+        n_in, n_out = int(in_mask.sum()), int(out_mask.sum())
+        if n_in < min_cells or n_out < min_cells:
+            return None, n_in, n_out
+        delta = _mean_expression(matrix[in_mask, :]) - _mean_expression(matrix[out_mask, :])
+        if delta.size == 0:
+            return None, n_in, n_out
+        # Exclude nuisance genes from the identity signature.
+        delta = np.where(usable, delta, -np.inf)
+        top_idx = np.argsort(delta)[::-1][:n_top_genes]
+        sig = [str(gene_array[k]) for k in top_idx if np.isfinite(delta[k]) and delta[k] > 0]
+        return sig, n_in, n_out
+
+    pairs_out: List[Dict[str, Any]] = []
+    for jac, ca, cb in candidates:
+        sig_a, na_in, _ = _within_sample_signature(ca, dom[ca])
+        sig_b, nb_in, _ = _within_sample_signature(cb, dom[cb])
+        if not sig_a or not sig_b:
+            continue
+        set_a, set_b = set(sig_a), set(sig_b)
+        shared_genes = [g for g in sig_a if g in set_b]  # keep sig_a ordering
+        similarity = len(set_a & set_b) / len(set_a | set_b)
+        pairs_out.append({
+            "cluster_a": ca, "sample_a": dom[ca], "n_cells_a": na_in,
+            "cluster_b": cb, "sample_b": dom[cb], "n_cells_b": nb_in,
+            "marker_overlap_jaccard": round(jac, 3),
+            "within_sample_signature_a": sig_a[:15],
+            "within_sample_signature_b": sig_b[:15],
+            "shared_identity_genes": shared_genes[:20],
+            "signature_similarity": round(similarity, 3),
+            "conclusive_batch_effect": bool(similarity >= signature_similarity_min),
+        })
+
+    pairs_out.sort(key=lambda e: e["signature_similarity"], reverse=True)
+    conclusive = [p for p in pairs_out if p["conclusive_batch_effect"]]
+    return {
+        "cross_sample_identity_pairs": pairs_out[:max_pairs],
+        "conclusive_pairs": conclusive,
+        "n_conclusive": len(conclusive),
+        "signature_similarity_min": signature_similarity_min,
+    }
+
+
 def _write_outputs(output_dir: Optional[str], tables: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
     artifacts: List[Dict[str, Any]] = []
     if not output_dir:
@@ -581,6 +682,18 @@ def diagnose_batch_effect(
     max_shared_labels = max([entry["n_broad_labels"] for entry in shared], default=0)
     n_shared_genes = len(shared)
 
+    # Paired within-sample identity DEG — the clean control (batch held constant
+    # inside each DEG). See _cross_sample_identity_deg.
+    identity_deg = _cross_sample_identity_deg(
+        adata,
+        batch_key,
+        cluster_key,
+        composition,
+        cluster_markers,
+        min_cells=min_cells_per_cluster_sample,
+        n_top_genes=n_top_genes,
+    )
+
     support_reasons: List[str] = []
     caution_reasons: List[str] = []
     condition_cols = _candidate_condition_keys(adata, batch_key, condition_keys)
@@ -613,6 +726,17 @@ def diagnose_batch_effect(
             f"clusters track sample labels (ARI {concordance['ari']:.2f}, NMI {concordance['nmi']:.2f} "
             f"between {cluster_key} and {batch_key}): {cluster_key} clusters largely correspond to "
             "individual samples rather than shared cell states"
+        )
+    if identity_deg["n_conclusive"]:
+        top = identity_deg["conclusive_pairs"][0]
+        shared_str = ", ".join(top["shared_identity_genes"][:8]) or "shared identity genes"
+        support_reasons.append(
+            f"within-sample identity DEG is conclusive: cluster {top['cluster_a']} (sample "
+            f"{top['sample_a']}) and cluster {top['cluster_b']} (sample {top['sample_b']}) share their "
+            f"within-sample identity signature (similarity {top['signature_similarity']:.2f}; shared "
+            f"genes: {shared_str}). Each was DEG'd against the rest of its OWN sample, so batch is held "
+            f"constant inside each test — a match means they are the same cell population separated only "
+            f"by sample, which is a batch effect that integration should merge"
         )
 
     # Name the markers behind sample-segregated Epithelial clusters and caveat them: the
@@ -707,6 +831,17 @@ def diagnose_batch_effect(
         if entropy_ok is not None
         else pd.DataFrame()
     )
+    identity_df = pd.DataFrame([
+        {
+            "cluster_a": p["cluster_a"], "sample_a": p["sample_a"],
+            "cluster_b": p["cluster_b"], "sample_b": p["sample_b"],
+            "marker_overlap_jaccard": p["marker_overlap_jaccard"],
+            "signature_similarity": p["signature_similarity"],
+            "conclusive_batch_effect": p["conclusive_batch_effect"],
+            "shared_identity_genes": ", ".join(p["shared_identity_genes"]),
+        }
+        for p in identity_deg["cross_sample_identity_pairs"]
+    ])
     artifacts = _write_outputs(
         output_dir,
         {
@@ -715,6 +850,7 @@ def diagnose_batch_effect(
             "batch_diagnostic_condition_confounding": confounding_df,
             "batch_diagnostic_shared_signatures": shared_df,
             "batch_diagnostic_neighborhood_entropy": entropy_df,
+            "batch_diagnostic_cross_sample_identity_deg": identity_df,
         },
     )
 
@@ -744,6 +880,13 @@ def diagnose_batch_effect(
         f"cluster↔sample ARI {concordance['ari']:.2f}, NMI {concordance['nmi']:.2f} "
         f"({concordance['interpretation']})"
     )
+    if identity_deg["n_conclusive"]:
+        top = identity_deg["conclusive_pairs"][0]
+        terminal_summary.append(
+            f"within-sample identity DEG: {identity_deg['n_conclusive']} conclusive cross-sample "
+            f"pair(s) — e.g. clusters {top['cluster_a']}({top['sample_a']}) & "
+            f"{top['cluster_b']}({top['sample_b']}) match at {top['signature_similarity']:.2f}"
+        )
     terminal_summary.append(f"→ {recommendation}")
 
     result = {
@@ -772,6 +915,21 @@ def diagnose_batch_effect(
         "condition_confounding": confounding,
         "state_sample_expression_shifts": shift_payload["state_sample_expression_shifts"][:50],
         "shared_cross_cell_type_signatures": shared[:30],
+        "cross_sample_identity_deg": {
+            "n_conclusive": identity_deg["n_conclusive"],
+            "signature_similarity_min": identity_deg["signature_similarity_min"],
+            "conclusive_pairs": identity_deg["conclusive_pairs"][:10],
+            "candidate_pairs": identity_deg["cross_sample_identity_pairs"][:10],
+            "interpretation": (
+                "Each cluster in a pair was DEG'd against the rest of its OWN sample, so batch is held "
+                "constant inside each test. A high signature_similarity means the two sample-private "
+                "clusters are the same cell population separated only by sample — conclusive evidence "
+                "that the split is technical (batch) and integration should merge them. Low similarity "
+                "means they are genuinely different populations and the separation may be real biology. "
+                "Candidate pairs are nominated by one-vs-all marker overlap; the within-sample "
+                "signature match is the confirmation."
+            ),
+        },
         "evidence_limits": [
             "This is a descriptive diagnostic, not proof that sample-associated differences are technical.",
             "One-sample-per-condition or sample-condition confounding cannot distinguish batch from biology.",

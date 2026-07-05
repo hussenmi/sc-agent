@@ -1008,6 +1008,44 @@ def _natural_cluster_sort(values: List[str]) -> List[str]:
     return sorted({str(v) for v in values}, key=_key)
 
 
+# Well-known per-cell metric obs columns worth painting on the UMAP, plus the
+# suffix rules for computed scores. See _suggested_umap_overlays.
+_PER_CELL_METRIC_OBS_KEYS = [
+    "batch_diagnostic_neighborhood_entropy",
+    "pct_counts_mt",
+    "pct_counts_ribo",
+    "doublet_score",
+    "total_counts",
+    "n_genes_by_counts",
+]
+
+
+def _suggested_umap_overlays(adata: Any) -> List[str]:
+    """obs columns that are per-cell metrics worth painting on the UMAP.
+
+    Returns known per-cell QC/diagnostic metrics present in obs plus any numeric
+    ``*_score`` / ``*_signature`` / ``*_entropy`` columns (e.g. gene-signature
+    scores, batch-mixing entropy). Tools surface this so the model paints each
+    with ``generate_figure(plot_type='umap', color_by=<key>)`` and interprets
+    WHERE the metric concentrates. Only suggested once a UMAP exists — a per-cell
+    metric with nowhere to plot it yet is not actionable.
+    """
+    if adata is None or "X_umap" not in getattr(adata, "obsm", {}):
+        return []
+    import pandas as _pd
+
+    cols = list(adata.obs.columns)
+    out = [k for k in _PER_CELL_METRIC_OBS_KEYS if k in cols]
+    for col in cols:
+        if col in out:
+            continue
+        lc = str(col).lower()
+        if (lc.endswith("_score") or lc.endswith("_signature") or lc.endswith("_entropy")) and \
+                _pd.api.types.is_numeric_dtype(adata.obs[col]):
+            out.append(col)
+    return out
+
+
 def _plot_cluster_qc_metrics(adata: Any, cluster_key: str, out_path: Any,
                              flagged_clusters: Any = None) -> Optional[str]:
     """Per-cluster QC metric box plots — one panel per metric, clusters on the
@@ -10400,6 +10438,7 @@ def process_tool_call(
                     "g2m_genes_total": len(g2m_genes),
                     "scores_added": ["S_score", "G2M_score", "phase"],
                     "phase_distribution": phase_counts,
+                    "suggested_umap_overlays": _suggested_umap_overlays(adata),
                     "message": (
                         f"Cell cycle scoring complete. Phase distribution: "
                         + ", ".join(f"{k}: {v}" for k, v in sorted(phase_counts.items()))
@@ -10496,6 +10535,7 @@ def process_tool_call(
                         "max": round(float(scores.max()), 4),
                         "pct_positive": round(float((scores > 0).mean() * 100), 1),
                     },
+                    "suggested_umap_overlays": _suggested_umap_overlays(adata),
                     "message": (
                         f"Scored {len(matched)}/{len(gene_list)} genes ({coverage_pct:.0f}% coverage). "
                         f"Score stored in adata.obs['{score_name}']. "
@@ -10772,6 +10812,10 @@ def process_tool_call(
             diagnostic["artifacts_created"] = artifacts_created
             diagnostic["warnings"] = warnings
             diagnostic["state"] = make_state(adata)
+            # Per-cell metrics (e.g. neighborhood batch-mixing entropy) are written
+            # to obs; nudge the model to paint them on the UMAP and read WHERE
+            # mixing fails, not just the scalar verdict.
+            diagnostic["suggested_umap_overlays"] = _suggested_umap_overlays(adata)
             return _finalize_result(
                 diagnostic,
                 adata,
