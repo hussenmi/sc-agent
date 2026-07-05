@@ -1139,6 +1139,29 @@ class AgentWorldState:
                 ),
             })
 
+        if self.structure_qc_obligation_unmet():
+            out.append({
+                "key": "structure_qc",
+                # 'entry' (not 'completion') so the bounded nudge lapses to a clean
+                # exit rather than a forced unvalidated save — if the user asked to
+                # skip structure QC, the model declines and the run ends normally.
+                "kind": "entry",
+                "blocks_terminal": True,
+                "guidance": (
+                    "Cluster metric QC (run_cluster_qc) ran but cluster STRUCTURE QC "
+                    "(run_cluster_structure_qc) never did. Structure QC — gene-gene "
+                    "covariance modules, clustered correlation heatmaps, and technical "
+                    "Moran's I — is a required evidence layer, not optional: it is the only "
+                    "check that can tell a coherent biological cluster from a doublet/noise "
+                    "mixture that looks metrically normal. Run run_cluster_structure_qc now "
+                    "(on the metric-flagged/ambiguous clusters, or over all clusters as a "
+                    "baseline when none were flagged — see structure_qc_baseline_clusters) "
+                    "before ending or moving to annotation. If — and only if — the user "
+                    "explicitly asked to skip structure QC, you may decline and end; that "
+                    "judgment is yours to make from the conversation."
+                ),
+            })
+
         if self.multi_sample_decision_unresolved():
             n = self._multi_sample_group_count()
             out.append({
@@ -1184,6 +1207,25 @@ class AgentWorldState:
             except (TypeError, ValueError):
                 continue
         return n
+
+    def structure_qc_obligation_unmet(self) -> bool:
+        """True iff metric cluster QC ran but structure QC never did.
+
+        Floor predicate for the ``structure_qc`` obligation. Structure QC (cluster
+        covariance / heatmaps / technical Moran's I) is required evidence whenever
+        the analysis reached cluster-level QC. ``satisfied`` = structure QC ran at
+        least once on some clustering — never a particular verdict. Whether the user
+        opted out is the MODEL's judgment, not the harness's: the model runs it by
+        default, and if the user asked to skip it the model declines and the bounded
+        obligation nudge lapses (this is an ``entry`` obligation, so no forced save).
+        The harness never pattern-matches the user's words. Uses only the registry
+        this object already maintains: metric QC writes ``checked_at``; structure QC
+        writes ``structure_qc_run_id``.
+        """
+        reg = self.cluster_qc_registry or {}
+        metric_qc_ran = any("checked_at" in entry for entry in reg.values())
+        structure_qc_ran = any(entry.get("structure_qc_run_id") for entry in reg.values())
+        return bool(metric_qc_ran and not structure_qc_ran)
 
     def multi_sample_decision_unresolved(self) -> bool:
         """True iff the data is multi-sample and no multi_sample_strategy is set.
@@ -1259,6 +1301,10 @@ class AgentWorldState:
             candidate_sources = dict(existing.get("candidate_sources") or {})
             unavailable = dict(existing.get("reference_source_unavailable") or {})
             unavailable.pop(tool_name.removeprefix("run_"), None)
+            # Remember the chosen CellTypist model so a later re-run doesn't
+            # re-trigger the model-selection gate once the user already picked.
+            if tool_name == "run_celltypist" and result.get("model"):
+                self.user_preferences["celltypist_model"] = result.get("model")
             candidate_sources[tool_name] = {
                 "annotation_key": result.get("annotation_key"),
                 "organism": (

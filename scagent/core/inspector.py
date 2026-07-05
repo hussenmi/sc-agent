@@ -1009,6 +1009,66 @@ def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
     return False, ""
 
 
+# Preferred layer names to search for a raw-counts matrix, most-specific first.
+_COUNTS_LAYER_NAMES = ["counts", "raw_counts", "raw_data", "soupx_counts", "spliced"]
+
+
+def find_counts_matrix(adata: AnnData, prefer_layer: Optional[str] = None):
+    """Locate a raw-counts matrix and the ``var`` frame that matches it.
+
+    Counts can live in a named layer, in ``adata.raw`` (which carries its *own*
+    ``var`` — often more genes than ``adata.var`` after HVG subsetting), or in
+    ``adata.X`` itself. This resolver returns whichever is integer-VALUED — the
+    check is on the values, not the dtype, because counts are frequently stored
+    as ``float32`` (a naive "X is float ⇒ no counts" test misses ``adata.raw``
+    entirely, which is exactly how SCimilarity was fed log-normalized data).
+
+    Parameters
+    ----------
+    adata : AnnData
+    prefer_layer : str, optional
+        A specific layer to use if it exists and is integer-valued.
+
+    Returns
+    -------
+    dict or None
+        ``{"X", "var", "source", "n_vars"}`` where ``source`` is
+        ``"layer:<name>"``, ``"raw"``, or ``"X"``; or None if no integer-valued
+        counts matrix is found anywhere.
+    """
+    candidates: List[str] = []
+    if prefer_layer:
+        candidates.append(prefer_layer)
+    candidates += [n for n in _COUNTS_LAYER_NAMES if n != prefer_layer]
+
+    for name in candidates:
+        if name in adata.layers and _is_integer_matrix(adata.layers[name]):
+            return {
+                "X": adata.layers[name],
+                "var": adata.var,
+                "source": f"layer:{name}",
+                "n_vars": adata.n_vars,
+            }
+
+    if adata.raw is not None and _is_integer_matrix(adata.raw.X):
+        return {
+            "X": adata.raw.X,
+            "var": adata.raw.var,
+            "source": "raw",
+            "n_vars": adata.raw.n_vars,
+        }
+
+    if _is_integer_matrix(adata.X):
+        return {
+            "X": adata.X,
+            "var": adata.var,
+            "source": "X",
+            "n_vars": adata.n_vars,
+        }
+
+    return None
+
+
 def _detect_gene_id_format(adata: AnnData) -> Tuple[str, bool, bool, List[str]]:
     """
     Detect the format of gene identifiers.
@@ -1063,8 +1123,13 @@ def _characterize_features(adata: AnnData) -> dict:
     entrez_count = sum(1 for g in stripped if entrez_re.match(g))
     symbol_count = sum(1 for g in stripped if symbol_re.match(g) and not ensembl_re.match(g))
 
-    has_symbols_col = "gene_symbols" in adata.var.columns or "gene_name" in adata.var.columns
-    has_ensembl_col = "gene_ids" in adata.var.columns or "ensembl_id" in adata.var.columns
+    # Content-validated column detection (recognizes feature_name/gene_symbols/…
+    # and rejects mislabelled columns). See core.genes.
+    from . import genes as _genes
+    symbol_col = _genes.find_symbol_column(adata)
+    ensembl_col = _genes.find_ensembl_column(adata)
+    has_symbols_col = symbol_col is not None
+    has_ensembl_col = ensembl_col is not None
 
     if ensembl_count > sample_size * 0.5:
         fmt = "ensembl"
@@ -1124,6 +1189,11 @@ def _characterize_features(adata: AnnData) -> dict:
         "gene_id_format": fmt,
         "has_gene_symbols": has_symbols_col or fmt == "symbol",
         "has_ensembl_ids": has_ensembl_col or fmt == "ensembl",
+        # Which var column carries symbols/IDs, and whether var_names can be
+        # converted to gene symbols offline (needed by SCimilarity/CellTypist).
+        "symbol_column": symbol_col,
+        "ensembl_column": ensembl_col,
+        "convertible_to_symbols": fmt == "symbol" or symbol_col is not None,
         "sample_gene_names": gene_names[:10],
         # extended info for LLM — raw facts, no pre-interpreted flags
         "genome_prefix": genome_prefix,

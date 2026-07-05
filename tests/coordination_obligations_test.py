@@ -46,6 +46,38 @@ def test_unmet_silent_when_annotation_never_entered():
 
 
 # --------------------------------------------------------------------------- #
+# 1b. structure QC completion obligation
+# --------------------------------------------------------------------------- #
+
+def test_structure_qc_unmet_when_metric_qc_ran_but_structure_did_not():
+    # run_cluster_qc writes `checked_at`; run_cluster_structure_qc writes
+    # `structure_qc_run_id`. Metric-only -> obligation is unmet and blocks the exit.
+    ws = AgentWorldState()
+    ws.cluster_qc_registry = {"leiden": {"cluster_key": "leiden", "checked_at": "t0"}}
+    assert ws.structure_qc_obligation_unmet() is True
+    o = next(o for o in ws.unmet_obligations() if o["key"] == "structure_qc")
+    assert o["blocks_terminal"] is True
+    # 'entry' so the bounded nudge lapses to a clean exit (no forced save) when
+    # the model — using its judgment — honors a user's request to skip structure QC.
+    assert o["kind"] == "entry"
+
+
+def test_structure_qc_satisfied_once_it_has_run():
+    ws = AgentWorldState()
+    ws.cluster_qc_registry = {
+        "leiden": {"cluster_key": "leiden", "checked_at": "t0", "structure_qc_run_id": "sq1"}
+    }
+    assert ws.structure_qc_obligation_unmet() is False
+    assert [o for o in ws.unmet_obligations() if o["key"] == "structure_qc"] == []
+
+
+def test_structure_qc_silent_before_any_cluster_qc():
+    # No cluster QC yet -> nothing to require.
+    ws = AgentWorldState()
+    assert ws.structure_qc_obligation_unmet() is False
+
+
+# --------------------------------------------------------------------------- #
 # 2. batch entry obligation is a floor (moot on single-sample)
 # --------------------------------------------------------------------------- #
 

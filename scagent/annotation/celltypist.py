@@ -263,83 +263,52 @@ def prepare_for_celltypist(
     """
     logger.info("Preparing data for CellTypist annotation...")
 
-    # Find raw counts
-    if raw_layer is None:
-        for layer in ['raw_counts', 'raw_data', 'counts']:
-            if layer in adata.layers:
-                raw_layer = layer
-                break
+    # Find raw counts — check named layers AND adata.raw (which carries its own
+    # var), on integer VALUES not dtype (counts are commonly stored as float32).
+    # See core.inspector.find_counts_matrix.
+    from ..core.inspector import find_counts_matrix
+    from ..core.genes import convert_var_to_symbols, infer_id_format
 
-    if raw_layer is not None:
-        logger.info(f"Using raw counts from layer '{raw_layer}'")
-        X = adata.layers[raw_layer].copy()
+    counts = find_counts_matrix(adata, prefer_layer=raw_layer)
+    if counts is not None:
+        X = counts["X"].copy()
+        counts_var = counts["var"]
+        logger.info(
+            f"Using raw counts from {counts['source']} ({counts['n_vars']} genes)"
+        )
     else:
-        # Falling back to adata.X is dangerous: by the time CellTypist is
-        # called, adata.X is almost always log-normalized. Running
-        # normalize_total + log1p on it produces log(1 + log1p_X / Σ * 10000)
-        # — a transformation CellTypist was never trained on. The model
-        # still returns confident-looking labels, but they are systematically
-        # wrong. Refuse rather than silently mis-annotate.
+        # No integer-valued counts anywhere. Falling back to adata.X is
+        # dangerous: by the time CellTypist is called, adata.X is almost always
+        # log-normalized. Running normalize_total + log1p on it produces
+        # log(1 + log1p_X / Σ * 10000) — a transformation CellTypist was never
+        # trained on. The model still returns confident-looking labels, but they
+        # are systematically wrong. Refuse rather than silently mis-annotate.
         if 'log1p' in adata.uns:
             raise ValueError(
-                "CellTypist requires raw integer counts, but no raw-counts "
-                "layer was found and adata.X is already log-normalized "
-                "(adata.uns['log1p'] is set). Re-normalizing log1p data would "
-                "produce wrong predictions. Place raw counts into "
-                "adata.layers['raw_counts'] before calling run_celltypist, "
-                "or pass raw_layer explicitly."
+                "CellTypist requires raw integer counts, but none were found in "
+                "any layer, adata.raw, or adata.X, and adata.X is already "
+                "log-normalized (adata.uns['log1p'] is set). Re-normalizing "
+                "log1p data would produce wrong predictions. Place raw counts "
+                "into adata.layers['raw_counts'] (or adata.raw) before calling "
+                "run_celltypist, or pass raw_layer explicitly."
             )
         logger.warning(
-            "No raw-counts layer found and adata.X is not flagged as "
-            "log-normalized; assuming adata.X holds raw counts."
+            "No integer-valued counts found; assuming adata.X holds raw counts."
         )
         X = adata.X.copy()
+        counts_var = adata.var
 
-    # Create new AnnData with raw counts
-    adata_ct = AnnData(X, obs=adata.obs.copy(), var=adata.var.copy())
+    # Create new AnnData with raw counts (var must match the counts matrix —
+    # adata.raw has its own var, often more genes than adata.var).
+    adata_ct = AnnData(X, obs=adata.obs.copy(), var=counts_var.copy())
 
-    # Ensure var_names are gene symbols, not Ensembl IDs.
-    # CellTypist will silently fail ("no features overlap") if given Ensembl IDs.
-    import re as _re
-    # --- Strip genome-prefix from multi-genome CellRanger references ---
-    # e.g. "GRCh38_CD3D" or "GRCh38___CD3D" → "CD3D"
-    _genome_prefix_re = _re.compile(r'^[A-Za-z0-9]+_{1,10}([A-Z].+)$')
-    _sample = list(adata_ct.var_names[:200])
-    _n_prefixed = sum(1 for v in _sample if _genome_prefix_re.match(str(v)))
-    if _n_prefixed > 100:
-        _cleaned = [_genome_prefix_re.sub(r'\1', v) for v in adata_ct.var_names]
-        adata_ct.var_names = _cleaned
-        adata_ct.var_names_make_unique()
-        logger.info(f"Stripped genome prefix from var_names (e.g. 'GRCh38_CD3D' → 'CD3D')")
-
-    # --- Swap Ensembl IDs to gene symbols if needed ---
-    _ensembl_re = _re.compile(r'^ENSG\d{5,}')
-    _n_ensembl = sum(1 for v in list(adata_ct.var_names[:200]) if _ensembl_re.match(str(v)))
-    if _n_ensembl > 100:
-        for _col in ['gene_symbols', 'gene_names', 'feature_name', 'Gene', 'Symbol']:
-            if _col in adata_ct.var.columns:
-                adata_ct.var_names = adata_ct.var[_col].astype(str).values
-                adata_ct.var_names_make_unique()
-                logger.info(f"Swapped var_names from Ensembl IDs to gene symbols using var['{_col}']")
-                break
-        else:
-            logger.warning("var_names look like Ensembl IDs but no gene-symbol column found in var; CellTypist may fail.")
-
-    # --- Strip -N suffixes added by var_names_make_unique (e.g. CD3D-1 → CD3D) ---
-    _suffixed = _re.compile(r'^(.+)-\d+$')
-    _base_names = [_suffixed.sub(r'\1', v) for v in adata_ct.var_names]
-    _seen: set = set()
-    _keep = []
-    for i, (orig, base) in enumerate(zip(adata_ct.var_names, _base_names)):
-        if base not in _seen:
-            _seen.add(base)
-            _keep.append(i)
-    if len(_keep) < len(adata_ct.var_names):
-        n_dropped = len(adata_ct.var_names) - len(_keep)
-        adata_ct = adata_ct[:, _keep].copy()
-        new_names = [_suffixed.sub(r'\1', v) for v in adata_ct.var_names]
-        adata_ct.var_names = new_names
-        logger.info(f"Stripped var_names_make_unique suffixes: dropped {n_dropped} duplicate-suffix genes")
+    # Ensure var_names are gene symbols — CellTypist silently fails ("no features
+    # overlap") when handed Ensembl IDs. Offline conversion via the dataset's own
+    # symbol column (feature_name/gene_symbols/...) when present; genome prefixes
+    # and duplicate symbols are handled by the shared helper.
+    if infer_id_format(adata_ct.var_names) != "symbol":
+        adata_ct, gene_report = convert_var_to_symbols(adata_ct, inplace=True)
+        logger.info(f"Gene-id conversion for CellTypist: {gene_report.message}")
 
     # Normalize to target_sum=10000 (CellTypist requirement)
     sc.pp.normalize_total(adata_ct, target_sum=target_sum, inplace=True)

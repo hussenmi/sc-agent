@@ -2827,7 +2827,8 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "model": {"type": "string", "description": "Model name (default: Immune_All_Low.pkl)"},
+                    "model": {"type": "string", "description": "CellTypist model name (e.g. 'Healthy_Adult_Lung.pkl'). Choose a model that matches the dataset tissue — the immune-only default 'Immune_All_Low.pkl' mislabels non-immune cells. Use list_celltypist_models to see options."},
+                    "model_selection_confirmed": {"type": "boolean", "description": "Set true once you have presented tissue-appropriate model options to the user (via pause_and_ask) and they chose. Required to run the default immune model, so an immune-only model is never applied to non-immune tissue by accident."},
                     "organism": {"type": "string", "enum": ["human", "mouse"], "description": "Dataset organism. Use explicit user-provided species when available; if ambiguous, ask before annotation."},
                     "allow_cross_species": {"type": "boolean", "description": "Expert override to run a species-mismatched CellTypist model as non-definitive exploratory output (default: false)."},
                     "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"},
@@ -3811,6 +3812,30 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to a single h5ad or 10x h5 file (optional - uses in-memory data). Do NOT pass a directory; for multi-sample loading use run_code."},
                     "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"},
                     "context": {"type": "string", "description": "Optional biological context hint from the user or file path (e.g., 'PBMC healthy human cells')"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "convert_gene_ids",
+            "description": (
+                "Normalize adata.var_names to gene SYMBOLS (e.g. Ensembl 'ENSG00000010610' → 'CD4'). "
+                "Use this when inspect_data reports genes.format='ensembl' (or 'entrez'/'mixed') and "
+                "genes.convertible_to_symbols=true, BEFORE annotation tools that align to a symbol "
+                "gene space (run_scimilarity, run_celltypist) or before plotting/scoring genes by "
+                "symbol. Offline and non-destructive: prefers the dataset's own symbol column "
+                "(genes.symbol_column, e.g. feature_name); original Ensembl IDs are preserved in "
+                "var['ensembl_id']; genome prefixes (e.g. 'GRCh38_') are stripped and duplicate "
+                "symbols made unique (no genes dropped). No-op if var_names are already symbols. "
+                "Set use_mygene=true only to attempt an online Ensembl→symbol lookup when there is no "
+                "in-file symbol column (requires network; fails soft when offline)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Optional h5ad path; defaults to the in-memory dataset."},
+                    "use_mygene": {"type": "boolean", "description": "Fallback to mygene.info online lookup when no in-file symbol column exists (default: false)."},
+                    "organism": {"type": "string", "enum": ["human", "mouse"], "description": "Organism hint for the mygene fallback (optional)."}
                 },
                 "required": []
             }
@@ -4996,6 +5021,23 @@ def process_tool_call(
             sc.pl.heatmap(adata_obj, var_names=genes, groupby=color_by, show=False)
         else:
             raise ValueError(f"Unsupported plot configuration: plot_type={plot_type}")
+
+        # Label clustering plots with their resolution + cluster count so the many
+        # near-identical resolution UMAPs are self-identifying (same coordinates —
+        # only the partition differs). Looked up from the clustering registry;
+        # batch/gene colorings have no resolution and keep their default title.
+        if plot_type in ("umap", "tsne") and color_by is not None:
+            try:
+                from ..core.inspector import get_clustering_registry
+                for _rec in get_clustering_registry(adata_obj):
+                    if getattr(_rec, "cluster_key", None) == color_by and _rec.resolution is not None:
+                        _title = f"{color_by} — resolution {_rec.resolution}"
+                        if color_by in adata_obj.obs.columns:
+                            _title += f", {adata_obj.obs[color_by].nunique()} clusters"
+                        ax.set_title(_title)
+                        break
+            except Exception:
+                pass
 
         # tight_layout fights an outside legend (it can clip or re-shrink the
         # panel); bbox_inches="tight" at save time already includes the legend.
@@ -6974,6 +7016,9 @@ def process_tool_call(
                     "format": state.gene_id_format,
                     "has_symbols": state.has_gene_symbols,
                     "has_ensembl": state.has_ensembl_ids,
+                    "symbol_column": feature_info.get("symbol_column"),
+                    "ensembl_column": feature_info.get("ensembl_column"),
+                    "convertible_to_symbols": feature_info.get("convertible_to_symbols"),
                     "sample": feature_info["sample_gene_names"],
                     "var_columns": list(working_adata.var.columns)[:10],
                     "genome_prefix": feature_info["genome_prefix"],
@@ -7794,6 +7839,27 @@ def process_tool_call(
                     "reason": batch_resolution.reason,
                     "candidates": [metadata_candidate_to_dict(c) for c in (batch_resolution.candidates or [])],
                 },
+            }
+            return json.dumps(result, indent=2), updated_adata
+
+        elif tool_name == "convert_gene_ids":
+            from ..core.genes import convert_var_to_symbols, infer_id_format
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=True)
+            before_fmt = infer_id_format(working_adata.var_names)
+            _, report = convert_var_to_symbols(
+                working_adata,
+                inplace=True,
+                use_mygene=bool(tool_input.get("use_mygene", False)),
+                organism=tool_input.get("organism"),
+            )
+            result = {
+                "status": "ok",
+                "tool": "convert_gene_ids",
+                "changed": report.changed,
+                "before_format": before_fmt,
+                "after_format": report.to_format,
+                "conversion": report.to_dict(),
+                "state": make_state(working_adata),
             }
             return json.dumps(result, indent=2), updated_adata
 
@@ -9654,6 +9720,67 @@ def process_tool_call(
                         "Set allow_cross_species=true only for an explicitly caveated exploratory run.",
                     ],
                 }, indent=2), adata
+
+            # Model-selection gate. CellTypist ships many tissue/context-specific
+            # models; the default is immune-only and silently mislabels non-immune
+            # cells (run_2026_07_02_122548: lung epithelium annotated as T/NK because
+            # Immune_All_Low won). Require an explicit, user-visible model choice
+            # instead of defaulting. The ENGINE only surfaces the catalog + enforces
+            # the process — which model fits the tissue is the model's judgment.
+            from ..config.defaults import CELLTYPIST_DEFAULTS as _CT_DEFAULTS
+            default_model_name = Path(str(_CT_DEFAULTS.model or "")).name
+            is_default_model = Path(str(model or "")).name == default_model_name
+            model_selection_confirmed = bool(
+                tool_input.get("model_selection_confirmed")
+                or tool_input.get("user_selected_model")
+            )
+            prior_model_choice = (
+                world_state.get_confirmed_value("celltypist_model")
+                if world_state is not None else None
+            )
+            if is_default_model and not model_selection_confirmed and not prior_model_choice:
+                try:
+                    catalog_records = celltypist_model_records(organism=organism or None)
+                except Exception:
+                    catalog_records = []
+                catalog_truncated = len(catalog_records) > 40
+                return json.dumps({
+                    "status": "needs_input",
+                    "tool": "run_celltypist",
+                    "reference_source": "celltypist",
+                    "unavailable_reference_source": "celltypist",
+                    "unavailable_reason": "model_selection_required",
+                    "required_input": "celltypist_model_choice",
+                    "message": (
+                        "CellTypist has many tissue- and context-specific models. The default "
+                        f"'{default_model_name}' is an immune/blood model — on non-immune tissue it "
+                        "forces cells into the nearest immune label (e.g. lung epithelium annotated as "
+                        "T/NK cells). Pick a model that matches THIS dataset's tissue before annotating, "
+                        "and let the user confirm."
+                    ),
+                    "dataset_biological_context": biological_context,
+                    "organism": organism or "unknown",
+                    "default_model": default_model_name,
+                    "available_models": catalog_records[:40],
+                    "available_models_truncated": catalog_truncated,
+                    "how_to_proceed": [
+                        "Read the model descriptions in available_models and judge which best fit this "
+                        "dataset's tissue/biology (use list_celltypist_models with a tissue query to "
+                        "narrow further, e.g. query='lung').",
+                        "Present your top 2-4 candidates — each with a one-line rationale — plus a clear "
+                        "recommendation to the user via pause_and_ask, and let them choose.",
+                        "Re-run run_celltypist with model='<chosen>.pkl' and model_selection_confirmed=true.",
+                        "Immune_All_Low / Immune_All_High are appropriate for immune/blood/PBMC data — if "
+                        "that is genuinely this dataset, still confirm with the user and pass "
+                        "model_selection_confirmed=true.",
+                    ],
+                    "model_discovery": {
+                        "list_models_code": "celltypist.models.models_description()",
+                        "download_model_code": "celltypist.models.download_models(model='<model>.pkl')",
+                        "official_models_url": "https://www.celltypist.org/models",
+                    },
+                }, indent=2), adata
+
             if majority and cluster_key not in adata.obs.columns:
                 return _smart_unavailable_result(
                     tool="run_celltypist",
