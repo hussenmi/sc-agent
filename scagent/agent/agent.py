@@ -1562,7 +1562,26 @@ class SCAgent:
         tool_name: str,
         result_data: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        if tool_name not in ("inspect_data", "record_inspection") or result_data.get("status") != "ok":
+        if result_data.get("status") != "ok":
+            return None
+        # Post-investigation re-ask: once the uncorrected first pass + diagnostic
+        # complete, re-open the strategy so the USER authorizes integrate/keep/
+        # separate — concluding "integration is needed" is not self-authorization
+        # to integrate. This is a mandatory gate, so it lives in this UNGUARDED
+        # dispatch builder rather than _build_checkpoint_payload, which returns
+        # early (and thus never raises the re-ask) in the default smart-autonomous
+        # mode. When it was trapped there the checkpoint silently never fired and
+        # the model hand-rolled the decision — numbered-text options whose pick was
+        # never recorded (so integration stayed blocked), or a pause_and_ask loop
+        # that never ended the turn so the selector never rendered.
+        if tool_name == "diagnose_batch_effect":
+            checkpoint = self._post_investigation_strategy_checkpoint()
+            if checkpoint is not None:
+                artifacts = self._checkpoint_artifact_paths(result_data)
+                if artifacts:
+                    checkpoint["artifacts"] = artifacts
+            return checkpoint
+        if tool_name not in ("inspect_data", "record_inspection"):
             return None
         if self.world_state.get_confirmed_value("multi_sample_strategy"):
             return None
@@ -2618,10 +2637,11 @@ class SCAgent:
                 }
 
         elif tool_name == "diagnose_batch_effect":
-            post_investigation = self._post_investigation_strategy_checkpoint()
-            if post_investigation is not None:
-                post_investigation["artifacts"] = artifacts
-                return post_investigation
+            # Handled unconditionally in _build_multi_sample_strategy_checkpoint,
+            # which runs earlier in the dispatch chain and — unlike this guarded
+            # builder — fires in smart-autonomous mode too. The post-investigation
+            # re-ask is a required authorization gate, not a soft workflow prompt.
+            pass
 
         elif tool_name in {"run_celltypist", "run_scimilarity"}:
             n_types = result_data.get("n_types", "?")

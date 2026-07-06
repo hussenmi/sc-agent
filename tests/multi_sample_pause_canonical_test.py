@@ -51,6 +51,25 @@ class _FakeWS:
         return self._group_count >= 2
 
 
+class _FakeAdata:
+    """Just enough to carry a batch-effect diagnostic in ``uns``."""
+
+    def __init__(self, diagnostic=None):
+        self.uns = {}
+        if diagnostic is not None:
+            self.uns["batch_effect_diagnostic"] = diagnostic
+
+
+_OK_DIAGNOSTIC = {
+    "status": "ok",
+    "batch_key": "dataset",
+    "n_batches": 4,
+    "verdict": "batch_effect_supported",
+    "recommendation": "Offer scVI integration and ask the user to confirm.",
+    "support_reasons": ["many clusters are sample-dominated"],
+}
+
+
 def _agent(world_state, adata=None) -> SCAgent:
     agent = object.__new__(SCAgent)
     agent.world_state = world_state
@@ -235,3 +254,101 @@ def test_pause_and_ask_not_canonicalized_single_sample():
     agent = _agent(ws)
     out = json.loads(agent._handle_pause_and_ask(dict(_BATCH_PAUSE)))
     assert out.get("kind") != "multi_sample_strategy"
+
+
+# --------------------------------------------------------------------------- #
+# Post-investigation re-ask fires unconditionally (the run_2026_07_06_03xxxx bug)
+#
+# The re-ask after diagnose_batch_effect used to live only in
+# _build_checkpoint_payload, which returns early in smart-autonomous mode — so
+# the mandatory integrate/keep/separate authorization gate silently never fired.
+# It now lives in the unguarded _build_multi_sample_strategy_checkpoint.
+# --------------------------------------------------------------------------- #
+
+
+def test_diagnose_batch_effect_raises_post_investigation_checkpoint():
+    ws = _FakeWS(
+        confirmed={"batch_key": "dataset", "multi_sample_strategy": "investigate_integration"},
+        data_summary={"batch_key": "dataset", "n_batches": 4, "batch_correction_applied": False},
+    )
+    agent = _agent(ws, adata=_FakeAdata(_OK_DIAGNOSTIC))
+    cp = agent._build_multi_sample_strategy_checkpoint(
+        "diagnose_batch_effect", {"status": "ok"}
+    )
+    assert cp is not None
+    assert cp["kind"] == "multi_sample_strategy"
+    assert cp["question"].startswith("Investigation complete")
+    # post-investigation drops the "investigate" option; offers integrate/keep/separate
+    assert "investigate_integration" not in cp["option_actions"]
+    assert cp["option_actions"][0] == "integrate_scvi"
+
+
+def test_diagnose_checkpoint_independent_of_collaborative_flags():
+    # The whole point of the fix: this builder does not consult
+    # self.collaborative / self.smart_autonomous, so it fires in every mode.
+    ws = _FakeWS(
+        confirmed={"batch_key": "dataset", "multi_sample_strategy": "investigate_integration"},
+        data_summary={"batch_key": "dataset", "n_batches": 4, "batch_correction_applied": False},
+    )
+    agent = _agent(ws, adata=_FakeAdata(_OK_DIAGNOSTIC))
+    # deliberately do NOT set agent.collaborative / agent.smart_autonomous
+    cp = agent._build_multi_sample_strategy_checkpoint(
+        "diagnose_batch_effect", {"status": "ok"}
+    )
+    assert cp is not None
+    assert cp["kind"] == "multi_sample_strategy"
+
+
+def test_diagnose_checkpoint_attaches_artifacts():
+    ws = _FakeWS(
+        confirmed={"batch_key": "dataset", "multi_sample_strategy": "investigate_integration"},
+        data_summary={"batch_key": "dataset", "n_batches": 4, "batch_correction_applied": False},
+    )
+    agent = _agent(ws, adata=_FakeAdata(_OK_DIAGNOSTIC))
+    result = {
+        "status": "ok",
+        "artifacts_created": [{"path": "figures/batch_umap.png"}],
+    }
+    cp = agent._build_multi_sample_strategy_checkpoint("diagnose_batch_effect", result)
+    assert cp is not None
+    assert "figures/batch_umap.png" in cp["artifacts"]
+
+
+def test_diagnose_checkpoint_none_when_diagnostic_missing():
+    ws = _FakeWS(
+        confirmed={"batch_key": "dataset", "multi_sample_strategy": "investigate_integration"},
+        data_summary={"batch_key": "dataset", "n_batches": 4},
+    )
+    agent = _agent(ws, adata=_FakeAdata(diagnostic=None))
+    cp = agent._build_multi_sample_strategy_checkpoint(
+        "diagnose_batch_effect", {"status": "ok"}
+    )
+    assert cp is None
+
+
+def test_diagnose_checkpoint_none_when_strategy_not_investigate():
+    # e.g. the user chose keep_unintegrated — no re-ask is owed.
+    ws = _FakeWS(
+        confirmed={"batch_key": "dataset", "multi_sample_strategy": "keep_unintegrated"},
+        data_summary={"batch_key": "dataset", "n_batches": 4},
+    )
+    agent = _agent(ws, adata=_FakeAdata(_OK_DIAGNOSTIC))
+    cp = agent._build_multi_sample_strategy_checkpoint(
+        "diagnose_batch_effect", {"status": "ok"}
+    )
+    assert cp is None
+
+
+def test_build_checkpoint_payload_no_longer_owns_diagnose_branch():
+    # Single source of truth: the guarded builder must not also emit the re-ask
+    # (it would double-handle, and in smart mode return None anyway). Run it in
+    # collaborative mode where the early guard passes.
+    ws = _FakeWS(
+        confirmed={"batch_key": "dataset", "multi_sample_strategy": "investigate_integration"},
+        data_summary={"batch_key": "dataset", "n_batches": 4, "batch_correction_applied": False},
+    )
+    agent = _agent(ws, adata=_FakeAdata(_OK_DIAGNOSTIC))
+    agent.collaborative = True
+    agent.smart_autonomous = False
+    cp = agent._build_checkpoint_payload("diagnose_batch_effect", {}, {"status": "ok"})
+    assert cp is None
