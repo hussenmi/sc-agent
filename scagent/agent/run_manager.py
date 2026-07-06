@@ -391,6 +391,23 @@ class RunManager:
         ``report_path`` links the turn entry to the comprehensive analysis report.
         """
         self.manifest.status = "completed"
+
+        # Soft check: every generated artifact README that requires a
+        # dataset-specific interpretation should have one. Missing ones become
+        # non-blocking warnings so the run still completes.
+        try:
+            from ..core.artifact_docs import scan_incomplete_interpretations
+
+            for rel in scan_incomplete_interpretations(self.run_dir):
+                warning = (
+                    f"Artifact documentation {rel} has no dataset-specific "
+                    "interpretation — call annotate_artifact_group to add one."
+                )
+                if warning not in self.manifest.warnings:
+                    self.manifest.warnings.append(warning)
+        except Exception:
+            pass  # documentation coverage must never block completion
+
         self._save_manifest()
 
         # Collect tools used in this turn from recent steps

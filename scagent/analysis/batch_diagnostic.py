@@ -599,16 +599,196 @@ def _cross_sample_identity_deg(
     }
 
 
-def _write_outputs(output_dir: Optional[str], tables: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
+def _batch_diagnostic_group_doc(params: Dict[str, Any]) -> "ArtifactGroupDoc":
+    """Static documentation for the batch-diagnostic CSVs.
+
+    Describes what each table computes and what its columns mean — authored next
+    to the tool (not the harness) because it documents this tool's own output.
+    The dataset-specific interpretation is left to the model.
+    """
+    from ..core.artifact_docs import ArtifactGroupDoc, FileDoc
+
+    return ArtifactGroupDoc(
+        group="diagnose_batch_effect",
+        title="Batch-effect diagnostic — how to read these files",
+        overview=(
+            "Descriptive diagnostic for whether an uncorrected multi-sample dataset "
+            "separates by sample/batch. Each CSV captures one line of evidence; "
+            "together they inform whether to integrate, keep unintegrated, or analyze "
+            "samples separately. None of these tables prove a difference is technical "
+            "rather than real per-sample biology — they are evidence, not proof."
+        ),
+        params=params,
+        files=[
+            FileDoc(
+                filename="batch_diagnostic_cluster_sample_composition.csv",
+                purpose=(
+                    "How each cluster's cells split across samples/batches — the primary "
+                    "signal for sample-private clusters."
+                ),
+                computation=(
+                    "Cross-tabulation of cluster x batch; per cluster the dominant batch and "
+                    "its fraction, plus a normalized entropy of the sample mixture."
+                ),
+                columns={
+                    "cluster": "Cluster id from the clustering used.",
+                    "n_cells": "Total cells in the cluster.",
+                    "dominant_batch": "Sample/batch contributing the most cells to the cluster.",
+                    "dominant_fraction": "Fraction of the cluster's cells from dominant_batch (1.0 = one sample).",
+                    "normalized_sample_entropy": "Evenness of the sample mixture, 0 (one sample) to 1 (even split).",
+                    "sample_exclusive": "True if dominant_fraction >= 0.98 (essentially one sample).",
+                    "sample_dominated": "True if dominant_fraction >= 0.80 (mostly one sample).",
+                    "batch_counts": "Per-batch cell counts (dict serialized as text).",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_broad_cluster_labels.csv",
+                purpose=(
+                    "Provisional broad lineage label per cluster, used only to group clusters "
+                    "for this diagnostic — NOT a final annotation."
+                ),
+                computation=(
+                    "Per-cluster marker genes (rank_genes_groups) matched against a small "
+                    "built-in broad-lineage marker set; highest-scoring lineage wins."
+                ),
+                columns={
+                    "cluster": "Cluster id.",
+                    "broad_label": "Provisional broad lineage (e.g. epithelial, myeloid) — do not reuse as annotation.",
+                    "confidence": "Confidence of the broad-label assignment.",
+                    "supporting_markers": "Markers that drove the label.",
+                    "top_markers": "Top marker genes for the cluster.",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_condition_confounding.csv",
+                purpose=(
+                    "Whether each supplied condition/covariate is confounded with the "
+                    "batch/sample variable — if so, batch and biology cannot be separated."
+                ),
+                computation=(
+                    "Cross-tabulation of batch x condition; purity of batches within conditions "
+                    "and vice versa; flagged confounded above a purity threshold."
+                ),
+                columns={
+                    "condition_key": "The obs column tested against batch.",
+                    "n_conditions": "Number of distinct condition values.",
+                    "max_batch_purity": "How cleanly the purest condition maps to a single batch.",
+                    "median_batch_purity": "Median of that batch-purity across conditions.",
+                    "max_condition_purity": "How cleanly the purest batch maps to a single condition.",
+                    "median_condition_purity": "Median of that condition-purity across batches.",
+                    "confounded_with_batch": "True if the two variables are largely redundant (confounded).",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_shared_signatures.csv",
+                purpose=(
+                    "Genes that shift the same way with a given sample across MULTIPLE cell "
+                    "types — a hallmark of a technical (batch-wide) effect, not one cell type's biology."
+                ),
+                computation=(
+                    "Per broad label, per-sample expression deltas vs the other samples; genes "
+                    "recurring in the same direction across >=2 broad labels are retained."
+                ),
+                columns={
+                    "batch": "Sample/batch the shift is associated with.",
+                    "direction": "'up' or 'down' in that batch.",
+                    "gene": "Gene symbol.",
+                    "n_broad_labels": "Number of distinct broad cell types showing this shift.",
+                    "broad_labels": "Which broad labels show it.",
+                    "max_abs_delta": "Largest absolute expression delta observed.",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_neighborhood_entropy.csv",
+                purpose=(
+                    "Per broad-label batch-mixing entropy in the chosen embedding — low entropy "
+                    "where a cell type spans several samples means it segregates by sample (batch-like)."
+                ),
+                computation=(
+                    "kNN graph in the chosen representation; per cell, entropy of its neighbors' "
+                    "batch labels; averaged per broad label."
+                ),
+                columns={
+                    "broad_label": "Provisional broad lineage.",
+                    "n_cells": "Cells with this label.",
+                    "n_batches_present": "How many batches contribute cells to this label.",
+                    "mean_entropy": "Mean neighborhood batch entropy (higher = better mixed; lower = more segregated).",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_cross_sample_identity_deg.csv",
+                purpose=(
+                    "The most conclusive test — pairs of sample-private clusters that are the same "
+                    "cell population separated only by sample (a batch split integration should merge)."
+                ),
+                computation=(
+                    "Candidate pairs nominated by one-vs-all marker overlap; each cluster is then "
+                    "DEG'd against the rest of its OWN sample (batch held constant) and the two "
+                    "within-sample signatures compared."
+                ),
+                how_to_read=(
+                    "High signature_similarity with conclusive_batch_effect=True means the split is "
+                    "technical (integrate to merge); low similarity means genuinely different "
+                    "populations, and the separation may be real biology."
+                ),
+                columns={
+                    "cluster_a": "First cluster of the pair.",
+                    "sample_a": "Sample of cluster_a.",
+                    "cluster_b": "Second cluster of the pair.",
+                    "sample_b": "Sample of cluster_b.",
+                    "marker_overlap_jaccard": "Jaccard overlap of the two clusters' one-vs-all markers (nominates the pair).",
+                    "signature_similarity": "Similarity of the two within-sample identity signatures (higher = more likely same population).",
+                    "conclusive_batch_effect": "True when similarity exceeds the threshold — conclusive that the split is batch, not biology.",
+                    "shared_identity_genes": "Genes shared by both within-sample signatures.",
+                },
+            ),
+        ],
+    )
+
+
+def _write_outputs(
+    output_dir: Optional[str],
+    tables: Dict[str, pd.DataFrame],
+    group_doc: Optional["ArtifactGroupDoc"] = None,
+) -> List[Dict[str, Any]]:
     artifacts: List[Dict[str, Any]] = []
     if not output_dir:
         return artifacts
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
+
+    # Per-file authored docs keyed by both full filename and stem.
+    file_docs: Dict[str, Any] = {}
+    if group_doc is not None:
+        for fdoc in group_doc.files:
+            file_docs[fdoc.filename] = fdoc
+            file_docs[Path(fdoc.filename).stem] = fdoc
+
     for stem, df in tables.items():
         path = root / f"{stem}.csv"
         df.to_csv(path, index=False)
-        artifacts.append({"path": str(path), "role": "artifact", "metadata": {"kind": stem}})
+        metadata: Dict[str, Any] = {"kind": stem}
+        fdoc = file_docs.get(stem) or file_docs.get(f"{stem}.csv")
+        if fdoc is not None:
+            from ..core.artifact_docs import artifact_column_metadata
+
+            metadata.update(artifact_column_metadata(fdoc, df))
+        artifacts.append({"path": str(path), "role": "artifact", "metadata": metadata})
+
+    # A single README documenting every file, plus a placeholder Interpretation
+    # section the model fills in later via annotate_artifact_group.
+    if group_doc is not None:
+        from ..core.artifact_docs import write_group_doc
+
+        frames = {f"{stem}.csv": df for stem, df in tables.items()}
+        readme_path = write_group_doc(root, group_doc, frames=frames)
+        artifacts.append(
+            {
+                "path": str(readme_path),
+                "role": "artifact_readme",
+                "metadata": {"kind": "artifact_readme", "group": group_doc.group},
+            }
+        )
     return artifacts
 
 
@@ -852,6 +1032,17 @@ def diagnose_batch_effect(
             "batch_diagnostic_neighborhood_entropy": entropy_df,
             "batch_diagnostic_cross_sample_identity_deg": identity_df,
         },
+        group_doc=_batch_diagnostic_group_doc(
+            {
+                "batch_key": batch_key,
+                "cluster_key": cluster_key,
+                "n_top_genes": n_top_genes,
+                "min_cells_per_cluster_sample": min_cells_per_cluster_sample,
+                "entropy_use_rep": entropy_use_rep,
+                "entropy_n_neighbors": entropy_n_neighbors,
+                "condition_keys": condition_keys or [],
+            }
+        ),
     )
 
     # Human-readable findings shown in the terminal (the agent prints

@@ -3267,6 +3267,38 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "annotate_artifact_group",
+            "description": (
+                "Record YOUR dataset-specific interpretation of a group of output files into that "
+                "group's auto-generated README.md (the '## Interpretation (dataset-specific)' section). "
+                "Tools that write a folder of artifacts (e.g. diagnose_batch_effect) emit a README "
+                "documenting each file's purpose, computation, and columns, and surface "
+                "`doc_interpretation_pending` in their result. Call this afterwards to add what the "
+                "results actually SHOW for this dataset — the concrete findings, which files/rows "
+                "support them, and the conclusion — in plain language. The structural documentation is "
+                "already written; supply only the interpretation. Reference specific files and columns "
+                "by name so a reader can follow your reasoning back to the data."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "group": {
+                        "type": "string",
+                        "description": "The artifact group id surfaced in the producing tool's `doc_interpretation_pending` (e.g. 'diagnose_batch_effect')."
+                    },
+                    "readme_path": {
+                        "type": "string",
+                        "description": "Optional explicit path to the group README.md (as given in `doc_interpretation_pending`). Use this if the group id is ambiguous."
+                    },
+                    "interpretation": {
+                        "type": "string",
+                        "description": "Your dataset-specific findings in markdown: what the files show, the evidence (cite files/columns/values), and the conclusion. This replaces the README's Interpretation placeholder."
+                    }
+                },
+                "required": ["interpretation"]
+            }
+        },
+        {
             "name": "run_batch_correction",
             "description": (
                 "Correct batch effects after the user explicitly chose integration. "
@@ -6416,7 +6448,12 @@ def process_tool_call(
                 _register_artifact_record(path, role="report", metadata={"name": safe_name})
                 return str(path)
 
-            def register_artifact(path, role: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
+            def register_artifact(
+                path,
+                role: Optional[str] = None,
+                metadata: Optional[Dict[str, Any]] = None,
+                columns: Optional[Dict[str, str]] = None,
+            ):
                 """Record a file written by this run_code call so its absolute
                 path comes back in result.artifacts_created.
 
@@ -6425,12 +6462,24 @@ def process_tool_call(
                 path. The returned dict has an absolute ``path`` field plus
                 optional ``role`` and ``metadata``.
 
+                For a data file you write (CSV/TSV), pass ``columns`` as a
+                {column_name: description} dict so the file is self-documenting:
+                the glossary is stored on the artifact metadata (same shape the
+                built-in tools produce), letting a reader — and later steps —
+                understand each column without re-deriving it.
+
                 Example:
                     p = Path(output_dir) / "evidence.json"
                     p.write_text(json.dumps(evidence))
                     register_artifact(p, role="annotation_evidence_json")
+                    register_artifact(scores_csv, columns={"gene": "symbol", "score": "AUC"})
                 """
-                return _register_artifact_record(path, role=role, metadata=metadata)
+                meta = dict(metadata) if isinstance(metadata, dict) else {}
+                if columns:
+                    meta["columns"] = [
+                        {"name": str(k), "description": str(v)} for k, v in columns.items()
+                    ]
+                return _register_artifact_record(path, role=role, metadata=meta or None)
 
             # Execute in controlled namespace
             # Note: Path and ensure_dir are provided - no need to import os
@@ -11006,6 +11055,20 @@ def process_tool_call(
                     artifacts_created.append(_pl)
             diagnostic["overlay_figures"] = overlay_paths
             diagnostic["artifacts_created"] = artifacts_created
+            # Point the model at the auto-written README so it records the
+            # dataset-specific interpretation via annotate_artifact_group.
+            _readme_art = next(
+                (a for a in artifacts_created if a.get("role") == "artifact_readme"), None
+            )
+            if _readme_art is not None:
+                diagnostic["doc_interpretation_pending"] = {
+                    "group": (_readme_art.get("metadata") or {}).get("group", "diagnose_batch_effect"),
+                    "readme_path": _readme_art.get("path"),
+                    "note": (
+                        "A README documenting these files was written. Call annotate_artifact_group "
+                        "with your dataset-specific interpretation of the batch-effect evidence."
+                    ),
+                }
             diagnostic["state"] = make_state(adata)
             return _finalize_result(
                 diagnostic,
@@ -11025,6 +11088,82 @@ def process_tool_call(
                         _check("no_correction_applied", not _batch_correction_present(adata), "No batch correction was applied by the diagnostic."),
                     ],
                 ),
+            )
+
+        elif tool_name == "annotate_artifact_group":
+            from ..core.artifact_docs import DOC_MARKER, set_interpretation
+
+            interpretation = (tool_input.get("interpretation") or "").strip()
+            if not interpretation:
+                return _error_result(
+                    tool="annotate_artifact_group",
+                    message="No interpretation text was provided.",
+                    recovery_options=["Pass the dataset-specific findings as `interpretation`."],
+                )
+            group = tool_input.get("group")
+            readme_path = tool_input.get("readme_path")
+            resolved = None
+            if readme_path:
+                cand = Path(readme_path)
+                if cand.exists():
+                    resolved = cand
+            # Resolve by group id via the manifest's registered READMEs.
+            if resolved is None and group and run_manager is not None:
+                for rec in reversed(run_manager.manifest.artifact_registry):
+                    meta = rec.get("metadata") or {}
+                    if rec.get("role") == "artifact_readme" and meta.get("group") == group:
+                        cand = Path(rec.get("path", ""))
+                        if cand.exists():
+                            resolved = cand
+                            break
+            # Last resort: scan the run dir for a marker README naming the group.
+            if resolved is None and group and run_manager is not None:
+                for cand in sorted(Path(run_manager.run_dir).rglob("README.md")):
+                    try:
+                        txt = cand.read_text()
+                    except Exception:
+                        continue
+                    if DOC_MARKER in txt and f"`{group}`" in txt:
+                        resolved = cand
+                        break
+            if resolved is None:
+                return _error_result(
+                    tool="annotate_artifact_group",
+                    message=(
+                        "Could not locate a documented artifact group"
+                        + (f" for group '{group}'" if group else "")
+                        + ". Pass the readme_path from the producing tool's doc_interpretation_pending."
+                    ),
+                    recovery_options=[
+                        "Use the readme_path surfaced in doc_interpretation_pending.",
+                    ],
+                )
+            try:
+                text = resolved.read_text()
+                resolved.write_text(set_interpretation(text, interpretation))
+            except Exception as e:
+                return _error_result(
+                    tool="annotate_artifact_group",
+                    message=f"Failed to write interpretation into {resolved}: {e}",
+                )
+            ann_result = {
+                "status": "ok",
+                "tool": "annotate_artifact_group",
+                "group": group,
+                "readme_path": str(resolved),
+                "message": f"Interpretation recorded in {resolved.name}.",
+            }
+            _ann_payload = _artifact_payload(
+                str(resolved),
+                role="artifact_readme",
+                metadata={"kind": "artifact_readme", "group": group, "interpreted": True},
+            )
+            return _finalize_result(
+                ann_result,
+                adata,
+                dataset_changed=False,
+                summary=ann_result["message"],
+                artifacts_created=[_ann_payload] if _ann_payload else [],
             )
 
         elif tool_name == "run_batch_correction":
@@ -13197,6 +13336,76 @@ def process_tool_call(
                         },
                     )
                 )
+
+                # A "how to read the heatmaps" README next to the PNGs. Findings
+                # are already in the markdown/JSON reports, so this reference doc
+                # does NOT require a separate model interpretation.
+                try:
+                    from ..core.artifact_docs import (
+                        ArtifactGroupDoc,
+                        FileDoc,
+                        write_group_doc,
+                    )
+
+                    _sq_doc = ArtifactGroupDoc(
+                        group="run_cluster_structure_qc",
+                        title="Cluster structure QC — how to read these heatmaps",
+                        overview=(
+                            "Gene-gene correlation heatmaps that adjudicate whether each analyzed "
+                            "cluster is a coherent cell population or a doublet/noise mixture. Only "
+                            "metric-flagged/ambiguous clusters and the least-coherent baseline "
+                            f"clusters are plotted (cap {max_heatmaps}); coherent clusters are "
+                            "assessed but not plotted. Dataset-specific findings and the per-cluster "
+                            f"verdicts live in the companion report "
+                            f"`reports/cluster_structure_qc_{structure_qc_run_id}_summary.md` "
+                            "(and the JSON alongside it)."
+                        ),
+                        params={
+                            "cluster_key": cluster_key,
+                            "clusters_analyzed": clusters_to_analyze,
+                            "n_genes": n_genes,
+                            "min_cells": min_cells,
+                            "corr_threshold": corr_threshold,
+                            "structure_qc_pass": structure_qc_pass,
+                        },
+                        interpretation_required=False,
+                        files=[
+                            FileDoc(
+                                filename="cluster_<id>_correlation.png",
+                                purpose=(
+                                    "One heatmap per plotted cluster (cluster id in the filename): "
+                                    "the clustered gene-gene correlation matrix over the cluster's "
+                                    "top variable genes."
+                                ),
+                                computation=(
+                                    "Pairwise correlation of the top variable genes within the "
+                                    "cluster, hierarchically ordered so co-varying genes sit together; "
+                                    "cross-referenced with a technical Moran's I check."
+                                ),
+                                how_to_read=(
+                                    "Strong off-diagonal blocks = coherent co-expression modules (a "
+                                    "real, structured population). A flat, block-free map = "
+                                    "unstructured, a possible doublet or low-quality mixture. Blocks "
+                                    "that align with a high technical Moran's I are flagged as "
+                                    "technical rather than biological structure."
+                                ),
+                            ),
+                        ],
+                    )
+                    _sq_readme = write_group_doc(figure_dir, _sq_doc)
+                    _sq_readme_payload = _artifact_payload(
+                        str(_sq_readme),
+                        role="artifact_readme",
+                        metadata={
+                            "kind": "artifact_readme",
+                            "group": "run_cluster_structure_qc",
+                            "structure_qc_run_id": structure_qc_run_id,
+                        },
+                    )
+                    if _sq_readme_payload:
+                        artifacts.append(_sq_readme_payload)
+                except Exception:
+                    pass  # a missing how-to-read README must never fail structure QC
 
             adata.uns.setdefault("cluster_structure_qc", {})
             adata.uns["cluster_structure_qc"][str(cluster_key)] = {

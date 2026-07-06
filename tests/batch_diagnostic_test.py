@@ -59,6 +59,23 @@ def test_batch_diagnostic_finds_shared_signature_and_confounding(tmp_path):
     )
     assert result["condition_confounding"][0]["confounded_with_batch"] is True
     assert (tmp_path / "batch_diagnostic_cluster_sample_composition.csv").exists()
+    # A self-documenting README is written alongside the CSVs, with the column
+    # glossary and an empty (to be filled by the model) interpretation section.
+    readme = tmp_path / "README.md"
+    assert readme.exists()
+    readme_text = readme.read_text()
+    from scagent.core import artifact_docs as _ad
+
+    assert _ad.DOC_MARKER in readme_text
+    assert "signature_similarity" in readme_text
+    assert _ad.interpretation_is_empty(readme_text) is True
+    # Each CSV artifact carries a machine-readable column glossary in metadata.
+    csv_arts = [
+        a for a in result["artifacts_created"]
+        if a.get("role") == "artifact" and str(a.get("path", "")).endswith(".csv")
+    ]
+    assert csv_arts and all("columns" in (a.get("metadata") or {}) for a in csv_arts)
+    assert any(a.get("role") == "artifact_readme" for a in result["artifacts_created"])
     # terminal_summary: human-readable findings the agent prints to the terminal.
     summary = result["terminal_summary"]
     assert summary[0] == "verdict: confounded_with_condition"
