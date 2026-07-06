@@ -1094,6 +1094,58 @@ def _suggested_umap_overlays(adata: Any) -> List[str]:
     return out
 
 
+def _plot_umap_overlays(adata: Any, keys, figure_dir: Any, run_manager=None,
+                        prefix: str = "umap") -> List[str]:
+    """Paint each per-cell metric in ``keys`` on the UMAP and save one figure each.
+
+    This is the auto-generation behind ``suggested_umap_overlays``: a per-cell
+    metric (batch-mixing entropy, gene-signature score, QC metric) is far more
+    informative painted on the embedding — showing WHERE it concentrates — than as
+    a scalar. Tools that write such a metric call this so the figure always exists,
+    rather than relying on the model to plot it. No-op without a UMAP. Robust: a
+    failed panel is skipped, never breaks the caller. Returns the saved file paths;
+    the caller (inside process_tool_call) wraps them into artifact payloads.
+    """
+    saved: List[str] = []
+    if adata is None or "X_umap" not in getattr(adata, "obsm", {}):
+        return saved
+    keys = [k for k in (keys or []) if k in adata.obs.columns]
+    if not keys:
+        return saved
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+    import scanpy as _sc
+
+    fig_dir = Path(figure_dir)
+    try:
+        fig_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return saved
+    for key in keys:
+        try:
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key))
+            out_path = unique_output_path(str(fig_dir / f"{prefix}_{safe}.png"))
+            ax = _sc.pl.umap(adata, color=key, show=False)
+            fig = ax.figure if hasattr(ax, "figure") else _plt.gcf()
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            _plt.close(fig)
+            if run_manager is not None:
+                try:
+                    run_manager.add_output(out_path)
+                except Exception:
+                    pass
+            saved.append(out_path)
+        except Exception:
+            try:
+                _plt.close("all")
+            except Exception:
+                pass
+            continue
+    return saved
+
+
 def _plot_cluster_qc_metrics(adata: Any, cluster_key: str, out_path: Any,
                              flagged_clusters: Any = None) -> Optional[str]:
     """Per-cluster QC metric box plots — one panel per metric, clusters on the
@@ -10541,6 +10593,9 @@ def process_tool_call(
                     )
 
                 phase_counts = adata.obs["phase"].value_counts().to_dict()
+                _ov_dir = (Path(run_manager.run_dir) if run_manager is not None else Path(".")) / "figures" / "per_cell_overlays"
+                _ov = _plot_umap_overlays(adata, ["S_score", "G2M_score", "phase"], _ov_dir, run_manager)
+                _ov_arts = [p for p in (_artifact_payload(x, role="figure", metadata={"kind": "per_cell_metric_umap"}) for x in _ov) if p]
                 return json.dumps({
                     "status": "ok",
                     "tool": "score_gene_signature",
@@ -10552,6 +10607,8 @@ def process_tool_call(
                     "scores_added": ["S_score", "G2M_score", "phase"],
                     "phase_distribution": phase_counts,
                     "suggested_umap_overlays": _suggested_umap_overlays(adata),
+                    "overlay_figures": _ov,
+                    "artifacts_created": _ov_arts,
                     "message": (
                         f"Cell cycle scoring complete. Phase distribution: "
                         + ", ".join(f"{k}: {v}" for k, v in sorted(phase_counts.items()))
@@ -10631,11 +10688,16 @@ def process_tool_call(
                     )
 
                 scores = adata.obs[score_name]
+                _ov_dir = (Path(run_manager.run_dir) if run_manager is not None else Path(".")) / "figures" / "per_cell_overlays"
+                _ov = _plot_umap_overlays(adata, [score_name], _ov_dir, run_manager)
+                _ov_arts = [p for p in (_artifact_payload(x, role="figure", metadata={"kind": "per_cell_metric_umap"}) for x in _ov) if p]
                 return json.dumps({
                     "status": "ok",
                     "tool": "score_gene_signature",
                     "mode": "signature",
                     "score_name": score_name,
+                    "overlay_figures": _ov,
+                    "artifacts_created": _ov_arts,
                     "genes_requested": len(gene_list),
                     "genes_matched": len(matched),
                     "genes_missing": len(missing),
@@ -10922,13 +10984,29 @@ def process_tool_call(
                 )
                 if payload:
                     artifacts_created.append(payload)
-            diagnostic["artifacts_created"] = artifacts_created
             diagnostic["warnings"] = warnings
+            # Per-cell neighborhood batch-mixing entropy is written to obs; AUTO-PAINT
+            # it (and any other per-cell metric present) on the UMAP so the model and
+            # user can see WHERE mixing fails, not just the scalar verdict. Don't rely
+            # on the model to plot it — the run_2026_07_05_233220 model never did.
+            overlay_keys = _suggested_umap_overlays(adata)
+            diagnostic["suggested_umap_overlays"] = overlay_keys
+            if run_manager is not None:
+                _ov_dir = Path(run_manager.run_dir) / "figures" / "per_cell_overlays"
+            else:
+                _ov_dir = Path("figures") / "per_cell_overlays"
+            # Prioritize the entropy overlay (this tool's own signal); include the rest.
+            _entropy_key = "batch_diagnostic_neighborhood_entropy"
+            _keys = ([_entropy_key] if _entropy_key in overlay_keys else []) + \
+                    [k for k in overlay_keys if k != _entropy_key]
+            overlay_paths = _plot_umap_overlays(adata, _keys, _ov_dir, run_manager)
+            for _p in overlay_paths:
+                _pl = _artifact_payload(_p, role="figure", metadata={"kind": "per_cell_metric_umap"})
+                if _pl:
+                    artifacts_created.append(_pl)
+            diagnostic["overlay_figures"] = overlay_paths
+            diagnostic["artifacts_created"] = artifacts_created
             diagnostic["state"] = make_state(adata)
-            # Per-cell metrics (e.g. neighborhood batch-mixing entropy) are written
-            # to obs; nudge the model to paint them on the UMAP and read WHERE
-            # mixing fails, not just the scalar verdict.
-            diagnostic["suggested_umap_overlays"] = _suggested_umap_overlays(adata)
             return _finalize_result(
                 diagnostic,
                 adata,

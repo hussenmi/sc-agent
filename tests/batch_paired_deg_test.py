@@ -126,3 +126,42 @@ def test_suggested_overlays_empty_without_umap():
     a = ad.AnnData(X=np.abs(np.random.default_rng(0).normal(size=(6, 4))).astype("float32"))
     a.obs["pct_counts_mt"] = np.linspace(1, 9, 6)
     assert _suggested_umap_overlays(a) == []  # nowhere to paint it yet
+
+
+# --- auto-generated per-cell UMAP overlays ------------------------------------
+def test_plot_umap_overlays_saves_one_figure_per_metric(tmp_path):
+    from scagent.agent.tools import _plot_umap_overlays
+    rng = np.random.default_rng(0)
+    a = ad.AnnData(X=np.abs(rng.normal(size=(30, 5))).astype("float32"))
+    a.obsm["X_umap"] = rng.normal(size=(30, 2))
+    a.obs["batch_diagnostic_neighborhood_entropy"] = rng.uniform(0, 1, 30)
+    a.obs["pct_counts_mt"] = rng.uniform(1, 9, 30)
+    paths = _plot_umap_overlays(a, ["batch_diagnostic_neighborhood_entropy", "pct_counts_mt"], tmp_path / "ov")
+    import os
+    assert len(paths) == 2
+    assert all(os.path.exists(p) for p in paths)
+    assert any("neighborhood_entropy" in p for p in paths)
+
+
+def test_plot_umap_overlays_noop_without_umap(tmp_path):
+    from scagent.agent.tools import _plot_umap_overlays
+    a = ad.AnnData(X=np.abs(np.random.default_rng(0).normal(size=(10, 4))).astype("float32"))
+    a.obs["pct_counts_mt"] = np.linspace(1, 9, 10)
+    assert _plot_umap_overlays(a, ["pct_counts_mt"], tmp_path / "ov") == []
+
+
+def test_score_gene_signature_auto_plots_overlay(tmp_path, monkeypatch):
+    import json
+
+    from scagent.agent.tools import process_tool_call
+    monkeypatch.chdir(tmp_path)
+    rng = np.random.default_rng(0)
+    a = ad.AnnData(X=np.abs(rng.normal(size=(40, 8))).astype("float32"),
+                   var=pd.DataFrame(index=[f"G{j}" for j in range(8)]))
+    a.obsm["X_umap"] = rng.normal(size=(40, 2))
+    res, _ = process_tool_call("score_gene_signature", {"gene_list": ["G0", "G1", "G2"], "score_name": "prog_score"}, a)
+    d = json.loads(res)
+    assert d["status"] == "ok"
+    assert d["overlay_figures"] and any("prog_score" in p for p in d["overlay_figures"])
+    import os
+    assert all(os.path.exists(p) for p in d["overlay_figures"])
