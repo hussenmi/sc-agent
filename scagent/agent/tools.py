@@ -2966,6 +2966,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "properties": {
                     "cluster_key": {"type": "string", "description": "obs column with cluster labels (default: leiden)"},
                     "allow_precorrection_clustering": {"type": "boolean", "description": "Expert override (default false). When the dataset is batch-corrected, prepare_annotation refuses to annotate a clustering that was NOT computed on the integrated embedding (e.g. a stale pre-integration clustering). Set true only to deliberately annotate a pre-integration clustering, with a documented reason."},
+                    "allow_skip_structure_qc": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until cluster STRUCTURE QC (run_cluster_structure_qc) has run on this clustering — it is required evidence that distinguishes coherent clusters from doublet/noise mixtures. Set true ONLY if the user explicitly asked to skip structure QC."},
                     "marker_dict": {
                         "type": "object",
                         "description": (
@@ -13090,6 +13091,53 @@ def process_tool_call(
                             "Annotate that post-integration clustering's cluster_key.",
                             "Override only with a documented reason: set "
                             "allow_precorrection_clustering=true.",
+                        ],
+                    )
+
+            # --- Floor 2: cluster STRUCTURE QC must have run on this clustering ---
+            # Structure QC (gene-gene covariance modules, clustered correlation
+            # heatmaps, technical Moran's I) is the ONLY check that distinguishes a
+            # coherent biological cluster from a doublet/noise mixture that looks
+            # metrically normal — it is required evidence BEFORE annotation, not
+            # optional, and must be re-run per clustering. The terminal obligation
+            # alone let a run skip it inline and dive straight into annotation
+            # (run_2026_07_05_225406). This gates annotation entry at the point of
+            # error. Freshness comes from the world_state registry (a recluster +
+            # re-run of run_cluster_qc clears the structure marker, so this
+            # re-fires); adata.uns is a data-persistent fallback when no world_state
+            # is present. Override only with an explicit user opt-out.
+            allow_skip_structure_qc = bool(tool_input.get("allow_skip_structure_qc", False))
+            if not allow_skip_structure_qc:
+                structure_done = False
+                if world_state is not None:
+                    _reg = getattr(world_state, "cluster_qc_registry", None) or {}
+                    _entry = _reg.get(str(cluster_key)) if isinstance(_reg, dict) else None
+                    structure_done = isinstance(_entry, dict) and bool(_entry.get("structure_qc_run_id"))
+                else:
+                    _uns_sq = adata.uns.get("cluster_structure_qc") if hasattr(adata, "uns") else None
+                    structure_done = isinstance(_uns_sq, dict) and str(cluster_key) in _uns_sq
+                if not structure_done:
+                    return _smart_unavailable_result(
+                        tool="prepare_annotation",
+                        message=(
+                            f"Cluster STRUCTURE QC has not run on the active clustering "
+                            f"'{cluster_key}'. Structure QC — gene-gene covariance modules, clustered "
+                            "correlation heatmaps, and technical Moran's I — is REQUIRED evidence "
+                            "before annotation: it is the only check that tells a coherent biological "
+                            "cluster from a doublet/noise mixture that looks metrically normal, and it "
+                            "must be run per clustering. Run it before preparing annotation."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["cluster_structure_qc"],
+                        recovery_options=[
+                            f"If not already done, run_cluster_qc(cluster_key='{cluster_key}') to "
+                            "nominate metric-flagged/ambiguous clusters (and structure_qc_baseline_clusters "
+                            "when none are flagged).",
+                            f"Then run_cluster_structure_qc(cluster_key='{cluster_key}') on those "
+                            "clusters — this is the required covariance-structure evidence layer.",
+                            "Then re-run prepare_annotation.",
+                            "Bypass ONLY if the user explicitly asked to skip structure QC: "
+                            "set allow_skip_structure_qc=true.",
                         ],
                     )
 

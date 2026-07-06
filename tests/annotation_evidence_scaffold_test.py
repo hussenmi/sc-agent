@@ -280,6 +280,9 @@ def _integration_adata(seed=1, n=90, g=40):
         rng.choice(["t cell", "b cell", "monocyte"], n)
     )
     register_clustering(a, cluster_key="leiden", method="leiden", resolution=1.0, use_rep="X_scVI")
+    # prepare_annotation now gates on cluster structure QC having run for this
+    # clustering; these tests exercise the scaffold, not that gate, so mark it done.
+    a.uns["cluster_structure_qc"] = {"leiden": {"structure_qc_run_id": "test-structure-qc"}}
     return a
 
 
