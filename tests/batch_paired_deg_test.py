@@ -68,7 +68,11 @@ def test_paired_deg_flags_same_type_across_samples_as_conclusive():
     # its shared within-sample identity is the planted identity genes
     assert {"G0", "G1", "G2"}.issubset(set(pair["shared_identity_genes"]))
     assert res["verdict"] == "batch_effect_supported"
-    assert any("within-sample identity DEG" in r for r in res["support_reasons"])
+    # The support reason is phrased in plain language (no raw "DEG" jargon leak)
+    # but still conveys the same-cell-type-split-across-samples finding.
+    assert any(
+        "same cell type appears split across samples" in r for r in res["support_reasons"]
+    )
 
 
 def test_paired_deg_does_not_flag_different_types():

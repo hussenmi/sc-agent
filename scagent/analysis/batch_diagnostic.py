@@ -911,12 +911,12 @@ def diagnose_batch_effect(
         top = identity_deg["conclusive_pairs"][0]
         shared_str = ", ".join(top["shared_identity_genes"][:8]) or "shared identity genes"
         support_reasons.append(
-            f"within-sample identity DEG is conclusive: cluster {top['cluster_a']} (sample "
-            f"{top['sample_a']}) and cluster {top['cluster_b']} (sample {top['sample_b']}) share their "
-            f"within-sample identity signature (similarity {top['signature_similarity']:.2f}; shared "
-            f"genes: {shared_str}). Each was DEG'd against the rest of its OWN sample, so batch is held "
-            f"constant inside each test — a match means they are the same cell population separated only "
-            f"by sample, which is a batch effect that integration should merge"
+            f"the same cell type appears split across samples: cluster {top['cluster_a']} (sample "
+            f"{top['sample_a']}) and cluster {top['cluster_b']} (sample {top['sample_b']}) carry almost "
+            f"the same marker genes when each is compared against the rest of its OWN sample "
+            f"(similarity {top['signature_similarity']:.2f}; shared genes: {shared_str}). Because each "
+            f"comparison stays inside a single sample, batch is held constant — so the match means these "
+            f"are one cell population pulled apart only by sample, a batch effect that integration should merge"
         )
 
     # Name the markers behind sample-segregated Epithelial clusters and caveat them: the
@@ -1047,36 +1047,52 @@ def diagnose_batch_effect(
 
     # Human-readable findings shown in the terminal (the agent prints
     # result["terminal_summary"] for reasoning tools). Keep it concise.
-    terminal_summary = [f"verdict: {verdict}"]
+    # Human-readable verdict label (the machine slug stays on result["verdict"]).
+    verdict_label = {
+        "confounded_with_condition": (
+            "Sample and experimental condition overlap, so a batch effect can't be "
+            "separated from real biology"
+        ),
+        "batch_effect_supported": "Evidence points to a technical batch effect across samples",
+        "insufficient_evidence": "Not enough evidence to call this a batch effect either way",
+        "no_correction_needed": "Samples look well mixed — no batch correction appears needed",
+    }.get(verdict, verdict)
+    terminal_summary = [f"Verdict: {verdict_label}"]
     terminal_summary += [f"• {r}" for r in support_reasons]
     terminal_summary += [f"⚠ {r}" for r in caution_reasons]
     if sample_dominated:
         terminal_summary.append(
-            f"{len(sample_dominated)} sample-dominated cluster(s); "
-            f"{dominated_cell_fraction * 100:.0f}% of cells in them"
+            f"{len(sample_dominated)} cluster(s) are made up almost entirely of one sample "
+            f"({dominated_cell_fraction * 100:.0f}% of all cells sit in them) — a sign cells are "
+            "grouping by which sample they came from rather than by cell type"
         )
     if entropy_ok is not None:
         if entropy_ok["mixing_ratio"] is not None:
             terminal_summary.append(
-                f"neighborhood batch entropy {entropy_ok['mean_entropy']:.2f} / "
-                f"ceiling {entropy_ok['global_ceiling']:.2f} "
-                f"(ratio {entropy_ok['mixing_ratio']:.2f}) in {entropy_ok['use_rep']}"
+                "Neighborhood mixing: on average each cell's nearest neighbors span "
+                f"{entropy_ok['mixing_ratio'] * 100:.0f}% of the sample variety you'd see if the "
+                "samples were perfectly intermixed — lower means cells tend to sit next to others "
+                "from their own sample (a batch signature)"
             )
         else:
             terminal_summary.append(
-                f"neighborhood batch entropy {entropy_ok['mean_entropy']:.2f} in "
-                f"{entropy_ok['use_rep']}"
+                "Neighborhood mixing across samples: entropy "
+                f"{entropy_ok['mean_entropy']:.2f} (higher = better intermixed)"
             )
     terminal_summary.append(
-        f"cluster↔sample ARI {concordance['ari']:.2f}, NMI {concordance['nmi']:.2f} "
-        f"({concordance['interpretation']})"
+        f"How closely clusters track samples: ARI {concordance['ari']:.2f}, NMI "
+        f"{concordance['nmi']:.2f} (0 = clusters unrelated to sample, 1 = clusters exactly follow "
+        f"sample; {concordance['interpretation']})"
     )
     if identity_deg["n_conclusive"]:
         top = identity_deg["conclusive_pairs"][0]
         terminal_summary.append(
-            f"within-sample identity DEG: {identity_deg['n_conclusive']} conclusive cross-sample "
-            f"pair(s) — e.g. clusters {top['cluster_a']}({top['sample_a']}) & "
-            f"{top['cluster_b']}({top['sample_b']}) match at {top['signature_similarity']:.2f}"
+            f"Same cell type split across samples: {identity_deg['n_conclusive']} clear case(s). "
+            f"For example, cluster {top['cluster_a']} (sample {top['sample_a']}) and cluster "
+            f"{top['cluster_b']} (sample {top['sample_b']}) carry almost the same marker genes when "
+            f"each is compared against the rest of its OWN sample (match "
+            f"{top['signature_similarity']:.2f}) — i.e. one population pulled apart by sample, "
+            "which is a batch effect integration should merge"
         )
     terminal_summary.append(f"→ {recommendation}")
 

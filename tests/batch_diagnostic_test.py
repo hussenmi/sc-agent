@@ -77,8 +77,12 @@ def test_batch_diagnostic_finds_shared_signature_and_confounding(tmp_path):
     assert csv_arts and all("columns" in (a.get("metadata") or {}) for a in csv_arts)
     assert any(a.get("role") == "artifact_readme" for a in result["artifacts_created"])
     # terminal_summary: human-readable findings the agent prints to the terminal.
+    # The verdict line is a plain-language label (the machine slug stays on
+    # result["verdict"], asserted above), not the raw enum value.
     summary = result["terminal_summary"]
-    assert summary[0] == "verdict: confounded_with_condition"
+    assert summary[0].startswith("Verdict:")
+    assert "confounded" not in summary[0].lower() or "condition" in summary[0].lower()
+    assert "confounded_with_condition" not in summary[0]  # no raw slug leaks
     assert summary[-1].startswith("→ ")  # recommendation line
 
 
