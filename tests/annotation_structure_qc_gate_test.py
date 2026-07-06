@@ -76,3 +76,43 @@ def test_explicit_opt_out_bypasses_structure_qc_gate():
         "prepare_annotation", {"cluster_key": "leiden", "allow_skip_structure_qc": True}, a
     )
     assert "cluster_structure_qc" not in _missing(res)
+
+
+# --- Floor 3: reference annotation (Scimilarity) must run before proposal ------
+def _adata_structure_done(**kw):
+    a = _adata(**kw)
+    # satisfy Floor 2 so Floor 3 (scimilarity) is what's exercised
+    a.uns["cluster_structure_qc"] = {"leiden": {"structure_qc_run_id": "sq1"}}
+    return a
+
+
+def test_prepare_refuses_without_scimilarity():
+    a = _adata_structure_done()
+    res, _ = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
+    assert "scimilarity" in _missing(res)
+
+
+def test_prepare_allowed_when_scimilarity_output_present():
+    a = _adata_structure_done()
+    a.obs["scimilarity_predictions_unconstrained"] = pd.Categorical(["T", "B", "Mono"] * (a.n_obs // 3 + 1))[: a.n_obs]
+    res, _ = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
+    assert "scimilarity" not in _missing(res)
+
+
+def test_prepare_allowed_when_scimilarity_blocker_recorded():
+    a = _adata_structure_done()
+    ws = AgentWorldState()
+    ws.cluster_qc_registry = {"leiden": {"cluster_key": "leiden", "checked_at": "t0", "structure_qc_run_id": "sq1"}}
+    ws.annotation_validation = {"reference_source_unavailable": {"scimilarity": {"reason": "package_missing"}}}
+    res, _ = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a, world_state=ws)
+    assert "scimilarity" not in _missing(res)
+
+
+def test_scimilarity_gate_opt_out():
+    a = _adata_structure_done()
+    res, _ = process_tool_call(
+        "prepare_annotation",
+        {"cluster_key": "leiden", "allow_skip_reference_tools": True},
+        a,
+    )
+    assert "scimilarity" not in _missing(res)

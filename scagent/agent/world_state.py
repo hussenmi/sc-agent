@@ -1022,6 +1022,24 @@ class AgentWorldState:
                     "cluster_decisions": result.get("cluster_decisions", {}),
                     "cluster_table": result.get("cluster_table", []),
                 }
+                # run_cluster_qc now auto-chains structure QC in the same call and
+                # embeds a slim `structure_qc` payload. Record it on the SAME
+                # registry entry so the structure_qc floor + prepare_annotation gate
+                # see it (structure QC ran on this clustering) without a separate
+                # run_cluster_structure_qc tool call.
+                embedded_sq = result.get("structure_qc")
+                if isinstance(embedded_sq, dict) and embedded_sq.get("structure_qc_run_id"):
+                    entry = self.cluster_qc_registry.get(str(cluster_key), {})
+                    entry["structure_checked_at"] = _utc_now_iso()
+                    entry["structure_qc_run_id"] = embedded_sq.get("structure_qc_run_id")
+                    entry["structure_qc_pass"] = embedded_sq.get("structure_qc_pass")
+                    entry["structure_figure_dir"] = embedded_sq.get("figure_dir")
+                    entry["structure_heatmap_paths"] = embedded_sq.get("heatmap_paths", [])
+                    entry["structure_qc_json"] = embedded_sq.get("structure_qc_json")
+                    entry["structure_qc_markdown"] = embedded_sq.get("structure_qc_markdown")
+                    entry["synthesized_removal"] = embedded_sq.get("synthesized_removal", [])
+                    self.cluster_qc_registry[str(cluster_key)] = entry
+
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
                     self.data_summary.get("cluster_key"),

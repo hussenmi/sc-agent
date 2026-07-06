@@ -109,3 +109,53 @@ def test_no_doublet_signal_nominates_baseline_structure_qc():
     assert d["doublet_signal_missing"] is True
     assert sorted(d["structure_qc_baseline_clusters"]) == ["0", "1", "2"]
     assert d["structure_qc_recommended"] is True
+
+
+# --- auto-chained structure QC (nominate + adjudicate in one run_cluster_qc) ---
+def _structure_capable_adata(n=120, g=60, k=3):
+    rng = np.random.default_rng(0)
+    leiden = [str(i % k) for i in range(n)]
+    a = ad.AnnData(X=rng.poisson(1.0, size=(n, g)).astype("float32"),
+                   var=pd.DataFrame(index=[f"g{j}" for j in range(g)]))
+    a.obs["leiden"] = pd.Categorical(leiden)
+    a.obs["total_counts"] = rng.uniform(2000, 5000, n).astype("float32")
+    a.obs["n_genes_by_counts"] = rng.uniform(1000, 2500, n).astype("float32")
+    a.obs["pct_counts_mt"] = rng.uniform(2, 8, n).astype("float32")
+    return a
+
+
+def test_run_cluster_qc_auto_runs_structure_qc():
+    a = _structure_capable_adata()
+    res, _ = process_tool_call("run_cluster_qc", {"save_checkpoint": False}, a)
+    d = json.loads(res)
+    assert d["structure_qc_ran"] is True
+    assert d["structure_qc"]["structure_qc_run_id"]
+    # structure QC record is written to adata.uns for the active clustering
+    assert "leiden" in a.uns.get("cluster_structure_qc", {})
+
+
+def test_auto_structure_qc_satisfies_obligation_and_gate():
+    # Full flow: run_cluster_qc auto-runs structure QC; applying the result to
+    # world_state records structure_qc_run_id -> structure_qc floor satisfied AND
+    # prepare_annotation's structure gate passes, with NO separate structure call.
+    a = _structure_capable_adata()
+    ws = AgentWorldState()
+    res, a = process_tool_call("run_cluster_qc", {"save_checkpoint": False}, a, world_state=ws)
+    ws.apply_tool_result("run_cluster_qc", json.loads(res), adata=a)
+    entry = ws.cluster_qc_registry.get("leiden", {})
+    assert entry.get("checked_at") and entry.get("structure_qc_run_id")
+    assert ws.structure_qc_obligation_unmet() is False
+    # prepare_annotation structure floor is satisfied (only scimilarity remains)
+    pres, _ = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a, world_state=ws)
+    missing = json.loads(pres).get("missing_prerequisites", []) or []
+    assert "cluster_structure_qc" not in missing
+
+
+def test_auto_structure_qc_can_be_disabled():
+    a = _structure_capable_adata()
+    res, _ = process_tool_call(
+        "run_cluster_qc", {"save_checkpoint": False, "auto_structure_qc": False}, a
+    )
+    d = json.loads(res)
+    assert d["structure_qc_ran"] is False
+    assert "structure_qc" not in d

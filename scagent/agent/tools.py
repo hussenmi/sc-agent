@@ -2966,7 +2966,8 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "properties": {
                     "cluster_key": {"type": "string", "description": "obs column with cluster labels (default: leiden)"},
                     "allow_precorrection_clustering": {"type": "boolean", "description": "Expert override (default false). When the dataset is batch-corrected, prepare_annotation refuses to annotate a clustering that was NOT computed on the integrated embedding (e.g. a stale pre-integration clustering). Set true only to deliberately annotate a pre-integration clustering, with a documented reason."},
-                    "allow_skip_structure_qc": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until cluster STRUCTURE QC (run_cluster_structure_qc) has run on this clustering — it is required evidence that distinguishes coherent clusters from doublet/noise mixtures. Set true ONLY if the user explicitly asked to skip structure QC."},
+                    "allow_skip_structure_qc": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until cluster STRUCTURE QC has run on this clustering (run_cluster_qc auto-runs it) — it is required evidence that distinguishes coherent clusters from doublet/noise mixtures. Set true ONLY if the user explicitly asked to skip structure QC."},
+                    "allow_skip_reference_tools": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until Scimilarity has run (or recorded a real blocker) — reference labels are primary annotation evidence and the proposal must be built after they exist. Set true ONLY if the user explicitly opted out of reference tools."},
                     "marker_dict": {
                         "type": "object",
                         "description": (
@@ -3607,7 +3608,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline structure-QC pass over all clusters is nominated so problematic clusters are not missed). Does NOT remove any cells; it nominates proposed-removal and ambiguous clusters for structure QC adjudication. Call this after EACH clustering (including after a removal+recluster) to identify low-quality, low-complexity, doublet-enriched, high-ribosomal, or ambiguous clusters before annotation. Also saves a per-cluster QC box-plot figure (one compact multi-panel figure per iteration, metric-flagged clusters highlighted) to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png and returns its path in `qc_metrics_figure` — cite it in the QC reasoning report.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on the flagged/ambiguous (or baseline) clusters — gene-gene covariance modules, clustered correlation heatmaps, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`) and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite both in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -3617,6 +3618,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "ribo_threshold": {"type": "number", "description": "Mean ribosomal% above which a cluster is flagged for structure-QC review (default: 50). Only applied when pct_counts_ribo is present in obs."},
                     "low_lib_fraction": {"type": "number", "description": "Fraction of global median library size below which lib size is considered low (default: 0.5)"},
                     "low_genes_fraction": {"type": "number", "description": "Fraction of global median n_genes below which gene count is considered low (default: 0.5)"},
+                    "auto_structure_qc": {"type": "boolean", "description": "Auto-run cluster structure QC on the flagged/ambiguous/baseline clusters within this call (default: true). Set false only to run structure QC separately with custom parameters."},
                     "save_checkpoint": {"type": "boolean", "description": "Save an h5ad checkpoint before any removal (default: true)"},
                     "checkpoint_path": {"type": "string", "description": "Path for checkpoint file (default: <output_dir>/checkpoint_pre_cleanup.h5ad)"}
                 },
@@ -12233,25 +12235,84 @@ def process_tool_call(
                 "ribo_signal_available": bool("pct_counts_ribo" in adata.obs.columns),
                 "state": make_state(adata),
             }
-            if structure_qc_baseline_clusters:
-                result["next_step"] = (
-                    "Doublet detection was not run, so metric QC could not flag doublet-enriched "
-                    "clusters and nothing was nominated for adjudication. Run "
-                    "run_cluster_structure_qc(clusters_to_analyze=structure_qc_baseline_clusters) "
-                    "as a baseline cluster-coherence check BEFORE annotation, even though no "
-                    "clusters were metric-flagged — this is the only layer that can catch a "
-                    "structurally incoherent (e.g. doublet-mixture) cluster with normal metrics."
+
+            # --- Auto-chain structure QC: nominate + adjudicate in ONE step ---
+            # Structure QC is not a separate, skippable checkbox — its gene-gene
+            # covariance evidence exists to inform the SAME cleanup decision as the
+            # metric screen. Run it here, immediately, on the flagged/ambiguous
+            # clusters (or the baseline set when nothing was metric-flagged), so a
+            # filtering decision is made from metric + structure evidence together,
+            # early, where it matters — not deferred to a later step the model can
+            # skip (run_2026_07_05_225406 skipped it and only ran it post-save).
+            # Embedded in this result so world_state records structure QC from the
+            # same call. Disable only with auto_structure_qc=false.
+            auto_structure_qc = bool(tool_input.get("auto_structure_qc", True))
+            structure_targets = list(dict.fromkeys(
+                [str(c) for c in (metric_flagged_clusters or [])]
+                + [str(c) for c in (ambiguous or [])]
+                + [str(c) for c in (structure_qc_baseline_clusters or [])]
+            ))
+            result["structure_qc_ran"] = False
+            if auto_structure_qc and structure_targets:
+                try:
+                    _sq_json, adata = process_tool_call(
+                        "run_cluster_structure_qc",
+                        {"cluster_key": cluster_key, "clusters_to_analyze": structure_targets},
+                        adata,
+                        world_state=world_state,
+                        run_manager=run_manager,
+                    )
+                    _sq = json.loads(_sq_json)
+                    if _sq.get("status") in ("ok", "success"):
+                        result["structure_qc_ran"] = True
+                        # Slim: the cleanup decision + figure pointers only. Full
+                        # per-cluster correlation detail is on adata.uns and the
+                        # saved cluster_structure_qc_*.json/.md reports.
+                        result["structure_qc"] = {
+                            "structure_qc_run_id": _sq.get("structure_qc_run_id"),
+                            "structure_qc_pass": _sq.get("structure_qc_pass"),
+                            "clusters_analyzed": _sq.get("clusters_analyzed") or structure_targets,
+                            "synthesized_removal": _sq.get("synthesized_removal"),
+                            "cells_in_synthesized_removal": _sq.get("cells_in_synthesized_removal"),
+                            "rescued_clusters": _sq.get("rescued_clusters"),
+                            "conflicting": _sq.get("conflicting"),
+                            "requires_review": _sq.get("requires_review"),
+                            "heatmap_paths": _sq.get("heatmap_paths"),
+                            "figure_dir": _sq.get("figure_dir"),
+                            "structure_qc_markdown": _sq.get("structure_qc_markdown"),
+                            "structure_qc_json": _sq.get("structure_qc_json"),
+                        }
+                        result["state"] = make_state(adata)  # uns changed
+                    else:
+                        result["structure_qc_error"] = _sq.get("message")
+                except Exception as _sq_err:  # pragma: no cover - defensive
+                    result["structure_qc_error"] = str(_sq_err)
+
+            _sq_note = ""
+            if result.get("structure_qc_ran"):
+                _syn = (result.get("structure_qc") or {}).get("synthesized_removal") or []
+                _sq_note = (
+                    f" Structure QC ran on {len(structure_targets)} cluster(s); "
+                    + (f"synthesized removal set: {_syn}." if _syn
+                       else "no clusters synthesized for removal (all coherent).")
                 )
+            elif structure_targets and result.get("structure_qc_error"):
+                _sq_note = (
+                    f" Structure QC could not run automatically ({result['structure_qc_error']}); "
+                    "run run_cluster_structure_qc manually before annotation."
+                )
+
+            if structure_qc_baseline_clusters:
                 summary = (
                     f"Cluster QC: no metric flags, but doublet detection was unavailable — "
-                    f"run structure QC as a baseline coherence check over all {len(cluster_qc)} "
-                    "clusters before annotation."
+                    f"structure QC run as a baseline coherence check over all {len(cluster_qc)} "
+                    f"clusters.{_sq_note}"
                 )
             else:
                 summary = (
                     f"Cluster QC: {len(metric_flagged_clusters)} metric-flagged cluster(s) "
                     f"({cells_metric_flagged} cells, {result['pct_metric_flagged']}%) and "
-                    f"{len(ambiguous)} ambiguous cluster(s) require structure QC adjudication."
+                    f"{len(ambiguous)} ambiguous cluster(s).{_sq_note}"
                 )
             artifacts = []
             if checkpoint_path:
@@ -13130,14 +13191,57 @@ def process_tool_call(
                         adata_obj=adata,
                         missing_prerequisites=["cluster_structure_qc"],
                         recovery_options=[
-                            f"If not already done, run_cluster_qc(cluster_key='{cluster_key}') to "
-                            "nominate metric-flagged/ambiguous clusters (and structure_qc_baseline_clusters "
-                            "when none are flagged).",
-                            f"Then run_cluster_structure_qc(cluster_key='{cluster_key}') on those "
-                            "clusters — this is the required covariance-structure evidence layer.",
+                            f"Run run_cluster_qc(cluster_key='{cluster_key}') — it now AUTO-RUNS "
+                            "structure QC on the flagged/ambiguous (or baseline) clusters in the same "
+                            "call, so this single step satisfies the requirement.",
+                            f"Or run run_cluster_structure_qc(cluster_key='{cluster_key}') directly on "
+                            "the metric-flagged/ambiguous clusters.",
                             "Then re-run prepare_annotation.",
                             "Bypass ONLY if the user explicitly asked to skip structure QC: "
                             "set allow_skip_structure_qc=true.",
+                        ],
+                    )
+
+            # --- Floor 3: reference annotation (Scimilarity) must have run first ---
+            # Scimilarity + CellTypist are PRIMARY annotation evidence; the proposal
+            # must be built AFTER the reference labels exist, not before. Previously
+            # a run that skipped Scimilarity built a weaker proposal and was only
+            # rejected downstream at stage/finalize (run_2026_07_05_225406) — a
+            # wasted loop. Gate here: Scimilarity must have run (output present) OR
+            # have a tool-recorded blocker (run_scimilarity failure records
+            # reference_source_unavailable). A manual "unavailable" claim is NOT
+            # enough — the strict tool-recorded check stays at finalize.
+            allow_skip_reference_tools = bool(tool_input.get("allow_skip_reference_tools", False))
+            if not allow_skip_reference_tools:
+                scim_ran = (
+                    any(str(c).lower().startswith("scimilarity") for c in adata.obs.columns)
+                    or any("scimilarity" in str(k).lower() for k in getattr(adata, "obsm", {}).keys())
+                )
+                scim_blocker = False
+                if world_state is not None:
+                    _av = getattr(world_state, "annotation_validation", None) or {}
+                    _rsu = _av.get("reference_source_unavailable") or {}
+                    scim_blocker = "scimilarity" in _rsu
+                if not scim_ran and not scim_blocker:
+                    return _smart_unavailable_result(
+                        tool="prepare_annotation",
+                        message=(
+                            "Scimilarity has not run. Reference annotation (Scimilarity, and "
+                            "CellTypist) is primary evidence for the proposal — build the proposal "
+                            "AFTER the reference labels exist, not before. Run run_scimilarity (with "
+                            "the dataset organism) first; if it genuinely cannot run, run it anyway so "
+                            "the tool records the concrete blocker (a manual 'unavailable' claim is "
+                            "rejected at finalize)."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["scimilarity"],
+                        recovery_options=[
+                            "run_scimilarity with the known organism (human/mouse), then re-run prepare_annotation.",
+                            "Also run run_celltypist with a tissue-appropriate model if not already done.",
+                            "If Scimilarity truly cannot run, run it once so the failure records the "
+                            "blocker — then prepare_annotation proceeds and finalize enforces the strict check.",
+                            "Bypass ONLY if the user explicitly opted out of reference tools: "
+                            "set allow_skip_reference_tools=true.",
                         ],
                     )
 
