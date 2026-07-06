@@ -44,13 +44,17 @@ def _run(adata, monkeypatch, tmp_path):
     return json.loads(rj)
 
 
-def test_no_baseline_when_doublets_present(monkeypatch, tmp_path):
+def test_baseline_runs_even_when_doublets_present_and_clean(monkeypatch, tmp_path):
+    # Structure QC must ALWAYS run: metric-clean is not "coherent". Even with
+    # doublet scores present and nothing metric-flagged, a baseline coherence
+    # check over all clusters is nominated and auto-run.
     r = _run(_clean_clustered_adata(with_doublets=True), monkeypatch, tmp_path)
     assert r["status"] == "ok"
     assert r["metric_flagged_clusters"] == []          # all clean
     assert r["doublet_signal_missing"] is False
-    assert r["structure_qc_baseline_clusters"] == []   # nothing to force
-    assert "next_step" not in r
+    assert sorted(r["structure_qc_baseline_clusters"]) == ["0", "1", "2"]
+    assert r.get("structure_qc_ran") is True
+    assert r["structure_qc"].get("structure_qc_run_id")
 
 
 def test_baseline_nominated_when_doublets_missing(monkeypatch, tmp_path):
@@ -64,3 +68,23 @@ def test_baseline_nominated_when_doublets_missing(monkeypatch, tmp_path):
     assert r["structure_qc_recommended"] is True
     assert r.get("structure_qc_ran") is True
     assert "structure_qc" in r and r["structure_qc"].get("structure_qc_run_id")
+
+
+def test_structure_qc_reports_coherence_breakdown_and_caps_heatmaps(monkeypatch, tmp_path):
+    # Coherence metrics computed for every cluster; result carries a breakdown +
+    # summary, and heatmaps are capped (max_heatmaps) rather than one-per-cluster.
+    import json
+    monkeypatch.chdir(tmp_path)
+    a = _clean_clustered_adata(with_doublets=True)
+    rj, _ = process_tool_call(
+        "run_cluster_qc",
+        {"cluster_key": "leiden", "save_checkpoint": False, "max_heatmaps": 2},
+        a,
+    )
+    r = json.loads(rj)
+    sq = r.get("structure_qc") or {}
+    assert sq.get("structure_qc_run_id")
+    assert sq.get("n_clusters_analyzed") == 3           # all clusters assessed
+    assert isinstance(sq.get("coherence_breakdown"), dict)
+    assert sq.get("n_heatmaps_rendered") <= 2           # capped
+    assert "coherence" in (sq.get("structure_summary") or "").lower()

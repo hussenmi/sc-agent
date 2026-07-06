@@ -12228,18 +12228,19 @@ def process_tool_call(
             metric_flagged_clusters = list(proposed_removal)
             cells_metric_flagged = cells_proposed
 
-            # When doublet detection was skipped/unavailable, metric QC has no
-            # doublet signal and cannot flag doublet-enriched clusters — and since
-            # structure QC normally only adjudicates metric-flagged/ambiguous
-            # clusters, it would never run, leaving a doublet mixture that looks
-            # metrically normal with NO detection path. In that case nominate a
-            # baseline structure-QC pass over all clusters so cluster coherence is
-            # still checked before annotation. (structure QC filters clusters below
-            # its min_cells, so nominating all is safe.) See prompts.py cluster-QC.
+            # Structure QC must ALWAYS run — "no metric flags" is NOT "clusters
+            # confirmed coherent". Metric QC cannot see a doublet/noise MIXTURE that
+            # happens to have normal library size, genes, and MT% (and if Scrublet
+            # was skipped there is no doublet signal at all — the case where a
+            # coherence check matters MOST). So whenever nothing is metric-flagged
+            # or ambiguous, nominate a baseline structure-QC pass over ALL clusters
+            # to confirm coherence. structure QC filters clusters below its
+            # min_cells and caps how many heatmaps it renders, so nominating all is
+            # safe and bounded. See prompts.py cluster-QC.
             doublet_signal_missing = not has_doublet
             structure_qc_baseline_clusters = (
                 sorted(set(cluster_labels))
-                if (doublet_signal_missing and not metric_flagged_clusters and not ambiguous)
+                if (not metric_flagged_clusters and not ambiguous)
                 else []
             )
 
@@ -12392,6 +12393,12 @@ def process_tool_call(
                             "structure_qc_run_id": _sq.get("structure_qc_run_id"),
                             "structure_qc_pass": _sq.get("structure_qc_pass"),
                             "clusters_analyzed": _sq.get("clusters_analyzed") or structure_targets,
+                            "n_clusters_analyzed": _sq.get("n_clusters_analyzed"),
+                            "n_coherent_clusters": _sq.get("n_coherent_clusters"),
+                            "n_noncoherent_clusters": _sq.get("n_noncoherent_clusters"),
+                            "coherence_breakdown": _sq.get("coherence_breakdown"),
+                            "n_heatmaps_rendered": _sq.get("n_heatmaps_rendered"),
+                            "structure_summary": _sq.get("structure_summary"),
                             "synthesized_removal": _sq.get("synthesized_removal"),
                             "cells_in_synthesized_removal": _sq.get("cells_in_synthesized_removal"),
                             "rescued_clusters": _sq.get("rescued_clusters"),
@@ -12410,12 +12417,7 @@ def process_tool_call(
 
             _sq_note = ""
             if result.get("structure_qc_ran"):
-                _syn = (result.get("structure_qc") or {}).get("synthesized_removal") or []
-                _sq_note = (
-                    f" Structure QC ran on {len(structure_targets)} cluster(s); "
-                    + (f"synthesized removal set: {_syn}." if _syn
-                       else "no clusters synthesized for removal (all coherent).")
-                )
+                _sq_note = " " + str((result.get("structure_qc") or {}).get("structure_summary") or "")
             elif structure_targets and result.get("structure_qc_error"):
                 _sq_note = (
                     f" Structure QC could not run automatically ({result['structure_qc_error']}); "
@@ -12423,10 +12425,11 @@ def process_tool_call(
                 )
 
             if structure_qc_baseline_clusters:
+                _no_dbl = " (doublet detection was not run, so a coherence check matters even more)" if doublet_signal_missing else ""
                 summary = (
-                    f"Cluster QC: no metric flags, but doublet detection was unavailable — "
-                    f"structure QC run as a baseline coherence check over all {len(cluster_qc)} "
-                    f"clusters.{_sq_note}"
+                    f"Cluster QC: no metric-flagged or ambiguous clusters{_no_dbl} — structure QC "
+                    f"run as a baseline coherence check over all {len(cluster_qc)} clusters, because "
+                    f"metric-clean does not mean coherent.{_sq_note}"
                 )
             else:
                 summary = (
@@ -12482,6 +12485,13 @@ def process_tool_call(
             min_cells = max(2, int(tool_input.get("min_cells", 15)))
             moran_min_cells = max(2, int(tool_input.get("moran_min_cells", 40)))
             corr_threshold = float(tool_input.get("corr_threshold", 0.3))
+            # Coherence metrics are computed for EVERY analyzed cluster; heatmap
+            # figures are capped so a baseline pass over many clusters doesn't emit
+            # dozens of PNGs. Originally metric-flagged/ambiguous clusters always get
+            # a heatmap; among the remaining (baseline) clusters, only the least
+            # coherent — the ones actually worth eyeballing — are plotted, up to the
+            # cap. Coherent clusters get a recorded verdict but no figure.
+            max_heatmaps = int(tool_input.get("max_heatmaps", 20))
 
             latest_cluster_qc = {}
             if world_state is not None:
@@ -12747,6 +12757,7 @@ def process_tool_call(
             artifacts = []
             heatmap_paths = []
             heatmap_artifacts = []
+            heatmaps_rendered = 0
             synthesized_removal = []
             rescued_clusters = []
             conflicting_clusters = []
@@ -12839,47 +12850,63 @@ def process_tool_call(
                         linkage_status = f"failed: {e}"
 
                 reordered = corr_matrix[_np.ix_(order, order)]
-                safe_cluster_id = _safe_path_component(cluster_id)
-                heatmap_path = figure_dir / f"cluster_{safe_cluster_id}_correlation.png"
-                fig_width = max(5.0, min(9.0, x_sub.shape[1] / 20))
-                fig, ax = _plt.subplots(figsize=(fig_width, fig_width))
-                image = ax.imshow(reordered, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
-                ax.set_title(
-                    f"{cluster_key} / pass {structure_qc_pass:03d} / cluster {cluster_id}\n"
-                    f"{x_sub.shape[1]} genes x {n_cells} cells | mean_abs_corr={mean_abs_corr:.3f}"
-                )
-                if x_sub.shape[1] <= 60:
-                    ordered_names = [selected_gene_names[int(i)] for i in order]
-                    ax.set_xticks(range(len(ordered_names)))
-                    ax.set_yticks(range(len(ordered_names)))
-                    ax.set_xticklabels(ordered_names, rotation=90, fontsize=5)
-                    ax.set_yticklabels(ordered_names, fontsize=5)
-                else:
-                    ax.set_xticks([])
-                    ax.set_yticks([])
-                for spine in ax.spines.values():
-                    spine.set_visible(False)
-                fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-                fig.tight_layout()
-                fig.savefig(heatmap_path, dpi=180)
-                _plt.close(fig)
-                heatmap_path_str = str(heatmap_path)
-                heatmap_artifact = _artifact_payload(
-                    heatmap_path_str,
-                    role="cluster_structure_heatmap",
-                    metadata={
-                        "cluster": str(cluster_id),
-                        "cluster_key": cluster_key,
-                        "structure_qc_run_id": structure_qc_run_id,
-                        "structure_qc_pass": structure_qc_pass,
-                    },
-                )
-                if heatmap_artifact:
-                    artifacts.append(heatmap_artifact)
-                    heatmap_artifacts.append(heatmap_artifact)
-                    heatmap_paths.append(heatmap_artifact.get("path", heatmap_path_str))
-
                 structure_interp = _structure_interpretation(mean_abs_corr, frac_pairs)
+
+                # Cap heatmap figures (b): always plot originally metric-flagged /
+                # ambiguous clusters; among baseline clusters plot only the
+                # non-coherent ones (unstructured/weak/inconclusive) worth eyeballing,
+                # up to max_heatmaps. Coherent clusters get a recorded verdict, no
+                # figure. Metrics above are computed for EVERY cluster regardless.
+                _orig_flagged = (
+                    str(metric_action) in {"propose_removal", "review"}
+                    or str(metric_severity) in {"obvious", "ambiguous"}
+                )
+                _render_heatmap = _orig_flagged or (
+                    structure_interp in {"unstructured", "weak", "inconclusive"}
+                    and heatmaps_rendered < max_heatmaps
+                )
+                heatmap_path_str = None
+                if _render_heatmap:
+                    safe_cluster_id = _safe_path_component(cluster_id)
+                    heatmap_path = figure_dir / f"cluster_{safe_cluster_id}_correlation.png"
+                    fig_width = max(5.0, min(9.0, x_sub.shape[1] / 20))
+                    fig, ax = _plt.subplots(figsize=(fig_width, fig_width))
+                    image = ax.imshow(reordered, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+                    ax.set_title(
+                        f"{cluster_key} / pass {structure_qc_pass:03d} / cluster {cluster_id}\n"
+                        f"{x_sub.shape[1]} genes x {n_cells} cells | mean_abs_corr={mean_abs_corr:.3f}"
+                    )
+                    if x_sub.shape[1] <= 60:
+                        ordered_names = [selected_gene_names[int(i)] for i in order]
+                        ax.set_xticks(range(len(ordered_names)))
+                        ax.set_yticks(range(len(ordered_names)))
+                        ax.set_xticklabels(ordered_names, rotation=90, fontsize=5)
+                        ax.set_yticklabels(ordered_names, fontsize=5)
+                    else:
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                    for spine in ax.spines.values():
+                        spine.set_visible(False)
+                    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+                    fig.tight_layout()
+                    fig.savefig(heatmap_path, dpi=180)
+                    _plt.close(fig)
+                    heatmaps_rendered += 1
+                    heatmap_path_str = str(heatmap_path)
+                    heatmap_artifact = _artifact_payload(
+                        heatmap_path_str,
+                        role="cluster_structure_heatmap",
+                        metadata={
+                            "cluster": str(cluster_id),
+                            "cluster_key": cluster_key,
+                            "structure_qc_run_id": structure_qc_run_id,
+                            "structure_qc_pass": structure_qc_pass,
+                        },
+                    )
+                    if heatmap_artifact:
+                        artifacts.append(heatmap_artifact)
+                        heatmap_artifacts.append(heatmap_artifact)
+                        heatmap_paths.append(heatmap_artifact.get("path", heatmap_path_str))
                 mt_mean = mt_z = lib_mean = lib_z = None
                 moran_i_mt = moran_i_lib = None
                 if n_cells < moran_min_cells:
@@ -12978,6 +13005,28 @@ def process_tool_call(
                 structure_evidence[str(cluster_id)] = record
 
             cells_in_synthesized_removal = int(cluster_labels.isin(synthesized_removal).sum())
+
+            # Coherence breakdown across ALL analyzed clusters (metrics computed for
+            # every one, even when its heatmap was not rendered) — for clear
+            # narration of what structure QC actually found, not just what it plotted.
+            coherence_breakdown: Dict[str, int] = {}
+            for _r in cluster_results:
+                _ci = str(_r.get("structure_interpretation") or "unknown")
+                coherence_breakdown[_ci] = coherence_breakdown.get(_ci, 0) + 1
+            n_coherent = coherence_breakdown.get("moderate", 0) + coherence_breakdown.get("strong", 0)
+            n_noncoherent = coherence_breakdown.get("unstructured", 0) + coherence_breakdown.get("weak", 0)
+            n_skipped_or_inconclusive = (
+                len(cluster_results) - n_coherent - n_noncoherent
+            )
+            structure_summary = (
+                f"Structure QC assessed coherence for {len(cluster_results)} cluster(s): "
+                f"{n_coherent} coherent (well-structured), {n_noncoherent} non-coherent "
+                f"(unstructured/weak — possible doublet/noise mixtures), "
+                f"{n_skipped_or_inconclusive} inconclusive/too-small. "
+                f"{heatmaps_rendered} correlation heatmap(s) saved (coherent clusters assessed "
+                f"but not plotted); synthesized removal set: {synthesized_removal or 'none'}."
+            )
+
             result = {
                 "status": "ok",
                 "tool": "run_cluster_structure_qc",
@@ -12985,6 +13034,11 @@ def process_tool_call(
                 "clusters_analyzed": clusters_to_analyze,
                 "missing_clusters": missing_clusters,
                 "n_clusters_analyzed": len(cluster_results),
+                "n_heatmaps_rendered": heatmaps_rendered,
+                "coherence_breakdown": coherence_breakdown,
+                "n_coherent_clusters": n_coherent,
+                "n_noncoherent_clusters": n_noncoherent,
+                "structure_summary": structure_summary,
                 "cluster_structure_evidence": cluster_results,
                 "structure_evidence_by_cluster": structure_evidence,
                 "synthesized_removal": synthesized_removal,
@@ -13186,11 +13240,7 @@ def process_tool_call(
                 result,
                 adata,
                 dataset_changed=False,
-                summary=(
-                    f"Cluster structure QC analyzed {len(cluster_results)} cluster(s); "
-                    f"{len(synthesized_removal)} synthesized removal candidate(s), "
-                    f"{len(rescued_clusters)} rescued structured ambiguous cluster(s)."
-                ),
+                summary=structure_summary,
                 artifacts_created=[artifact for artifact in artifacts if artifact],
                 verification=_build_verification(
                     "passed",
