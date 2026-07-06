@@ -188,16 +188,46 @@ def unique_output_path(path: str) -> str:
     return f"{base}_{i}{ext}"
 
 
+def _resolve_h5ad_compression():
+    """Compression settings for h5ad writes: (compression, compression_opts).
+
+    anndata/h5py default to NO compression, so h5ad files of raw/normalized
+    counts are stored uncompressed (a 151k-cell lung atlas ran to ~9 GB per
+    file). scRNA matrices are sparse and highly compressible, so we gzip by
+    default — typically a multi-fold size reduction for a modest write-time cost.
+
+    Overridable via env:
+      * ``SCAGENT_H5AD_COMPRESSION`` — 'gzip' (default), 'lzf', or 'none'/'off'.
+      * ``SCAGENT_H5AD_COMPRESSION_LEVEL`` — gzip level 0-9 (default: h5py's 4).
+    """
+    codec = (os.environ.get("SCAGENT_H5AD_COMPRESSION", "gzip") or "").strip().lower()
+    if codec in ("", "none", "off", "false", "0"):
+        return None, None
+    if codec == "gzip":
+        level_raw = os.environ.get("SCAGENT_H5AD_COMPRESSION_LEVEL", "").strip()
+        if level_raw:
+            try:
+                return "gzip", max(0, min(9, int(level_raw)))
+            except ValueError:
+                pass
+        return "gzip", None
+    return codec, None
+
+
 def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
-    details = {"save_mode": "direct", "warnings": []}
+    compression, compression_opts = _resolve_h5ad_compression()
+    details = {"save_mode": "direct", "warnings": [], "compression": compression}
     first_error_msg = None
     second_error_msg = None
+
+    def _write(obj):
+        obj.write_h5ad(output_path, compression=compression, compression_opts=compression_opts)
 
     uns_has_nulls = _contains_none_value(getattr(current_adata, "uns", {}))
     if uns_has_nulls:
         try:
             sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
-            sanitized.write_h5ad(output_path)
+            _write(sanitized)
             details["save_mode"] = "clean_obs_var_uns_preflight"
             details["warnings"].append("Null values in .uns were stringified before saving.")
             return details
@@ -209,7 +239,7 @@ def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
             )
 
     try:
-        current_adata.write_h5ad(output_path)
+        _write(current_adata)
         return details
     except Exception as first_error:
         first_error_msg = str(first_error)
@@ -217,7 +247,7 @@ def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
 
     try:
         sanitized = _make_serializable_copy(current_adata, aggressive_uns=False)
-        sanitized.write_h5ad(output_path)
+        _write(sanitized)
         details["save_mode"] = "clean_obs_var"
         return details
     except Exception as second_error:
@@ -226,7 +256,7 @@ def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
 
     try:
         sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
-        sanitized.write_h5ad(output_path)
+        _write(sanitized)
         details["save_mode"] = "clean_obs_var_uns"
         return details
     except Exception as third_error:

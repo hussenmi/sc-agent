@@ -305,7 +305,9 @@ def _maybe_save_on_exit(agent, console) -> None:
     save_path = selection.value if selection.action == "custom" else default_path
     try:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        agent.adata.write_h5ad(save_path)
+        from .agent.tools import write_h5ad_safe
+
+        write_h5ad_safe(agent.adata, save_path)
         console.print(f"[green]Saved to {save_path}[/green]")
     except Exception as e:
         console.print(f"[red]Save failed: {e}[/red]")
@@ -625,7 +627,9 @@ def run_qc(args):
 
     run_qc_pipeline(adata, mt_threshold=args.mt_threshold)
 
-    adata.write_h5ad(args.output_path)
+    from .agent.tools import write_h5ad_safe
+
+    write_h5ad_safe(adata, args.output_path)
     print(f"Filtered: {n_before} -> {adata.n_obs} cells")
     print(f"Saved to: {args.output_path}")
 
