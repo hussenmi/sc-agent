@@ -693,6 +693,54 @@ def _report_fmt(value: Any, limit: Optional[int] = None) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
+def _annotation_low_confidence_clusters(per_cluster: Dict[str, Any], limit: int = 40) -> List[Dict[str, Any]]:
+    """Compact ``[{cluster, label, confidence}]`` for clusters NOT at high
+    confidence — the only per-cluster detail the model needs inline (to caveat the
+    uncertain calls). Full evidence stays on ``adata.uns['annotation_validation']``
+    and the saved annotation_validation_*.json/.md.
+    """
+    out: List[Dict[str, Any]] = []
+    for cid, ev in (per_cluster or {}).items():
+        if not isinstance(ev, dict):
+            continue
+        conf = str(ev.get("confidence", "")).strip().lower()
+        if conf and conf != "high":
+            out.append({
+                "cluster": str(cid),
+                "label": ev.get("label"),
+                "confidence": ev.get("confidence"),
+            })
+    out.sort(key=lambda e: (0, int(e["cluster"])) if str(e["cluster"]).isdigit() else (1, str(e["cluster"])))
+    return out[:limit]
+
+
+def _slim_annotation_validation(validation_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact copy of an annotation_validation payload for the tool RESULT.
+
+    Drops the full ``per_cluster_evidence`` blob (all clusters' evidence — the
+    single biggest driver of context overflow after finalize) and the verbose
+    ``auto_fixes`` list, replacing them with counts, the tier breakdown, and a
+    short low-confidence cluster list. This ONLY trims what re-enters the
+    conversation: the full payload is still written to
+    ``adata.uns['annotation_validation']`` and the saved JSON/MD reports, and the
+    biological outputs (obs labels) are unchanged. Every metadata field consumed by
+    world_state (counts, policy, tier breakdown, panglaodb_required_clusters, …) is
+    preserved.
+    """
+    per_cluster = validation_payload.get("per_cluster_evidence") or {}
+    slim = {
+        k: v for k, v in validation_payload.items()
+        if k not in ("per_cluster_evidence", "auto_fixes")
+    }
+    slim["n_auto_fixes"] = len(validation_payload.get("auto_fixes") or [])
+    slim["low_confidence_clusters"] = _annotation_low_confidence_clusters(per_cluster)
+    slim["per_cluster_evidence_note"] = (
+        "Full per-cluster evidence omitted here to save context; it is in "
+        "adata.uns['annotation_validation'] and the saved annotation_validation_*.json/.md."
+    )
+    return slim
+
+
 def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str:
     """Build a comprehensive, deterministic markdown record of every decision the
     agent made this session — QC thresholds and what was removed/kept and why,
@@ -14635,6 +14683,19 @@ def process_tool_call(
 
 
             if validation_failures:
+                # Only echo per-cluster detail for the FAILING clusters — the
+                # actionable set the model must fix. Replaying all 60 clusters'
+                # evidence on every failed finalize is a context-overflow driver
+                # (and the full record is on adata.uns / the saved reports anyway).
+                _failing_ids = {
+                    m.group(1)
+                    for f in validation_failures
+                    for m in [re.match(r"Cluster (\S+?):", str(f))]
+                    if m
+                }
+                _failing_per_cluster = {
+                    cid: pc for cid, pc in per_cluster_validation.items() if cid in _failing_ids
+                } or per_cluster_validation  # fall back if no ids parsed
                 return _error_result(
                     tool="finalize_annotation",
                     message="Evidence validation failed: " + _format_validation_failures_per_cluster(validation_failures),
@@ -14650,8 +14711,9 @@ def process_tool_call(
                     ],
                     extra={
                         "validation_failures": validation_failures,
-                        "per_cluster_validation": per_cluster_validation,
-                        "auto_fixes": auto_fixes,
+                        "per_cluster_validation": _failing_per_cluster,
+                        "per_cluster_validation_scope": "failing_only",
+                        "n_auto_fixes": len(auto_fixes),
                         "missing_reference_sources": missing_reference_sources,
                         "reference_source_unavailable_tool_recorded": tool_recorded_unavailable_sources,
                         "reference_source_unavailable_manual": manual_unavailable_sources,
@@ -14721,9 +14783,9 @@ def process_tool_call(
                         "cluster_key": cluster_key,
                         "n_clusters_validated": len(cluster_to_label_preview),
                         "label_counts": label_counts_preview,
-                        "annotation_validation": validation_payload_preview,
+                        "annotation_validation": _slim_annotation_validation(validation_payload_preview),
                         "used_staged_evidence": used_staged_evidence,
-                        "auto_fixes": auto_fixes,
+                        "n_auto_fixes": len(auto_fixes),
                         "state": make_state(adata),
                     },
                     adata,
@@ -14961,6 +15023,9 @@ def process_tool_call(
                     )
                 )
 
+            # Full validation_payload is on adata.uns + saved to disk (above); the
+            # RESULT carries only the slim summary so 60 clusters' evidence doesn't
+            # re-enter (and recur in) the conversation and overflow context.
             result = {
                 "status": "ok",
                 "tool": "finalize_annotation",
@@ -14968,10 +15033,9 @@ def process_tool_call(
                 "cluster_key": cluster_key,
                 "n_clusters_labeled": len(cluster_to_label),
                 "label_counts": label_counts,
-                "cell_type_breakdown": label_counts,
-                "annotation_validation": validation_payload,
+                "annotation_validation": _slim_annotation_validation(validation_payload),
                 "used_staged_evidence": used_staged_evidence,
-                "auto_fixes": auto_fixes,
+                "n_auto_fixes": len(auto_fixes),
                 "annotation_validation_json": (
                     annotation_json_path if run_manager else None
                 ),
