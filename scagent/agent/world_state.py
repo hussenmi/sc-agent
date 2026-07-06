@@ -157,6 +157,12 @@ class AgentWorldState:
     clustering_registry: List[Dict[str, Any]] = field(default_factory=list)
     annotation_sources: List[str] = field(default_factory=list)
     cluster_qc_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # The clustering the model is actively working on — the one run_clustering most
+    # recently produced (or run_cluster_qc was last run on). The cluster_qc / QC
+    # obligation gates on THIS, not the static 'leiden' primary alias, which after a
+    # recluster still points at the throwaway uncorrected clustering and made the QC
+    # obligation impossible to satisfy (run_2026_07_06_015633).
+    active_cluster_key: Optional[str] = None
     artifacts: List[ArtifactRecord] = field(default_factory=list)
     outstanding_decisions: List[DecisionRecord] = field(default_factory=list)
     resolved_decisions: List[DecisionRecord] = field(default_factory=list)
@@ -590,6 +596,19 @@ class AgentWorldState:
             digest.update(str(name).encode("utf-8", errors="replace"))
         return digest.hexdigest()[:16]
 
+    def _resolve_active_cluster_key(self, adata, fallback: Optional[str]) -> Optional[str]:
+        """The clustering the QC obligation should track — the one the model is
+        actively working on. Prefer the explicitly-tracked ``active_cluster_key``
+        (set by run_clustering / run_cluster_qc) when it is still a real obs column;
+        otherwise fall back to the inspector's primary (``fallback``). This stops
+        the obligation from gating on the static 'leiden' alias (the uncorrected
+        throwaway) after a post-integration recluster to e.g. 'leiden_res_1'.
+        """
+        ak = self.active_cluster_key
+        if ak and adata is not None and ak in getattr(adata, "obs", {}).columns:
+            return ak
+        return fallback
+
     def _cluster_qc_summary(self, adata, cluster_key: Optional[str], processing: Dict[str, Any]) -> Dict[str, Any]:
         if adata is None:
             return {"status": "not_applicable", "reason": "no data loaded"}
@@ -763,7 +782,7 @@ class AgentWorldState:
         self.data_summary["batch_strategy"] = self._batch_strategy_summary(state, processing)
         self.data_summary["cluster_qc"] = self._cluster_qc_summary(
             adata,
-            state.cluster_key,
+            self._resolve_active_cluster_key(adata, state.cluster_key),
             processing,
         )
         self.metadata_candidates = [
@@ -987,16 +1006,23 @@ class AgentWorldState:
                     keys.append(str(comparison.get("cluster_key")))
             for key in keys:
                 self.cluster_qc_registry.pop(key, None)
+            # This clustering is now the active working one — the QC obligation must
+            # track IT, not the stale 'leiden' primary alias.
+            if tool_name == "run_clustering" and result.get("cluster_key"):
+                self.active_cluster_key = str(result.get("cluster_key"))
             if adata is not None:
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
-                    self.data_summary.get("cluster_key"),
+                    self._resolve_active_cluster_key(adata, self.data_summary.get("cluster_key")),
                     self.data_summary.get("processing", {}),
                 )
 
         if tool_name == "run_cluster_qc" and result.get("status") in {"ok", "success"} and adata is not None:
             cluster_key = result.get("cluster_key")
             if cluster_key:
+                # QC ran on this clustering → it's the active working one the
+                # obligation should track.
+                self.active_cluster_key = str(cluster_key)
                 n_clusters = None
                 if cluster_key in adata.obs.columns:
                     n_clusters = int(adata.obs[cluster_key].nunique())
@@ -1042,7 +1068,7 @@ class AgentWorldState:
 
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
-                    self.data_summary.get("cluster_key"),
+                    self._resolve_active_cluster_key(adata, self.data_summary.get("cluster_key")),
                     self.data_summary.get("processing", {}),
                 )
 
@@ -1101,7 +1127,7 @@ class AgentWorldState:
                 )
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
-                    self.data_summary.get("cluster_key"),
+                    self._resolve_active_cluster_key(adata, self.data_summary.get("cluster_key")),
                     self.data_summary.get("processing", {}),
                 )
 

@@ -159,3 +159,45 @@ def test_auto_structure_qc_can_be_disabled():
     d = json.loads(res)
     assert d["structure_qc_ran"] is False
     assert "structure_qc" not in d
+
+
+# --- obligation tracks the ACTIVE working clustering, not the stale alias -------
+def _two_clustering_adata():
+    import scanpy as sc
+    rng = np.random.default_rng(0)
+    n, g = 300, 60
+    a = ad.AnnData(X=rng.poisson(1.0, size=(n, g)).astype("float32"),
+                   var=pd.DataFrame(index=[f"g{j}" for j in range(g)]))
+    a.obs["total_counts"] = rng.normal(5000, 200, n)
+    a.obs["n_genes_by_counts"] = rng.normal(2000, 80, n)
+    a.obs["pct_counts_mt"] = rng.normal(5, 0.5, n)
+    sc.pp.pca(a, n_comps=10); sc.pp.neighbors(a)
+    from scagent.core.inspector import register_clustering
+    a.obs["leiden"] = pd.Categorical([str(i % 6) for i in range(n)])
+    register_clustering(a, cluster_key="leiden", method="leiden", resolution=2.0)
+    a.obsm["X_scVI"] = rng.normal(size=(n, 10)).astype("float32")
+    a.obs["leiden_res_1"] = pd.Categorical([str(i % 4) for i in range(n)])
+    register_clustering(a, cluster_key="leiden_res_1", method="leiden", resolution=1.0, use_rep="X_scVI")
+    return a
+
+
+def test_qc_obligation_clears_on_active_post_integration_clustering():
+    # run_2026_07_06_015633: after reclustering to leiden_res_1, the 'leiden' alias
+    # stayed primary, so the QC obligation gated on the throwaway uncorrected
+    # clustering and never cleared even after QC on leiden_res_1. The obligation now
+    # tracks the active working clustering.
+    a = _two_clustering_adata()
+    ws = AgentWorldState()
+    ws.apply_tool_result("run_clustering", {"status": "ok", "cluster_key": "leiden_res_1"}, adata=a)
+    ws.sync_from_adata(a)
+    assert ws.active_cluster_key == "leiden_res_1"
+    assert ws.data_summary["cluster_qc"]["cluster_key"] == "leiden_res_1"
+    assert "cluster_qc" in [o["key"] for o in ws.unmet_obligations()]
+
+    res, a = process_tool_call("run_cluster_qc", {"cluster_key": "leiden_res_1", "save_checkpoint": False}, a, world_state=ws)
+    ws.apply_tool_result("run_cluster_qc", json.loads(res), adata=a)
+    # obligation cleared and STAYS cleared across a subsequent sync
+    assert "cluster_qc" not in [o["key"] for o in ws.unmet_obligations()]
+    ws.sync_from_adata(a)
+    assert "cluster_qc" not in [o["key"] for o in ws.unmet_obligations()]
+    assert ws.structure_qc_obligation_unmet() is False

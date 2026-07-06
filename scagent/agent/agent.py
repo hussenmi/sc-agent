@@ -1430,6 +1430,35 @@ class SCAgent:
             "examples": candidate.get("examples") or [],
         }
 
+    def _multi_sample_partition_from_state(self) -> Optional[Dict[str, Any]]:
+        """Build a sample-like partition from the recorded world state.
+
+        Unlike ``_multi_sample_partition_from_result``, this reads the confirmed
+        batch key and group count the runtime already tracks. It works after
+        ``record_inspection`` (whose tool result carries no batch-candidate
+        block) and when a model-authored ``pause_and_ask`` has to be redirected
+        to the canonical selector — cases where no inspection ``result_data`` is
+        available to parse.
+        """
+        ws = getattr(self, "world_state", None)
+        if ws is None:
+            return None
+        ds = ws.data_summary or {}
+        column = (
+            ws.get_confirmed_value("batch_key")
+            or ds.get("batch_key")
+            or ds.get("recommended_batch_key")
+        )
+        n_groups = int(ws._multi_sample_group_count() or 0)
+        if not column or n_groups < 2:
+            return None
+        return {
+            "column": str(column),
+            "n_groups": n_groups,
+            "role": "sample",
+            "needs_key_confirmation": False,
+        }
+
     def _multi_sample_strategy_checkpoint(
         self,
         partition: Dict[str, Any],
@@ -1533,13 +1562,20 @@ class SCAgent:
         tool_name: str,
         result_data: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        if tool_name != "inspect_data" or result_data.get("status") != "ok":
+        if tool_name not in ("inspect_data", "record_inspection") or result_data.get("status") != "ok":
             return None
         if self.world_state.get_confirmed_value("multi_sample_strategy"):
             return None
         if (result_data.get("batch") or {}).get("batch_correction_applied"):
             return None
         partition = self._multi_sample_partition_from_result(result_data)
+        if partition is None:
+            # record_inspection's result carries no batch-candidate block, so
+            # derive the partition from the world state it has just updated with
+            # the confirmed batch key. This lets the runtime raise the canonical
+            # strategy selector even when the model records inspection directly
+            # instead of calling inspect_data.
+            partition = self._multi_sample_partition_from_state()
         if partition is None:
             return None
         return self._multi_sample_strategy_checkpoint(partition)
@@ -7052,6 +7088,50 @@ class SCAgent:
                         "checkpoint instead of an ad hoc integration pause."
                     ),
                 }, indent=2)
+        # Initial multi-sample strategy decision. If the data is multi-sample and
+        # no strategy is set yet, the model must NOT hand-roll this choice with
+        # free-text options: their slugged action ids (e.g.
+        # "investigate_first_run_uncorrected_analysis_then_diagnose_batch_e") never
+        # match the canonical enum the downstream gates check for
+        # (investigate_integration, integrate_scvi, keep_unintegrated,
+        # analyze_separately), so diagnose_batch_effect and the integration path
+        # stay permanently blocked. Substitute the runtime's canonical selector so
+        # the user's pick maps to a recognized strategy value.
+        if self.world_state is not None and self.world_state.multi_sample_decision_unresolved():
+            strategy_text = " ".join(
+                [str(question), str(context)]
+                + [str(option) for option in options]
+                + [str(action) for action in (tool_input.get("option_actions") or [])]
+            ).lower()
+            if re.search(
+                r"\b(sample|samples|batch|batches|integrat|scvi|harmony|bbknn|"
+                r"dataset|datasets|donor|donors|uncorrected|corrected|combined|separately)\b",
+                strategy_text,
+            ):
+                partition = self._multi_sample_partition_from_state()
+                if partition is not None:
+                    canonical = self._multi_sample_strategy_checkpoint(partition)
+                    self._set_pending_checkpoint(canonical)
+                    return json.dumps({
+                        "status": "ok",
+                        "tool": "pause_and_ask",
+                        "paused": True,
+                        "question": canonical.get("question", question),
+                        "context": canonical.get("context", context),
+                        "options": canonical.get("options", options),
+                        "option_actions": canonical.get("option_actions", []),
+                        "decision_key": canonical.get("decision_key", "multi_sample_strategy"),
+                        "kind": canonical.get("kind", "multi_sample_strategy"),
+                        "action_inputs": canonical.get("action_inputs", {}),
+                        "message": (
+                            "Using the runtime's canonical multi-sample strategy selector "
+                            "instead of ad hoc free-text options, so the user's choice maps "
+                            "to a recognized strategy (investigate / integrate with scVI / "
+                            "keep uncorrected / analyze separately). End the turn; the runtime "
+                            "renders the choices."
+                        ),
+                    }, indent=2)
+
         cleanup_text = " ".join([str(question), str(context)] + [str(option) for option in options]).lower()
         if (
             re.search(r"\b(remove|drop|filter|exclude|subset)\b", cleanup_text)
