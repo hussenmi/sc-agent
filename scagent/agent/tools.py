@@ -4953,22 +4953,39 @@ def process_tool_call(
 
         if source == "raw":
             raw = adata.raw
-            raw_var = list(raw.var_names)
-            cur_var = list(adata.var_names)
+            raw_var = [str(g) for g in raw.var_names]
+            cur_var = [str(g) for g in adata.var_names]
             if raw_var == cur_var:
-                X_aligned = raw.X
-            else:
-                pos = {g: i for i, g in enumerate(raw_var)}
-                if all(g in pos for g in cur_var):
-                    idx = [pos[g] for g in cur_var]
-                    X_aligned = raw.X[:, idx]
-                else:
-                    # Gene sets don't align safely; leave to normalize_data's error.
-                    return None
+                adata.layers[raw_layer_name] = raw.X.copy() if hasattr(raw.X, "copy") else raw.X
+                return (
+                    f"materialized raw counts from adata.raw into layer '{raw_layer_name}' "
+                    f"({len(cur_var)} genes)"
+                )
+            pos = {g: i for i, g in enumerate(raw_var)}
+            align_via = None
+            # 1. Direct name alignment — raw is in the same ID space as adata.var.
+            if all(g in pos for g in cur_var):
+                idx = [pos[g] for g in cur_var]
+                align_via = "gene name"
+            # 2. Fallback via preserved original IDs. convert_gene_ids rewrites
+            #    adata.var_names to symbols but leaves adata.raw in the ORIGINAL id
+            #    space (e.g. Ensembl), saving the pre-conversion ids in
+            #    var['ensembl_id']. Map current genes -> their original id -> raw
+            #    column, so counts stay aligned after gene-id conversion. (This
+            #    automates the manual recovery seen in run_2026_07_05_225406.)
+            elif "ensembl_id" in adata.var.columns:
+                orig_ids = [str(e) for e in adata.var["ensembl_id"].tolist()]
+                if all(e in pos for e in orig_ids):
+                    idx = [pos[e] for e in orig_ids]
+                    align_via = "var['ensembl_id']"
+            if align_via is None:
+                # Gene sets don't align safely; leave to normalize_data's error.
+                return None
+            X_aligned = raw.X[:, idx]
             adata.layers[raw_layer_name] = X_aligned.copy() if hasattr(X_aligned, "copy") else X_aligned
             return (
                 f"materialized raw counts from adata.raw into layer '{raw_layer_name}' "
-                f"(aligned {len(cur_var)} genes)"
+                f"(aligned {len(cur_var)} genes via {align_via})"
             )
         return None
 
@@ -8921,6 +8938,14 @@ def process_tool_call(
                 ),
                 "n_removed": 0,
             }
+            # Resolve raw counts into the expected layer BEFORE any destructive
+            # gene removal. Two reasons: (1) if X is already processed and counts
+            # live only in adata.raw, normalize_data needs them in a layer; (2)
+            # doing it first means a failure to locate counts never leaves a
+            # half-stripped object, and the materialized layer is sliced along with
+            # adata by the ribosomal removal below, so it stays gene-aligned.
+            raw_counts_note = _ensure_raw_counts_layer(adata, raw_layer_name)
+
             if remove_ribosomal_genes:
                 ribo_mask = _feature_mask_from_patterns(
                     adata.var_names,
@@ -8950,11 +8975,6 @@ def process_tool_call(
                     sample = sample.toarray()
                 sample = np.asarray(sample)
                 return bool(np.allclose(sample, np.round(sample)))
-
-            # If X is already processed and raw counts live only in adata.raw,
-            # materialize them into the expected layer so normalize_data can reset
-            # from counts without the user hand-copying adata.raw.X first.
-            raw_counts_note = _ensure_raw_counts_layer(adata, raw_layer_name)
 
             try:
                 normalize_data(

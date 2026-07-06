@@ -149,3 +149,38 @@ def test_normalize_aligns_raw_superset_genes():
     d = json.loads(res)
     assert d["status"] == "ok"
     assert "aligned 30 genes" in (d["raw_counts_source_note"] or "")
+
+
+def test_normalize_aligns_raw_via_ensembl_id_after_gene_conversion():
+    # The run_2026_07_05_225406 failure: convert_gene_ids rewrote adata.var_names
+    # to symbols but left adata.raw in Ensembl space, so raw could not be aligned
+    # by name. The preserved var['ensembl_id'] bridges them, and ribo removal in
+    # the same call must not desync the layer.
+    import pandas as pd
+
+    from scagent.core.genes import convert_var_to_symbols
+
+    rng = np.random.default_rng(0)
+    n_obs, n_genes = 200, 80  # comfortably sized so seurat_v3 HVG is numerically stable
+    ensembl = [f"ENSG{str(i).zfill(11)}" for i in range(n_genes)]
+    symbols = [f"SYM{i}" for i in range(n_genes)]
+    symbols[3] = "RPL3"          # a ribosomal gene so removal fires
+    var = pd.DataFrame({"feature_name": pd.Categorical(symbols)}, index=ensembl)
+    counts = sp.csr_matrix(rng.integers(0, 30, size=(n_obs, n_genes)).astype("float32"))
+    lognorm = counts.copy()
+    lognorm.data = np.log1p(lognorm.data).astype("float32")
+    a = ad.AnnData(X=lognorm, var=var.copy())
+    a.var_names = pd.Index(ensembl)
+    a.uns["log1p"] = {"base": None}
+    a.raw = ad.AnnData(X=counts.copy(), var=var.copy())  # raw stays Ensembl-indexed
+
+    a, _ = convert_var_to_symbols(a, inplace=True)
+    assert "ensembl_id" in a.var.columns
+    assert str(a.raw.var_names[0]).startswith("ENSG")  # raw NOT converted
+
+    res, _ = process_tool_call("normalize_and_hvg", {"n_hvg": 30, "normalization_source": "auto"}, a)
+    d = json.loads(res)
+    assert d["status"] == "ok", d.get("message")
+    assert "ensembl_id" in (d["raw_counts_source_note"] or "")
+    assert d["reset_from_raw_counts"] is True
+    assert d["after"]["n_genes"] == n_genes - 1  # RPL3 removed, layer stayed aligned
