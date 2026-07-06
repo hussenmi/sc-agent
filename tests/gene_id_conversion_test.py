@@ -22,9 +22,9 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from scagent.core import genes
-from scagent.core.inspector import find_counts_matrix, _characterize_features
 from scagent.agent.tools import get_tools, process_tool_call
+from scagent.core import genes
+from scagent.core.inspector import _characterize_features, find_counts_matrix
 
 
 # --- fixtures ------------------------------------------------------------------
@@ -184,3 +184,41 @@ def test_convert_gene_ids_tool_converts_in_place():
     assert d["conversion"]["symbol_column"] == "feature_name"
     # the returned (persisted) adata now uses symbols
     assert "CD3D" in list(updated.var_names)
+
+
+# --- auto-convert at LOAD (root fix: convert once, before any analysis) --------
+def test_load_data_auto_converts_ensembl_to_symbols(tmp_path):
+    # Root fix for run_2026_07_05_233220: conversion done LATE let ribo removal /
+    # MT% / DEG run on Ensembl var_names and cascade. load_data now converts up
+    # front so every downstream step sees symbols.
+    rng = np.random.default_rng(0)
+    n, g = 50, 12
+    ens = [f"ENSG{str(i).zfill(11)}" for i in range(g)]
+    syms = [f"SYM{i}" for i in range(g)]
+    syms[3] = "RPL3"
+    var = pd.DataFrame({"feature_name": pd.Categorical(syms)}, index=ens)
+    a = ad.AnnData(X=sp.csr_matrix(rng.integers(0, 10, size=(n, g)).astype("float32")), var=var)
+    a.var_names = ens
+    fp = tmp_path / "ensembl.h5ad"
+    a.write_h5ad(fp)
+
+    res, loaded = process_tool_call("load_data", {"data_path": str(fp)}, None)
+    d = json.loads(res)
+    assert d["genes"]["format"] == "symbol"
+    assert (d["genes"]["auto_converted_to_symbols"] or {}).get("source") == "column:feature_name"
+    assert "RPL3" in list(loaded.var_names)
+    assert "ensembl_id" in loaded.var.columns  # originals preserved
+
+
+def test_load_data_symbol_indexed_is_noop(tmp_path):
+    a = ad.AnnData(
+        X=sp.csr_matrix(np.random.default_rng(0).integers(0, 10, size=(20, 4)).astype("float32")),
+        var=pd.DataFrame(index=["CD3D", "CD4", "MS4A1", "GAPDH"]),
+    )
+    fp = tmp_path / "symbols.h5ad"
+    a.write_h5ad(fp)
+    res, loaded = process_tool_call("load_data", {"data_path": str(fp)}, None)
+    d = json.loads(res)
+    assert d["genes"]["format"] == "symbol"
+    assert d["genes"]["auto_converted_to_symbols"] is None  # nothing to convert
+    assert "scagent_gene_id_conversion" not in loaded.uns

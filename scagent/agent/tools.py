@@ -4820,6 +4820,34 @@ def process_tool_call(
             payload.update(extra)
         return json.dumps(payload, indent=2), adata_obj
 
+    def _autoconvert_symbols_on_load(adata):
+        """Convert var_names to gene symbols ONCE, at load, before any analysis.
+
+        Gene-identifier conversion must happen before anything that depends on gene
+        identity (MT/ribosomal QC + removal, marker/DEG interpretation, reference
+        annotation, plotting by symbol). Doing it late cascades: normalize_and_hvg
+        removing ribosomal genes by 'RPL'/'RPS' matched NOTHING on Ensembl
+        var_names, so ribo genes survived into DEGs (run_2026_07_05_233220), MT% was
+        0, etc. Converting the primary dataset here — offline, using the dataset's
+        own symbol column, preserving the originals in var['ensembl_id'] — makes
+        every downstream step operate on symbols. No-op when var_names are already
+        symbols or no symbol column exists. Records a report on
+        adata.uns['scagent_gene_id_conversion'] so load_data/inspect_data surface it.
+        """
+        try:
+            from ..core.genes import convert_var_to_symbols, infer_id_format
+            if infer_id_format(adata.var_names) == "symbol":
+                return adata
+            _, report = convert_var_to_symbols(adata, inplace=True)
+            if report.changed:
+                try:
+                    adata.uns["scagent_gene_id_conversion"] = report.to_dict()
+                except Exception:
+                    pass
+        except Exception:
+            pass  # never block a load on conversion; downstream is symbol-aware too
+        return adata
+
     def get_adata(tool_input, existing_adata, update_memory: bool = True, prefer_memory: bool = False):
         """Get adata from memory or load from disk.
 
@@ -4841,7 +4869,10 @@ def process_tool_call(
         # Otherwise load from disk
         if data_path and data_path != "memory":
             loaded = load_data(data_path)
+            # Convert gene ids to symbols up front only when this load establishes
+            # the primary in-memory dataset (not a transient read-only inspection).
             if update_memory:
+                loaded = _autoconvert_symbols_on_load(loaded)
                 return loaded, loaded
             return loaded, existing_adata
         raise ValueError("No data available. Provide data_path or load data first.")
@@ -7998,6 +8029,10 @@ def process_tool_call(
                     "has_symbols": state.has_gene_symbols,
                     "sample": feature_info["sample_gene_names"],
                     "mt_genes_detected": feature_info["mt_genes_detected"],
+                    # Auto-converted to symbols at load when needed, so all
+                    # downstream analysis (QC, ribo removal, DEG, annotation) uses
+                    # symbols. Originals preserved in var['ensembl_id'].
+                    "auto_converted_to_symbols": working_adata.uns.get("scagent_gene_id_conversion"),
                 },
                 "obs_columns_detail": ocd,
                 "batch_metadata": {
@@ -8950,8 +8985,15 @@ def process_tool_call(
             raw_counts_note = _ensure_raw_counts_layer(adata, raw_layer_name)
 
             if remove_ribosomal_genes:
+                # Match ribosomal patterns against gene SYMBOLS, not raw var_names.
+                # The primary dataset is symbol-converted at load, but data built in
+                # run_code (e.g. a multi-sample concat) may still be Ensembl-indexed;
+                # matching 'RPL'/'RPS' against Ensembl IDs would remove nothing and
+                # let ribosomal genes leak into HVG/PCA/DEG. See core.qc.
+                from ..core.qc import _gene_names_for_prefix_matching
+                _ribo_match_names = _gene_names_for_prefix_matching(adata)
                 ribo_mask = _feature_mask_from_patterns(
-                    adata.var_names,
+                    _ribo_match_names,
                     ribosomal_remove_patterns,
                     match_mode="match",
                 )
