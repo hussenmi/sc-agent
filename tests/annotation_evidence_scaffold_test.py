@@ -330,6 +330,41 @@ def test_stage_with_reasoning_only_then_finalize_writes_labels():
     assert "cell_type" in a.obs.columns
 
 
+def test_finalize_does_not_clobber_preexisting_annotation():
+    # A pre-existing 'cell_type' (e.g. the source paper's labels) must be preserved;
+    # scagent writes to 'cell_type_scagent' by default instead of overwriting.
+    a = _integration_adata()
+    a.obs["cell_type"] = pd.Categorical(["SourcePaperLabel"] * a.n_obs)
+    _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
+    clusters = list(a.uns["annotation_evidence_scaffold"].keys())
+    ev = {c: {"reasoning": f"Cluster {c}: lineage from reference consensus + DEG support; reviewed."} for c in clusters}
+    _, a = process_tool_call("stage_annotation_evidence", {"evidence_summary": ev}, a)
+    res, a = process_tool_call("finalize_annotation", {"cluster_key": "leiden"}, a)
+    r = json.loads(res)
+    assert r["status"] == "ok"
+    assert r["annotation_key"] == "cell_type_scagent"
+    assert r["annotation_key_redirected_from"] == "cell_type"
+    # original preserved untouched
+    assert list(a.obs["cell_type"].astype(str).unique()) == ["SourcePaperLabel"]
+    assert "cell_type_scagent" in a.obs.columns
+
+
+def test_finalize_overwrite_true_replaces_preexisting():
+    a = _integration_adata()
+    a.obs["cell_type"] = pd.Categorical(["SourcePaperLabel"] * a.n_obs)
+    _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
+    clusters = list(a.uns["annotation_evidence_scaffold"].keys())
+    ev = {c: {"reasoning": f"Cluster {c}: lineage from reference consensus + DEG support; reviewed."} for c in clusters}
+    _, a = process_tool_call("stage_annotation_evidence", {"evidence_summary": ev}, a)
+    res, a = process_tool_call(
+        "finalize_annotation", {"cluster_key": "leiden", "annotation_key": "cell_type", "overwrite": True}, a
+    )
+    r = json.loads(res)
+    assert r["annotation_key"] == "cell_type"
+    assert r["annotation_key_redirected_from"] is None
+    assert "SourcePaperLabel" not in list(a.obs["cell_type"].astype(str).unique())
+
+
 def test_stage_reports_clusters_awaiting_reasoning():
     a = _integration_adata()
     _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)

@@ -14851,19 +14851,30 @@ def process_tool_call(
                     adata_obj=adata,
                     recovery_options=["Re-run prepare_annotation with the correct cluster_key."],
                 )
-            if annotation_key in adata.obs.columns and not overwrite and not validate_only:
-                return _error_result(
-                    tool="finalize_annotation",
-                    message=(
-                        f"Column '{annotation_key}' already exists on adata.obs. "
-                        "Pass overwrite=true to replace it, or use a different annotation_key."
-                    ),
-                    adata_obj=adata,
-                    recovery_options=[
-                        f"Retry with overwrite=true if you intend to replace '{annotation_key}'.",
-                        "Pick a new annotation_key that does not collide with an existing column.",
-                    ],
-                )
+
+            # Non-destructive default: never clobber a PRE-EXISTING annotation
+            # column (e.g. the dataset's own 'cell_type' from the source paper —
+            # which is exactly the ground truth to compare against). If the target
+            # column exists and scagent did not write it this session, write the new
+            # analysis to a distinct '<key>_scagent' column and keep the original.
+            # Overwriting a pre-existing column requires an explicit overwrite=true.
+            # scagent's own columns (from a re-run) are refreshed in place.
+            annotation_key_redirected_from = None
+            if not validate_only:
+                scagent_written = set(adata.uns.get("scagent_annotation_keys", []) or [])
+                if (
+                    annotation_key in adata.obs.columns
+                    and annotation_key not in scagent_written
+                    and not overwrite
+                ):
+                    _base = f"{annotation_key}_scagent"
+                    _new = _base
+                    _i = 2
+                    while _new in adata.obs.columns:
+                        _new = f"{_base}_{_i}"
+                        _i += 1
+                    annotation_key_redirected_from = annotation_key
+                    annotation_key = _new
 
             _validation_report = _validate_annotation_evidence(
                 adata=adata,
@@ -15045,6 +15056,15 @@ def process_tool_call(
                     )
                 series = series.fillna("Unassigned")
                 adata.obs[annotation_key] = _pd.Categorical(series.values)
+                # Remember which columns scagent wrote, so a later finalize refreshes
+                # its own column in place instead of spawning '<key>_scagent_2'.
+                try:
+                    _sk = list(adata.uns.get("scagent_annotation_keys", []) or [])
+                    if annotation_key not in _sk:
+                        _sk.append(annotation_key)
+                    adata.uns["scagent_annotation_keys"] = _sk
+                except Exception:
+                    pass
             except Exception as e:
                 return _error_result(
                     tool="finalize_annotation",
@@ -15244,6 +15264,7 @@ def process_tool_call(
                 "status": "ok",
                 "tool": "finalize_annotation",
                 "annotation_key": annotation_key,
+                "annotation_key_redirected_from": annotation_key_redirected_from,
                 "cluster_key": cluster_key,
                 "n_clusters_labeled": len(cluster_to_label),
                 "label_counts": label_counts,
@@ -15258,12 +15279,18 @@ def process_tool_call(
                 ),
                 "state": make_state(adata),
             }
+            _redirect_note = (
+                f" (wrote to '{annotation_key}' to preserve the pre-existing "
+                f"'{annotation_key_redirected_from}' annotation for comparison)"
+                if annotation_key_redirected_from else ""
+            )
             return _finalize_result(
                 result, adata,
                 dataset_changed=True,
                 summary=(
                     f"Wrote final annotation '{annotation_key}' for {len(cluster_to_label)} clusters "
                     f"({len(label_counts)} unique labels) with conditional annotation validation."
+                    + _redirect_note
                 ),
                 artifacts_created=[artifact for artifact in artifacts if artifact],
                 verification=_build_verification(
