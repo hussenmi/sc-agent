@@ -84,6 +84,7 @@ results/
 article_figures/
 two_replicates/
 startup_ideas/
+config/
 
 # NAT eval run artifacts (regeneratable; nat_runs is GBs of per-run h5ad).
 # Summarized results live in the committed RESULTS_*.md docs + nat_eval_figs/.
@@ -109,3 +110,4 @@ agent_demo.py
 *.rd
 *_truth.csv
 LUNG_*
+!docs/nvidia_collab.md
