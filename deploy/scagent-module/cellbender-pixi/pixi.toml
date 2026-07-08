@@ -1,0 +1,21 @@
+# =============================================================================
+# CellBender 0.3.2 — standalone pixi env (shared, for the scagent Lmod module)
+# =============================================================================
+# CellBender deps conflict with the RAPIDS stack, so it is NOT bundled in the
+# scagent env; the module points SCAGENT_CELLBENDER at this binary instead.
+# Rebuilt as a lockfile-reproducible pixi env (replaces the old personal venv at
+# /usersoftware/peerd/ibrahih3/envs/cellbender, which non-peerd users couldn't
+# reach). cellbender 0.3.2 leaves torch unpinned; a current torch wheel enables
+# GPU on H200 (the old env's torch 1.13/cu117 predates Hopper, so it was CPU-only).
+# =============================================================================
+[workspace]
+name = "cellbender"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.10.*"
+pip = "*"
+
+[pypi-dependencies]
+cellbender = "==0.3.2"

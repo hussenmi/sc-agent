@@ -1,0 +1,4 @@
+# Track only the manifest + lock. The solved env (.pixi/, ~17G) and install logs
+# are build artifacts — reproduced by `pixi install` from pixi.toml + pixi.lock.
+.pixi/
+*.log

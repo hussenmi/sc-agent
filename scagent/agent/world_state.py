@@ -12,8 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import hashlib
+import importlib.util
 import json
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -153,11 +157,21 @@ class AgentWorldState:
     clustering_registry: List[Dict[str, Any]] = field(default_factory=list)
     annotation_sources: List[str] = field(default_factory=list)
     cluster_qc_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # The clustering the model is actively working on — the one run_clustering most
+    # recently produced (or run_cluster_qc was last run on). The cluster_qc / QC
+    # obligation gates on THIS, not the static 'leiden' primary alias, which after a
+    # recluster still points at the throwaway uncorrected clustering and made the QC
+    # obligation impossible to satisfy (run_2026_07_06_015633).
+    active_cluster_key: Optional[str] = None
     artifacts: List[ArtifactRecord] = field(default_factory=list)
     outstanding_decisions: List[DecisionRecord] = field(default_factory=list)
     resolved_decisions: List[DecisionRecord] = field(default_factory=list)
     user_preferences: Dict[str, Any] = field(default_factory=dict)
     context_hints: List[str] = field(default_factory=list)
+    # Subset of context_hints that genuinely came from the user (e.g. a typed
+    # experiment description), as opposed to tool/model-supplied `context` args.
+    # Used to attribute biological-context provenance correctly.
+    user_context_hints: List[str] = field(default_factory=list)
     annotation_validation: Dict[str, Any] = field(default_factory=dict)
     last_action: Dict[str, Any] = field(default_factory=dict)
     recent_events: List[Dict[str, Any]] = field(default_factory=list)
@@ -184,16 +198,17 @@ class AgentWorldState:
         ]
         annotation_keys = []
         if adata is not None:
+            # Content-validated cell-type candidates only (exact canonical name +
+            # categorical-label structure). No substring name-guessing — matching
+            # tokens like "label" wrongly pulled in non-annotation columns (and is
+            # exactly the fuzzy behavior we removed). Columns the harness does not
+            # recognize are still visible to the model via the per-column facts.
             semantic_roles = self.data_summary.get("semantic_obs_roles", {})
             annotation_keys = [
                 candidate.get("column")
                 for candidate in semantic_roles.get("cell_type", [])
                 if candidate.get("column")
             ]
-            for column in adata.obs.columns:
-                if any(token in column.lower() for token in ("celltyp", "scimilar", "annotation", "label")):
-                    if column not in annotation_keys:
-                        annotation_keys.append(column)
         deg_available = bool(adata is not None and "rank_genes_groups" in adata.uns)
         primary_cluster_key = self.data_summary.get("cluster_key")
         obs_columns = list(adata.obs.columns) if adata is not None else []
@@ -216,7 +231,7 @@ class AgentWorldState:
 
         if adata is not None:
             # Always available
-            available_actions.extend(["run_code", "inspect_data", "save_data", "ask_user"])
+            available_actions.extend(["run_code", "inspect_data", "save_data", "pause_and_ask"])
 
             # QC
             if not processing.get("has_qc_metrics"):
@@ -263,8 +278,20 @@ class AgentWorldState:
                 blocked_actions.append({"action": "run_deg", "needs": "clusters or annotations"})
 
             # Pseudobulk DEG — needs groups to aggregate AND raw counts for DESeq2
-            if (processing.get("has_clusters") or self.annotation_sources) and processing.get("has_raw_counts"):
+            pseudobulk_available = (
+                importlib.util.find_spec("scagent.analysis.pseudobulk") is not None
+            )
+            if (
+                pseudobulk_available
+                and (processing.get("has_clusters") or self.annotation_sources)
+                and processing.get("has_raw_counts")
+            ):
                 available_actions.append("run_pseudobulk_deg")
+            elif not pseudobulk_available:
+                blocked_actions.append({
+                    "action": "run_pseudobulk_deg",
+                    "needs": "pseudobulk implementation is not installed in this checkout",
+                })
             elif not (processing.get("has_clusters") or self.annotation_sources):
                 blocked_actions.append({"action": "run_pseudobulk_deg", "needs": "clusters or annotations"})
             else:
@@ -298,8 +325,18 @@ class AgentWorldState:
                 blocked_actions.append({"action": "score_gene_signature", "needs": "normalized data"})
 
             # Spectra — needs annotations/clusters for cell_type_key, normalized data
-            if (processing.get("has_clusters") or self.annotation_sources) and processing.get("is_normalized"):
+            spectra_available = importlib.util.find_spec("scagent.analysis.spectra") is not None
+            if (
+                spectra_available
+                and (processing.get("has_clusters") or self.annotation_sources)
+                and processing.get("is_normalized")
+            ):
                 available_actions.append("run_spectra")
+            elif not spectra_available:
+                blocked_actions.append({
+                    "action": "run_spectra",
+                    "needs": "Spectra implementation is not installed in this checkout",
+                })
             else:
                 blocked_actions.append({"action": "run_spectra", "needs": "normalized data and cell type labels or clusters"})
 
@@ -351,6 +388,10 @@ class AgentWorldState:
         """Summarize whether a multi-partition dataset has an explicit batch plan."""
         batch_key = self.get_confirmed_value("batch_key") or state.batch_key
         n_batches = int(state.n_batches or 0)
+        if (not batch_key or n_batches < 2) and state.metadata_candidates:
+            top_candidate = state.metadata_candidates[0]
+            batch_key = batch_key or top_candidate.column
+            n_batches = max(n_batches, int(top_candidate.n_unique or 0))
 
         if not batch_key or n_batches < 2:
             return {
@@ -369,25 +410,76 @@ class AgentWorldState:
                 "reason": "A batch-corrected representation or graph is present.",
             }
 
+        selected_strategy = self.get_confirmed_value("multi_sample_strategy")
+        if selected_strategy:
+            strategy_action = (
+                selected_strategy.get("action")
+                if isinstance(selected_strategy, dict)
+                else selected_strategy
+            )
+            strategy_details = (
+                selected_strategy.get("details")
+                if isinstance(selected_strategy, dict)
+                else None
+            )
+            strategy_summaries = {
+                "investigate_integration": (
+                    "investigate_requested",
+                    "Run an uncorrected first pass (PCA, neighbors, UMAP, clustering) and assess "
+                    "batch mixing. Do not integrate yet: once the first pass produces a clustering, "
+                    "the runtime re-opens the multi_sample_strategy decision so the user picks "
+                    "integrate/keep/separate based on the diagnostic.",
+                ),
+                "integrate_scvi": (
+                    "scvi_requested",
+                    "Confirm the sample key if needed, then integrate with scVI before the final graph and clustering.",
+                ),
+                "keep_unintegrated": (
+                    "uncorrected_requested",
+                    "Keep samples combined in one analysis without batch correction.",
+                ),
+                "analyze_separately": (
+                    "separate_analysis_requested",
+                    "Run sample-specific analyses rather than constructing a shared integrated representation.",
+                ),
+                "custom": (
+                    "custom_strategy",
+                    strategy_details or "Follow the user's custom multi-sample strategy.",
+                ),
+            }
+            status, next_action = strategy_summaries.get(
+                strategy_action,
+                ("strategy_selected", f"Follow the selected strategy: {strategy_action}."),
+            )
+            return {
+                "status": status,
+                "batch_key": batch_key,
+                "n_batches": n_batches,
+                "method": "scvi" if strategy_action == "integrate_scvi" else None,
+                "selected_strategy": selected_strategy,
+                "reason": "The user explicitly selected how the samples should be handled.",
+                "next_action": next_action,
+            }
+
         if processing.get("has_neighbors") or processing.get("has_umap") or processing.get("has_clusters"):
             status = "needs_review"
-            next_action = "Score or inspect batch mixing, then rerun batch correction if sample structure remains."
+            next_action = "Present the sample-handling choice with pause_and_ask (investigate / integrate with scVI / keep uncorrected / analyze separately), then end the turn."
             reason = (
                 "A multi-group batch key is present, but neighbors/UMAP/clustering already exist "
-                "without a recorded correction strategy."
+                "without a user-selected sample-handling strategy."
             )
         elif processing.get("has_pca"):
             status = "needs_decision"
-            next_action = "Run score_integration on X_pca and/or run_batch_correction before neighbors/UMAP/clustering."
-            reason = "A multi-group batch key is present after PCA; choose and record a batch strategy before graph construction."
+            next_action = "Present the sample-handling strategy choice with pause_and_ask; do not correct automatically."
+            reason = "A multi-group sample-like key is present after PCA, but no strategy has been selected."
         elif processing.get("is_normalized") or processing.get("has_hvg"):
             status = "pending_pca"
-            next_action = "Run PCA, then assess batch mixing or run batch correction before graph construction."
-            reason = "A multi-group batch key is present and will matter once PCA is available."
+            next_action = "Use the user's selected strategy before constructing the final graph."
+            reason = "A multi-group sample-like key is present, but its presence alone does not justify correction."
         else:
             status = "pending_preprocessing"
-            next_action = "Carry the batch key through QC/normalization and revisit before neighbors/UMAP/clustering."
-            reason = "A multi-group batch key is present early in the workflow."
+            next_action = "Present the strategy choice with pause_and_ask before any preprocessing; preprocessing is blocked until a strategy is selected."
+            reason = "A multi-group sample-like key is present early in the workflow; correction is opt-in."
 
         return {
             "status": status,
@@ -413,6 +505,7 @@ class AgentWorldState:
             "resolved_decisions": [decision.to_dict() for decision in self.resolved_decisions],
             "user_preferences": self.user_preferences,
             "context_hints": self.context_hints,
+            "user_context_hints": self.user_context_hints,
             "annotation_validation": self.annotation_validation,
             "last_action": self.last_action,
             "recent_events": self.recent_events,
@@ -443,6 +536,11 @@ class AgentWorldState:
             "annotation_validation": self.annotation_validation,
             "latest_verification": self.latest_verification,
             "last_action": self.last_action,
+            # Scientific-spine obligations that are triggered-but-unmet. Surfaced
+            # every turn (not just in the inspect_data tool result) so a required
+            # decision/step is in front of the model from the first turn, regardless
+            # of which tools it has called. Empty list = nothing pending.
+            "unmet_obligations": self.unmet_obligations(),
             # Cap in the system-prompt snapshot to keep context small on long
             # sessions. The full step_log is still available via to_dict() for
             # notebook generation and reporting.
@@ -455,14 +553,22 @@ class AgentWorldState:
     def set_active_request(self, request: str) -> None:
         self.active_request = request
 
-    def add_context_hint(self, hint: str) -> None:
-        """Persist a user/tool-provided biological or workflow hint."""
+    def add_context_hint(self, hint: str, *, source: str = "model") -> None:
+        """Persist a biological or workflow hint.
+
+        source="user" marks text the user actually typed (e.g. an experiment
+        description); the default "model" is for tool/model-supplied `context`
+        args. Only user-origin hints are later treated as user-provided context.
+        """
         normalized = " ".join(str(hint or "").split())
         if not normalized:
             return
         if normalized not in self.context_hints:
             self.context_hints.append(normalized)
             self.context_hints = self.context_hints[-20:]
+        if source == "user" and normalized not in self.user_context_hints:
+            self.user_context_hints.append(normalized)
+            self.user_context_hints = self.user_context_hints[-20:]
 
     @staticmethod
     def _adata_fingerprint(adata) -> tuple:
@@ -489,6 +595,19 @@ class AgentWorldState:
             digest.update(b"|")
             digest.update(str(name).encode("utf-8", errors="replace"))
         return digest.hexdigest()[:16]
+
+    def _resolve_active_cluster_key(self, adata, fallback: Optional[str]) -> Optional[str]:
+        """The clustering the QC obligation should track — the one the model is
+        actively working on. Prefer the explicitly-tracked ``active_cluster_key``
+        (set by run_clustering / run_cluster_qc) when it is still a real obs column;
+        otherwise fall back to the inspector's primary (``fallback``). This stops
+        the obligation from gating on the static 'leiden' alias (the uncorrected
+        throwaway) after a post-integration recluster to e.g. 'leiden_res_1'.
+        """
+        ak = self.active_cluster_key
+        if ak and adata is not None and ak in getattr(adata, "obs", {}).columns:
+            return ak
+        return fallback
 
     def _cluster_qc_summary(self, adata, cluster_key: Optional[str], processing: Dict[str, Any]) -> Dict[str, Any]:
         if adata is None:
@@ -577,7 +696,14 @@ class AgentWorldState:
             self._inspect_cache_key = fingerprint
             self._inspect_cache_state = state
         processing = {
-            "has_raw_counts": state.has_raw_layer,
+            # "raw counts are available" — in a layer, adata.raw, OR the X matrix
+            # itself (X is integer counts, even when stored as float32). Previously
+            # this was has_raw_layer only, so a raw-count X with no separate layer
+            # (e.g. *_raw.h5ad files) misreported as has_raw_counts=false and
+            # confused the model into thinking X wasn't raw.
+            "has_raw_counts": bool(state.has_raw_layer or state.has_raw or state.is_counts),
+            # Explicit: does the live X matrix contain raw integer counts right now.
+            "x_is_raw_counts": bool(state.is_counts),
             "has_qc_metrics": state.has_qc_metrics,
             "has_doublets": state.has_doublet_scores,
             "is_normalized": state.is_normalized,
@@ -588,14 +714,54 @@ class AgentWorldState:
             "has_clusters": state.has_clusters,
             "has_celltypes": state.has_celltype_annotations,
         }
-        context_text = " ".join(
-            part for part in [self.active_request, request_text, *self.context_hints] if part
+        # Genuine user text (request + user-typed hints) vs tool/model-supplied
+        # `context` args. Keeping them separate stops a model-guessed context
+        # (e.g. "PBMC scRNA-seq") from being attributed to the user.
+        user_text = " ".join(
+            part for part in [self.active_request, request_text, *self.user_context_hints] if part
         )
+        model_hints = [h for h in self.context_hints if h not in self.user_context_hints]
+        hint_text = " ".join(model_hints)
         biological_context = infer_biological_context(
             adata,
-            text_context=context_text,
+            text_context=user_text,
+            hint_context=hint_text,
             _precomputed_state=state,
         ).to_dict()
+
+        # A model-recorded inspection decision (see record_inspection) overrides
+        # the heuristic *judgments* — which column is the cell type, the species.
+        # Facts (obs_columns_detail, shape, is_counts, …) stay heuristic and are
+        # recomputed every sync; only the judgment layer defers to the model.
+        # Absent a recorded decision, behavior is exactly as before.
+        inspection = self.get_confirmed_value("inspection")
+        cell_type_key = state.cell_type_key
+        cluster_key = state.cluster_key
+        if inspection:
+            # The inspection's cell_type_col reflects PRE-EXISTING columns at load
+            # (null = no labels, which suppresses heuristic false-positives like a
+            # predicted_doublet QC flag). Once the pipeline produces an annotation,
+            # that real cell_type column must win — so only apply the override
+            # before annotation is finalized; afterward trust the heuristic, which
+            # detects the new column. (Otherwise has_celltypes stays False after a
+            # successful annotation, mis-reporting the run's state.)
+            av = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
+            annotation_done = bool(av.get("finalized")) or av.get("status") == "validated_and_finalized"
+            if not annotation_done:
+                cell_type_key = inspection.get("cell_type_col")
+                processing["has_celltypes"] = cell_type_key is not None
+            if inspection.get("cluster_col"):
+                cluster_key = inspection["cluster_col"]
+            if inspection.get("species"):
+                biological_context["species"] = inspection["species"]
+                biological_context["species_source"] = "model_inspection"
+            if inspection.get("tissue"):
+                biological_context["tissue"] = inspection["tissue"]
+                biological_context["tissue_source"] = "model_inspection"
+            if inspection.get("condition"):
+                biological_context["condition"] = inspection["condition"]
+                biological_context["condition_source"] = "model_inspection"
+
         self.analysis_stage = _stage_from_processing(processing)
         self.data_summary = {
             "shape": {"n_cells": state.n_cells, "n_genes": state.n_genes},
@@ -606,9 +772,9 @@ class AgentWorldState:
             "n_batches": state.n_batches,
             "batch_correction_applied": state.batch_correction_applied,
             "batch_correction_method": state.batch_correction_method,
-            "cluster_key": state.cluster_key,
+            "cluster_key": cluster_key,
             "n_clusters": state.n_clusters,
-            "cell_type_key": state.cell_type_key,
+            "cell_type_key": cell_type_key,
             "semantic_obs_roles": semantic_roles_to_dict(state.semantic_obs_roles),
             "obs_columns_detail": obs_columns_detail(adata.obs, adata.n_obs),
             "biological_context": biological_context,
@@ -616,7 +782,7 @@ class AgentWorldState:
         self.data_summary["batch_strategy"] = self._batch_strategy_summary(state, processing)
         self.data_summary["cluster_qc"] = self._cluster_qc_summary(
             adata,
-            state.cluster_key,
+            self._resolve_active_cluster_key(adata, state.cluster_key),
             processing,
         )
         self.metadata_candidates = [
@@ -632,9 +798,26 @@ class AgentWorldState:
             annotation_sources.append("celltypist")
         if state.has_scimilarity:
             annotation_sources.append("scimilarity")
-        if state.cell_type_candidates and not (state.has_celltypist or state.has_scimilarity):
+        # "external_or_manual" is a judgment (is some obs column a real label?).
+        # When the model has recorded an inspection, trust its cell_type_col call
+        # over the heuristic candidate — so a barcode column ruled out as labels
+        # does not keep surfacing as an annotation source.
+        if inspection:
+            has_manual_labels = inspection.get("cell_type_col") is not None
+        else:
+            has_manual_labels = bool(state.cell_type_candidates)
+        if has_manual_labels and not (state.has_celltypist or state.has_scimilarity):
             annotation_sources.append("external_or_manual")
         self.annotation_sources = annotation_sources
+
+        # Surface the recorded inspection so the model sees its own settled
+        # decision in the snapshot instead of re-deriving roles every turn.
+        # inspection_source records which path produced the role/species
+        # judgments — "model" (record_inspection) vs "heuristic" — so flag
+        # compliance is measurable post-hoc from the manifest.
+        if inspection:
+            self.data_summary["inspection"] = inspection
+        self.data_summary["inspection_source"] = "model" if inspection else "heuristic"
 
         self.data_summary["capabilities"] = self._derive_capabilities(adata)
 
@@ -706,6 +889,62 @@ class AgentWorldState:
     def get_confirmed_value(self, key: str) -> Any:
         return self.user_preferences.get(key)
 
+    def record_inspection(self, payload: Dict[str, Any], adata=None) -> Dict[str, Any]:
+        """Record the model's inspection judgment (column roles + species).
+
+        This is the judgment layer of the facts/judgment split: the model reads
+        the deterministic fact sheet and reports which obs column is the cell
+        type / batch / donor / sample and the species. We validate the claim
+        (named columns must exist; species constrained), then store it as a
+        resolved decision so it (a) overrides the heuristic in sync_from_adata,
+        (b) surfaces in the snapshot, and (c) flows to the manifest. batch_col is
+        routed through the existing ``batch_key`` slot the pipeline already reads.
+
+        Returns ``{"status": "ok", "inspection": {...}}`` or
+        ``{"status": "error", "errors": [...]}``; on error nothing is stored.
+        """
+        obs_cols = set(adata.obs.columns) if adata is not None else set()
+        errors: List[str] = []
+        for field_name in ("cell_type_col", "batch_col", "donor_col", "sample_col", "cluster_col"):
+            value = payload.get(field_name)
+            if value is not None and adata is not None and value not in obs_cols:
+                errors.append(
+                    f"{field_name}={value!r} is not an obs column. "
+                    f"Available: {sorted(obs_cols)}"
+                )
+        species = payload.get("species")
+        species_norm = str(species).lower() if species is not None else None
+        if species_norm is not None and species_norm not in {"human", "mouse", "unknown"}:
+            errors.append(f"species={species!r} must be one of human, mouse, unknown.")
+        if errors:
+            return {"status": "error", "errors": errors}
+
+        def _clean_text(value):
+            text = str(value).strip() if value is not None else ""
+            return text or None
+
+        inspection = {
+            "cell_type_col": payload.get("cell_type_col"),
+            "batch_col": payload.get("batch_col"),
+            "donor_col": payload.get("donor_col"),
+            "sample_col": payload.get("sample_col"),
+            "cluster_col": payload.get("cluster_col"),
+            "species": species_norm,
+            "tissue": _clean_text(payload.get("tissue")),
+            "condition": _clean_text(payload.get("condition")),
+            "rationale": str(payload.get("rationale", "")),
+            "recorded_at": _utc_now_iso(),
+        }
+        self.resolve_decision("inspection", inspection, source="model_inspection")
+        if species_norm:
+            self.resolve_decision("species", species_norm, source="model_inspection")
+        if inspection["batch_col"]:
+            self.resolve_decision("batch_key", inspection["batch_col"], source="model_inspection")
+        # Re-sync so data_summary reflects the new decision immediately.
+        if adata is not None:
+            self.sync_from_adata(adata, request_text=self.active_request)
+        return {"status": "ok", "inspection": inspection}
+
     def apply_tool_result(self, tool_name: str, result: Dict[str, Any], adata=None) -> None:
         if adata is not None:
             self.sync_from_adata(adata, request_text=self.active_request)
@@ -767,16 +1006,23 @@ class AgentWorldState:
                     keys.append(str(comparison.get("cluster_key")))
             for key in keys:
                 self.cluster_qc_registry.pop(key, None)
+            # This clustering is now the active working one — the QC obligation must
+            # track IT, not the stale 'leiden' primary alias.
+            if tool_name == "run_clustering" and result.get("cluster_key"):
+                self.active_cluster_key = str(result.get("cluster_key"))
             if adata is not None:
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
-                    self.data_summary.get("cluster_key"),
+                    self._resolve_active_cluster_key(adata, self.data_summary.get("cluster_key")),
                     self.data_summary.get("processing", {}),
                 )
 
         if tool_name == "run_cluster_qc" and result.get("status") in {"ok", "success"} and adata is not None:
             cluster_key = result.get("cluster_key")
             if cluster_key:
+                # QC ran on this clustering → it's the active working one the
+                # obligation should track.
+                self.active_cluster_key = str(cluster_key)
                 n_clusters = None
                 if cluster_key in adata.obs.columns:
                     n_clusters = int(adata.obs[cluster_key].nunique())
@@ -802,9 +1048,27 @@ class AgentWorldState:
                     "cluster_decisions": result.get("cluster_decisions", {}),
                     "cluster_table": result.get("cluster_table", []),
                 }
+                # run_cluster_qc now auto-chains structure QC in the same call and
+                # embeds a slim `structure_qc` payload. Record it on the SAME
+                # registry entry so the structure_qc floor + prepare_annotation gate
+                # see it (structure QC ran on this clustering) without a separate
+                # run_cluster_structure_qc tool call.
+                embedded_sq = result.get("structure_qc")
+                if isinstance(embedded_sq, dict) and embedded_sq.get("structure_qc_run_id"):
+                    entry = self.cluster_qc_registry.get(str(cluster_key), {})
+                    entry["structure_checked_at"] = _utc_now_iso()
+                    entry["structure_qc_run_id"] = embedded_sq.get("structure_qc_run_id")
+                    entry["structure_qc_pass"] = embedded_sq.get("structure_qc_pass")
+                    entry["structure_figure_dir"] = embedded_sq.get("figure_dir")
+                    entry["structure_heatmap_paths"] = embedded_sq.get("heatmap_paths", [])
+                    entry["structure_qc_json"] = embedded_sq.get("structure_qc_json")
+                    entry["structure_qc_markdown"] = embedded_sq.get("structure_qc_markdown")
+                    entry["synthesized_removal"] = embedded_sq.get("synthesized_removal", [])
+                    self.cluster_qc_registry[str(cluster_key)] = entry
+
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
-                    self.data_summary.get("cluster_key"),
+                    self._resolve_active_cluster_key(adata, self.data_summary.get("cluster_key")),
                     self.data_summary.get("processing", {}),
                 )
 
@@ -863,9 +1127,202 @@ class AgentWorldState:
                 )
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,
-                    self.data_summary.get("cluster_key"),
+                    self._resolve_active_cluster_key(adata, self.data_summary.get("cluster_key")),
                     self.data_summary.get("processing", {}),
                 )
+
+    def unmet_obligations(self) -> List[Dict[str, Any]]:
+        """Scientific-spine obligations that are *triggered but not satisfied*.
+
+        A read-only **view** over state this object already computes — it adds no
+        new tracking. Each entry is a plain dict describing a floor the harness
+        should bind the model to (vs. the advisory `blocked_actions`/decisions it
+        only serializes). The enforcement (re-prompt → block + fallback, or entry
+        gating) lives in the agent loop; this method only *reports* what is unmet.
+
+        Obligations are deliberately limited to load-bearing **scientific-validity**
+        checkpoints, not tool-ordering prerequisites:
+
+        - ``annotation_finalize`` (completion): annotation was entered
+          (``prepare_annotation`` set ``required``) but never finalized. This is the
+          same predicate the save/report guard uses; surfacing it here lets the
+          *terminal* exit (a no-tool-call stop) be guarded too, not just save/report.
+        - ``batch_decision`` (entry): a multi-sample dataset needs the
+          ``multi_sample_strategy`` decision resolved before clustering/annotation.
+
+        Both are **floors, not ceilings** — `satisfied` means *a decision was made /
+        annotation was finalized*, never a particular outcome. A model that already
+        does the right thing is never bound.
+        """
+        out: List[Dict[str, Any]] = []
+
+        av = self.annotation_validation if isinstance(self.annotation_validation, dict) else {}
+        if (
+            av.get("required")
+            and not av.get("finalized")
+            and av.get("status") != "validated_and_finalized"
+        ):
+            out.append({
+                "key": "annotation_finalize",
+                "kind": "completion",
+                "blocks_terminal": True,
+                "finalize_attempts": int(av.get("finalize_attempts", 0) or 0),
+                "status": av.get("status"),
+                "guidance": (
+                    "Annotation was started (prepare_annotation) but not finalized "
+                    f"(annotation_validation.status={av.get('status')!r}). Do not end the "
+                    "run with prose. Either: (1) call stage_annotation_evidence for any "
+                    "uncovered clusters, then finalize_annotation; (2) if a cluster cannot "
+                    "be resolved, stage it with confidence=low and finalize anyway "
+                    "(PanglaoDB is optional, not a gate); or (3) as a last resort, call "
+                    "save_data(allow_unvalidated=true) to persist a clearly-marked "
+                    "incomplete result. Emit the tool call now — do not run more queries."
+                ),
+            })
+
+        if self.cluster_qc_obligation_unmet():
+            out.append({
+                "key": "cluster_qc",
+                # 'entry' like structure_qc: a bounded nudge that lapses to a
+                # clean exit if the user opted out of QC — never a forced save.
+                "kind": "entry",
+                "blocks_terminal": True,
+                "guidance": (
+                    "Clustering is done and QC metrics are available, but metric "
+                    "cluster QC (run_cluster_qc) has not run on the ACTIVE clustering. "
+                    "Run run_cluster_qc now: it builds the per-cluster QC table "
+                    "(library size, detected genes, MT%, ribosomal%, doublet score) "
+                    "that nominates low-quality / doublet / ambiguous clusters and is "
+                    "the entry to the cluster-QC evidence chain — structure QC then "
+                    "adjudicates coherence. This is required after EACH clustering, "
+                    "including after a removal+recluster, so problematic clusters are "
+                    "not missed even when no doublet signal exists (a coherence check "
+                    "still runs as a baseline). If — and only if — the user explicitly "
+                    "asked to skip cluster QC, you may decline and end; that judgment "
+                    "is yours to make from the conversation."
+                ),
+            })
+
+        if self.structure_qc_obligation_unmet():
+            out.append({
+                "key": "structure_qc",
+                # 'entry' (not 'completion') so the bounded nudge lapses to a clean
+                # exit rather than a forced unvalidated save — if the user asked to
+                # skip structure QC, the model declines and the run ends normally.
+                "kind": "entry",
+                "blocks_terminal": True,
+                "guidance": (
+                    "Cluster metric QC (run_cluster_qc) ran but cluster STRUCTURE QC "
+                    "(run_cluster_structure_qc) never did. Structure QC — gene-gene "
+                    "covariance modules, clustered correlation heatmaps, and technical "
+                    "Moran's I — is a required evidence layer, not optional: it is the only "
+                    "check that can tell a coherent biological cluster from a doublet/noise "
+                    "mixture that looks metrically normal. Run run_cluster_structure_qc now "
+                    "(on the metric-flagged/ambiguous clusters, or over all clusters as a "
+                    "baseline when none were flagged — see structure_qc_baseline_clusters) "
+                    "before ending or moving to annotation. If — and only if — the user "
+                    "explicitly asked to skip structure QC, you may decline and end; that "
+                    "judgment is yours to make from the conversation."
+                ),
+            })
+
+        if self.multi_sample_decision_unresolved():
+            n = self._multi_sample_group_count()
+            out.append({
+                "key": "batch_decision",
+                "kind": "entry",
+                "blocks_terminal": True,
+                "guidance": (
+                    f"This dataset has {n} sample-like groups but the multi_sample_strategy "
+                    "decision is unresolved. Present the choice to the user now with "
+                    "pause_and_ask — investigate (uncorrected first pass → diagnose_batch_effect), "
+                    "integrate, keep one combined uncorrected analysis, or analyze separately — "
+                    "then end your turn. Preprocessing is blocked until a strategy is selected, so "
+                    "do not run QC/normalization first and do not deliberate about proceeding: "
+                    "'investigate' is an option you offer here, not a step you take before asking."
+                ),
+            })
+
+        return out
+
+    def note_spine_intervention(self, keys: List[str], action: str) -> None:
+        """Record a coordination-harness intervention for telemetry/audit.
+
+        Lands in `recent_events` (→ snapshot → manifest), so spine adherence —
+        how often the floor had to nudge or force a fallback, and on which
+        obligations — is measurable post-hoc (e.g. by the NAT eval) rather than
+        only in agent.log.
+        """
+        self.recent_events.append({
+            "tool": "spine_obligation_gate",
+            "status": action,  # "nudge" | "forced_fallback"
+            "timestamp": _utc_now_iso(),
+            "summary": f"unmet obligations: {', '.join(keys)}",
+        })
+        self.recent_events = self.recent_events[-25:]
+
+    def _multi_sample_group_count(self) -> int:
+        """Largest detected sample-like group count (batch_key or top candidate)."""
+        ds = self.data_summary or {}
+        n = int(ds.get("n_batches") or 0)
+        for cand in (self.metadata_candidates or []):
+            try:
+                n = max(n, int(getattr(cand, "n_unique", None) or (cand.get("n_unique") if isinstance(cand, dict) else 0) or 0))
+            except (TypeError, ValueError):
+                continue
+        return n
+
+    def cluster_qc_obligation_unmet(self) -> bool:
+        """True iff a clustering exists with QC metrics but metric cluster QC has
+        not run on the ACTIVE clustering.
+
+        Floor predicate for the ``cluster_qc`` obligation and the entry to the
+        cluster-QC evidence chain: metric QC nominates suspicious clusters and, by
+        writing the registry, unlocks the ``structure_qc`` floor. It is freshness-
+        tracked per clustering (``_cluster_qc_summary`` returns ``needed`` when the
+        cell set or cluster count changed), so after a removal+recluster it becomes
+        ``needed`` again — which is what drives the iterative QC rounds. Re-running
+        metric QC overwrites the registry entry (dropping its structure_qc marker),
+        so the ``structure_qc`` floor then re-fires for the new round too.
+
+        ``satisfied`` = metric QC ran on the active clustering, never a particular
+        verdict; whether the user opted out of QC is the MODEL's judgment (bounded
+        entry-obligation nudge), not the harness's — no intent pattern-matching.
+        """
+        summary = self.data_summary.get("cluster_qc") if isinstance(self.data_summary, dict) else None
+        if not isinstance(summary, dict):
+            return False
+        return summary.get("status") == "needed"
+
+    def structure_qc_obligation_unmet(self) -> bool:
+        """True iff metric cluster QC ran but structure QC never did.
+
+        Floor predicate for the ``structure_qc`` obligation. Structure QC (cluster
+        covariance / heatmaps / technical Moran's I) is required evidence whenever
+        the analysis reached cluster-level QC. ``satisfied`` = structure QC ran at
+        least once on some clustering — never a particular verdict. Whether the user
+        opted out is the MODEL's judgment, not the harness's: the model runs it by
+        default, and if the user asked to skip it the model declines and the bounded
+        obligation nudge lapses (this is an ``entry`` obligation, so no forced save).
+        The harness never pattern-matches the user's words. Uses only the registry
+        this object already maintains: metric QC writes ``checked_at``; structure QC
+        writes ``structure_qc_run_id``.
+        """
+        reg = self.cluster_qc_registry or {}
+        metric_qc_ran = any("checked_at" in entry for entry in reg.values())
+        structure_qc_ran = any(entry.get("structure_qc_run_id") for entry in reg.values())
+        return bool(metric_qc_ran and not structure_qc_ran)
+
+    def multi_sample_decision_unresolved(self) -> bool:
+        """True iff the data is multi-sample and no multi_sample_strategy is set.
+
+        Floor predicate for the batch entry obligation. ``satisfied`` = a strategy
+        was chosen (any option); ``moot`` (returns False) when the data is
+        single-sample, so it can never fire on a single-sample dataset.
+        """
+        if self.get_confirmed_value("multi_sample_strategy"):
+            return False
+        return self._multi_sample_group_count() >= 2
 
     def _update_annotation_validation(self, tool_name: str, result: Dict[str, Any]) -> None:
         """Track whether automated annotation has external marker validation."""
@@ -904,6 +1361,22 @@ class AgentWorldState:
                 ),
             }
             return
+        if tool_name == "finalize_annotation" and status not in {"ok", "success"}:
+            # Count only *genuine* finalize attempts — ones where evidence was
+            # actually evaluated and failed validation, not the trivial
+            # "stage evidence first" rejection. The save guard uses this so it
+            # can degrade to an honestly-labeled unvalidated save after the
+            # agent has truly tried, instead of blocking forever and ending the
+            # run with no final dataset on disk.
+            is_genuine_attempt = bool(result.get("validation_failures")) or (
+                "validation failed" in str(result.get("message", "")).lower()
+            )
+            if is_genuine_attempt and isinstance(self.annotation_validation, dict):
+                self.annotation_validation["finalize_attempts"] = (
+                    int(self.annotation_validation.get("finalize_attempts", 0)) + 1
+                )
+                self.annotation_validation["last_finalize_error"] = result.get("message")
+            return
         if status not in {"ok", "success"}:
             return
 
@@ -914,6 +1387,10 @@ class AgentWorldState:
             candidate_sources = dict(existing.get("candidate_sources") or {})
             unavailable = dict(existing.get("reference_source_unavailable") or {})
             unavailable.pop(tool_name.removeprefix("run_"), None)
+            # Remember the chosen CellTypist model so a later re-run doesn't
+            # re-trigger the model-selection gate once the user already picked.
+            if tool_name == "run_celltypist" and result.get("model"):
+                self.user_preferences["celltypist_model"] = result.get("model")
             candidate_sources[tool_name] = {
                 "annotation_key": result.get("annotation_key"),
                 "organism": (
@@ -1021,17 +1498,26 @@ class AgentWorldState:
                 "deg_required": True,
                 "deg_completed": True,
                 "finalized": False,
+                "evidence_scaffold_available": bool(result.get("evidence_scaffold_ready")),
                 "instruction": (
-                    (
+                    "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] "
+                    "with every derivable field pre-filled; submit only per-cluster `reasoning` (plus any "
+                    "label/confidence overrides) to stage_annotation_evidence/finalize_annotation — do not "
+                    "rebuild the evidence dict by hand in run_code. "
+                    + (
                         "Query PanglaoDB only for clusters in panglaodb_required_clusters using "
                         "panglaodb_queries_required and panglaodb_reverse_marker_queries_required, "
                         "aggregate reverse gene-symbol hits across multiple DEGs, compare markers "
-                        "against each required cluster's top_degs, then stage/finalize annotation."
+                        "against each required cluster's top_degs, then stage/finalize annotation. "
+                        "PanglaoDB is optional, not a gate: if a flagged cluster cannot be resolved "
+                        "(label not covered, e.g. CMP/MEP/early-erythroid, or query inconclusive), "
+                        "submit panglaodb_queried=false and confidence=low — the validator "
+                        "accepts reference+DEG evidence and will not block finalize. Do not loop."
+                        if required_clusters else
+                        "No cluster was flagged for upfront PanglaoDB adjudication. Submit reasoning from "
+                        "reference labels plus DEG support; query PanglaoDB reactively only if "
+                        "stage_annotation_evidence/finalize_annotation reports a cluster still requires it."
                     )
-                    if required_clusters else
-                    "No cluster was flagged for upfront PanglaoDB adjudication. Stage evidence from "
-                    "reference labels plus submitted DEG support; query PanglaoDB reactively only if "
-                    "stage_annotation_evidence/finalize_annotation reports a cluster still requires it."
                 ),
             }
             return

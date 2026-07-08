@@ -10,14 +10,42 @@ Implements lab's best practices for single-cell QC:
 
 from typing import Optional, Union, List
 import numpy as np
+import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 import logging
 
 from ..config.defaults import QC_DEFAULTS
+from . import genes as _genes
+from .gpu import gpu_available, on_gpu
 from .inspector import resolve_batch_metadata
 
 logger = logging.getLogger(__name__)
+
+
+def _gene_names_for_prefix_matching(adata: AnnData) -> List[str]:
+    """Gene names to match MT/ribo (and similar) symbol prefixes against.
+
+    Returns ``var_names`` when they are already gene symbols; otherwise the
+    dataset's content-validated symbol column (``feature_name``/``gene_symbols``/…)
+    when one exists, so MT/ribo detection works on Ensembl- or Entrez-indexed
+    objects instead of silently matching nothing. Falls back to ``var_names`` when
+    no symbol column is found. A dominant multi-genome prefix (``GRCh38_``) is
+    stripped so ``MT-``/``RPS`` still match. See core.genes.
+    """
+    if _genes.infer_id_format(adata.var_names) == "symbol":
+        names = [str(n) for n in adata.var_names]
+    else:
+        col = _genes.find_symbol_column(adata)
+        if col is not None:
+            series = adata.var[col]
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                series = series.astype(str)
+            names = [str(v) for v in series.tolist()]
+        else:
+            names = [str(n) for n in adata.var_names]
+    stripped, _ = _genes.strip_genome_prefix(names)
+    return stripped
 
 
 def _safe_scrublet_n_prin_comps(
@@ -78,17 +106,32 @@ def calculate_qc_metrics(
 
     logger.info("Calculating QC metrics...")
 
-    # Basic QC metrics
-    sc.pp.calculate_qc_metrics(adata, inplace=True)
+    # Gene NAMES to match MT/ribo prefixes against. Critical: var_names are often
+    # Ensembl IDs (ENSG…), against which 'MT-'/'RPS'/'RPL' match NOTHING — which
+    # silently yields pct_counts_mt/pct_counts_ribo = 0 for every cell (the empty
+    # QC panels in run_2026_07_02_150701, misread as "snRNA-seq excludes MT/ribo").
+    # When var_names are not symbols, match against the dataset's symbol column
+    # (feature_name/gene_symbols/…, content-validated). A dominant genome prefix
+    # (e.g. 'GRCh38_MT-CO1') is stripped so the prefix still matches.
+    match_names = _gene_names_for_prefix_matching(adata)
+
+    def _prefix_mask(prefixes) -> pd.Series:
+        # Case-insensitive so mouse ('mt-', 'Rps'/'Rpl') is caught as well as human.
+        prefixes = (prefixes,) if isinstance(prefixes, str) else tuple(prefixes)
+        lower = tuple(p.lower() for p in prefixes)
+        return pd.Series(
+            [str(n).lower().startswith(lower) for n in match_names],
+            index=adata.var_names,
+        )
 
     # Mitochondrial genes
-    adata.var['mt'] = adata.var_names.str.startswith(mt_prefix)
-    n_mt_genes = adata.var['mt'].sum()
+    adata.var['mt'] = _prefix_mask(mt_prefix)
+    n_mt_genes = int(adata.var['mt'].sum())
     logger.info(f"Found {n_mt_genes} mitochondrial genes")
 
     # Ribosomal genes
-    adata.var['ribo'] = adata.var_names.str.startswith(ribo_prefixes)
-    n_ribo_genes = adata.var['ribo'].sum()
+    adata.var['ribo'] = _prefix_mask(ribo_prefixes)
+    n_ribo_genes = int(adata.var['ribo'].sum())
     logger.info(f"Found {n_ribo_genes} ribosomal genes")
 
     # Calculate MT and ribo content; log1p=True adds log1p_total_counts and
@@ -205,10 +248,25 @@ def filter_genes(
         sc.pp.filter_genes(adata, min_cells=min_cells)
         logger.info(f"Filtered genes by min_cells={min_cells:.0f}: {n_before:,} -> {adata.n_vars:,}")
 
+    # Names to match against — symbol column when var_names are Ensembl/Entrez, so
+    # removal doesn't silently miss every gene (see _gene_names_for_prefix_matching).
+    match_names = None
+
+    def _prefix_mask(prefixes) -> pd.Series:
+        nonlocal match_names
+        if match_names is None:
+            match_names = _gene_names_for_prefix_matching(adata)
+        prefixes = (prefixes,) if isinstance(prefixes, str) else tuple(prefixes)
+        lower = tuple(p.lower() for p in prefixes)
+        return pd.Series(
+            [str(n).lower().startswith(lower) for n in match_names],
+            index=adata.var_names,
+        )
+
     # Remove ribosomal genes
     if remove_ribo:
         if 'ribo' not in adata.var.columns:
-            adata.var['ribo'] = adata.var_names.str.startswith(QC_DEFAULTS.ribo_prefixes)
+            adata.var['ribo'] = _prefix_mask(QC_DEFAULTS.ribo_prefixes)
 
         n_ribo = adata.var['ribo'].sum()
         adata._inplace_subset_var(~adata.var['ribo'])
@@ -217,7 +275,7 @@ def filter_genes(
     # Remove MT genes
     if remove_mt:
         if 'mt' not in adata.var.columns:
-            adata.var['mt'] = adata.var_names.str.startswith(QC_DEFAULTS.mt_prefix)
+            adata.var['mt'] = _prefix_mask(QC_DEFAULTS.mt_prefix)
 
         n_mt = adata.var['mt'].sum()
         adata._inplace_subset_var(~adata.var['mt'])
@@ -333,6 +391,16 @@ def detect_doublets(
     IMPORTANT: Must be run on raw counts, before normalization.
     If batch_key is provided, runs Scrublet per batch.
 
+    GPU note: when ``SCAGENT_GPU`` is enabled, doublet detection runs through
+    rapids_singlecell's Scrublet on the GPU (much faster on large data). This is
+    an *approximation* of the CPU path, not a bit-for-bit match: rapids_singlecell
+    does its own internal gene selection and does not expose
+    ``min_counts``/``min_cells``/``min_gene_variability_pctl``, so it typically
+    flags somewhat fewer doublets (per-cell score rank correlation ~0.45 in
+    testing). It uses adata.X (assumed raw counts per the contract above) and
+    handles ``batch_key`` internally without the obs-label fragility of
+    ``sc.pp.scrublet``. If the GPU run fails it falls back to the CPU path.
+
     Parameters
     ----------
     adata : AnnData
@@ -392,7 +460,37 @@ def detect_doublets(
             safe_n_prin_comps,
         )
 
-    if batch_key and batch_key in adata.obs.columns:
+    # GPU path (SCAGENT_GPU): rapids_singlecell Scrublet. Approximate vs CPU — see
+    # the GPU note in this function's docstring. rsc handles batch_key internally
+    # (no obs-label fragility) and does not accept the min_*/variability params.
+    gpu_done = False
+    if gpu_available():
+        try:
+            import rapids_singlecell as rsc
+
+            logger.info("Running GPU Scrublet via rapids_singlecell (approximate; see docstring).")
+            gpu_batch_key = batch_key if (batch_key and batch_key in adata.obs.columns) else None
+            with on_gpu(adata):
+                rsc.pp.scrublet(
+                    adata,
+                    batch_key=gpu_batch_key,
+                    sim_doublet_ratio=sim_doublet_ratio,
+                    expected_doublet_rate=expected_doublet_rate,
+                    n_prin_comps=safe_n_prin_comps,
+                    log_transform=True,
+                    random_state=random_state,
+                    verbose=False,
+                )
+            # Normalize dtypes to match the CPU path (float64 score, bool flag).
+            adata.obs["doublet_score"] = np.asarray(adata.obs["doublet_score"], dtype=np.float64)
+            adata.obs["predicted_doublet"] = np.asarray(adata.obs["predicted_doublet"], dtype=bool)
+            gpu_done = True
+        except Exception as e:
+            logger.warning("GPU Scrublet failed (%s); falling back to CPU Scrublet.", e)
+
+    if gpu_done:
+        pass
+    elif batch_key and batch_key in adata.obs.columns:
         # Run Scrublet per-batch using a manual loop instead of sc.pp.scrublet(batch_key=...).
         # sc.pp.scrublet's batch_key implementation reassigns scores via adata.obs.loc[sub.obs_names],
         # which fails with a KeyError when obs_names contain non-standard separators (e.g.

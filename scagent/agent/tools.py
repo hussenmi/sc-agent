@@ -15,12 +15,255 @@ os.environ.setdefault('TQDM_MININTERVAL', '0.5')  # Update less frequently
 
 from typing import List, Dict, Any, Optional
 import hashlib
+import importlib.util
 import json
 import logging
 from pathlib import Path
 import re
 
 logger = logging.getLogger(__name__)
+
+
+def _default_n_pcs_from_variance(
+    variance_ratios,
+    variance_target: float = 0.75,
+    max_default_n_pcs: int = 50,
+) -> int:
+    """Default number of PCs to feed the neighbor graph.
+
+    Keeps principal components until cumulative explained variance reaches
+    ``variance_target`` (a fraction in [0, 1]), capped at ``max_default_n_pcs`` —
+    whichever bound is reached first. Falls back to the number of available PCs
+    when fewer were computed or the target is never reached.
+    """
+    import numpy as np
+
+    ratios = np.asarray(variance_ratios, dtype=float)
+    n_shown = int(ratios.size)
+    if n_shown == 0:
+        return max_default_n_pcs
+    cumvar = np.cumsum(ratios)
+    above_target = np.where(cumvar >= variance_target)[0]
+    variance_threshold_n_pcs = int(above_target[0]) + 1 if above_target.size else n_shown
+    return min(max_default_n_pcs, variance_threshold_n_pcs, n_shown)
+
+
+def _stringify_dataframe_columns(df):
+    if df is None:
+        return df
+    for col in df.columns:
+        try:
+            dtype_str = str(df[col].dtype)
+        except Exception:
+            dtype_str = ""
+        if dtype_str in {"object", "category"}:
+            df[col] = df[col].astype(str)
+    return df
+
+
+def _sanitize_uns_value(value, *, preserve_none: bool = True):
+    import numpy as _np
+    import pandas as _pd
+    try:
+        import scipy.sparse as _sp
+    except Exception:
+        _sp = None
+
+    if value is None:
+        return None if preserve_none else ""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (_np.integer, _np.floating, _np.bool_)):
+        return value.item()
+    if _sp is not None and _sp.issparse(value):
+        return value.toarray().tolist()
+    if isinstance(value, _np.ndarray):
+        if value.dtype.names is not None:
+            return {
+                str(name): _sanitize_uns_value(value[name], preserve_none=preserve_none)
+                for name in value.dtype.names
+            }
+        if value.dtype.kind in "biufc":
+            return value.tolist()
+        if value.dtype.kind in "SU":
+            return value.astype(str).tolist()
+        return [
+            _sanitize_uns_value(v, preserve_none=preserve_none)
+            for v in value.tolist()
+        ]
+    if isinstance(value, (_pd.Series, _pd.Index)):
+        return [
+            _sanitize_uns_value(v, preserve_none=preserve_none)
+            for v in value.tolist()
+        ]
+    if isinstance(value, _pd.DataFrame):
+        safe_df = value.copy()
+        _stringify_dataframe_columns(safe_df)
+        return {
+            str(col): [
+                _sanitize_uns_value(v, preserve_none=preserve_none)
+                for v in safe_df[col].tolist()
+            ]
+            for col in safe_df.columns
+        }
+    if isinstance(value, dict):
+        return {
+            str(k): _sanitize_uns_value(v, preserve_none=preserve_none)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        sanitized_items = [
+            _sanitize_uns_value(v, preserve_none=preserve_none)
+            for v in value
+        ]
+        normalized_items = []
+        for item in sanitized_items:
+            if isinstance(item, (dict, list, tuple, set)):
+                try:
+                    normalized_items.append(json.dumps(item, default=str, sort_keys=True))
+                except Exception:
+                    normalized_items.append(str(item))
+            else:
+                normalized_items.append(item)
+        return normalized_items
+    return str(value)
+
+
+def _contains_none_value(value) -> bool:
+    import numpy as _np
+    import pandas as _pd
+
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return any(_contains_none_value(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_none_value(v) for v in value)
+    if isinstance(value, _np.ndarray):
+        if value.dtype.names is not None:
+            return any(_contains_none_value(value[name]) for name in value.dtype.names)
+        if value.dtype.kind == "O":
+            return any(_contains_none_value(v) for v in value.ravel().tolist())
+        return False
+    if isinstance(value, (_pd.Series, _pd.Index)):
+        return any(v is None for v in value.tolist())
+    if isinstance(value, _pd.DataFrame):
+        return any(v is None for v in value.to_numpy(dtype=object).ravel().tolist())
+    return False
+
+
+def _make_serializable_copy(current_adata, aggressive_uns: bool = False):
+    sanitized = current_adata.copy()
+    _stringify_dataframe_columns(sanitized.obs)
+    _stringify_dataframe_columns(sanitized.var)
+    if sanitized.raw is not None:
+        _stringify_dataframe_columns(sanitized.raw.var)
+    if aggressive_uns:
+        sanitized.uns = {
+            str(k): _sanitize_uns_value(v, preserve_none=False)
+            for k, v in sanitized.uns.items()
+        }
+    return sanitized
+
+
+def unique_output_path(path: str) -> str:
+    """Return a path that does not overwrite an existing file.
+
+    If ``path`` is free (or falsy), return it unchanged. Otherwise insert
+    ``_2``, ``_3``, ... before the extension until a free name is found
+    (``umap_leiden.png`` -> ``umap_leiden_2.png``). This makes figure saves
+    non-destructive: repeated saves that would reuse a name — multi-resolution
+    clustering UMAPs, pre/post-integration UMAPs — preserve every output instead
+    of silently clobbering the previous one. The caller must use the returned
+    path (not the requested one) so provenance points at the file that was written.
+    """
+    import os as _os
+
+    if not path or not _os.path.exists(path):
+        return path
+    base, ext = _os.path.splitext(path)
+    i = 2
+    while _os.path.exists(f"{base}_{i}{ext}"):
+        i += 1
+    return f"{base}_{i}{ext}"
+
+
+def _resolve_h5ad_compression():
+    """Compression settings for h5ad writes: (compression, compression_opts).
+
+    anndata/h5py default to NO compression, so h5ad files of raw/normalized
+    counts are stored uncompressed (a 151k-cell lung atlas ran to ~9 GB per
+    file). scRNA matrices are sparse and highly compressible, so we gzip by
+    default — typically a multi-fold size reduction for a modest write-time cost.
+
+    Overridable via env:
+      * ``SCAGENT_H5AD_COMPRESSION`` — 'gzip' (default), 'lzf', or 'none'/'off'.
+      * ``SCAGENT_H5AD_COMPRESSION_LEVEL`` — gzip level 0-9 (default: h5py's 4).
+    """
+    codec = (os.environ.get("SCAGENT_H5AD_COMPRESSION", "gzip") or "").strip().lower()
+    if codec in ("", "none", "off", "false", "0"):
+        return None, None
+    if codec == "gzip":
+        level_raw = os.environ.get("SCAGENT_H5AD_COMPRESSION_LEVEL", "").strip()
+        if level_raw:
+            try:
+                return "gzip", max(0, min(9, int(level_raw)))
+            except ValueError:
+                pass
+        return "gzip", None
+    return codec, None
+
+
+def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
+    compression, compression_opts = _resolve_h5ad_compression()
+    details = {"save_mode": "direct", "warnings": [], "compression": compression}
+    first_error_msg = None
+    second_error_msg = None
+
+    def _write(obj):
+        obj.write_h5ad(output_path, compression=compression, compression_opts=compression_opts)
+
+    uns_has_nulls = _contains_none_value(getattr(current_adata, "uns", {}))
+    if uns_has_nulls:
+        try:
+            sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
+            _write(sanitized)
+            details["save_mode"] = "clean_obs_var_uns_preflight"
+            details["warnings"].append("Null values in .uns were stringified before saving.")
+            return details
+        except Exception as preflight_error:
+            first_error_msg = str(preflight_error)
+            details["warnings"].append(
+                "Preflight serialization cleanup failed; retrying direct save: "
+                f"{first_error_msg}"
+            )
+
+    try:
+        _write(current_adata)
+        return details
+    except Exception as first_error:
+        first_error_msg = str(first_error)
+        details["warnings"].append(f"Direct save failed; retrying with obs/var cleanup: {first_error_msg}")
+
+    try:
+        sanitized = _make_serializable_copy(current_adata, aggressive_uns=False)
+        _write(sanitized)
+        details["save_mode"] = "clean_obs_var"
+        return details
+    except Exception as second_error:
+        second_error_msg = str(second_error)
+        details["warnings"].append(f"Obs/var cleanup save failed; retrying with uns cleanup: {second_error_msg}")
+
+    try:
+        sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
+        _write(sanitized)
+        details["save_mode"] = "clean_obs_var_uns"
+        return details
+    except Exception as third_error:
+        raise RuntimeError(
+            "Unable to save AnnData after serialization cleanup. "
+            f"Direct error: {first_error_msg}; obs/var cleanup error: {second_error_msg}; uns cleanup error: {third_error}"
+        )
 
 
 def _make_annotation_proposal_fingerprint(
@@ -440,6 +683,11 @@ def _loads_tolerant(text: str) -> Optional[Any]:
     raw = text.strip()
     if not raw:
         return None
+    # Strip a ```json ... ``` (or bare ```) markdown fence if the model wrapped
+    # its payload in one — a common quirk that otherwise dead-ends parsing.
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[A-Za-z0-9_-]*[ \t]*\r?\n?", "", raw)
+        raw = re.sub(r"\r?\n?```[ \t]*$", "", raw).strip()
     try:
         return json.loads(raw)
     except Exception:
@@ -473,6 +721,54 @@ def _report_fmt(value: Any, limit: Optional[int] = None) -> str:
     else:
         text = str(value)
     return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _annotation_low_confidence_clusters(per_cluster: Dict[str, Any], limit: int = 40) -> List[Dict[str, Any]]:
+    """Compact ``[{cluster, label, confidence}]`` for clusters NOT at high
+    confidence — the only per-cluster detail the model needs inline (to caveat the
+    uncertain calls). Full evidence stays on ``adata.uns['annotation_validation']``
+    and the saved annotation_validation_*.json/.md.
+    """
+    out: List[Dict[str, Any]] = []
+    for cid, ev in (per_cluster or {}).items():
+        if not isinstance(ev, dict):
+            continue
+        conf = str(ev.get("confidence", "")).strip().lower()
+        if conf and conf != "high":
+            out.append({
+                "cluster": str(cid),
+                "label": ev.get("label"),
+                "confidence": ev.get("confidence"),
+            })
+    out.sort(key=lambda e: (0, int(e["cluster"])) if str(e["cluster"]).isdigit() else (1, str(e["cluster"])))
+    return out[:limit]
+
+
+def _slim_annotation_validation(validation_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact copy of an annotation_validation payload for the tool RESULT.
+
+    Drops the full ``per_cluster_evidence`` blob (all clusters' evidence — the
+    single biggest driver of context overflow after finalize) and the verbose
+    ``auto_fixes`` list, replacing them with counts, the tier breakdown, and a
+    short low-confidence cluster list. This ONLY trims what re-enters the
+    conversation: the full payload is still written to
+    ``adata.uns['annotation_validation']`` and the saved JSON/MD reports, and the
+    biological outputs (obs labels) are unchanged. Every metadata field consumed by
+    world_state (counts, policy, tier breakdown, panglaodb_required_clusters, …) is
+    preserved.
+    """
+    per_cluster = validation_payload.get("per_cluster_evidence") or {}
+    slim = {
+        k: v for k, v in validation_payload.items()
+        if k not in ("per_cluster_evidence", "auto_fixes")
+    }
+    slim["n_auto_fixes"] = len(validation_payload.get("auto_fixes") or [])
+    slim["low_confidence_clusters"] = _annotation_low_confidence_clusters(per_cluster)
+    slim["per_cluster_evidence_note"] = (
+        "Full per-cluster evidence omitted here to save context; it is in "
+        "adata.uns['annotation_validation'] and the saved annotation_validation_*.json/.md."
+    )
+    return slim
 
 
 def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str:
@@ -790,6 +1086,96 @@ def _natural_cluster_sort(values: List[str]) -> List[str]:
     return sorted({str(v) for v in values}, key=_key)
 
 
+# Well-known per-cell metric obs columns worth painting on the UMAP, plus the
+# suffix rules for computed scores. See _suggested_umap_overlays.
+_PER_CELL_METRIC_OBS_KEYS = [
+    "batch_diagnostic_neighborhood_entropy",
+    "pct_counts_mt",
+    "pct_counts_ribo",
+    "doublet_score",
+    "total_counts",
+    "n_genes_by_counts",
+]
+
+
+def _suggested_umap_overlays(adata: Any) -> List[str]:
+    """obs columns that are per-cell metrics worth painting on the UMAP.
+
+    Returns known per-cell QC/diagnostic metrics present in obs plus any numeric
+    ``*_score`` / ``*_signature`` / ``*_entropy`` columns (e.g. gene-signature
+    scores, batch-mixing entropy). Tools surface this so the model paints each
+    with ``generate_figure(plot_type='umap', color_by=<key>)`` and interprets
+    WHERE the metric concentrates. Only suggested once a UMAP exists — a per-cell
+    metric with nowhere to plot it yet is not actionable.
+    """
+    if adata is None or "X_umap" not in getattr(adata, "obsm", {}):
+        return []
+    import pandas as _pd
+
+    cols = list(adata.obs.columns)
+    out = [k for k in _PER_CELL_METRIC_OBS_KEYS if k in cols]
+    for col in cols:
+        if col in out:
+            continue
+        lc = str(col).lower()
+        if (lc.endswith("_score") or lc.endswith("_signature") or lc.endswith("_entropy")) and \
+                _pd.api.types.is_numeric_dtype(adata.obs[col]):
+            out.append(col)
+    return out
+
+
+def _plot_umap_overlays(adata: Any, keys, figure_dir: Any, run_manager=None,
+                        prefix: str = "umap") -> List[str]:
+    """Paint each per-cell metric in ``keys`` on the UMAP and save one figure each.
+
+    This is the auto-generation behind ``suggested_umap_overlays``: a per-cell
+    metric (batch-mixing entropy, gene-signature score, QC metric) is far more
+    informative painted on the embedding — showing WHERE it concentrates — than as
+    a scalar. Tools that write such a metric call this so the figure always exists,
+    rather than relying on the model to plot it. No-op without a UMAP. Robust: a
+    failed panel is skipped, never breaks the caller. Returns the saved file paths;
+    the caller (inside process_tool_call) wraps them into artifact payloads.
+    """
+    saved: List[str] = []
+    if adata is None or "X_umap" not in getattr(adata, "obsm", {}):
+        return saved
+    keys = [k for k in (keys or []) if k in adata.obs.columns]
+    if not keys:
+        return saved
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+    import scanpy as _sc
+
+    fig_dir = Path(figure_dir)
+    try:
+        fig_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return saved
+    for key in keys:
+        try:
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key))
+            out_path = unique_output_path(str(fig_dir / f"{prefix}_{safe}.png"))
+            ax = _sc.pl.umap(adata, color=key, show=False)
+            fig = ax.figure if hasattr(ax, "figure") else _plt.gcf()
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            _plt.close(fig)
+            if run_manager is not None:
+                try:
+                    run_manager.add_output(out_path)
+                except Exception:
+                    pass
+            saved.append(out_path)
+        except Exception:
+            try:
+                _plt.close("all")
+            except Exception:
+                pass
+            continue
+    return saved
+
+
 def _plot_cluster_qc_metrics(adata: Any, cluster_key: str, out_path: Any,
                              flagged_clusters: Any = None) -> Optional[str]:
     """Per-cluster QC metric box plots — one panel per metric, clusters on the
@@ -960,6 +1346,147 @@ def _format_validation_failures_per_cluster(failures: List[str]) -> str:
     for g in globals_:
         lines.append(f"(global): {g}")
     return " | ".join(lines)
+
+
+# Confidence ceiling implied by each validation tier. The evidence validator
+# still auto-caps below this (QC caveats, thin DEG support), so these are the
+# best-case starting confidences the model would otherwise have to type in.
+_ANNOTATION_TIER_CONFIDENCE = {
+    "reference_consensus_plus_deg": "high",
+    "cytopus_plus_deg": "medium",
+    "reference_partial_plus_deg": "medium",
+    "needs_external_adjudication": "low",
+}
+
+
+def _build_annotation_evidence_scaffold(
+    cluster_summaries: List[Dict[str, Any]],
+    reference_keys: List[Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Build a ready-to-edit evidence dict from a ``prepare_annotation`` proposal.
+
+    Every field the annotation-evidence validator can derive mechanically is
+    pre-filled from the proposal so the model only has to write ``reasoning``
+    (and adjust ``label``/``confidence`` where it disagrees). This is exactly the
+    proposal→evidence transform the model previously had to reverse-engineer by
+    hand — the dominant cause of the stage/finalize thrash and the EMERGENCY
+    context compactions in that phase.
+
+    ``reasoning`` and ``source_synthesis.final_decision_basis`` are intentionally
+    left blank: they require the model's judgment and are the natural gate that
+    forces per-cluster review before labels are written.
+    """
+    scaffold: Dict[str, Dict[str, Any]] = {}
+    has_reference = bool(reference_keys)
+    for summary in cluster_summaries:
+        if not isinstance(summary, dict):
+            continue
+        cid = str(summary.get("cluster_id"))
+        proposed = summary.get("proposed_label")
+        label = proposed.strip() if isinstance(proposed, str) and proposed.strip() else ""
+
+        genes = list(summary.get("suggested_supporting_genes") or [])
+        if not genes:
+            genes = list(summary.get("discriminating_degs") or [])[:6]
+
+        tier = summary.get("validation_tier") or "needs_external_adjudication"
+
+        # reference_annotation_support: {annotation_key: top_label} — pure provenance.
+        ref_support: Dict[str, Any] = {}
+        for ref_entry in summary.get("reference_annotations") or []:
+            if not isinstance(ref_entry, dict):
+                continue
+            key = str(ref_entry.get("annotation_key") or "").strip()
+            if key:
+                ref_support[key] = ref_entry.get("top_label") or ""
+
+        # competing_labels_considered: proposal competitors plus any reference
+        # label that differs from the chosen one (this is what was missing for
+        # the reference-ambiguous cluster 17 in run_2026_07_02_002825).
+        competing: List[str] = []
+        for comp in summary.get("competing_labels") or []:
+            comp_label = comp.get("label") if isinstance(comp, dict) else comp
+            if isinstance(comp_label, str) and comp_label.strip() and comp_label.strip() != label:
+                competing.append(comp_label.strip())
+        for ref_entry in summary.get("reference_annotations") or []:
+            if not isinstance(ref_entry, dict):
+                continue
+            ref_label = ref_entry.get("top_label")
+            if isinstance(ref_label, str) and ref_label.strip() and ref_label.strip() != label:
+                competing.append(ref_label.strip())
+        competing = [x for i, x in enumerate(competing) if x not in competing[:i]]
+
+        rc = summary.get("reference_consensus") or {}
+        n_sources = len(ref_support)
+        if n_sources == 0:
+            agreement = "no_reference"
+        elif rc.get("has_consensus"):
+            agreement = "reference_consensus"
+        elif n_sources >= 2:
+            agreement = "reference_sources_disagree"
+        else:
+            agreement = "single_reference_source"
+
+        entry: Dict[str, Any] = {
+            "label": label,
+            "deg_derived_label": label,
+            "supporting_genes": genes,
+            "panglaodb_queried": False,
+            "confidence": _ANNOTATION_TIER_CONFIDENCE.get(tier, "low"),
+            "source_synthesis": {"agreement": agreement, "final_decision_basis": ""},
+            "reasoning": "",
+        }
+        if competing:
+            entry["competing_labels_considered"] = competing
+        if has_reference:
+            entry["reference_annotation_support"] = ref_support
+        scaffold[cid] = entry
+    return scaffold
+
+
+def _merge_evidence_over_scaffold(
+    adata: Any,
+    proposal_fingerprint: Any,
+    model_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Overlay the model's submitted evidence on the stored scaffold.
+
+    The scaffold in ``adata.uns['annotation_evidence_scaffold']`` supplies the
+    mechanically-derivable defaults; the model's ``model_evidence`` overrides
+    them field-by-field (so submitting just ``{cid: {reasoning: ...}}`` is
+    enough). The scaffold is used only when its fingerprint matches the current
+    proposal, so a re-clustering can never leak stale defaults.
+    """
+    merged: Dict[str, Any] = {}
+    scaffold = None
+    try:
+        scaffold = adata.uns.get("annotation_evidence_scaffold")
+        scaffold_fp = adata.uns.get("annotation_evidence_scaffold_fingerprint")
+    except Exception:
+        scaffold, scaffold_fp = None, None
+    fingerprint_ok = (
+        not isinstance(proposal_fingerprint, str)
+        or not proposal_fingerprint
+        or not isinstance(scaffold_fp, str)
+        or scaffold_fp == proposal_fingerprint
+    )
+    if isinstance(scaffold, dict) and scaffold and fingerprint_ok:
+        for cid, entry in scaffold.items():
+            if isinstance(entry, dict):
+                merged[str(cid)] = dict(entry)
+    for cid, entry in (model_evidence or {}).items():
+        key = str(cid)
+        if not isinstance(entry, dict):
+            merged[key] = entry
+            continue
+        base = merged.get(key)
+        if isinstance(base, dict):
+            base = dict(base)
+            base.update(entry)
+            merged[key] = base
+        else:
+            merged[key] = dict(entry)
+    return merged
 
 
 def _validate_annotation_evidence(
@@ -1503,9 +2030,32 @@ def _validate_annotation_evidence(
                 checks["discriminating_supporting_genes_matched_cluster_degs"] = discriminating_matched_degs
                 checks["n_discriminating_supporting_genes_matched_cluster_degs"] = len(discriminating_matched_degs)
                 if not matched_degs:
+                    # Echo the cluster's pre-validated markers so the agent fixes
+                    # this in one shot instead of guessing (and re-tripping the
+                    # nuisance gate above). suggested_supporting_genes /
+                    # discriminating_degs are built with the SAME nuisance/broad
+                    # filters this validator applies, so they are guaranteed to
+                    # pass both checks. Falling back to the raw DEG set would risk
+                    # re-suggesting nuisance genes, so we don't.
+                    _entry = proposal_cluster_entries.get(cid, {}) or {}
+                    _suggested = (
+                        _entry.get("suggested_supporting_genes")
+                        or _entry.get("discriminating_degs")
+                    )
+                    if _suggested:
+                        _hint = (
+                            "Cite from these (already validated for this cluster — non-nuisance, "
+                            f"present in its DEGs): {list(_suggested)[:15]}."
+                        )
+                    else:
+                        _hint = (
+                            "this cluster has no discriminating DEGs (its top DEGs are all "
+                            "nuisance/broad-context) — it may be low-quality or a doublet; lower "
+                            "the confidence or flag it rather than forcing a specific marker."
+                        )
                     validation_failures.append(
                         f"Cluster {cid}: none of supporting_genes={supporting[:10]} appear in this "
-                        f"cluster's top DEGs. Cite genes that are actually differentially expressed in cluster {cid}."
+                        f"cluster's top DEGs. {_hint}"
                     )
                 elif not non_nuisance_matched_degs:
                     validation_failures.append(
@@ -1647,6 +2197,44 @@ def _validate_annotation_evidence(
                 "margin": cytopus_adj.get("margin"),
             }
 
+        # --- DEG-first derivation floor (Floor 2): markers have the final say ---
+        # The model must independently state the label this cluster's own top DEGs
+        # indicate (not the reference models); if that differs from the final label
+        # it must justify the override. The harness enforces only that this
+        # reasoning HAPPENED — it does not judge the biology (no marker/lineage
+        # tables in the engine). The model supplies all domain knowledge; the floor
+        # guarantees the cluster's own evidence was confronted, which is what the
+        # reference-dominated failure (a SFTPC/SFTPB cluster labeled a T cell)
+        # skipped.
+        deg_derived_text = str(ev.get("deg_derived_label") or "").strip()
+        if not deg_derived_text:
+            validation_failures.append(
+                f"Cluster {cid}: missing 'deg_derived_label'. State the cell type this "
+                f"cluster's own top DEGs indicate, independent of CellTypist/Scimilarity "
+                f"(top DEGs: {cluster_top_deg_genes[:10]}). Derive from the markers first, "
+                f"then reconcile with the reference labels — the DEGs have the final say."
+            )
+        else:
+            deg_first_matches = _annotation_labels_biologically_compatible(
+                deg_derived_text, final_label_text
+            )
+            checks["deg_first_reconciliation"] = {
+                "deg_derived_label": deg_derived_text,
+                "final_label": final_label_text,
+                "matches_final": deg_first_matches,
+            }
+            if not deg_first_matches and len(
+                str(ev.get("deg_override_justification") or "").strip()
+            ) < 20:
+                validation_failures.append(
+                    f"Cluster {cid}: the DEG-derived label ({deg_derived_text!r}) differs from "
+                    f"the final label ({final_label_text!r}), but no 'deg_override_justification' "
+                    f"was provided. Because the cluster's own markers have the final say, "
+                    f"overriding them requires an explicit, evidence-based justification naming "
+                    f"which DEGs support the final label over the DEG-derived one. If you cannot "
+                    f"justify the override from the DEGs, use the DEG-derived label."
+                )
+
         # A cross-lineage override of a TWO-SOURCE reference consensus keeps the
         # high bar (handled later) — Cytopus alone cannot rescue it.
         crosses_two_source_consensus = bool(
@@ -1728,8 +2316,12 @@ def _validate_annotation_evidence(
         # it to panglaodb_queried=false rather than hard-failing. This prevents
         # over-claims (e.g. 'dendritic cells' pasted onto a T-cell cluster) from
         # cascading into a blocked finalize.
+        # An over-claimed/incompatible panglaodb_label_used is never worth
+        # blocking finalize on. Drop it and fall back to reference+DEG evidence;
+        # if the cluster genuinely needed external adjudication, the soft
+        # handling just below caps confidence and records a caveat.
         if _panglao_incompatible_msg:
-            if not panglaodb_required and apply_auto_fixes and pq:
+            if apply_auto_fixes and pq:
                 ev = dict(ev)
                 ev["panglaodb_queried"] = False
                 ev.pop("panglaodb_label_used", None)
@@ -1738,25 +2330,43 @@ def _validate_annotation_evidence(
                 checks["panglaodb_queried"] = False
                 auto_fixes.append(
                     f"Cluster {cid}: dropped an unsupported PanglaoDB claim "
-                    f"(panglaodb_label_used={panglao_label_text!r} is not compatible with {final_label_text!r}); "
-                    "the cluster is reference+DEG sufficient, so set panglaodb_queried=false."
+                    f"(panglaodb_label_used={panglao_label_text!r} is not compatible with {final_label_text!r})."
                 )
-            else:
-                validation_failures.append(_panglao_incompatible_msg)
+            checks["panglaodb_label_incompatible_note"] = _panglao_incompatible_msg
 
+        # PanglaoDB is an OPTIONAL external adjudicator, NOT a gate. DEGs +
+        # CellTypist/Scimilarity + Cytopus are the primary drivers. When a
+        # cluster still needs external adjudication that PanglaoDB could not
+        # provide — references disagree and neither Cytopus nor PanglaoDB covers
+        # the label (common for progenitor/transitional types like CMP/MEP) —
+        # do NOT loop finalize. Accept the label on reference + DEG evidence,
+        # flag it unresolved, and cap confidence to low (below) so the result is
+        # honest rather than blocked. A cluster PanglaoDB *can* adjudicate is
+        # still upgraded above this tier via the call-history path earlier.
+        external_adjudication_unresolved = False
         if panglaodb_required:
             panglaodb_required_clusters.append(cid)
-            if not pq:
-                validation_failures.append(
-                    f"Cluster {cid}: panglaodb_queried must be true because external adjudication is required "
-                    f"({', '.join(panglaodb_required_reasons) or 'needs_external_adjudication'})."
-                )
-            elif (queried_celltypes_normalized or queried_gene_symbols_normalized) and not panglaodb_has_call_history_support:
-                validation_failures.append(
-                    f"Cluster {cid}: label {label!r} (panglaodb_label_used={panglaodb_label_used!r}) "
-                    "was not found in the PanglaoDB call history recorded in world state. "
-                    "Either query PanglaoDB for this label or record the gene_symbol reverse query that supports it."
-                )
+            external_adjudication_unresolved = True
+            validation_tier = "reference_deg_unadjudicated"
+            checks["validation_tier"] = validation_tier
+            note = (
+                "External adjudication was warranted ("
+                + (", ".join(panglaodb_required_reasons) or "needs_external_adjudication")
+                + ") but PanglaoDB could not resolve it; label rests on reference + DEG "
+                "evidence at reduced (low) confidence."
+            )
+            checks["external_adjudication_status"] = "attempted_unresolved"
+            checks["external_adjudication_note"] = note
+            if apply_auto_fixes:
+                ev = dict(ev)
+                ev["external_adjudication_status"] = "attempted_unresolved"
+                ev["external_adjudication_note"] = note
+                evidence_str[cid] = ev
+            auto_fixes.append(
+                f"Cluster {cid}: external adjudication unresolved by PanglaoDB "
+                f"({', '.join(panglaodb_required_reasons) or 'needs_external_adjudication'}); "
+                "accepted on reference + DEG evidence with confidence capped to low."
+            )
 
         if validation_tier in {"reference_consensus_plus_deg", "reference_partial_plus_deg", "cytopus_plus_deg"}:
             panglaodb_support_level = validation_tier
@@ -1773,6 +2383,16 @@ def _validate_annotation_evidence(
                         comp_label = comp
                     if isinstance(comp_label, str) and comp_label.strip():
                         inferred_competing.append(comp_label.strip())
+                # Reference-derived ambiguity (e.g. CellTypist vs Scimilarity
+                # disagree) leaves competing_labels empty but the differing
+                # reference label IS the alternative considered — pull it in so
+                # such clusters don't hard-fail (regression: run_2026_07_02, c17).
+                for ref_entry in proposal_entry.get("reference_annotations", []) or []:
+                    if not isinstance(ref_entry, dict):
+                        continue
+                    ref_label = ref_entry.get("top_label")
+                    if isinstance(ref_label, str) and ref_label.strip():
+                        inferred_competing.append(ref_label.strip())
                 label_for_filter = label.strip() if isinstance(label, str) else ""
                 inferred_competing = [
                     x for i, x in enumerate(inferred_competing)
@@ -1803,6 +2423,26 @@ def _validate_annotation_evidence(
                 ref_support_ok = len(ref_support) > 0
             elif isinstance(ref_support, str):
                 ref_support_ok = bool(ref_support.strip())
+            if not ref_support_ok and apply_auto_fixes:
+                # reference_annotation_support is pure provenance (which label
+                # each reference tool assigned this cluster) — fully derivable
+                # from the proposal, so fill it rather than blocking finalize.
+                derived_support: Dict[str, Any] = {}
+                for ref_entry in proposal_entry.get("reference_annotations", []) or []:
+                    if not isinstance(ref_entry, dict):
+                        continue
+                    key = str(ref_entry.get("annotation_key") or "").strip()
+                    if key:
+                        derived_support[key] = ref_entry.get("top_label") or ""
+                if any(v not in (None, "", [], {}) for v in derived_support.values()):
+                    ev = dict(ev)
+                    ev["reference_annotation_support"] = derived_support
+                    evidence_str[cid] = ev
+                    ref_support = derived_support
+                    ref_support_ok = True
+                    auto_fixes.append(
+                        f"Cluster {cid}: filled reference_annotation_support from prepare_annotation reference labels."
+                    )
             if not ref_support_ok:
                 validation_failures.append(
                     f"Cluster {cid}: missing reference_annotation_support for reference columns {reference_keys}."
@@ -1908,6 +2548,17 @@ def _validate_annotation_evidence(
                     f"Cluster {cid}: auto-lowered confidence high → low because no PanglaoDB call history "
                     "backs this label (self-attested)."
                 )
+        # Unresolved external adjudication → honest low confidence (any starting
+        # level), since the label rests on reference + DEG evidence only.
+        if external_adjudication_unresolved and apply_auto_fixes and conf in {"high", "medium"}:
+            ev = dict(ev)
+            ev["confidence"] = "low"
+            evidence_str[cid] = ev
+            conf = "low"
+            auto_fixes.append(
+                f"Cluster {cid}: capped confidence to low — external adjudication warranted but "
+                "unresolved (reference + DEG support only)."
+            )
         checks["confidence"] = conf
         # If auto-fixes are disabled we still emit the prior strict messages
         # so callers that want the raw rejection report can see them.
@@ -2015,9 +2666,29 @@ def _validate_annotation_evidence(
                     "DEG/PanglaoDB support, QC caveats, source agreement/discordance, and the final decision basis."
                 )
             else:
-                checks["source_synthesis"] = source_synthesis
                 agreement = source_synthesis.get("agreement")
                 basis = source_synthesis.get("final_decision_basis")
+                # The scaffold fills source_synthesis.agreement but leaves the
+                # decision basis blank; the model's per-cluster `reasoning` IS
+                # that basis. When basis is blank/thin but reasoning is
+                # substantive, derive it rather than demanding a duplicate field.
+                reasoning_text = ev.get("reasoning")
+                if (
+                    apply_auto_fixes
+                    and (not isinstance(basis, str) or len(basis.strip()) < 20)
+                    and isinstance(reasoning_text, str)
+                    and len(reasoning_text.strip()) >= 20
+                ):
+                    source_synthesis = dict(source_synthesis)
+                    source_synthesis["final_decision_basis"] = reasoning_text.strip()
+                    basis = source_synthesis["final_decision_basis"]
+                    ev = dict(ev)
+                    ev["source_synthesis"] = source_synthesis
+                    evidence_str[cid] = ev
+                    auto_fixes.append(
+                        f"Cluster {cid}: set source_synthesis.final_decision_basis from reasoning."
+                    )
+                checks["source_synthesis"] = source_synthesis
                 if not isinstance(agreement, str) or not agreement.strip():
                     validation_failures.append(
                         f"Cluster {cid}: source_synthesis.agreement is required."
@@ -2252,7 +2923,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_neighbors": {"type": "integer", "description": "Number of neighbors (default: 30)"},
-                    "n_pcs": {"type": "integer", "description": "Number of PCs to use from the representation (optional)"},
+                    "n_pcs": {"type": "integer", "description": "Number of PCs to use from the representation. If omitted and use_rep=X_pca, defaults to the PCs needed to reach 75% cumulative variance, capped at 50 (whichever comes first); for non-PCA representations all dimensions are used."},
                     "use_rep": {"type": "string", "description": "Representation in adata.obsm to use (default: X_pca)"},
                     "metric": {"type": "string", "description": "Distance metric (default: euclidean)"},
                     "key_added": {"type": "string", "description": "Optional alternate neighbors key. Omit to write the default graph."}
@@ -2324,7 +2995,8 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
-                    "model": {"type": "string", "description": "Model name (default: Immune_All_Low.pkl)"},
+                    "model": {"type": "string", "description": "CellTypist model name (e.g. 'Healthy_Adult_Lung.pkl'). Choose a model that matches the dataset tissue — the immune-only default 'Immune_All_Low.pkl' mislabels non-immune cells. Use list_celltypist_models to see options."},
+                    "model_selection_confirmed": {"type": "boolean", "description": "Set true once you have presented tissue-appropriate model options to the user (via pause_and_ask) and they chose. Required to run the default immune model, so an immune-only model is never applied to non-immune tissue by accident."},
                     "organism": {"type": "string", "enum": ["human", "mouse"], "description": "Dataset organism. Use explicit user-provided species when available; if ambiguous, ask before annotation."},
                     "allow_cross_species": {"type": "boolean", "description": "Expert override to run a species-mismatched CellTypist model as non-definitive exploratory output (default: false)."},
                     "majority_voting": {"type": "boolean", "description": "Use majority voting (default: true)"},
@@ -2375,6 +3047,9 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "cluster_key": {"type": "string", "description": "obs column with cluster labels (default: leiden)"},
+                    "allow_precorrection_clustering": {"type": "boolean", "description": "Expert override (default false). When the dataset is batch-corrected, prepare_annotation refuses to annotate a clustering that was NOT computed on the integrated embedding (e.g. a stale pre-integration clustering). Set true only to deliberately annotate a pre-integration clustering, with a documented reason."},
+                    "allow_skip_structure_qc": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until cluster STRUCTURE QC has run on this clustering (run_cluster_qc auto-runs it) — it is required evidence that distinguishes coherent clusters from doublet/noise mixtures. Set true ONLY if the user explicitly asked to skip structure QC."},
+                    "allow_skip_reference_tools": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until Scimilarity has run (or recorded a real blocker) — reference labels are primary annotation evidence and the proposal must be built after they exist. Set true ONLY if the user explicitly opted out of reference tools."},
                     "marker_dict": {
                         "type": "object",
                         "description": (
@@ -2568,16 +3243,102 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "diagnose_batch_effect",
+            "description": (
+                "Run the lightweight uncorrected multi-sample diagnostic after PCA/neighbors/UMAP/clustering "
+                "when the user selected investigate_integration. It checks cluster-by-sample composition, "
+                "provisional broad cluster labels from marker DEGs, sample-associated expression shifts within "
+                "broad states, shared cross-cell-type signatures, UMAP state separation, neighborhood "
+                "batch-mixing entropy in PCA space (a continuous check that also catches batches that smear "
+                "through shared regions without forming their own clusters), cluster-vs-sample ARI/NMI (a "
+                "global scalar for how strongly clusters track samples), and confounding between "
+                "sample/batch and condition-like metadata. It also flags sample-segregated epithelial clusters "
+                "(by their markers, e.g. EPCAM/KRT) as possibly donor/patient-private epithelial biology rather than batch. "
+                "This is descriptive evidence only; it must be followed by a user confirmation before scVI integration."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "batch_key": {
+                        "type": "string",
+                        "description": "obs column identifying samples/batches to investigate."
+                    },
+                    "cluster_key": {
+                        "type": "string",
+                        "description": "obs column with uncorrected clusters (default: leiden)."
+                    },
+                    "condition_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional condition/design columns to test for sample confounding. If omitted, condition-like columns are auto-detected."
+                    },
+                    "min_cells_per_cluster_sample": {
+                        "type": "integer",
+                        "description": "Minimum cells per broad state × sample for descriptive sample-vs-rest expression shifts (default: 30)."
+                    },
+                    "n_top_genes": {
+                        "type": "integer",
+                        "description": "Number of marker/shift genes to inspect per cluster or state (default: 25)."
+                    },
+                    "entropy_use_rep": {
+                        "type": "string",
+                        "description": "Embedding used for the neighborhood batch-mixing entropy check (default: X_pca, the uncorrected representation). The check is skipped gracefully if absent."
+                    },
+                    "entropy_n_neighbors": {
+                        "type": "integer",
+                        "description": "Neighborhood size for the batch-mixing entropy check (default: 50)."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory for diagnostic CSV artifacts (optional; defaults to the run artifact directory)."
+                    }
+                },
+                "required": ["batch_key"]
+            }
+        },
+        {
+            "name": "annotate_artifact_group",
+            "description": (
+                "Record YOUR dataset-specific interpretation of a group of output files into that "
+                "group's auto-generated README.md (the '## Interpretation (dataset-specific)' section). "
+                "Tools that write a folder of artifacts (e.g. diagnose_batch_effect) emit a README "
+                "documenting each file's purpose, computation, and columns, and surface "
+                "`doc_interpretation_pending` in their result. Call this afterwards to add what the "
+                "results actually SHOW for this dataset — the concrete findings, which files/rows "
+                "support them, and the conclusion — in plain language. The structural documentation is "
+                "already written; supply only the interpretation. Reference specific files and columns "
+                "by name so a reader can follow your reasoning back to the data."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "group": {
+                        "type": "string",
+                        "description": "The artifact group id surfaced in the producing tool's `doc_interpretation_pending` (e.g. 'diagnose_batch_effect')."
+                    },
+                    "readme_path": {
+                        "type": "string",
+                        "description": "Optional explicit path to the group README.md (as given in `doc_interpretation_pending`). Use this if the group id is ambiguous."
+                    },
+                    "interpretation": {
+                        "type": "string",
+                        "description": "Your dataset-specific findings in markdown: what the files show, the evidence (cite files/columns/values), and the conclusion. This replaces the README's Interpretation placeholder."
+                    }
+                },
+                "required": ["interpretation"]
+            }
+        },
+        {
             "name": "run_batch_correction",
             "description": (
-                "Correct batch effects using Harmony, BBKNN, Scanorama, or scVI. "
-                "Harmony: fast, corrects PCA embeddings, good for mild-to-moderate batch effects. "
-                "BBKNN: fast, builds a batch-balanced k-NN graph in PCA space; correction lives in "
-                "the neighbor graph (not a separate embedding). Run UMAP/clustering separately unless explicitly requested. "
-                "Good default when you have many samples (e.g. >10 batches). "
-                "Scanorama: MNN-based, also corrects gene expression, good for partially overlapping datasets. "
+                "Correct batch effects after the user explicitly chose integration. "
+                "Correction is opt-in and must follow an explicit user strategy; metadata names alone are not sufficient. "
+                "scVI is the default when the user chooses integration. "
                 "scVI: deep generative model, models raw counts directly, best for complex/strong batch effects "
-                "but requires raw_counts layer and takes longer to train (recommended max_epochs=200). "
+                "but requires raw_counts layer and takes longer to train. It trains on the highly variable "
+                "genes and stops early once the validation ELBO plateaus, picking the least-busy GPU automatically. "
+                "Harmony, BBKNN, and Scanorama remain available only when the user or a source workflow explicitly "
+                "selects them. "
                 "This tool only performs batch correction. Run run_neighbors and run_umap as separate steps afterwards."
             ),
             "input_schema": {
@@ -2590,15 +3351,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                         "type": "string",
                         "enum": ["harmony", "bbknn", "scanorama", "scvi"],
                         "description": (
-                            "Correction method (default: harmony). "
-                            "bbknn: batch-balanced graph, good for many batches (>10 samples). "
-                            "scvi: best for complex effects but needs raw_counts layer."
+                            "Correction method (default: scvi). Other methods are used only when "
+                            "the user or a source workflow explicitly selects them."
                         )
                     },
                     "n_pcs": {"type": "integer", "description": "BBKNN only: number of PCA components to use (default: 30)"},
                     "neighbors_within_batch": {"type": "integer", "description": "BBKNN only: neighbors contributed per batch per cell (default: 3; total = n_batches × this value)"},
                     "n_latent": {"type": "integer", "description": "scVI only: latent space dimensions (default: 30)"},
-                    "max_epochs": {"type": "integer", "description": "scVI only: training epochs (default: 200; use fewer only for quick tests)"},
+                    "max_epochs": {"type": "integer", "description": "scVI only: upper bound on training epochs. Leave unset to use scVI's cell-count heuristic (400 for <=20k cells, decaying above); early stopping halts sooner once the validation ELBO plateaus. A train/validation ELBO convergence plot (scvi_training_loss.png) and per-epoch history CSV are saved, and the result reports epochs_trained / early_stopped / final ELBOs. Set a small value (e.g. 10) only for quick tests."},
                     "store_normalized": {"type": "boolean", "description": "scVI only: store scVI-normalized expression in layers['scvi_normalized'] (default: false)"}
                 },
                 "required": []
@@ -2612,8 +3372,11 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "computes the Shannon entropy of batch labels — high entropy means batches are "
                 "well-mixed. The score is normalized to [0, 1] where 1 = perfect mixing. "
                 "Call this after run_batch_correction to quantify whether integration worked. "
-                "Can also be called on uncorrected embeddings (use_rep='X_pca') as a baseline "
-                "to compare before/after. Stores per-cell scores in obs['integration_entropy']."
+                "For a defensible before/after, score like-for-like latent spaces: pass "
+                "use_rep='X_pca' for the pre-integration baseline and the corrected latent "
+                "embedding (use_rep='X_scVI', or 'X_pca_harmony' for Harmony) for the post-integration "
+                "score — not 'X_umap', whose 2-D distortion conflates the integration effect with the "
+                "representation change. Stores per-cell scores in obs['integration_entropy']."
             ),
             "input_schema": {
                 "type": "object",
@@ -2624,7 +3387,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     },
                     "use_rep": {
                         "type": "string",
-                        "description": "Embedding to evaluate (default: 'X_umap'). Use the corrected embedding for post-integration score, or 'X_pca' for pre-integration baseline."
+                        "description": "Embedding to evaluate (default: 'X_umap'). For a like-for-like before/after, use the corrected latent embedding ('X_scVI' / 'X_pca_harmony') for the post-integration score and 'X_pca' for the pre-integration baseline. Avoid 'X_umap' for before/after comparison — its 2-D distortion conflates the integration effect with the representation change."
                     },
                     "n_neighbors": {
                         "type": "integer",
@@ -2685,7 +3448,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "groupby": {"type": "string", "description": "Group column (default: leiden)"},
                     "method": {"type": "string", "enum": ["wilcoxon", "t-test", "logreg"], "description": "Method (default: wilcoxon)"},
                     "layer": {"type": "string", "description": "Optional expression layer to use for DEG (for example scran_norm)"},
-                    "use_raw": {"type": "boolean", "description": "Whether to use adata.raw for DEG when layer is not set. If omitted, follows Scanpy default (uses adata.raw when present)."},
+                    "use_raw": {"type": "boolean", "description": "Whether to use adata.raw for DEG when layer is not set. Omit (default False) to use adata.X — the log-normalized, full-gene analysis matrix this pipeline maintains. Only set True if you have confirmed adata.X is scaled/z-scored (this pipeline does not scale X in place)."},
                     "key_added": {"type": "string", "description": "Key in adata.uns for DEG results (default: rank_genes_groups)"},
                     "n_genes": {"type": "integer", "description": "Number of ranked genes to store per group (default: 100)"},
                     "target_geneset": {"type": "string", "description": "Target gene set database for compatibility check (default: MSigDB_Hallmark_2020)"}
@@ -2959,15 +3722,17 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, library size, n_genes, doublet score). Does NOT remove any cells; it nominates proposed-removal and ambiguous clusters for structure QC adjudication. Call this after first clustering to identify low-quality, low-complexity, doublet-enriched, or ambiguous clusters before annotation. Also saves a per-cluster QC box-plot figure (one compact multi-panel figure per iteration, metric-flagged clusters highlighted) to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png and returns its path in `qc_metrics_figure` — cite it in the QC reasoning report.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on the flagged/ambiguous (or baseline) clusters — gene-gene covariance modules, clustered correlation heatmaps, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`) and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite both in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "cluster_key": {"type": "string", "description": "obs column to group by (default: leiden)"},
                     "doublet_threshold": {"type": "number", "description": "Mean doublet score above which to flag as doublet-enriched (default: 0.3)"},
                     "mt_threshold": {"type": "number", "description": "Mean MT% above which a cluster is flagged as elevated (default: 25)"},
+                    "ribo_threshold": {"type": "number", "description": "Mean ribosomal% above which a cluster is flagged for structure-QC review (default: 50). Only applied when pct_counts_ribo is present in obs."},
                     "low_lib_fraction": {"type": "number", "description": "Fraction of global median library size below which lib size is considered low (default: 0.5)"},
                     "low_genes_fraction": {"type": "number", "description": "Fraction of global median n_genes below which gene count is considered low (default: 0.5)"},
+                    "auto_structure_qc": {"type": "boolean", "description": "Auto-run cluster structure QC on the flagged/ambiguous/baseline clusters within this call (default: true). Set false only to run structure QC separately with custom parameters."},
                     "save_checkpoint": {"type": "boolean", "description": "Save an h5ad checkpoint before any removal (default: true)"},
                     "checkpoint_path": {"type": "string", "description": "Path for checkpoint file (default: <output_dir>/checkpoint_pre_cleanup.h5ad)"}
                 },
@@ -3010,11 +3775,12 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "save_data",
-            "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete.",
+            "description": "Save the current in-memory AnnData object without modifying it. Use this as the final save step after analysis and annotation are complete. If annotation was required but finalize_annotation genuinely cannot pass validation after honest attempts, pass allow_unvalidated=true to save anyway as a clearly-marked UNVALIDATED file rather than losing the analysis.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "output_path": {"type": "string", "description": "Path to save the current in-memory h5ad"}
+                    "output_path": {"type": "string", "description": "Path to save the current in-memory h5ad"},
+                    "allow_unvalidated": {"type": "boolean", "description": "Escape hatch: when annotation consensus could not be finalized, set true to save anyway. The file is suffixed _UNVALIDATED and adata.uns['annotation_status'] is set to 'unvalidated'. Only use after genuine finalize_annotation attempts have failed."}
                 },
                 "required": ["output_path"]
             }
@@ -3213,7 +3979,25 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "options": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of discrete choices if applicable. Omit for open-ended questions."
+                        "minItems": 2,
+                        "maxItems": 5,
+                        "description": "Two to five concise user-facing choices. Omit for an open-ended question."
+                    },
+                    "option_actions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Stable machine-readable action id for each option, in the same order. "
+                            "Use short snake_case values."
+                        )
+                    },
+                    "decision_key": {
+                        "type": "string",
+                        "description": "Stable snake_case key identifying this decision."
+                    },
+                    "allow_custom": {
+                        "type": "boolean",
+                        "description": "Whether the selector should offer a custom free-text response. Defaults to true."
                     }
                 },
                 "required": ["question", "context"]
@@ -3232,6 +4016,30 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to a single h5ad or 10x h5 file (optional - uses in-memory data). Do NOT pass a directory; for multi-sample loading use run_code."},
                     "goal": {"type": "string", "description": "Analysis goal to get recommendations (e.g., 'cluster', 'annotate')"},
                     "context": {"type": "string", "description": "Optional biological context hint from the user or file path (e.g., 'PBMC healthy human cells')"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "convert_gene_ids",
+            "description": (
+                "Normalize adata.var_names to gene SYMBOLS (e.g. Ensembl 'ENSG00000010610' → 'CD4'). "
+                "Use this when inspect_data reports genes.format='ensembl' (or 'entrez'/'mixed') and "
+                "genes.convertible_to_symbols=true, BEFORE annotation tools that align to a symbol "
+                "gene space (run_scimilarity, run_celltypist) or before plotting/scoring genes by "
+                "symbol. Offline and non-destructive: prefers the dataset's own symbol column "
+                "(genes.symbol_column, e.g. feature_name); original Ensembl IDs are preserved in "
+                "var['ensembl_id']; genome prefixes (e.g. 'GRCh38_') are stripped and duplicate "
+                "symbols made unique (no genes dropped). No-op if var_names are already symbols. "
+                "Set use_mygene=true only to attempt an online Ensembl→symbol lookup when there is no "
+                "in-file symbol column (requires network; fails soft when offline)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Optional h5ad path; defaults to the in-memory dataset."},
+                    "use_mygene": {"type": "boolean", "description": "Fallback to mygene.info online lookup when no in-file symbol column exists (default: false)."},
+                    "organism": {"type": "string", "enum": ["human", "mouse"], "description": "Organism hint for the mygene fallback (optional)."}
                 },
                 "required": []
             }
@@ -3397,6 +4205,24 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             }
         },
         {
+            "name": "inspect_data_inputs",
+            "description": (
+                "Inspect a file or directory for supported single-cell datasets without "
+                "loading or concatenating them. Always use this first when the user gives "
+                "a directory or multiple input files."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or workspace-relative input file/directory path."
+                    }
+                },
+                "required": ["path"]
+            }
+        },
+        {
             "name": "inspect_workspace",
             "description": "Read-only workspace inspection for the current project or run directory. Use this sparingly for awareness and recovery.",
             "input_schema": {
@@ -3454,6 +4280,16 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
     ]
 
     tools = action_tools + meta_tools + inspection_tools
+    optional_analysis_tools = {
+        "run_pseudobulk_deg": "scagent.analysis.pseudobulk",
+        "run_spectra": "scagent.analysis.spectra",
+    }
+    tools = [
+        tool
+        for tool in tools
+        if tool["name"] not in optional_analysis_tools
+        or importlib.util.find_spec(optional_analysis_tools[tool["name"]]) is not None
+    ]
 
     if include_describe_image:
         tools.append({
@@ -3483,6 +4319,40 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     },
                 },
                 "required": ["figure_path"],
+            },
+        })
+
+    # Model-driven inspection (default ON; disable with SCAGENT_MODEL_INSPECTION=0):
+    # the model reads the deterministic fact sheet from inspect_data and records
+    # its own role/species interpretation, which overrides the heuristic. A safety
+    # net falls back to the heuristic if the model skips record_inspection.
+    if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") != "0":
+        tools.append({
+            "name": "record_inspection",
+            "description": (
+                "Record your interpretation of the dataset after reading the fact sheet "
+                "from inspect_data. Report which obs column (if any) holds cell-type "
+                "labels, which holds the batch / donor / sample grouping, and the species. "
+                "OMIT a field when no column qualifies — e.g. a per-cell barcode column is "
+                "NOT cell-type labels, so leave cell_type_col unset. The runtime validates "
+                "that named columns exist and records the decision, which overrides the "
+                "heuristic guesses for the rest of the run. Call this once, right after "
+                "inspect_data, before proceeding with the analysis."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cell_type_col": {"type": "string", "description": "obs column holding cell-type labels. Omit if none — barcodes/per-cell IDs are not labels."},
+                    "batch_col": {"type": "string", "description": "obs column to use as the batch key for correction/stratification. Omit if single-batch."},
+                    "donor_col": {"type": "string", "description": "obs column identifying the donor/patient. Omit if absent."},
+                    "sample_col": {"type": "string", "description": "obs column identifying the sample/library. Omit if absent."},
+                    "cluster_col": {"type": "string", "description": "obs column holding existing cluster assignments (e.g. leiden). Omit if the data is not yet clustered."},
+                    "species": {"type": "string", "enum": ["human", "mouse", "unknown"], "description": "Species inferred from gene symbols / IDs / namespace counts."},
+                    "tissue": {"type": "string", "description": "Tissue / system, free text (e.g. lung, PBMC, brain). Omit if unknown."},
+                    "condition": {"type": "string", "description": "Experimental condition / disease state, free text (e.g. healthy, IPF, tumor). Omit if unknown."},
+                    "rationale": {"type": "string", "description": "Brief justification citing the facts you used (cardinality, unique_fraction, example values, gene namespace) and any context from the request."},
+                },
+                "required": [],
             },
         })
 
@@ -3561,6 +4431,60 @@ def _dataframe_preview(df, n: int = 5, max_cols: int = 20) -> dict:
     }
 
 
+def _is_discrete_obs_color(adata_obj, key) -> bool:
+    """True if a UMAP/t-SNE color key is a discrete obs column with a legend.
+
+    Excludes genes (not in obs), continuous numeric columns (colorbar, no
+    legend), and very-high-cardinality columns where no legend helps.
+    """
+    import pandas as _pd
+    if key is None or key not in adata_obj.obs.columns:
+        return False
+    series = adata_obj.obs[key]
+    if _pd.api.types.is_numeric_dtype(series) and not _pd.api.types.is_bool_dtype(series):
+        return False
+    return int(series.nunique(dropna=True)) <= 60
+
+
+def _add_outside_categorical_legend(ax, adata_obj, key: str) -> bool:
+    """Draw a discrete category legend OUTSIDE the data panel (to the right).
+
+    Scanpy's default 'right margin' legend shrinks the axes inside a fixed figure
+    to fit many long labels, squishing the embedding. Drawing our own legend
+    outside (multi-column when there are many categories) keeps the panel's
+    shape. Returns True if a legend was added.
+    """
+    import matplotlib
+    from matplotlib.lines import Line2D
+
+    series = adata_obj.obs[key]
+    if str(series.dtype) != "category":
+        series = series.astype("category")
+    cats = [str(c) for c in series.cat.categories]
+    if not cats:
+        return False
+    raw_colors = adata_obj.uns.get(f"{key}_colors")
+    colors = list(raw_colors) if raw_colors is not None else []
+    if len(colors) < len(cats):
+        try:
+            cmap = matplotlib.colormaps["tab20"].resampled(len(cats))
+        except Exception:  # older matplotlib
+            cmap = matplotlib.cm.get_cmap("tab20", len(cats))
+        colors = [matplotlib.colors.to_hex(cmap(i)) for i in range(len(cats))]
+    handles = [
+        Line2D([0], [0], marker="o", linestyle="", markersize=6,
+               markerfacecolor=colors[i], markeredgecolor="none", label=cats[i])
+        for i in range(len(cats))
+    ]
+    ncol = 2 if len(cats) > 16 else 1
+    ax.legend(
+        handles=handles, loc="center left", bbox_to_anchor=(1.02, 0.5),
+        frameon=False, ncol=ncol, fontsize=8, handletextpad=0.3,
+        columnspacing=1.0, borderaxespad=0.0, markerscale=1.2,
+    )
+    return True
+
+
 def process_tool_call(
     tool_name: str,
     tool_input: Dict[str, Any],
@@ -3601,6 +4525,7 @@ def process_tool_call(
         run_phenograph,
         calculate_qc_metrics,
         detect_doublets,
+        discover_data_inputs,
     )
     from ..core.normalization import select_hvg
     from ..core.clustering import run_differential_expression, get_top_markers
@@ -3624,8 +4549,10 @@ def process_tool_call(
         """Create compact state dict."""
         state = inspect_data(adata)
         return {
-            "has_raw_counts": state.has_raw_layer or state.has_raw,
+            "has_raw_counts": bool(state.has_raw_layer or (state.has_raw and state.raw_is_counts) or state.is_counts),
+            "x_is_raw_counts": bool(state.is_counts),
             "raw_in_adata_raw": state.has_raw,
+            "raw_adata_is_counts": bool(state.has_raw and state.raw_is_counts),
             "raw_in_layer": state.has_raw_layer,
             "raw_layer_name": state.raw_layer_name if state.has_raw_layer else None,
             "has_qc_metrics": state.has_qc_metrics,
@@ -3811,6 +4738,7 @@ def process_tool_call(
 
     def _analysis_guidance(state, *, goal: Any = None, context: str = "") -> Dict[str, Any]:
         batch_relevant_now = _batch_relevance(state, goal=goal, context=context)
+        selected_strategy = _confirmed_decision_value("multi_sample_strategy")
         batch_strategy = {
             "status": "not_applicable",
             "batch_key": state.batch_key,
@@ -3825,36 +4753,56 @@ def process_tool_call(
                     "method": state.batch_correction_method or "unknown",
                     "next_action": "Use the corrected graph/embedding for UMAP, clustering, and annotation.",
                 }
+            elif selected_strategy:
+                strategy_action = (
+                    selected_strategy.get("action")
+                    if isinstance(selected_strategy, dict)
+                    else selected_strategy
+                )
+                batch_strategy = {
+                    "status": "selected",
+                    "batch_key": state.batch_key,
+                    "n_batches": state.n_batches,
+                    "selected_strategy": selected_strategy,
+                    "next_action": {
+                        "investigate_integration": "Run the uncorrected first pass, then diagnose_batch_effect.",
+                        "integrate_scvi": "Integrate with scVI using the confirmed sample key.",
+                        "keep_unintegrated": "Proceed with one combined uncorrected representation.",
+                        "analyze_separately": "Run separate sample-specific analyses.",
+                    }.get(strategy_action, "Follow the user's custom sample-handling strategy."),
+                }
             elif state.has_neighbors or state.has_umap or state.has_clusters:
                 batch_strategy = {
                     "status": "needs_review",
                     "batch_key": state.batch_key,
                     "n_batches": state.n_batches,
-                    "next_action": "Score or inspect batch mixing; rerun batch correction if sample structure remains.",
+                    "next_action": "Ask the user to select a sample-handling strategy; do not correct automatically.",
                 }
             elif state.has_pca:
                 batch_strategy = {
                     "status": "needs_decision",
                     "batch_key": state.batch_key,
                     "n_batches": state.n_batches,
-                    "next_action": "Run score_integration on X_pca and/or run_batch_correction before neighbors/UMAP/clustering.",
+                    "next_action": "Ask whether to investigate, integrate with scVI, keep uncorrected, or analyze separately.",
                 }
             else:
                 batch_strategy = {
-                    "status": "pending_pca",
+                    "status": "needs_decision",
                     "batch_key": state.batch_key,
                     "n_batches": state.n_batches,
-                    "next_action": "Carry batch metadata through preprocessing, then decide after PCA.",
+                    "next_action": "Ask how the samples should be handled; metadata alone does not justify correction.",
                 }
 
         if not state.has_qc_metrics:
             next_priority = "qc_preview"
         elif not state.is_normalized:
             next_priority = "normalize_and_hvg"
-        elif batch_relevant_now and state.has_pca and not state.batch_correction_applied and not state.has_neighbors:
+        elif (
+            batch_relevant_now
+            and not selected_strategy
+            and not state.batch_correction_applied
+        ):
             next_priority = "batch_strategy"
-        elif batch_relevant_now and state.has_neighbors and not state.batch_correction_applied:
-            next_priority = "review_batch_strategy"
         elif not (state.has_pca and state.has_neighbors and state.has_umap):
             next_priority = "run_pca"
         elif not state.has_clusters:
@@ -3873,7 +4821,7 @@ def process_tool_call(
         ]
         if batch_relevant_now:
             notes.append(
-                "Batch handling is relevant for this request. For multi-sample data, record a batch strategy before neighbors/UMAP/clustering: run correction, or score/inspect mixing and record why correction is unnecessary."
+                "Multiple sample-like groups are present. Do not batch-correct automatically; obtain and follow the user's multi-sample strategy."
             )
         else:
             notes.append(
@@ -3986,6 +4934,34 @@ def process_tool_call(
             payload.update(extra)
         return json.dumps(payload, indent=2), adata_obj
 
+    def _autoconvert_symbols_on_load(adata):
+        """Convert var_names to gene symbols ONCE, at load, before any analysis.
+
+        Gene-identifier conversion must happen before anything that depends on gene
+        identity (MT/ribosomal QC + removal, marker/DEG interpretation, reference
+        annotation, plotting by symbol). Doing it late cascades: normalize_and_hvg
+        removing ribosomal genes by 'RPL'/'RPS' matched NOTHING on Ensembl
+        var_names, so ribo genes survived into DEGs (run_2026_07_05_233220), MT% was
+        0, etc. Converting the primary dataset here — offline, using the dataset's
+        own symbol column, preserving the originals in var['ensembl_id'] — makes
+        every downstream step operate on symbols. No-op when var_names are already
+        symbols or no symbol column exists. Records a report on
+        adata.uns['scagent_gene_id_conversion'] so load_data/inspect_data surface it.
+        """
+        try:
+            from ..core.genes import convert_var_to_symbols, infer_id_format
+            if infer_id_format(adata.var_names) == "symbol":
+                return adata
+            _, report = convert_var_to_symbols(adata, inplace=True)
+            if report.changed:
+                try:
+                    adata.uns["scagent_gene_id_conversion"] = report.to_dict()
+                except Exception:
+                    pass
+        except Exception:
+            pass  # never block a load on conversion; downstream is symbol-aware too
+        return adata
+
     def get_adata(tool_input, existing_adata, update_memory: bool = True, prefer_memory: bool = False):
         """Get adata from memory or load from disk.
 
@@ -3993,6 +4969,12 @@ def process_tool_call(
         and does not replace the active in-memory AnnData tracked by the agent.
         """
         data_path = tool_input.get("data_path")
+        # Normalize the path: strip whitespace, and treat an empty/whitespace-only
+        # string as "no path given" so it falls back to in-memory data instead of
+        # erroring. A stray data_path="" is a common model artifact (e.g. after a
+        # concat in run_code) and should not be read as "load from disk".
+        if isinstance(data_path, str):
+            data_path = data_path.strip() or None
         if prefer_memory and existing_adata is not None:
             return existing_adata, existing_adata
         # If adata is already in memory and no specific path given, use it
@@ -4001,7 +4983,10 @@ def process_tool_call(
         # Otherwise load from disk
         if data_path and data_path != "memory":
             loaded = load_data(data_path)
+            # Convert gene ids to symbols up front only when this load establishes
+            # the primary in-memory dataset (not a transient read-only inspection).
             if update_memory:
+                loaded = _autoconvert_symbols_on_load(loaded)
                 return loaded, loaded
             return loaded, existing_adata
         raise ValueError("No data available. Provide data_path or load data first.")
@@ -4080,6 +5065,78 @@ def process_tool_call(
             "which preserves raw counts in layers['raw_counts'] before normalizing."
         )
 
+    def _ensure_raw_counts_layer(adata, raw_layer_name: str = "raw_counts"):
+        """Make adata.layers[raw_layer_name] hold integer counts when X is already
+        processed and counts live only in adata.raw.
+
+        General fix for CELLxGENE-style objects (run_2026_07_02_150701): raw counts
+        sat in adata.raw (float32 but integer-valued), normalize_and_hvg only knew
+        how to reset from a *named layer*, and the model had to hand-copy
+        adata.raw.X into a layer across ~5 failed iterations. Here we do that
+        alignment once, automatically, using the shared counts resolver. Returns a
+        short note describing what was materialized, or None if nothing was needed.
+        adata.raw is aligned to the current var_names (it often carries a superset
+        of genes) so the layer matches adata's shape.
+        """
+        from ..core.inspector import _is_integer_matrix, find_counts_matrix
+
+        # Already have integer counts under the expected name, or X itself is
+        # counts (normalization_source='auto' handles that) — nothing to do.
+        if raw_layer_name in adata.layers and _is_integer_matrix(adata.layers[raw_layer_name]):
+            return None
+        if _is_integer_matrix(adata.X):
+            return None
+
+        found = find_counts_matrix(adata, prefer_layer=raw_layer_name)
+        if found is None:
+            return None  # let normalize_data raise its own clear error
+
+        source = found["source"]
+        if source.startswith("layer:"):
+            src = source.split(":", 1)[1]
+            if src == raw_layer_name:
+                return None
+            adata.layers[raw_layer_name] = adata.layers[src]
+            return f"copied integer counts from layer '{src}' into '{raw_layer_name}'"
+
+        if source == "raw":
+            raw = adata.raw
+            raw_var = [str(g) for g in raw.var_names]
+            cur_var = [str(g) for g in adata.var_names]
+            if raw_var == cur_var:
+                adata.layers[raw_layer_name] = raw.X.copy() if hasattr(raw.X, "copy") else raw.X
+                return (
+                    f"materialized raw counts from adata.raw into layer '{raw_layer_name}' "
+                    f"({len(cur_var)} genes)"
+                )
+            pos = {g: i for i, g in enumerate(raw_var)}
+            align_via = None
+            # 1. Direct name alignment — raw is in the same ID space as adata.var.
+            if all(g in pos for g in cur_var):
+                idx = [pos[g] for g in cur_var]
+                align_via = "gene name"
+            # 2. Fallback via preserved original IDs. convert_gene_ids rewrites
+            #    adata.var_names to symbols but leaves adata.raw in the ORIGINAL id
+            #    space (e.g. Ensembl), saving the pre-conversion ids in
+            #    var['ensembl_id']. Map current genes -> their original id -> raw
+            #    column, so counts stay aligned after gene-id conversion. (This
+            #    automates the manual recovery seen in run_2026_07_05_225406.)
+            elif "ensembl_id" in adata.var.columns:
+                orig_ids = [str(e) for e in adata.var["ensembl_id"].tolist()]
+                if all(e in pos for e in orig_ids):
+                    idx = [pos[e] for e in orig_ids]
+                    align_via = "var['ensembl_id']"
+            if align_via is None:
+                # Gene sets don't align safely; leave to normalize_data's error.
+                return None
+            X_aligned = raw.X[:, idx]
+            adata.layers[raw_layer_name] = X_aligned.copy() if hasattr(X_aligned, "copy") else X_aligned
+            return (
+                f"materialized raw counts from adata.raw into layer '{raw_layer_name}' "
+                f"(aligned {len(cur_var)} genes via {align_via})"
+            )
+        return None
+
     def _state_preservation_warning(tool_input, existing_adata):
         if existing_adata is not None and tool_input.get("data_path") not in (None, "memory"):
             return ["Ignored data_path and continued with the in-memory dataset to preserve prior analysis state."]
@@ -4148,12 +5205,25 @@ def process_tool_call(
                 phenograph_kwargs["use_rep"] = use_rep
             run_phenograph(adata_obj, **phenograph_kwargs)
 
+        # Record the representation this clustering was computed on, so annotation
+        # can verify it ran on the integrated embedding (Floor 1). Leiden clusters
+        # the active neighbor graph, whose rep scagent always records explicitly.
+        if normalized_method == "leiden":
+            _neigh = adata_obj.uns.get("neighbors")
+            _params = _neigh.get("params") if isinstance(_neigh, dict) else None
+            resolved_rep = (
+                _params.get("use_rep") if isinstance(_params, dict) else None
+            )
+        else:
+            resolved_rep = use_rep or "X_pca"
+
         register_clustering(
             adata_obj,
             cluster_key=cluster_key,
             method=normalized_method,
             resolution=resolution,
             created_by="tool",
+            use_rep=resolved_rep,
         )
         primary_alias = default_cluster_key_for_method(normalized_method)
         primary_cluster_key = primary_alias if primary_alias in adata_obj.obs.columns else ""
@@ -4165,6 +5235,7 @@ def process_tool_call(
                 method=normalized_method,
                 resolution=resolution,
                 created_by="tool",
+                use_rep=resolved_rep,
             )
             primary_alias_created = primary_cluster_key in adata_obj.obs.columns
         primary_alias_available = bool(primary_cluster_key and primary_cluster_key in adata_obj.obs.columns)
@@ -4201,6 +5272,11 @@ def process_tool_call(
         import matplotlib.pyplot as plt
         import scanpy as sc
 
+        # Never overwrite an existing figure — a reused name (e.g. umap_leiden.png
+        # across resolutions, or pre/post integration) gets _2/_3. Callers must use
+        # the returned result["output_path"], which reflects the file written here.
+        output_path = unique_output_path(output_path)
+
         genes = genes or []
         if plot_type == "umap":
             if "X_umap" not in adata_obj.obsm:
@@ -4230,22 +5306,21 @@ def process_tool_call(
 
         fig, ax = plt.subplots(figsize=(10, 8))
 
-        if plot_type == "umap":
+        added_outside_legend = False
+        if plot_type in ("umap", "tsne"):
+            plotfn = sc.pl.umap if plot_type == "umap" else sc.pl.tsne
             kwargs = dict(ax=ax, show=False)
             if dot_size is not None:
                 kwargs["size"] = dot_size
             if color_by is None:
-                sc.pl.umap(adata_obj, **kwargs)
+                plotfn(adata_obj, **kwargs)
+            elif _is_discrete_obs_color(adata_obj, color_by):
+                # Suppress scanpy's right-margin legend (it squishes the panel to
+                # fit many long labels) and add our own legend OUTSIDE the axes.
+                plotfn(adata_obj, color=color_by, legend_loc="none", **kwargs)
+                added_outside_legend = _add_outside_categorical_legend(ax, adata_obj, color_by)
             else:
-                sc.pl.umap(adata_obj, color=color_by, **kwargs)
-        elif plot_type == "tsne":
-            kwargs = dict(ax=ax, show=False)
-            if dot_size is not None:
-                kwargs["size"] = dot_size
-            if color_by is None:
-                sc.pl.tsne(adata_obj, **kwargs)
-            else:
-                sc.pl.tsne(adata_obj, color=color_by, **kwargs)
+                plotfn(adata_obj, color=color_by, **kwargs)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -4255,7 +5330,27 @@ def process_tool_call(
         else:
             raise ValueError(f"Unsupported plot configuration: plot_type={plot_type}")
 
-        plt.tight_layout()
+        # Label clustering plots with their resolution + cluster count so the many
+        # near-identical resolution UMAPs are self-identifying (same coordinates —
+        # only the partition differs). Looked up from the clustering registry;
+        # batch/gene colorings have no resolution and keep their default title.
+        if plot_type in ("umap", "tsne") and color_by is not None:
+            try:
+                from ..core.inspector import get_clustering_registry
+                for _rec in get_clustering_registry(adata_obj):
+                    if getattr(_rec, "cluster_key", None) == color_by and _rec.resolution is not None:
+                        _title = f"{color_by} — resolution {_rec.resolution}"
+                        if color_by in adata_obj.obs.columns:
+                            _title += f", {adata_obj.obs[color_by].nunique()} clusters"
+                        ax.set_title(_title)
+                        break
+            except Exception:
+                pass
+
+        # tight_layout fights an outside legend (it can clip or re-shrink the
+        # panel); bbox_inches="tight" at save time already includes the legend.
+        if not added_outside_legend:
+            plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close()
 
@@ -4363,107 +5458,10 @@ def process_tool_call(
         fig.subplots_adjust(hspace=0.25, wspace=0.04)
 
         base, ext = os.path.splitext(output_path)
-        grid_path = f"{base}_grid{ext}"
+        grid_path = unique_output_path(f"{base}_grid{ext}")
         fig.savefig(grid_path, dpi=150, bbox_inches="tight", facecolor="white")
         _mplt.close(fig)
         return grid_path
-
-    def _stringify_dataframe_columns(df):
-        if df is None:
-            return df
-        for col in df.columns:
-            try:
-                dtype_str = str(df[col].dtype)
-            except Exception:
-                dtype_str = ""
-            if dtype_str in {"object", "category"}:
-                df[col] = df[col].astype(str)
-        return df
-
-    def _sanitize_uns_value(value):
-        import numpy as _np
-        import pandas as _pd
-        try:
-            import scipy.sparse as _sp
-        except Exception:
-            _sp = None
-
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, (_np.integer, _np.floating, _np.bool_)):
-            return value.item()
-        if _sp is not None and _sp.issparse(value):
-            return value.toarray().tolist()
-        if isinstance(value, _np.ndarray):
-            if value.dtype.names is not None:
-                return {str(name): _sanitize_uns_value(value[name]) for name in value.dtype.names}
-            if value.dtype.kind in "biufc":
-                return value.tolist()
-            if value.dtype.kind in "SU":
-                return value.astype(str).tolist()
-            return [_sanitize_uns_value(v) for v in value.tolist()]
-        if isinstance(value, (_pd.Series, _pd.Index)):
-            return [_sanitize_uns_value(v) for v in value.tolist()]
-        if isinstance(value, _pd.DataFrame):
-            safe_df = value.copy()
-            _stringify_dataframe_columns(safe_df)
-            return {str(col): [_sanitize_uns_value(v) for v in safe_df[col].tolist()] for col in safe_df.columns}
-        if isinstance(value, dict):
-            return {str(k): _sanitize_uns_value(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            sanitized_items = [_sanitize_uns_value(v) for v in value]
-            normalized_items = []
-            for item in sanitized_items:
-                if isinstance(item, (dict, list, tuple, set)):
-                    try:
-                        normalized_items.append(json.dumps(item, default=str, sort_keys=True))
-                    except Exception:
-                        normalized_items.append(str(item))
-                else:
-                    normalized_items.append(item)
-            return normalized_items
-        return str(value)
-
-    def _make_serializable_copy(current_adata, aggressive_uns: bool = False):
-        sanitized = current_adata.copy()
-        _stringify_dataframe_columns(sanitized.obs)
-        _stringify_dataframe_columns(sanitized.var)
-        if sanitized.raw is not None:
-            _stringify_dataframe_columns(sanitized.raw.var)
-        if aggressive_uns:
-            sanitized.uns = {str(k): _sanitize_uns_value(v) for k, v in sanitized.uns.items()}
-        return sanitized
-
-    def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
-        details = {"save_mode": "direct", "warnings": []}
-        first_error_msg = None
-        second_error_msg = None
-        try:
-            current_adata.write_h5ad(output_path)
-            return details
-        except Exception as first_error:
-            first_error_msg = str(first_error)
-            details["warnings"].append(f"Direct save failed; retrying with obs/var cleanup: {first_error_msg}")
-
-        try:
-            sanitized = _make_serializable_copy(current_adata, aggressive_uns=False)
-            sanitized.write_h5ad(output_path)
-            details["save_mode"] = "clean_obs_var"
-            return details
-        except Exception as second_error:
-            second_error_msg = str(second_error)
-            details["warnings"].append(f"Obs/var cleanup save failed; retrying with uns cleanup: {second_error_msg}")
-
-        try:
-            sanitized = _make_serializable_copy(current_adata, aggressive_uns=True)
-            sanitized.write_h5ad(output_path)
-            details["save_mode"] = "clean_obs_var_uns"
-            return details
-        except Exception as third_error:
-            raise RuntimeError(
-                "Unable to save AnnData after serialization cleanup. "
-                f"Direct error: {first_error_msg}; obs/var cleanup error: {second_error_msg}; uns cleanup error: {third_error}"
-            )
 
     def search_web(query: str, site: str = "", max_results: int = 5) -> Dict[str, Any]:
         """Search web/docs using Tavily (primary), DuckDuckGo (secondary), or Google CSE (last fallback)."""
@@ -4984,19 +5982,7 @@ def process_tool_call(
 
     try:
         # ===== META TOOLS =====
-        if tool_name == "ask_user":
-            # This is handled specially by the agent loop - just return the question
-            return json.dumps({
-                "status": "needs_input",
-                "tool": "ask_user",
-                "question": tool_input["question"],
-                "options": tool_input.get("options", []),
-                "option_actions": tool_input.get("option_actions", []),
-                "default": tool_input.get("default", ""),
-                "decision_key": tool_input.get("decision_key", ""),
-            }, indent=2), adata
-
-        elif tool_name == "run_code":
+        if tool_name == "run_code":
             # Execute custom Python code on adata
             import scanpy as sc
             import pandas as pd
@@ -5492,7 +6478,12 @@ def process_tool_call(
                 _register_artifact_record(path, role="report", metadata={"name": safe_name})
                 return str(path)
 
-            def register_artifact(path, role: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
+            def register_artifact(
+                path,
+                role: Optional[str] = None,
+                metadata: Optional[Dict[str, Any]] = None,
+                columns: Optional[Dict[str, str]] = None,
+            ):
                 """Record a file written by this run_code call so its absolute
                 path comes back in result.artifacts_created.
 
@@ -5501,12 +6492,24 @@ def process_tool_call(
                 path. The returned dict has an absolute ``path`` field plus
                 optional ``role`` and ``metadata``.
 
+                For a data file you write (CSV/TSV), pass ``columns`` as a
+                {column_name: description} dict so the file is self-documenting:
+                the glossary is stored on the artifact metadata (same shape the
+                built-in tools produce), letting a reader — and later steps —
+                understand each column without re-deriving it.
+
                 Example:
                     p = Path(output_dir) / "evidence.json"
                     p.write_text(json.dumps(evidence))
                     register_artifact(p, role="annotation_evidence_json")
+                    register_artifact(scores_csv, columns={"gene": "symbol", "score": "AUC"})
                 """
-                return _register_artifact_record(path, role=role, metadata=metadata)
+                meta = dict(metadata) if isinstance(metadata, dict) else {}
+                if columns:
+                    meta["columns"] = [
+                        {"name": str(k), "description": str(v)} for k, v in columns.items()
+                    ]
+                return _register_artifact_record(path, role=role, metadata=meta or None)
 
             # Execute in controlled namespace
             # Note: Path and ensure_dir are provided - no need to import os
@@ -5671,10 +6674,17 @@ def process_tool_call(
             if _written_artifacts:
                 result["artifacts_created"] = list(_written_artifacts)
             if captured_output:
-                # Truncate if too long
-                result["output"] = captured_output[:2000]
-                if len(captured_output) > 2000:
+                # Cap the stdout returned to the model. The old 2000-char cap was
+                # too tight for inspecting structured data (e.g. annotation
+                # evidence across 18 clusters), forcing the model to page through
+                # the same print in many run_code calls. Configurable via
+                # SCAGENT_RUN_CODE_MAX_OUTPUT; report the true length when cut so
+                # the model knows how much it's missing.
+                _max_out = int(os.environ.get("SCAGENT_RUN_CODE_MAX_OUTPUT", "8000"))
+                result["output"] = captured_output[:_max_out]
+                if len(captured_output) > _max_out:
                     result["output_truncated"] = True
+                    result["output_total_chars"] = len(captured_output)
 
             return json.dumps(result, indent=2), adata
 
@@ -6138,11 +7148,38 @@ def process_tool_call(
                 # commas). Genuinely truncated blobs still fail -> clear error.
                 parsed = _loads_tolerant(data)
                 if parsed is None:
+                    n_chars = len(data)
+                    looks_truncated = (
+                        data.count("{") != data.count("}")
+                        or data.count("[") != data.count("]")
+                    )
+                    if looks_truncated:
+                        message = (
+                            f"`data` could not be parsed — it looks truncated ({n_chars} chars, "
+                            "unbalanced braces/brackets). A large payload stringified into this "
+                            "argument was almost certainly cut off. Do NOT retry write_json with a "
+                            "stringified blob — build the object in run_code and write it directly "
+                            "with json.dump to a file, then register_artifact the path."
+                        )
+                        recovery_options = [
+                            "In run_code: `p = Path(output_dir)/'<name>.json'; "
+                            "p.write_text(json.dumps(obj)); register_artifact(p)` — no size limit.",
+                            "For annotation evidence specifically, pass that file path to "
+                            "stage_annotation_evidence(evidence_path=...).",
+                        ]
+                    else:
+                        message = (
+                            f"`data` must be a JSON object or array, not a string ({n_chars} chars). "
+                            "Pass the structured data directly (data={...}), not a quoted/serialized blob."
+                        )
+                        recovery_options = [
+                            "Call write_json with data as a real object: data={\"0\": {...}, \"1\": {...}}.",
+                        ]
                     return json.dumps({
                         "status": "error",
                         "tool": "write_json",
-                        "message": "`data` must be a JSON object or array, not a string. Pass the structured data directly (data={...}), not a quoted/serialized blob.",
-                        "recovery_options": ["Call write_json with data as a real object: data={\"0\": {...}, \"1\": {...}}."],
+                        "message": message,
+                        "recovery_options": recovery_options,
                     }, indent=2), adata
                 data = parsed
             if not isinstance(data, (dict, list)):
@@ -6284,7 +7321,13 @@ def process_tool_call(
             if state.has_raw:
                 raw_info["adata_raw"] = {
                     "n_vars": state.raw_n_vars,
-                    "note": "full gene set before HVG subsetting" if state.raw_n_vars > state.n_genes else "same gene set as X",
+                    "is_counts": bool(state.raw_is_counts),
+                    "note": (
+                        ("full gene set before HVG subsetting" if state.raw_n_vars > state.n_genes else "same gene set as X")
+                        + ("; holds integer counts — usable as the raw-counts source (normalize_and_hvg reads it automatically)"
+                           if state.raw_is_counts
+                           else "; non-integer values — NOT raw counts")
+                    ),
                 }
             if state.has_raw_layer:
                 raw_info["layers"].append(state.raw_layer_name)
@@ -6304,6 +7347,9 @@ def process_tool_call(
                     "format": state.gene_id_format,
                     "has_symbols": state.has_gene_symbols,
                     "has_ensembl": state.has_ensembl_ids,
+                    "symbol_column": feature_info.get("symbol_column"),
+                    "ensembl_column": feature_info.get("ensembl_column"),
+                    "convertible_to_symbols": feature_info.get("convertible_to_symbols"),
                     "sample": feature_info["sample_gene_names"],
                     "var_columns": list(working_adata.var.columns)[:10],
                     "genome_prefix": feature_info["genome_prefix"],
@@ -6377,6 +7423,11 @@ def process_tool_call(
                 "var_preview": _dataframe_preview(working_adata.var),
                 "obs_columns_detail": _obs_columns_detail(working_adata.obs, working_adata.n_obs),
             }
+            # Under model-driven inspection, attach the comprehensive judgment-free
+            # fact sheet so the model can record_inspection from it.
+            if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") != "0":
+                from ..core.inspector import dataset_facts
+                result["facts"] = dataset_facts(working_adata)
             if goal:
                 result["recommended_steps"] = recommend_next_steps(state, goal)
             decisions = []
@@ -6407,6 +7458,50 @@ def process_tool_call(
                         ),
                     ],
                 ),
+            )
+
+        elif tool_name == "record_inspection":
+            if world_state is None:
+                return _finalize_result(
+                    {
+                        "status": "error",
+                        "tool": "record_inspection",
+                        "message": "No world_state available to record the inspection.",
+                    },
+                    adata,
+                    dataset_changed=False,
+                    summary="record_inspection failed: no world_state.",
+                )
+            outcome = world_state.record_inspection(tool_input, adata=adata)
+            if outcome.get("status") != "ok":
+                return _finalize_result(
+                    {
+                        "status": "error",
+                        "tool": "record_inspection",
+                        "errors": outcome.get("errors", []),
+                        "message": (
+                            "Inspection not recorded. Use obs column names from "
+                            "obs_columns_detail, or omit a field when no column qualifies, "
+                            "then call record_inspection again."
+                        ),
+                    },
+                    adata,
+                    dataset_changed=False,
+                    summary="record_inspection rejected: invalid fields.",
+                )
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "record_inspection",
+                    "inspection": outcome["inspection"],
+                    "message": (
+                        "Recorded. This overrides the heuristic role/species guesses "
+                        "for the rest of the run and is now reflected in the data summary."
+                    ),
+                },
+                adata,
+                dataset_changed=False,
+                summary="Recorded inspection interpretation (column roles + species).",
             )
 
         elif tool_name == "inspect_session":
@@ -6946,6 +8041,30 @@ def process_tool_call(
                 summary="Inspected the active or persisted run ledger.",
             )
 
+        elif tool_name == "inspect_data_inputs":
+            try:
+                discovery = discover_data_inputs(tool_input["path"])
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                return _error_result(
+                    tool="inspect_data_inputs",
+                    message=str(exc),
+                    adata_obj=adata,
+                    recovery_options=["Check the path and inspect its parent directory."],
+                )
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "inspect_data_inputs",
+                    **discovery,
+                },
+                adata,
+                dataset_changed=False,
+                summary=(
+                    f"Found {discovery['n_source_datasets']} source-like single-cell "
+                    f"dataset(s) in {discovery['path']}."
+                ),
+            )
+
         elif tool_name == "inspect_workspace":
             workspace_root = Path.cwd().resolve()
             allowed_roots = [workspace_root]
@@ -7041,6 +8160,10 @@ def process_tool_call(
                     "has_symbols": state.has_gene_symbols,
                     "sample": feature_info["sample_gene_names"],
                     "mt_genes_detected": feature_info["mt_genes_detected"],
+                    # Auto-converted to symbols at load when needed, so all
+                    # downstream analysis (QC, ribo removal, DEG, annotation) uses
+                    # symbols. Originals preserved in var['ensembl_id'].
+                    "auto_converted_to_symbols": working_adata.uns.get("scagent_gene_id_conversion"),
                 },
                 "obs_columns_detail": ocd,
                 "batch_metadata": {
@@ -7051,6 +8174,27 @@ def process_tool_call(
                     "reason": batch_resolution.reason,
                     "candidates": [metadata_candidate_to_dict(c) for c in (batch_resolution.candidates or [])],
                 },
+            }
+            return json.dumps(result, indent=2), updated_adata
+
+        elif tool_name == "convert_gene_ids":
+            from ..core.genes import convert_var_to_symbols, infer_id_format
+            working_adata, updated_adata = get_adata(tool_input, adata, update_memory=True)
+            before_fmt = infer_id_format(working_adata.var_names)
+            _, report = convert_var_to_symbols(
+                working_adata,
+                inplace=True,
+                use_mygene=bool(tool_input.get("use_mygene", False)),
+                organism=tool_input.get("organism"),
+            )
+            result = {
+                "status": "ok",
+                "tool": "convert_gene_ids",
+                "changed": report.changed,
+                "before_format": before_fmt,
+                "after_format": report.to_format,
+                "conversion": report.to_dict(),
+                "state": make_state(working_adata),
             }
             return json.dumps(result, indent=2), updated_adata
 
@@ -7708,7 +8852,7 @@ def process_tool_call(
                         "QC filtering was not applied. Review the thresholds, parameters, and removal "
                         "counts, then confirm before I remove cells or genes."
                     ),
-                    "required_next_action": "ask_user",
+                    "required_next_action": "resolve_pending_decision",
                     "before": {"n_cells": n_before, "n_genes": g_before},
                     "after": {"n_cells": n_before, "n_genes": g_before},
                     "recommendation": recommendation,
@@ -7963,9 +9107,24 @@ def process_tool_call(
                 ),
                 "n_removed": 0,
             }
+            # Resolve raw counts into the expected layer BEFORE any destructive
+            # gene removal. Two reasons: (1) if X is already processed and counts
+            # live only in adata.raw, normalize_data needs them in a layer; (2)
+            # doing it first means a failure to locate counts never leaves a
+            # half-stripped object, and the materialized layer is sliced along with
+            # adata by the ribosomal removal below, so it stays gene-aligned.
+            raw_counts_note = _ensure_raw_counts_layer(adata, raw_layer_name)
+
             if remove_ribosomal_genes:
+                # Match ribosomal patterns against gene SYMBOLS, not raw var_names.
+                # The primary dataset is symbol-converted at load, but data built in
+                # run_code (e.g. a multi-sample concat) may still be Ensembl-indexed;
+                # matching 'RPL'/'RPS' against Ensembl IDs would remove nothing and
+                # let ribosomal genes leak into HVG/PCA/DEG. See core.qc.
+                from ..core.qc import _gene_names_for_prefix_matching
+                _ribo_match_names = _gene_names_for_prefix_matching(adata)
                 ribo_mask = _feature_mask_from_patterns(
-                    adata.var_names,
+                    _ribo_match_names,
                     ribosomal_remove_patterns,
                     match_mode="match",
                 )
@@ -8079,6 +9238,7 @@ def process_tool_call(
                 "reset_reason": adata.uns.get("normalization", {}).get("reset_reason"),
                 "input_x_preserved_layer": adata.uns.get("normalization", {}).get("input_x_preserved_layer"),
                 "raw_layer_name": raw_layer_name,
+                "raw_counts_source_note": raw_counts_note,
                 "raw_counts_present": raw_counts_present,
                 "raw_counts_integer_like": raw_counts_integer_like,
                 "adata_raw_set": adata.raw is not None,
@@ -8208,19 +9368,30 @@ def process_tool_call(
                 return int(np.argmax(dist)) + 1  # 1-indexed
 
             elbow_pc = _find_pca_elbow(variance_ratios)
-            elbow_buffer_n_pcs = 10
-            elbow_buffered_n_pcs = min(elbow_pc + elbow_buffer_n_pcs, n_shown)
-            conservative_floor_n_pcs = min(30, n_shown)
-            suggested_n_pcs = max(elbow_buffered_n_pcs, conservative_floor_n_pcs)
+            variance_target = 0.75
+            max_default_n_pcs = 50
+            cumvar_frac = np.cumsum(np.asarray(variance_ratios, dtype=float))
+            _above_target = np.where(cumvar_frac >= variance_target)[0]
+            variance_threshold_n_pcs = int(_above_target[0]) + 1 if _above_target.size else n_shown
+            suggested_n_pcs = _default_n_pcs_from_variance(
+                variance_ratios, variance_target, max_default_n_pcs
+            )
+            cumvar_at_suggested = float(cumvar_frac[suggested_n_pcs - 1]) if n_shown else 0.0
+            hit_variance_target = bool(_above_target.size) and variance_threshold_n_pcs <= max_default_n_pcs
             pca_selection_rationale = (
-                f"Elbow detection placed the knee at PC{elbow_pc}. The buffered knee keeps "
-                f"{elbow_buffered_n_pcs} PCs by adding {elbow_buffer_n_pcs} PCs beyond the knee, "
-                "which is a conservative margin meant to retain biological signal that may sit "
-                "just past the sharpest variance drop, not treating the knee as a hard cutoff. "
-                f"The tool recommends {suggested_n_pcs} PCs because single-cell analyses usually "
-                f"benefit from retaining at least {conservative_floor_n_pcs} PCs when available, "
-                "so subtler immune states, rare populations, and technical structure are not "
-                "discarded too early. "
+                f"Default n_pcs keeps principal components until cumulative variance reaches "
+                f"{variance_target:.0%}, capped at {max_default_n_pcs} PCs — whichever is reached "
+                "first. "
+                + (
+                    f"Cumulative variance crosses {variance_target:.0%} at PC{variance_threshold_n_pcs}, "
+                    f"at or below the {max_default_n_pcs}-PC cap, so the default is {suggested_n_pcs} PCs "
+                    f"({cumvar_at_suggested:.0%} cumulative variance)."
+                    if hit_variance_target else
+                    f"Cumulative variance does not reach {variance_target:.0%} within the {n_shown} "
+                    f"computed PCs, so the default falls back to the {suggested_n_pcs}-PC cap "
+                    f"({cumvar_at_suggested:.0%} cumulative variance)."
+                )
+                + f" For reference, elbow detection placed the knee at PC{elbow_pc}. "
                 "The agent should still override this with explicit reasoning if the dataset "
                 "is very small, clearly over-noisy, or the user/source specifies a different value."
             )
@@ -8247,7 +9418,7 @@ def process_tool_call(
                 ax1.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
                             label=f"Elbow PC{elbow_pc}")
                 ax1.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
-                            label=f"Suggested n_pcs={suggested_n_pcs}")
+                            label=f"Default n_pcs={suggested_n_pcs}")
                 ax1.set_xlabel("Principal Component")
                 ax1.set_ylabel("Variance Explained (%)")
                 ax1.set_title("Variance per PC")
@@ -8257,8 +9428,9 @@ def process_tool_call(
                 ax2.axvline(elbow_pc, color="darkorange", linestyle="--", linewidth=1.5,
                             label=f"Elbow PC{elbow_pc}")
                 ax2.axvline(suggested_n_pcs, color="firebrick", linestyle="--", linewidth=1.5,
-                            label=f"Suggested n_pcs={suggested_n_pcs}")
-                ax2.axhline(80, color="gray", linestyle=":", linewidth=1, label="80% threshold")
+                            label=f"Default n_pcs={suggested_n_pcs}")
+                ax2.axhline(variance_target * 100, color="gray", linestyle=":", linewidth=1,
+                            label=f"{variance_target:.0%} threshold")
                 ax2.set_xlabel("Principal Component")
                 ax2.set_ylabel("Cumulative Variance (%)")
                 ax2.set_title("Cumulative Variance Explained")
@@ -8282,9 +9454,10 @@ def process_tool_call(
                 "variance_explained_total": float(variance_ratios.sum()),
                 "variance_ratio_per_pc": [round(float(v), 5) for v in variance_ratios],
                 "elbow_pc": elbow_pc,
-                "elbow_buffer_n_pcs": elbow_buffer_n_pcs,
-                "elbow_buffered_n_pcs": elbow_buffered_n_pcs,
-                "conservative_floor_n_pcs": conservative_floor_n_pcs,
+                "variance_target_pct": round(variance_target * 100, 1),
+                "variance_threshold_n_pcs": variance_threshold_n_pcs,
+                "max_default_n_pcs": max_default_n_pcs,
+                "cumulative_variance_at_suggested": round(cumvar_at_suggested, 4),
                 "suggested_n_pcs": suggested_n_pcs,
                 "pca_selection_rationale": pca_selection_rationale,
                 "scree_plot": scree_path,
@@ -8307,8 +9480,8 @@ def process_tool_call(
                 dataset_changed=True,
                 summary=(
                     f"Ran PCA with n_comps={n_comps}; elbow at PC{elbow_pc}, "
-                    f"elbow+{elbow_buffer_n_pcs}={elbow_buffered_n_pcs}, suggested n_pcs={suggested_n_pcs} "
-                    "for run_neighbors."
+                    f"{variance_target:.0%} cumulative variance at PC{variance_threshold_n_pcs}, "
+                    f"default n_pcs={suggested_n_pcs} (cap {max_default_n_pcs}) for run_neighbors."
                 ),
                 verification=_build_verification(
                     "passed",
@@ -8330,6 +9503,18 @@ def process_tool_call(
             metric = tool_input.get("metric", "euclidean")
             key_added = tool_input.get("key_added")
 
+            # When the caller doesn't specify n_pcs and we're building the graph on
+            # PCA, fall back to the variance-based default (cumulative variance up to
+            # 75%, capped at 50 PCs — whichever comes first) instead of silently using
+            # all computed PCs.
+            n_pcs_source = "explicit" if n_pcs is not None else "unset"
+            if n_pcs is None and use_rep == "X_pca":
+                pca_uns = adata.uns.get("pca") if hasattr(adata, "uns") else None
+                variance_ratios = pca_uns.get("variance_ratio") if isinstance(pca_uns, dict) else None
+                if variance_ratios is not None and len(variance_ratios) > 0:
+                    n_pcs = _default_n_pcs_from_variance(variance_ratios)
+                    n_pcs_source = "variance_default"
+
             if use_rep not in adata.obsm:
                 available_reps = [k for k in adata.obsm.keys()]
                 return _smart_unavailable_result(
@@ -8350,11 +9535,22 @@ def process_tool_call(
                 batch_key = batch_resolution.applied_column
                 n_batches = int(adata.obs[batch_key].nunique(dropna=True)) if batch_key else 0
                 if n_batches > 1:
-                    warnings.append(
-                        f"Detected {n_batches} groups in batch key '{batch_key}' and no recorded batch correction. "
-                        "For open-ended multi-sample analyses, run score_integration and/or run_batch_correction "
-                        "before building an uncorrected PCA neighbor graph unless this is intentional."
+                    selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+                    strategy_action = (
+                        selected_strategy.get("action")
+                        if isinstance(selected_strategy, dict)
+                        else selected_strategy
                     )
+                    if not selected_strategy:
+                        warnings.append(
+                            f"Detected {n_batches} groups in sample-like key '{batch_key}', but no "
+                            "multi-sample strategy is recorded. Do not infer correction from metadata alone."
+                        )
+                    elif strategy_action == "analyze_separately":
+                        warnings.append(
+                            "The user selected separate sample-specific analyses, but this call is building "
+                            "one combined neighbor graph. Confirm that this combined graph is intentional."
+                        )
 
             compute_neighbors(
                 adata,
@@ -8377,6 +9573,7 @@ def process_tool_call(
                 "saved": output_path is not None,
                 "n_neighbors": n_neighbors,
                 "n_pcs": n_pcs,
+                "n_pcs_source": n_pcs_source,
                 "use_rep": use_rep,
                 "metric": metric,
                 "neighbors_key": graph_key,
@@ -8394,7 +9591,12 @@ def process_tool_call(
                 result,
                 adata,
                 dataset_changed=True,
-                summary=f"Computed neighbors only using {use_rep} with n_neighbors={n_neighbors}.",
+                summary=(
+                    f"Computed neighbors only using {use_rep} with n_neighbors={n_neighbors}, "
+                    f"n_pcs={n_pcs}"
+                    + (" (variance-based default)" if n_pcs_source == "variance_default" else "")
+                    + "."
+                ),
                 verification=_build_verification(
                     "passed",
                     "Neighbor graph was computed without UMAP or clustering side effects.",
@@ -8438,10 +9640,22 @@ def process_tool_call(
                 batch_key = batch_resolution.applied_column
                 n_batches = int(adata.obs[batch_key].nunique(dropna=True)) if batch_key else 0
                 if n_batches > 1:
-                    warnings.append(
-                        f"Detected {n_batches} groups in batch key '{batch_key}' and no recorded batch correction. "
-                        "UMAP will reflect the existing uncorrected neighbor graph unless batch correction is run first."
+                    selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+                    strategy_action = (
+                        selected_strategy.get("action")
+                        if isinstance(selected_strategy, dict)
+                        else selected_strategy
                     )
+                    if not selected_strategy:
+                        warnings.append(
+                            f"Detected {n_batches} groups in sample-like key '{batch_key}', but no "
+                            "multi-sample strategy is recorded. UMAP remains uncorrected; correction is not automatic."
+                        )
+                    elif strategy_action == "analyze_separately":
+                        warnings.append(
+                            "The user selected separate sample-specific analyses, but this call is computing "
+                            "a combined UMAP. Confirm that this combined view is intentional."
+                        )
 
             compute_umap(
                 adata,
@@ -8654,7 +9868,14 @@ def process_tool_call(
 
                 if generate_figures and "X_umap" in adata.obsm:
                     path_root = figure_dir or "."
-                    figure_name = f"umap_{cluster_key}.png"
+                    # Name by resolution so each sweep point is distinct and self-
+                    # describing; _render_figure still uniquifies as a backstop.
+                    res_tag = result_payload.get("resolution")
+                    figure_name = (
+                        f"umap_{cluster_key}_res{res_tag}.png"
+                        if res_tag is not None
+                        else f"umap_{cluster_key}.png"
+                    )
                     figure_path = os.path.join(path_root, figure_name)
                     figure_result = _render_figure(
                         adata,
@@ -8663,6 +9884,8 @@ def process_tool_call(
                         color_by=cluster_key,
                         include_image=include_images,
                     )
+                    # Use the path actually written (may have been uniquified).
+                    figure_path = figure_result["output_path"]
                     compare_entry["figure_path"] = figure_path
                     if include_images and "image_base64" in figure_result:
                         image_payloads.append({
@@ -8681,12 +9904,18 @@ def process_tool_call(
                         f"Cannot promote resolution {promote_resolution}; "
                         f"expected clustering key '{promote_key}' was not generated."
                     )
+                _cmp_neigh = adata.uns.get("neighbors")
+                _cmp_params = _cmp_neigh.get("params") if isinstance(_cmp_neigh, dict) else None
+                _promote_rep = (
+                    _cmp_params.get("use_rep") if isinstance(_cmp_params, dict) else None
+                )
                 promote_clustering_to_primary(
                     adata,
                     cluster_key=promote_key,
                     method=method,
                     resolution=float(promote_resolution),
                     created_by="tool",
+                    use_rep=_promote_rep,
                 )
 
             result = {
@@ -8842,6 +10071,67 @@ def process_tool_call(
                         "Set allow_cross_species=true only for an explicitly caveated exploratory run.",
                     ],
                 }, indent=2), adata
+
+            # Model-selection gate. CellTypist ships many tissue/context-specific
+            # models; the default is immune-only and silently mislabels non-immune
+            # cells (run_2026_07_02_122548: lung epithelium annotated as T/NK because
+            # Immune_All_Low won). Require an explicit, user-visible model choice
+            # instead of defaulting. The ENGINE only surfaces the catalog + enforces
+            # the process — which model fits the tissue is the model's judgment.
+            from ..config.defaults import CELLTYPIST_DEFAULTS as _CT_DEFAULTS
+            default_model_name = Path(str(_CT_DEFAULTS.model or "")).name
+            is_default_model = Path(str(model or "")).name == default_model_name
+            model_selection_confirmed = bool(
+                tool_input.get("model_selection_confirmed")
+                or tool_input.get("user_selected_model")
+            )
+            prior_model_choice = (
+                world_state.get_confirmed_value("celltypist_model")
+                if world_state is not None else None
+            )
+            if is_default_model and not model_selection_confirmed and not prior_model_choice:
+                try:
+                    catalog_records = celltypist_model_records(organism=organism or None)
+                except Exception:
+                    catalog_records = []
+                catalog_truncated = len(catalog_records) > 40
+                return json.dumps({
+                    "status": "needs_input",
+                    "tool": "run_celltypist",
+                    "reference_source": "celltypist",
+                    "unavailable_reference_source": "celltypist",
+                    "unavailable_reason": "model_selection_required",
+                    "required_input": "celltypist_model_choice",
+                    "message": (
+                        "CellTypist has many tissue- and context-specific models. The default "
+                        f"'{default_model_name}' is an immune/blood model — on non-immune tissue it "
+                        "forces cells into the nearest immune label (e.g. lung epithelium annotated as "
+                        "T/NK cells). Pick a model that matches THIS dataset's tissue before annotating, "
+                        "and let the user confirm."
+                    ),
+                    "dataset_biological_context": biological_context,
+                    "organism": organism or "unknown",
+                    "default_model": default_model_name,
+                    "available_models": catalog_records[:40],
+                    "available_models_truncated": catalog_truncated,
+                    "how_to_proceed": [
+                        "Read the model descriptions in available_models and judge which best fit this "
+                        "dataset's tissue/biology (use list_celltypist_models with a tissue query to "
+                        "narrow further, e.g. query='lung').",
+                        "Present your top 2-4 candidates — each with a one-line rationale — plus a clear "
+                        "recommendation to the user via pause_and_ask, and let them choose.",
+                        "Re-run run_celltypist with model='<chosen>.pkl' and model_selection_confirmed=true.",
+                        "Immune_All_Low / Immune_All_High are appropriate for immune/blood/PBMC data — if "
+                        "that is genuinely this dataset, still confirm with the user and pass "
+                        "model_selection_confirmed=true.",
+                    ],
+                    "model_discovery": {
+                        "list_models_code": "celltypist.models.models_description()",
+                        "download_model_code": "celltypist.models.download_models(model='<model>.pkl')",
+                        "official_models_url": "https://www.celltypist.org/models",
+                    },
+                }, indent=2), adata
+
             if majority and cluster_key not in adata.obs.columns:
                 return _smart_unavailable_result(
                     tool="run_celltypist",
@@ -9382,6 +10672,9 @@ def process_tool_call(
                     )
 
                 phase_counts = adata.obs["phase"].value_counts().to_dict()
+                _ov_dir = (Path(run_manager.run_dir) if run_manager is not None else Path(".")) / "figures" / "per_cell_overlays"
+                _ov = _plot_umap_overlays(adata, ["S_score", "G2M_score", "phase"], _ov_dir, run_manager)
+                _ov_arts = [p for p in (_artifact_payload(x, role="figure", metadata={"kind": "per_cell_metric_umap"}) for x in _ov) if p]
                 return json.dumps({
                     "status": "ok",
                     "tool": "score_gene_signature",
@@ -9392,6 +10685,9 @@ def process_tool_call(
                     "g2m_genes_total": len(g2m_genes),
                     "scores_added": ["S_score", "G2M_score", "phase"],
                     "phase_distribution": phase_counts,
+                    "suggested_umap_overlays": _suggested_umap_overlays(adata),
+                    "overlay_figures": _ov,
+                    "artifacts_created": _ov_arts,
                     "message": (
                         f"Cell cycle scoring complete. Phase distribution: "
                         + ", ".join(f"{k}: {v}" for k, v in sorted(phase_counts.items()))
@@ -9471,11 +10767,16 @@ def process_tool_call(
                     )
 
                 scores = adata.obs[score_name]
+                _ov_dir = (Path(run_manager.run_dir) if run_manager is not None else Path(".")) / "figures" / "per_cell_overlays"
+                _ov = _plot_umap_overlays(adata, [score_name], _ov_dir, run_manager)
+                _ov_arts = [p for p in (_artifact_payload(x, role="figure", metadata={"kind": "per_cell_metric_umap"}) for x in _ov) if p]
                 return json.dumps({
                     "status": "ok",
                     "tool": "score_gene_signature",
                     "mode": "signature",
                     "score_name": score_name,
+                    "overlay_figures": _ov,
+                    "artifacts_created": _ov_arts,
                     "genes_requested": len(gene_list),
                     "genes_matched": len(matched),
                     "genes_missing": len(missing),
@@ -9488,6 +10789,7 @@ def process_tool_call(
                         "max": round(float(scores.max()), 4),
                         "pct_positive": round(float((scores > 0).mean() * 100), 1),
                     },
+                    "suggested_umap_overlays": _suggested_umap_overlays(adata),
                     "message": (
                         f"Scored {len(matched)}/{len(gene_list)} genes ({coverage_pct:.0f}% coverage). "
                         f"Score stored in adata.obs['{score_name}']. "
@@ -9498,8 +10800,6 @@ def process_tool_call(
                 }, indent=2), adata
 
         elif tool_name == "run_spectra":
-            from ..analysis.spectra import run_spectra
-
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
 
@@ -9518,6 +10818,8 @@ def process_tool_call(
             output_dir = fix_output_path(tool_input.get("output_dir"), "run_spectra")
 
             try:
+                from ..analysis.spectra import run_spectra
+
                 result = run_spectra(
                     adata,
                     cell_type_key=cell_type_key,
@@ -9619,15 +10921,58 @@ def process_tool_call(
                     recovery_options=["Provide output_path as a .h5ad file path or directory."],
                 )
 
+            # If annotation validation was required but never finalized, the save
+            # guard only let this through as an escape hatch (attempts exhausted
+            # or allow_unvalidated). Mark the dataset honestly so a
+            # not-formally-validated annotation can never be mistaken for a
+            # finalized one: stamp adata.uns, suffix the filename, and warn.
+            unvalidated_warnings: List[str] = []
+            _av = getattr(world_state, "annotation_validation", None) or {}
+            annotation_unvalidated = bool(_av.get("required")) and not (
+                _av.get("finalized") or _av.get("status") == "validated_and_finalized"
+            )
+            if annotation_unvalidated:
+                from datetime import datetime, timezone
+                try:
+                    adata.uns["annotation_status"] = "unvalidated"
+                    adata.uns["annotation_validation_note"] = {
+                        "reason": (
+                            "Saved before finalize_annotation passed consensus validation. "
+                            "Cell-type labels are NOT formally validated."
+                        ),
+                        "validation_status": _av.get("status"),
+                        "finalize_attempts": int(_av.get("finalize_attempts", 0) or 0),
+                        "last_finalize_error": _av.get("last_finalize_error"),
+                        "saved_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                except Exception:
+                    pass
+                _stem, _ext = os.path.splitext(output_path)
+                if "UNVALIDATED" not in os.path.basename(_stem).upper():
+                    output_path = f"{_stem}_UNVALIDATED{_ext or '.h5ad'}"
+                unvalidated_warnings.append(
+                    "Annotation was NOT finalized through consensus validation. Saved as a "
+                    f"clearly-marked UNVALIDATED dataset ({os.path.basename(output_path)}); "
+                    "adata.uns['annotation_status']='unvalidated'. Treat cell-type labels as provisional."
+                )
+
             save_details = write_h5ad_safe(adata, output_path)
-            artifact = _artifact_payload(output_path, role="saved_dataset", metadata={"save_mode": save_details.get("save_mode", "direct")})
+            artifact = _artifact_payload(
+                output_path,
+                role="saved_dataset",
+                metadata={
+                    "save_mode": save_details.get("save_mode", "direct"),
+                    "annotation_status": "unvalidated" if annotation_unvalidated else "validated",
+                },
+            )
             save_result = {
                 "status": "ok",
                 "tool": "save_data",
                 "output_path": output_path,
                 "saved": True,
+                "annotation_unvalidated": annotation_unvalidated,
                 "save_mode": save_details.get("save_mode", "direct"),
-                "warnings": save_details.get("warnings", []),
+                "warnings": list(save_details.get("warnings", [])) + unvalidated_warnings,
                 "shape": {"n_cells": adata.n_obs, "n_genes": adata.n_vars},
                 "state": make_state(adata)
             }
@@ -9646,10 +10991,275 @@ def process_tool_call(
                 ),
             )
 
+        elif tool_name == "diagnose_batch_effect":
+            from ..analysis.batch_diagnostic import diagnose_batch_effect
+
+            adata, _ = get_adata(tool_input, adata, prefer_memory=True)
+            selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+            strategy_action = (
+                selected_strategy.get("action")
+                if isinstance(selected_strategy, dict)
+                else selected_strategy
+            )
+            if strategy_action != "investigate_integration":
+                return _error_result(
+                    tool="diagnose_batch_effect",
+                    message=(
+                        "Batch-effect investigation is user-selected. The recorded "
+                        f"multi-sample strategy is '{strategy_action}', not investigate_integration."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ask the user whether to investigate integration need, integrate with scVI, keep unintegrated, or analyze separately.",
+                    ],
+                    extra={"requires_user_strategy": True, "selected_strategy": strategy_action},
+                )
+
+            batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
+            if not batch_key:
+                return _error_result(
+                    tool="diagnose_batch_effect",
+                    message="No batch_key was provided and no confirmed batch_key exists in session state.",
+                    adata_obj=adata,
+                    recovery_options=["Confirm the sample/batch column before running the diagnostic."],
+                )
+            warnings = []
+            batch_key = _validate_obs_column(adata, batch_key, warnings, required=True, context="batch_key")
+            cluster_key = tool_input.get("cluster_key") or "leiden"
+            cluster_key = _validate_obs_column(adata, cluster_key, warnings, required=True, context="cluster_key")
+            output_dir = tool_input.get("output_dir")
+            if not output_dir and run_manager is not None:
+                output_dir = str(Path(run_manager.run_dir) / "artifacts" / "batch_diagnostic")
+
+            try:
+                diagnostic = diagnose_batch_effect(
+                    adata,
+                    batch_key=batch_key,
+                    cluster_key=cluster_key,
+                    condition_keys=tool_input.get("condition_keys"),
+                    min_cells_per_cluster_sample=int(tool_input.get("min_cells_per_cluster_sample") or 30),
+                    n_top_genes=int(tool_input.get("n_top_genes") or 25),
+                    entropy_use_rep=tool_input.get("entropy_use_rep") or "X_pca",
+                    entropy_n_neighbors=int(tool_input.get("entropy_n_neighbors") or 50),
+                    output_dir=output_dir,
+                )
+            except Exception as e:
+                return _error_result(
+                    tool="diagnose_batch_effect",
+                    message=str(e),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Verify the batch and cluster columns exist.",
+                        "Run the uncorrected PCA/neighbors/UMAP/clustering first.",
+                    ],
+                )
+
+            artifacts_created = []
+            for artifact in diagnostic.get("artifacts_created") or []:
+                payload = _artifact_payload(
+                    artifact.get("path"),
+                    role=artifact.get("role", "artifact"),
+                    metadata=artifact.get("metadata") or {"kind": "batch_diagnostic"},
+                )
+                if payload:
+                    artifacts_created.append(payload)
+            diagnostic["warnings"] = warnings
+            # Per-cell neighborhood batch-mixing entropy is written to obs; AUTO-PAINT
+            # it (and any other per-cell metric present) on the UMAP so the model and
+            # user can see WHERE mixing fails, not just the scalar verdict. Don't rely
+            # on the model to plot it — the run_2026_07_05_233220 model never did.
+            overlay_keys = _suggested_umap_overlays(adata)
+            diagnostic["suggested_umap_overlays"] = overlay_keys
+            if run_manager is not None:
+                _ov_dir = Path(run_manager.run_dir) / "figures" / "per_cell_overlays"
+            else:
+                _ov_dir = Path("figures") / "per_cell_overlays"
+            # Prioritize the entropy overlay (this tool's own signal); include the rest.
+            _entropy_key = "batch_diagnostic_neighborhood_entropy"
+            _keys = ([_entropy_key] if _entropy_key in overlay_keys else []) + \
+                    [k for k in overlay_keys if k != _entropy_key]
+            overlay_paths = _plot_umap_overlays(adata, _keys, _ov_dir, run_manager)
+            for _p in overlay_paths:
+                _pl = _artifact_payload(_p, role="figure", metadata={"kind": "per_cell_metric_umap"})
+                if _pl:
+                    artifacts_created.append(_pl)
+            diagnostic["overlay_figures"] = overlay_paths
+            diagnostic["artifacts_created"] = artifacts_created
+            # Point the model at the auto-written README so it records the
+            # dataset-specific interpretation via annotate_artifact_group.
+            _readme_art = next(
+                (a for a in artifacts_created if a.get("role") == "artifact_readme"), None
+            )
+            if _readme_art is not None:
+                diagnostic["doc_interpretation_pending"] = {
+                    "group": (_readme_art.get("metadata") or {}).get("group", "diagnose_batch_effect"),
+                    "readme_path": _readme_art.get("path"),
+                    "note": (
+                        "A README documenting these files was written. Call annotate_artifact_group "
+                        "with your dataset-specific interpretation of the batch-effect evidence."
+                    ),
+                }
+            diagnostic["state"] = make_state(adata)
+            return _finalize_result(
+                diagnostic,
+                adata,
+                dataset_changed=False,
+                summary=(
+                    f"Batch-effect diagnostic verdict: {diagnostic.get('verdict')}. "
+                    f"{diagnostic.get('recommendation')}"
+                ),
+                artifacts_created=artifacts_created,
+                verification=_build_verification(
+                    "passed",
+                    "Batch-effect diagnostic completed without applying correction.",
+                    [
+                        _check("batch_key_present", batch_key in adata.obs.columns, f"Batch key '{batch_key}' exists."),
+                        _check("cluster_key_present", cluster_key in adata.obs.columns, f"Cluster key '{cluster_key}' exists."),
+                        _check("no_correction_applied", not _batch_correction_present(adata), "No batch correction was applied by the diagnostic."),
+                    ],
+                ),
+            )
+
+        elif tool_name == "annotate_artifact_group":
+            from ..core.artifact_docs import DOC_MARKER, set_interpretation
+
+            interpretation = (tool_input.get("interpretation") or "").strip()
+            if not interpretation:
+                return _error_result(
+                    tool="annotate_artifact_group",
+                    message="No interpretation text was provided.",
+                    recovery_options=["Pass the dataset-specific findings as `interpretation`."],
+                )
+            group = tool_input.get("group")
+            readme_path = tool_input.get("readme_path")
+            resolved = None
+            if readme_path:
+                cand = Path(readme_path)
+                if cand.exists():
+                    resolved = cand
+            # Resolve by group id via the manifest's registered READMEs.
+            if resolved is None and group and run_manager is not None:
+                for rec in reversed(run_manager.manifest.artifact_registry):
+                    meta = rec.get("metadata") or {}
+                    if rec.get("role") == "artifact_readme" and meta.get("group") == group:
+                        cand = Path(rec.get("path", ""))
+                        if cand.exists():
+                            resolved = cand
+                            break
+            # Last resort: scan the run dir for a marker README naming the group.
+            if resolved is None and group and run_manager is not None:
+                for cand in sorted(Path(run_manager.run_dir).rglob("README.md")):
+                    try:
+                        txt = cand.read_text()
+                    except Exception:
+                        continue
+                    if DOC_MARKER in txt and f"`{group}`" in txt:
+                        resolved = cand
+                        break
+            if resolved is None:
+                return _error_result(
+                    tool="annotate_artifact_group",
+                    message=(
+                        "Could not locate a documented artifact group"
+                        + (f" for group '{group}'" if group else "")
+                        + ". Pass the readme_path from the producing tool's doc_interpretation_pending."
+                    ),
+                    recovery_options=[
+                        "Use the readme_path surfaced in doc_interpretation_pending.",
+                    ],
+                )
+            try:
+                text = resolved.read_text()
+                resolved.write_text(set_interpretation(text, interpretation))
+            except Exception as e:
+                return _error_result(
+                    tool="annotate_artifact_group",
+                    message=f"Failed to write interpretation into {resolved}: {e}",
+                )
+            ann_result = {
+                "status": "ok",
+                "tool": "annotate_artifact_group",
+                "group": group,
+                "readme_path": str(resolved),
+                "message": f"Interpretation recorded in {resolved.name}.",
+            }
+            _ann_payload = _artifact_payload(
+                str(resolved),
+                role="artifact_readme",
+                metadata={"kind": "artifact_readme", "group": group, "interpreted": True},
+            )
+            return _finalize_result(
+                ann_result,
+                adata,
+                dataset_changed=False,
+                summary=ann_result["message"],
+                artifacts_created=[_ann_payload] if _ann_payload else [],
+            )
+
         elif tool_name == "run_batch_correction":
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
-            method = tool_input.get("method", "harmony")
+            method = tool_input.get("method", "scvi")
+            selected_strategy = _confirmed_decision_value("multi_sample_strategy")
+            strategy_action = (
+                selected_strategy.get("action")
+                if isinstance(selected_strategy, dict)
+                else selected_strategy
+            )
+            explicitly_selected_method = (
+                selected_strategy.get("method")
+                if isinstance(selected_strategy, dict)
+                else None
+            )
+            if not selected_strategy:
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        "Batch correction is opt-in. No user-selected multi-sample strategy "
+                        "is recorded, so correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Ask whether to investigate integration need, integrate with scVI, "
+                        "keep samples combined without correction, or analyze samples separately."
+                    ],
+                    extra={"method": method, "requires_user_strategy": True},
+                )
+            if strategy_action not in {"integrate_scvi", "custom"}:
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        f"The recorded multi-sample strategy is '{strategy_action}', not integration. "
+                        "Batch correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Continue with the selected strategy, or ask the user to explicitly change it."
+                    ],
+                    extra={"method": method, "selected_strategy": selected_strategy},
+                )
+            if strategy_action == "integrate_scvi" and method != "scvi":
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        f"The user selected scVI integration, but method='{method}' was requested. "
+                        "Batch correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=["Retry with method='scvi'."],
+                    extra={"method": method, "selected_strategy": selected_strategy},
+                )
+            if explicitly_selected_method and method != explicitly_selected_method:
+                return _error_result(
+                    tool="run_batch_correction",
+                    message=(
+                        f"The user explicitly selected '{explicitly_selected_method}', but "
+                        f"method='{method}' was requested. Batch correction was not run."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[f"Retry with method='{explicitly_selected_method}'."],
+                    extra={"method": method, "selected_strategy": selected_strategy},
+                )
             requested_batch_key = tool_input.get("batch_key") or _confirmed_decision_value("batch_key")
             if not requested_batch_key:
                 raise ValueError(
@@ -9686,7 +11296,10 @@ def process_tool_call(
                 corrected_rep = None
             elif method == "scvi":
                 n_latent = int(tool_input.get("n_latent") or 30)
-                max_epochs = int(tool_input.get("max_epochs") or 200)
+                # Leave max_epochs unset (None) unless the user gave one, so run_scvi
+                # falls back to scVI's cell-count heuristic rather than a fixed cap.
+                _raw_max_epochs = tool_input.get("max_epochs")
+                max_epochs = int(_raw_max_epochs) if _raw_max_epochs else None
                 store_normalized = bool(tool_input.get("store_normalized", False))
                 # scVI requires raw integer counts — validate before training
                 try:
@@ -9703,12 +11316,16 @@ def process_tool_call(
                         ],
                         extra={"method": "scvi"},
                     )
+                scvi_diag_dir = (
+                    str(Path(run_manager.run_dir) / "figures") if run_manager is not None else None
+                )
                 run_scvi(
                     adata,
                     batch_key=batch_key,
                     n_latent=n_latent,
                     max_epochs=max_epochs,
                     store_normalized=store_normalized,
+                    diagnostics_dir=scvi_diag_dir,
                 )
                 corrected_rep = "X_scVI"
             else:
@@ -9747,8 +11364,40 @@ def process_tool_call(
             extra = {}
             if method == "scvi":
                 extra["n_latent"] = int(tool_input.get("n_latent") or 30)
-                extra["max_epochs"] = int(tool_input.get("max_epochs") or 200)
                 extra["scvi_normalized_stored"] = bool(tool_input.get("store_normalized", False))
+                # Surface what actually happened during training (epochs run vs cap,
+                # convergence, loss-curve artifact) rather than just the requested cap.
+                training = adata.uns.get("scvi_training") or {}
+                extra["max_epochs"] = training.get("resolved_max_epochs") or max_epochs
+                for key in (
+                    "epochs_trained",
+                    "early_stopped",
+                    "final_elbo_train",
+                    "final_elbo_validation",
+                    "best_val_epoch",
+                    "overfitting_warning",
+                ):
+                    if training.get(key) is not None:
+                        extra[key] = training[key]
+                loss_plot = training.get("loss_plot")
+                if loss_plot and os.path.exists(loss_plot):
+                    extra["training_loss_plot"] = loss_plot
+                    plot_artifact = _artifact_payload(
+                        loss_plot,
+                        role="figure",
+                        metadata={"kind": "scvi_training_loss"},
+                    )
+                    if plot_artifact is not None:
+                        artifacts_created.append(plot_artifact)
+                history_csv = training.get("history_csv")
+                if history_csv and os.path.exists(history_csv):
+                    csv_artifact = _artifact_payload(
+                        history_csv,
+                        role="artifact",
+                        metadata={"kind": "scvi_training_history"},
+                    )
+                    if csv_artifact is not None:
+                        artifacts_created.append(csv_artifact)
             elif method == "bbknn":
                 extra["n_pcs"] = int(tool_input.get("n_pcs") or 30)
                 extra["neighbors_within_batch"] = int(tool_input.get("neighbors_within_batch") or 3)
@@ -9772,7 +11421,7 @@ def process_tool_call(
                 "corrected_embedding": corrected_embedding_label,
                 "neighbors_recomputed": neighbors_recomputed,
                 "umap_recomputed": False,
-                "note": "Batch correction complete. Run run_umap next (and run_neighbors first for Harmony/Scanorama/scVI).",
+                "note": "Batch correction complete. Run run_neighbors and run_umap next on the corrected representation.",
                 "warnings": warnings,
                 "state": make_state(adata),
                 **extra,
@@ -10148,8 +11797,6 @@ def process_tool_call(
             }, indent=2), adata
 
         elif tool_name == "run_pseudobulk_deg":
-            from ..analysis.pseudobulk import run_pseudobulk_deg
-
             warnings = _state_preservation_warning(tool_input, adata)
             adata, _ = get_adata(tool_input, adata, prefer_memory=True)
 
@@ -10178,6 +11825,8 @@ def process_tool_call(
                 )
 
             try:
+                from ..analysis.pseudobulk import run_pseudobulk_deg
+
                 result = run_pseudobulk_deg(
                     adata,
                     sample_col=sample_col,
@@ -10402,6 +12051,9 @@ def process_tool_call(
                 genes=genes,
                 include_image=include_image,
             )
+            # _render_figure may have uniquified the path to avoid overwriting;
+            # use the actual file it wrote for the artifact, grid, and everything below.
+            output_path = result["output_path"]
             result["available_clusterings"] = _clusterings_payload(adata)
             artifact = _artifact_payload(
                 output_path,
@@ -10620,6 +12272,7 @@ def process_tool_call(
 
             doublet_threshold = float(tool_input.get("doublet_threshold", 0.3))
             mt_threshold = float(tool_input.get("mt_threshold", 25.0))
+            ribo_threshold = float(tool_input.get("ribo_threshold", 50.0))
             low_lib_frac = float(tool_input.get("low_lib_fraction", 0.5))
             low_genes_frac = float(tool_input.get("low_genes_fraction", 0.5))
             save_checkpoint = bool(tool_input.get("save_checkpoint", True))
@@ -10659,19 +12312,29 @@ def process_tool_call(
                 mean_lib = float(row["mean_lib_size"])
                 mean_genes = float(row["mean_n_genes"])
                 mean_doublet = float(row.get("mean_doublet", 0.0))
+                has_ribo_metric = "mean_ribo" in row.index
+                mean_ribo = float(row.get("mean_ribo", 0.0))
 
                 lib_low = mean_lib < low_lib_frac * global_lib
                 genes_low = mean_genes < low_genes_frac * global_genes
                 mt_high = mean_mt > mt_threshold
                 doublet_high = mean_doublet > doublet_threshold and "mean_doublet" in row.index
                 high_library = mean_lib > 1.5 * global_lib
+                # Elevated ribosomal fraction flags low-complexity / stressed cells.
+                # Alone it is suggestive, not definitive, so it routes to structure-QC
+                # review rather than auto-removal.
+                ribo_high = has_ribo_metric and mean_ribo > ribo_threshold
 
                 evidence = {
                     "low_library": bool(lib_low),
                     "low_genes": bool(genes_low),
                     "high_mt": bool(mt_high),
+                    "high_ribo": bool(ribo_high),
                     "high_doublet_score": bool(doublet_high),
                     "high_library": bool(high_library),
+                    "mean_mt_pct": round(mean_mt, 2),
+                    "mean_ribo_pct": round(mean_ribo, 2) if has_ribo_metric else None,
+                    "mean_doublet_score": round(mean_doublet, 3) if "mean_doublet" in row.index else None,
                     "mean_library_fraction_of_global_median": round(mean_lib / global_lib, 2) if global_lib else None,
                     "mean_genes_fraction_of_global_median": round(mean_genes / global_genes, 2) if global_genes else None,
                 }
@@ -10686,6 +12349,8 @@ def process_tool_call(
                     )
                 if mt_high:
                     reasons.append(f"mean MT% is above {mt_threshold:g}%")
+                if ribo_high:
+                    reasons.append(f"mean ribosomal% is above {ribo_threshold:g}%")
                 if doublet_high:
                     reasons.append(f"mean doublet score is above {doublet_threshold:g}")
                 if high_library:
@@ -10707,6 +12372,10 @@ def process_tool_call(
                     recommended_action = "propose_removal"
                     severity = "obvious"
                     proposed_removal.append(str(cluster))
+                elif ribo_high:
+                    recommended_action = "review"
+                    severity = "ambiguous"
+                    ambiguous.append(str(cluster))
                 else:
                     recommended_action = "keep"
                     severity = "clean"
@@ -10727,6 +12396,22 @@ def process_tool_call(
             cells_total = adata.n_obs
             metric_flagged_clusters = list(proposed_removal)
             cells_metric_flagged = cells_proposed
+
+            # Structure QC must ALWAYS run — "no metric flags" is NOT "clusters
+            # confirmed coherent". Metric QC cannot see a doublet/noise MIXTURE that
+            # happens to have normal library size, genes, and MT% (and if Scrublet
+            # was skipped there is no doublet signal at all — the case where a
+            # coherence check matters MOST). So whenever nothing is metric-flagged
+            # or ambiguous, nominate a baseline structure-QC pass over ALL clusters
+            # to confirm coherence. structure QC filters clusters below its
+            # min_cells and caps how many heatmaps it renders, so nominating all is
+            # safe and bounded. See prompts.py cluster-QC.
+            doublet_signal_missing = not has_doublet
+            structure_qc_baseline_clusters = (
+                sorted(set(cluster_labels))
+                if (not metric_flagged_clusters and not ambiguous)
+                else []
+            )
 
             checkpoint_path = None
             if save_checkpoint:
@@ -10816,6 +12501,11 @@ def process_tool_call(
                     "Metric QC flagged these clusters as problematic/suspicious and in need of "
                     "structure QC adjudication; this is not a removal decision."
                 ),
+                "doublet_signal_missing": doublet_signal_missing,
+                "structure_qc_baseline_clusters": structure_qc_baseline_clusters,
+                "structure_qc_recommended": bool(
+                    metric_flagged_clusters or ambiguous or structure_qc_baseline_clusters
+                ),
                 "proposed_removal": proposed_removal,
                 "ambiguous": ambiguous,
                 "clean": clean,
@@ -10827,12 +12517,95 @@ def process_tool_call(
                 "qc_metrics_figure": qc_metrics_figure,
                 "thresholds_used": {
                     "mt_threshold": mt_threshold,
+                    "ribo_threshold": ribo_threshold,
                     "doublet_threshold": doublet_threshold,
                     "low_lib_fraction": low_lib_frac,
                     "low_genes_fraction": low_genes_frac,
                 },
+                "ribo_signal_available": bool("pct_counts_ribo" in adata.obs.columns),
                 "state": make_state(adata),
             }
+
+            # --- Auto-chain structure QC: nominate + adjudicate in ONE step ---
+            # Structure QC is not a separate, skippable checkbox — its gene-gene
+            # covariance evidence exists to inform the SAME cleanup decision as the
+            # metric screen. Run it here, immediately, on the flagged/ambiguous
+            # clusters (or the baseline set when nothing was metric-flagged), so a
+            # filtering decision is made from metric + structure evidence together,
+            # early, where it matters — not deferred to a later step the model can
+            # skip (run_2026_07_05_225406 skipped it and only ran it post-save).
+            # Embedded in this result so world_state records structure QC from the
+            # same call. Disable only with auto_structure_qc=false.
+            auto_structure_qc = bool(tool_input.get("auto_structure_qc", True))
+            structure_targets = list(dict.fromkeys(
+                [str(c) for c in (metric_flagged_clusters or [])]
+                + [str(c) for c in (ambiguous or [])]
+                + [str(c) for c in (structure_qc_baseline_clusters or [])]
+            ))
+            result["structure_qc_ran"] = False
+            if auto_structure_qc and structure_targets:
+                try:
+                    _sq_json, adata = process_tool_call(
+                        "run_cluster_structure_qc",
+                        {"cluster_key": cluster_key, "clusters_to_analyze": structure_targets},
+                        adata,
+                        world_state=world_state,
+                        run_manager=run_manager,
+                    )
+                    _sq = json.loads(_sq_json)
+                    if _sq.get("status") in ("ok", "success"):
+                        result["structure_qc_ran"] = True
+                        # Slim: the cleanup decision + figure pointers only. Full
+                        # per-cluster correlation detail is on adata.uns and the
+                        # saved cluster_structure_qc_*.json/.md reports.
+                        result["structure_qc"] = {
+                            "structure_qc_run_id": _sq.get("structure_qc_run_id"),
+                            "structure_qc_pass": _sq.get("structure_qc_pass"),
+                            "clusters_analyzed": _sq.get("clusters_analyzed") or structure_targets,
+                            "n_clusters_analyzed": _sq.get("n_clusters_analyzed"),
+                            "n_coherent_clusters": _sq.get("n_coherent_clusters"),
+                            "n_noncoherent_clusters": _sq.get("n_noncoherent_clusters"),
+                            "coherence_breakdown": _sq.get("coherence_breakdown"),
+                            "n_heatmaps_rendered": _sq.get("n_heatmaps_rendered"),
+                            "structure_summary": _sq.get("structure_summary"),
+                            "synthesized_removal": _sq.get("synthesized_removal"),
+                            "cells_in_synthesized_removal": _sq.get("cells_in_synthesized_removal"),
+                            "rescued_clusters": _sq.get("rescued_clusters"),
+                            "conflicting": _sq.get("conflicting"),
+                            "requires_review": _sq.get("requires_review"),
+                            "heatmap_paths": _sq.get("heatmap_paths"),
+                            "figure_dir": _sq.get("figure_dir"),
+                            "structure_qc_markdown": _sq.get("structure_qc_markdown"),
+                            "structure_qc_json": _sq.get("structure_qc_json"),
+                        }
+                        result["state"] = make_state(adata)  # uns changed
+                    else:
+                        result["structure_qc_error"] = _sq.get("message")
+                except Exception as _sq_err:  # pragma: no cover - defensive
+                    result["structure_qc_error"] = str(_sq_err)
+
+            _sq_note = ""
+            if result.get("structure_qc_ran"):
+                _sq_note = " " + str((result.get("structure_qc") or {}).get("structure_summary") or "")
+            elif structure_targets and result.get("structure_qc_error"):
+                _sq_note = (
+                    f" Structure QC could not run automatically ({result['structure_qc_error']}); "
+                    "run run_cluster_structure_qc manually before annotation."
+                )
+
+            if structure_qc_baseline_clusters:
+                _no_dbl = " (doublet detection was not run, so a coherence check matters even more)" if doublet_signal_missing else ""
+                summary = (
+                    f"Cluster QC: no metric-flagged or ambiguous clusters{_no_dbl} — structure QC "
+                    f"run as a baseline coherence check over all {len(cluster_qc)} clusters, because "
+                    f"metric-clean does not mean coherent.{_sq_note}"
+                )
+            else:
+                summary = (
+                    f"Cluster QC: {len(metric_flagged_clusters)} metric-flagged cluster(s) "
+                    f"({cells_metric_flagged} cells, {result['pct_metric_flagged']}%) and "
+                    f"{len(ambiguous)} ambiguous cluster(s).{_sq_note}"
+                )
             artifacts = []
             if checkpoint_path:
                 artifacts.append(_artifact_payload(checkpoint_path, role="checkpoint", metadata={"stage": "pre_cluster_qc_cleanup"}))
@@ -10845,11 +12618,7 @@ def process_tool_call(
             return _finalize_result(
                 result, adata,
                 dataset_changed=False,
-                summary=(
-                    f"Cluster QC: {len(metric_flagged_clusters)} metric-flagged cluster(s) "
-                    f"({cells_metric_flagged} cells, {result['pct_metric_flagged']}%) and "
-                    f"{len(ambiguous)} ambiguous cluster(s) require structure QC adjudication."
-                ),
+                summary=summary,
                 artifacts_created=artifacts,
             )
 
@@ -10885,6 +12654,13 @@ def process_tool_call(
             min_cells = max(2, int(tool_input.get("min_cells", 15)))
             moran_min_cells = max(2, int(tool_input.get("moran_min_cells", 40)))
             corr_threshold = float(tool_input.get("corr_threshold", 0.3))
+            # Coherence metrics are computed for EVERY analyzed cluster; heatmap
+            # figures are capped so a baseline pass over many clusters doesn't emit
+            # dozens of PNGs. Originally metric-flagged/ambiguous clusters always get
+            # a heatmap; among the remaining (baseline) clusters, only the least
+            # coherent — the ones actually worth eyeballing — are plotted, up to the
+            # cap. Coherent clusters get a recorded verdict but no figure.
+            max_heatmaps = int(tool_input.get("max_heatmaps", 20))
 
             latest_cluster_qc = {}
             if world_state is not None:
@@ -11150,6 +12926,7 @@ def process_tool_call(
             artifacts = []
             heatmap_paths = []
             heatmap_artifacts = []
+            heatmaps_rendered = 0
             synthesized_removal = []
             rescued_clusters = []
             conflicting_clusters = []
@@ -11242,47 +13019,63 @@ def process_tool_call(
                         linkage_status = f"failed: {e}"
 
                 reordered = corr_matrix[_np.ix_(order, order)]
-                safe_cluster_id = _safe_path_component(cluster_id)
-                heatmap_path = figure_dir / f"cluster_{safe_cluster_id}_correlation.png"
-                fig_width = max(5.0, min(9.0, x_sub.shape[1] / 20))
-                fig, ax = _plt.subplots(figsize=(fig_width, fig_width))
-                image = ax.imshow(reordered, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
-                ax.set_title(
-                    f"{cluster_key} / pass {structure_qc_pass:03d} / cluster {cluster_id}\n"
-                    f"{x_sub.shape[1]} genes x {n_cells} cells | mean_abs_corr={mean_abs_corr:.3f}"
-                )
-                if x_sub.shape[1] <= 60:
-                    ordered_names = [selected_gene_names[int(i)] for i in order]
-                    ax.set_xticks(range(len(ordered_names)))
-                    ax.set_yticks(range(len(ordered_names)))
-                    ax.set_xticklabels(ordered_names, rotation=90, fontsize=5)
-                    ax.set_yticklabels(ordered_names, fontsize=5)
-                else:
-                    ax.set_xticks([])
-                    ax.set_yticks([])
-                for spine in ax.spines.values():
-                    spine.set_visible(False)
-                fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-                fig.tight_layout()
-                fig.savefig(heatmap_path, dpi=180)
-                _plt.close(fig)
-                heatmap_path_str = str(heatmap_path)
-                heatmap_artifact = _artifact_payload(
-                    heatmap_path_str,
-                    role="cluster_structure_heatmap",
-                    metadata={
-                        "cluster": str(cluster_id),
-                        "cluster_key": cluster_key,
-                        "structure_qc_run_id": structure_qc_run_id,
-                        "structure_qc_pass": structure_qc_pass,
-                    },
-                )
-                if heatmap_artifact:
-                    artifacts.append(heatmap_artifact)
-                    heatmap_artifacts.append(heatmap_artifact)
-                    heatmap_paths.append(heatmap_artifact.get("path", heatmap_path_str))
-
                 structure_interp = _structure_interpretation(mean_abs_corr, frac_pairs)
+
+                # Cap heatmap figures (b): always plot originally metric-flagged /
+                # ambiguous clusters; among baseline clusters plot only the
+                # non-coherent ones (unstructured/weak/inconclusive) worth eyeballing,
+                # up to max_heatmaps. Coherent clusters get a recorded verdict, no
+                # figure. Metrics above are computed for EVERY cluster regardless.
+                _orig_flagged = (
+                    str(metric_action) in {"propose_removal", "review"}
+                    or str(metric_severity) in {"obvious", "ambiguous"}
+                )
+                _render_heatmap = _orig_flagged or (
+                    structure_interp in {"unstructured", "weak", "inconclusive"}
+                    and heatmaps_rendered < max_heatmaps
+                )
+                heatmap_path_str = None
+                if _render_heatmap:
+                    safe_cluster_id = _safe_path_component(cluster_id)
+                    heatmap_path = figure_dir / f"cluster_{safe_cluster_id}_correlation.png"
+                    fig_width = max(5.0, min(9.0, x_sub.shape[1] / 20))
+                    fig, ax = _plt.subplots(figsize=(fig_width, fig_width))
+                    image = ax.imshow(reordered, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+                    ax.set_title(
+                        f"{cluster_key} / pass {structure_qc_pass:03d} / cluster {cluster_id}\n"
+                        f"{x_sub.shape[1]} genes x {n_cells} cells | mean_abs_corr={mean_abs_corr:.3f}"
+                    )
+                    if x_sub.shape[1] <= 60:
+                        ordered_names = [selected_gene_names[int(i)] for i in order]
+                        ax.set_xticks(range(len(ordered_names)))
+                        ax.set_yticks(range(len(ordered_names)))
+                        ax.set_xticklabels(ordered_names, rotation=90, fontsize=5)
+                        ax.set_yticklabels(ordered_names, fontsize=5)
+                    else:
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                    for spine in ax.spines.values():
+                        spine.set_visible(False)
+                    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+                    fig.tight_layout()
+                    fig.savefig(heatmap_path, dpi=180)
+                    _plt.close(fig)
+                    heatmaps_rendered += 1
+                    heatmap_path_str = str(heatmap_path)
+                    heatmap_artifact = _artifact_payload(
+                        heatmap_path_str,
+                        role="cluster_structure_heatmap",
+                        metadata={
+                            "cluster": str(cluster_id),
+                            "cluster_key": cluster_key,
+                            "structure_qc_run_id": structure_qc_run_id,
+                            "structure_qc_pass": structure_qc_pass,
+                        },
+                    )
+                    if heatmap_artifact:
+                        artifacts.append(heatmap_artifact)
+                        heatmap_artifacts.append(heatmap_artifact)
+                        heatmap_paths.append(heatmap_artifact.get("path", heatmap_path_str))
                 mt_mean = mt_z = lib_mean = lib_z = None
                 moran_i_mt = moran_i_lib = None
                 if n_cells < moran_min_cells:
@@ -11381,6 +13174,28 @@ def process_tool_call(
                 structure_evidence[str(cluster_id)] = record
 
             cells_in_synthesized_removal = int(cluster_labels.isin(synthesized_removal).sum())
+
+            # Coherence breakdown across ALL analyzed clusters (metrics computed for
+            # every one, even when its heatmap was not rendered) — for clear
+            # narration of what structure QC actually found, not just what it plotted.
+            coherence_breakdown: Dict[str, int] = {}
+            for _r in cluster_results:
+                _ci = str(_r.get("structure_interpretation") or "unknown")
+                coherence_breakdown[_ci] = coherence_breakdown.get(_ci, 0) + 1
+            n_coherent = coherence_breakdown.get("moderate", 0) + coherence_breakdown.get("strong", 0)
+            n_noncoherent = coherence_breakdown.get("unstructured", 0) + coherence_breakdown.get("weak", 0)
+            n_skipped_or_inconclusive = (
+                len(cluster_results) - n_coherent - n_noncoherent
+            )
+            structure_summary = (
+                f"Structure QC assessed coherence for {len(cluster_results)} cluster(s): "
+                f"{n_coherent} coherent (well-structured), {n_noncoherent} non-coherent "
+                f"(unstructured/weak — possible doublet/noise mixtures), "
+                f"{n_skipped_or_inconclusive} inconclusive/too-small. "
+                f"{heatmaps_rendered} correlation heatmap(s) saved (coherent clusters assessed "
+                f"but not plotted); synthesized removal set: {synthesized_removal or 'none'}."
+            )
+
             result = {
                 "status": "ok",
                 "tool": "run_cluster_structure_qc",
@@ -11388,6 +13203,11 @@ def process_tool_call(
                 "clusters_analyzed": clusters_to_analyze,
                 "missing_clusters": missing_clusters,
                 "n_clusters_analyzed": len(cluster_results),
+                "n_heatmaps_rendered": heatmaps_rendered,
+                "coherence_breakdown": coherence_breakdown,
+                "n_coherent_clusters": n_coherent,
+                "n_noncoherent_clusters": n_noncoherent,
+                "structure_summary": structure_summary,
                 "cluster_structure_evidence": cluster_results,
                 "structure_evidence_by_cluster": structure_evidence,
                 "synthesized_removal": synthesized_removal,
@@ -11547,6 +13367,76 @@ def process_tool_call(
                     )
                 )
 
+                # A "how to read the heatmaps" README next to the PNGs. Findings
+                # are already in the markdown/JSON reports, so this reference doc
+                # does NOT require a separate model interpretation.
+                try:
+                    from ..core.artifact_docs import (
+                        ArtifactGroupDoc,
+                        FileDoc,
+                        write_group_doc,
+                    )
+
+                    _sq_doc = ArtifactGroupDoc(
+                        group="run_cluster_structure_qc",
+                        title="Cluster structure QC — how to read these heatmaps",
+                        overview=(
+                            "Gene-gene correlation heatmaps that adjudicate whether each analyzed "
+                            "cluster is a coherent cell population or a doublet/noise mixture. Only "
+                            "metric-flagged/ambiguous clusters and the least-coherent baseline "
+                            f"clusters are plotted (cap {max_heatmaps}); coherent clusters are "
+                            "assessed but not plotted. Dataset-specific findings and the per-cluster "
+                            f"verdicts live in the companion report "
+                            f"`reports/cluster_structure_qc_{structure_qc_run_id}_summary.md` "
+                            "(and the JSON alongside it)."
+                        ),
+                        params={
+                            "cluster_key": cluster_key,
+                            "clusters_analyzed": clusters_to_analyze,
+                            "n_genes": n_genes,
+                            "min_cells": min_cells,
+                            "corr_threshold": corr_threshold,
+                            "structure_qc_pass": structure_qc_pass,
+                        },
+                        interpretation_required=False,
+                        files=[
+                            FileDoc(
+                                filename="cluster_<id>_correlation.png",
+                                purpose=(
+                                    "One heatmap per plotted cluster (cluster id in the filename): "
+                                    "the clustered gene-gene correlation matrix over the cluster's "
+                                    "top variable genes."
+                                ),
+                                computation=(
+                                    "Pairwise correlation of the top variable genes within the "
+                                    "cluster, hierarchically ordered so co-varying genes sit together; "
+                                    "cross-referenced with a technical Moran's I check."
+                                ),
+                                how_to_read=(
+                                    "Strong off-diagonal blocks = coherent co-expression modules (a "
+                                    "real, structured population). A flat, block-free map = "
+                                    "unstructured, a possible doublet or low-quality mixture. Blocks "
+                                    "that align with a high technical Moran's I are flagged as "
+                                    "technical rather than biological structure."
+                                ),
+                            ),
+                        ],
+                    )
+                    _sq_readme = write_group_doc(figure_dir, _sq_doc)
+                    _sq_readme_payload = _artifact_payload(
+                        str(_sq_readme),
+                        role="artifact_readme",
+                        metadata={
+                            "kind": "artifact_readme",
+                            "group": "run_cluster_structure_qc",
+                            "structure_qc_run_id": structure_qc_run_id,
+                        },
+                    )
+                    if _sq_readme_payload:
+                        artifacts.append(_sq_readme_payload)
+                except Exception:
+                    pass  # a missing how-to-read README must never fail structure QC
+
             adata.uns.setdefault("cluster_structure_qc", {})
             adata.uns["cluster_structure_qc"][str(cluster_key)] = {
                 "structure_qc_run_id": structure_qc_run_id,
@@ -11589,11 +13479,7 @@ def process_tool_call(
                 result,
                 adata,
                 dataset_changed=False,
-                summary=(
-                    f"Cluster structure QC analyzed {len(cluster_results)} cluster(s); "
-                    f"{len(synthesized_removal)} synthesized removal candidate(s), "
-                    f"{len(rescued_clusters)} rescued structured ambiguous cluster(s)."
-                ),
+                summary=structure_summary,
                 artifacts_created=[artifact for artifact in artifacts if artifact],
                 verification=_build_verification(
                     "passed",
@@ -11637,6 +13523,136 @@ def process_tool_call(
                         f"Pass an existing cluster column via cluster_key. Available columns: {list(adata.obs.columns)[:30]}",
                     ],
                 )
+
+            # --- Floor 1: annotation must bind to a post-integration clustering ---
+            # If the dataset was batch-corrected, the clustering being annotated
+            # must have been computed on the integrated embedding. Annotating a
+            # stale pre-integration clustering (the run_2026_06_29_202520 failure,
+            # where annotation ran on a res-1.5 clustering instead of the final
+            # post-scVI res-1.0 one) is refused here, at the point of error. The
+            # set of integrated embeddings lives in core.inspector (single source
+            # of truth, method-convention, not hardcoded here).
+            from ..core.inspector import integrated_embedding_keys
+
+            integrated_present = integrated_embedding_keys(adata)
+            allow_precorrection = bool(tool_input.get("allow_precorrection_clustering", False))
+            if integrated_present and not allow_precorrection:
+                _rec = next(
+                    (c for c in get_clustering_registry(adata) if c.key == cluster_key), None
+                )
+                _rep = _rec.use_rep if _rec is not None else None
+                if _rep not in integrated_present:
+                    return _smart_unavailable_result(
+                        tool="prepare_annotation",
+                        message=(
+                            f"Clustering '{cluster_key}' was computed on "
+                            f"'{_rep or 'an unrecorded/pre-integration'}' representation, but this "
+                            f"dataset was batch-corrected (integrated embedding(s): "
+                            f"{integrated_present}). Annotation must run on a clustering computed "
+                            f"on the integrated embedding — otherwise labels reflect uncorrected, "
+                            f"batch-confounded structure. Re-cluster on the integrated embedding "
+                            f"at your final annotation resolution, then re-run prepare_annotation."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["post_integration_clustering"],
+                        recovery_options=[
+                            f"run_neighbors with use_rep='{integrated_present[0]}', then "
+                            "run_clustering at the final annotation resolution (e.g. 1.0).",
+                            "Annotate that post-integration clustering's cluster_key.",
+                            "Override only with a documented reason: set "
+                            "allow_precorrection_clustering=true.",
+                        ],
+                    )
+
+            # --- Floor 2: cluster STRUCTURE QC must have run on this clustering ---
+            # Structure QC (gene-gene covariance modules, clustered correlation
+            # heatmaps, technical Moran's I) is the ONLY check that distinguishes a
+            # coherent biological cluster from a doublet/noise mixture that looks
+            # metrically normal — it is required evidence BEFORE annotation, not
+            # optional, and must be re-run per clustering. The terminal obligation
+            # alone let a run skip it inline and dive straight into annotation
+            # (run_2026_07_05_225406). This gates annotation entry at the point of
+            # error. Freshness comes from the world_state registry (a recluster +
+            # re-run of run_cluster_qc clears the structure marker, so this
+            # re-fires); adata.uns is a data-persistent fallback when no world_state
+            # is present. Override only with an explicit user opt-out.
+            allow_skip_structure_qc = bool(tool_input.get("allow_skip_structure_qc", False))
+            if not allow_skip_structure_qc:
+                structure_done = False
+                if world_state is not None:
+                    _reg = getattr(world_state, "cluster_qc_registry", None) or {}
+                    _entry = _reg.get(str(cluster_key)) if isinstance(_reg, dict) else None
+                    structure_done = isinstance(_entry, dict) and bool(_entry.get("structure_qc_run_id"))
+                else:
+                    _uns_sq = adata.uns.get("cluster_structure_qc") if hasattr(adata, "uns") else None
+                    structure_done = isinstance(_uns_sq, dict) and str(cluster_key) in _uns_sq
+                if not structure_done:
+                    return _smart_unavailable_result(
+                        tool="prepare_annotation",
+                        message=(
+                            f"Cluster STRUCTURE QC has not run on the active clustering "
+                            f"'{cluster_key}'. Structure QC — gene-gene covariance modules, clustered "
+                            "correlation heatmaps, and technical Moran's I — is REQUIRED evidence "
+                            "before annotation: it is the only check that tells a coherent biological "
+                            "cluster from a doublet/noise mixture that looks metrically normal, and it "
+                            "must be run per clustering. Run it before preparing annotation."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["cluster_structure_qc"],
+                        recovery_options=[
+                            f"Run run_cluster_qc(cluster_key='{cluster_key}') — it now AUTO-RUNS "
+                            "structure QC on the flagged/ambiguous (or baseline) clusters in the same "
+                            "call, so this single step satisfies the requirement.",
+                            f"Or run run_cluster_structure_qc(cluster_key='{cluster_key}') directly on "
+                            "the metric-flagged/ambiguous clusters.",
+                            "Then re-run prepare_annotation.",
+                            "Bypass ONLY if the user explicitly asked to skip structure QC: "
+                            "set allow_skip_structure_qc=true.",
+                        ],
+                    )
+
+            # --- Floor 3: reference annotation (Scimilarity) must have run first ---
+            # Scimilarity + CellTypist are PRIMARY annotation evidence; the proposal
+            # must be built AFTER the reference labels exist, not before. Previously
+            # a run that skipped Scimilarity built a weaker proposal and was only
+            # rejected downstream at stage/finalize (run_2026_07_05_225406) — a
+            # wasted loop. Gate here: Scimilarity must have run (output present) OR
+            # have a tool-recorded blocker (run_scimilarity failure records
+            # reference_source_unavailable). A manual "unavailable" claim is NOT
+            # enough — the strict tool-recorded check stays at finalize.
+            allow_skip_reference_tools = bool(tool_input.get("allow_skip_reference_tools", False))
+            if not allow_skip_reference_tools:
+                scim_ran = (
+                    any(str(c).lower().startswith("scimilarity") for c in adata.obs.columns)
+                    or any("scimilarity" in str(k).lower() for k in getattr(adata, "obsm", {}).keys())
+                )
+                scim_blocker = False
+                if world_state is not None:
+                    _av = getattr(world_state, "annotation_validation", None) or {}
+                    _rsu = _av.get("reference_source_unavailable") or {}
+                    scim_blocker = "scimilarity" in _rsu
+                if not scim_ran and not scim_blocker:
+                    return _smart_unavailable_result(
+                        tool="prepare_annotation",
+                        message=(
+                            "Scimilarity has not run. Reference annotation (Scimilarity, and "
+                            "CellTypist) is primary evidence for the proposal — build the proposal "
+                            "AFTER the reference labels exist, not before. Run run_scimilarity (with "
+                            "the dataset organism) first; if it genuinely cannot run, run it anyway so "
+                            "the tool records the concrete blocker (a manual 'unavailable' claim is "
+                            "rejected at finalize)."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["scimilarity"],
+                        recovery_options=[
+                            "run_scimilarity with the known organism (human/mouse), then re-run prepare_annotation.",
+                            "Also run run_celltypist with a tissue-appropriate model if not already done.",
+                            "If Scimilarity truly cannot run, run it once so the failure records the "
+                            "blocker — then prepare_annotation proceeds and finalize enforces the strict check.",
+                            "Bypass ONLY if the user explicitly opted out of reference tools: "
+                            "set allow_skip_reference_tools=true.",
+                        ],
+                    )
 
             annotation_key = tool_input.get("annotation_key", "cell_type")
             marker_dict = tool_input.get("marker_dict") or {}
@@ -12538,6 +14554,21 @@ def process_tool_call(
             except Exception:
                 pass
 
+            # Build a ready-to-edit evidence scaffold with every mechanically
+            # derivable field pre-filled (label, supporting_genes, confidence,
+            # reference_annotation_support, competing_labels, source_synthesis).
+            # stage/finalize overlay the model's submissions on top, so the model
+            # only writes `reasoning` instead of reverse-engineering the proposal.
+            evidence_scaffold = _build_annotation_evidence_scaffold(
+                cluster_summaries, valid_reference_keys
+            )
+            try:
+                adata.uns["annotation_evidence_scaffold"] = evidence_scaffold
+                if isinstance(proposal_fingerprint, str) and proposal_fingerprint:
+                    adata.uns["annotation_evidence_scaffold_fingerprint"] = proposal_fingerprint
+            except Exception:
+                pass
+
             # Clear staged evidence when the new proposal does not match what was
             # last staged. Without this, finalize_annotation will silently reuse
             # stale labels from a prior clustering whose cluster ids happen to
@@ -12650,6 +14681,8 @@ def process_tool_call(
                 "reference_annotation_notice": reference_annotation_notice,
                 "clusters": clusters_result_view,
                 "full_proposal_in": "adata.uns['annotation_proposal'] (full per-cluster DEGs/reference detail; the DEG table is also at deg_table_csv)",
+                "evidence_scaffold_ready": True,
+                "evidence_scaffold_in": "adata.uns['annotation_evidence_scaffold'] (label, supporting_genes, confidence, reference_annotation_support, competing_labels, source_synthesis pre-filled; reasoning blank). stage/finalize overlay your submitted fields on top of it.",
                 "panglaodb_queries_required": panglaodb_queries,
                 "panglaodb_reverse_marker_queries_required": panglaodb_reverse_queries,
                 "panglaodb_required_clusters": panglaodb_required_clusters,
@@ -12663,16 +14696,13 @@ def process_tool_call(
                 "n_stale_evidence_entries_cleared": n_evidence_cleared,
                 "prior_evidence_fingerprint": prior_fp,
                 "next_steps": [
-                    "Set each cluster's supporting_genes from its `suggested_supporting_genes` (these are the discriminating DEGs — already non-nuisance and non-broad, so they pass validation on the first try). Add cluster-specific markers from `discriminating_degs` if needed.",
-                    "Do NOT cite genes from `broad_context_degs` (MHC-II like HLA-DRA/CD74, housekeeping, generic myeloid) or `nuisance_degs` (MT/ribosomal/hemoglobin/MALAT1) as the supporting evidence — the validator rejects them as non-discriminating, which is the #1 cause of re-staging loops.",
-                    "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in staged evidence.",
-                    "For each entry in panglaodb_queries_required, call bc_get_panglaodb_marker_genes (mouse or human as appropriate); these are limited to clusters needing external adjudication.",
-                    "For each entry in panglaodb_reverse_marker_queries_required, call bc_get_panglaodb_marker_genes with gene_symbol and species; aggregate returned cell_type values per required cluster across multiple genes.",
-                    "Do not infer alternatives from a single top gene. Treat reverse-lookup labels as candidates only when supported by multiple DEG genes, then query those cell_type labels directly.",
-                    "For panglaodb_optional_clusters, synthesize labels from CellTypist/Scimilarity agreement and submitted DEG support; PanglaoDB can remain false unless validation later flags that cluster.",
-                    "Compare PanglaoDB markers against each required cluster's top_degs and any reference_annotations to confirm, revise, broaden, or reject each candidate label.",
-                    "For ambiguous clusters, query competing labels too — the goal is adjudication, not confirmation.",
-                    "Stage ALL clusters in ONE stage_annotation_evidence call (pass evidence_summary as a structured object; for >~25 clusters use write_json then evidence_path). Read result.validation, fix only the flagged clusters, and re-stage. Call finalize_annotation only after stage reports validation.status='ok' for every cluster — do not call finalize speculatively while clusters are still failing.",
+                    "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] with every derivable field pre-filled per cluster (label←proposed_label, supporting_genes←suggested_supporting_genes, confidence←validation_tier, reference_annotation_support, competing_labels_considered, source_synthesis). Do NOT rebuild this by hand in run_code — that reverse-engineering is exactly what the scaffold removes.",
+                    "To annotate: call stage_annotation_evidence (or finalize_annotation directly) with evidence_summary containing ONLY the fields you are adding or changing per cluster. At minimum supply a `reasoning` string (>=20 chars) for every cluster; all other fields fall back to the scaffold. Reviewing each cluster and writing its reasoning IS the required judgment step.",
+                    "Change a cluster's `label` (and `deg_derived_label`) only where your reading of the DEGs/references disagrees with the scaffold's proposed_label; cite genes from suggested_supporting_genes / discriminating_degs — never broad_context_degs (MHC-II like HLA-DRA/CD74, housekeeping) or nuisance_degs (MT/ribosomal/hemoglobin/MALAT1).",
+                    "Query bc_get_panglaodb_marker_genes ONLY for panglaodb_required_clusters (and panglaodb_reverse_marker_queries_required for reverse lookups); for those clusters set panglaodb_queried=true and panglaodb_label_used in your submitted evidence. Aggregate reverse hits across multiple DEGs; do not infer a label from a single gene. Everything else keeps panglaodb_queried=false.",
+                    "If a required cluster can't be resolved by PanglaoDB (label uncovered, e.g. CMP/MEP/early-erythroid, or inconclusive), submit panglaodb_queried=false + confidence='low' with a one-line caveat in reasoning — the validator accepts reference+DEG evidence and caps to low. Do not loop.",
+                    "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in submitted evidence.",
+                    "stage_annotation_evidence runs the finalize validator and returns ready_to_finalize + clusters_failing + auto_fixes; correct only the flagged clusters and re-submit. Or skip staging and call finalize_annotation once every cluster has reasoning.",
                 ],
                 "state": make_state(adata),
             }
@@ -12845,6 +14875,10 @@ def process_tool_call(
 
             normalized_incoming = {str(k): v for k, v in incoming.items()}
             staged.update(normalized_incoming)
+            # Overlay the model's submissions on the pre-filled scaffold so a
+            # submission of just {cid: {reasoning: ...}} yields complete evidence.
+            # The scaffold supplies every derivable field; the model's entries win.
+            staged = _merge_evidence_over_scaffold(adata, proposal_fp, staged)
             try:
                 adata.uns["annotation_evidence_summary"] = staged
             except Exception:
@@ -12858,8 +14892,15 @@ def process_tool_call(
                 pass
 
             proposal_clusters = [str(c) for c in proposal.get("cluster_ids", [])]
-            covered = [c for c in proposal_clusters if c in staged]
-            missing = [c for c in proposal_clusters if c not in staged]
+            # With the scaffold as the base, every cluster carries derived fields;
+            # the remaining human judgment is the per-cluster `reasoning`, so
+            # coverage tracks which clusters have a model-authored reasoning.
+            def _has_reasoning(cid: str) -> bool:
+                entry = staged.get(cid)
+                return isinstance(entry, dict) and bool(str(entry.get("reasoning", "")).strip())
+
+            covered = [c for c in proposal_clusters if _has_reasoning(c)]
+            missing = [c for c in proposal_clusters if not _has_reasoning(c)]
             unknown = [c for c in staged.keys() if c not in proposal_clusters]
 
             # Validate the merged evidence so the model sees every issue at
@@ -12900,8 +14941,9 @@ def process_tool_call(
             full_coverage = n_covered_with_evidence == n_proposal and n_proposal > 0
             has_blocking_issues = bool(stage_failures)
             validation_status = "ok" if not has_blocking_issues else "issues"
-            # Unambiguous gate for the model: only finalize when every proposal
-            # cluster is covered AND no cluster has a blocking validation issue.
+            # Unambiguous gate for the model: finalize only when every proposal
+            # cluster has a model-authored reasoning AND no cluster has a blocking
+            # validation issue (missing reasoning also surfaces as a failure).
             ready_to_finalize = full_coverage and not has_blocking_issues
             clusters_failing = sorted({
                 m.group(1)
@@ -12910,21 +14952,45 @@ def process_tool_call(
                 if m
             })
 
+            # Trim the per-cluster payload that re-enters context every round:
+            # full detail only for clusters that need action (failing), a compact
+            # label/confidence/tier line for the rest. The full record lives in
+            # adata.uns after finalize; the model doesn't need 32 detailed blocks
+            # replayed on every staging round (a driver of EMERGENCY compactions).
+            failing_set = set(clusters_failing)
+            if has_blocking_issues:
+                per_cluster_payload = {
+                    cid: pc for cid, pc in stage_per_cluster.items() if cid in failing_set
+                }
+            else:
+                per_cluster_payload = {
+                    cid: {
+                        "label": pc.get("label"),
+                        "confidence": pc.get("confidence"),
+                        "validation_tier": pc.get("validation_tier"),
+                        "panglaodb_queried": pc.get("panglaodb_queried"),
+                    }
+                    for cid, pc in stage_per_cluster.items()
+                }
+
             result = {
                 "status": "ok",
                 "tool": "stage_annotation_evidence",
                 "ready_to_finalize": ready_to_finalize,
                 "clusters_failing": clusters_failing,
+                "clusters_awaiting_reasoning": missing[:50],
                 "n_entries_received": len(normalized_incoming),
                 "n_entries_staged_total": len(staged),
                 "evidence_source": evidence_source,
                 "replace": replace,
                 "coverage": {
                     "n_proposal_clusters": n_proposal,
+                    "n_with_reasoning": n_covered_with_evidence,
                     "n_covered": n_covered_with_evidence,
                     "n_missing": len(missing),
                     "missing_clusters": missing[:50],
                     "unknown_clusters": unknown[:50],
+                    "note": "n_covered counts clusters with a model-authored reasoning; all other evidence fields come from the scaffold.",
                 },
                 "validation": {
                     "status": validation_status,
@@ -12935,31 +15001,32 @@ def process_tool_call(
                         _format_validation_failures_per_cluster(stage_failures)
                         if stage_failures else ""
                     ),
-                    "per_cluster_validation": stage_per_cluster,
+                    "per_cluster_validation": per_cluster_payload,
+                    "per_cluster_detail_scope": "failing_only" if has_blocking_issues else "compact_summary",
                     "panglaodb_required_clusters": stage_panglaodb_required,
                 },
                 "next_steps": (
                     [
-                        f"Fix the {len(stage_failures)} validation issue(s) above before calling finalize_annotation.",
-                        "Resubmit stage_annotation_evidence with the corrected entries (only the failing clusters need to be re-sent).",
+                        f"Fix the {len(stage_failures)} validation issue(s) above (clusters {clusters_failing}) before calling finalize_annotation.",
+                        "Resubmit stage_annotation_evidence with only the failing clusters corrected; already-valid clusters are preserved.",
                     ]
                     if has_blocking_issues
                     else (
                         [
-                            "Call finalize_annotation to write the labels; evidence_summary can be omitted if the staged evidence is complete.",
+                            "Call finalize_annotation to write the labels; evidence_summary can be omitted — the staged evidence is complete.",
                         ]
                         if full_coverage
                         else [
-                            "Continue staging evidence until all proposal clusters are covered.",
-                            "Then call finalize_annotation; evidence_summary can be omitted if staged evidence is complete.",
+                            f"Supply a `reasoning` (>=20 chars) for the {len(missing)} cluster(s) still awaiting it: {missing[:50]}.",
+                            "Then call finalize_annotation; all other fields are already filled from the scaffold.",
                         ]
                     )
                 ),
                 "state": make_state(adata),
             }
             summary = (
-                f"Staged annotation evidence for {len(normalized_incoming)} clusters "
-                f"({n_covered_with_evidence}/{n_proposal} proposal clusters covered)"
+                f"Staged annotation evidence: {n_covered_with_evidence}/{n_proposal} clusters have reasoning "
+                f"({len(normalized_incoming)} entries submitted this call)"
             )
             if stage_auto_fixes:
                 summary += f"; {len(stage_auto_fixes)} auto-fix(es) applied"
@@ -13086,13 +15153,44 @@ def process_tool_call(
                         "Or pass evidence_summary directly in this finalize_annotation call.",
                     ],
                 )
-            evidence: Dict[str, Any] = {}
+            model_evidence: Dict[str, Any] = {}
             used_staged_evidence = False
             if isinstance(staged_evidence, dict) and staged_evidence:
-                evidence.update({str(k): v for k, v in staged_evidence.items() if isinstance(v, dict)})
+                model_evidence.update({str(k): v for k, v in staged_evidence.items() if isinstance(v, dict)})
                 used_staged_evidence = True
             if isinstance(incoming_evidence, dict) and incoming_evidence:
-                evidence.update({str(k): v for k, v in incoming_evidence.items()})
+                model_evidence.update({str(k): v for k, v in incoming_evidence.items()})
+            # Overlay the model's evidence on the pre-filled scaffold so a caller
+            # that only supplied `reasoning` per cluster still finalizes with
+            # complete evidence. If no scaffold matches, this is a no-op passthrough.
+            evidence: Dict[str, Any] = _merge_evidence_over_scaffold(
+                adata, proposal_fp, model_evidence
+            )
+            scaffold_used = bool(evidence) and len(evidence) > len(model_evidence)
+            # `reasoning` is the one field the scaffold leaves blank; it is the
+            # required human judgment. If the model supplied none anywhere, give
+            # the precise next action instead of the old "evidence is required"
+            # message (which a prior run misread as a persistence bug).
+            model_reasoned = any(
+                isinstance(v, dict) and str(v.get("reasoning", "")).strip()
+                for v in model_evidence.values()
+            )
+            if evidence and (scaffold_used or isinstance(adata.uns.get("annotation_evidence_scaffold"), dict)) and not model_reasoned:
+                n_scaffold = len([c for c in evidence if isinstance(evidence.get(c), dict)])
+                return _error_result(
+                    tool="finalize_annotation",
+                    message=(
+                        f"A pre-filled annotation evidence scaffold covers all {n_scaffold} cluster(s), but no "
+                        "per-cluster `reasoning` has been supplied yet. Every label needs a model-written "
+                        "reasoning (>=20 chars) — that review is the required judgment step, not a persistence issue."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Call finalize_annotation (or stage_annotation_evidence) with evidence_summary={cluster_id: {reasoning: '...'}} for every cluster. label, supporting_genes, confidence, reference_annotation_support, competing_labels_considered and source_synthesis are already filled from the proposal.",
+                        "Override `label` (and deg_derived_label) only for clusters where your reading of the DEGs/references differs from the scaffold's proposed_label.",
+                        "For panglaodb_required_clusters, add panglaodb_queried=true and panglaodb_label_used after querying bc_get_panglaodb_marker_genes.",
+                    ],
+                )
             if not evidence:
                 return _error_result(
                     tool="finalize_annotation",
@@ -13120,19 +15218,30 @@ def process_tool_call(
                     adata_obj=adata,
                     recovery_options=["Re-run prepare_annotation with the correct cluster_key."],
                 )
-            if annotation_key in adata.obs.columns and not overwrite and not validate_only:
-                return _error_result(
-                    tool="finalize_annotation",
-                    message=(
-                        f"Column '{annotation_key}' already exists on adata.obs. "
-                        "Pass overwrite=true to replace it, or use a different annotation_key."
-                    ),
-                    adata_obj=adata,
-                    recovery_options=[
-                        f"Retry with overwrite=true if you intend to replace '{annotation_key}'.",
-                        "Pick a new annotation_key that does not collide with an existing column.",
-                    ],
-                )
+
+            # Non-destructive default: never clobber a PRE-EXISTING annotation
+            # column (e.g. the dataset's own 'cell_type' from the source paper —
+            # which is exactly the ground truth to compare against). If the target
+            # column exists and scagent did not write it this session, write the new
+            # analysis to a distinct '<key>_scagent' column and keep the original.
+            # Overwriting a pre-existing column requires an explicit overwrite=true.
+            # scagent's own columns (from a re-run) are refreshed in place.
+            annotation_key_redirected_from = None
+            if not validate_only:
+                scagent_written = set(adata.uns.get("scagent_annotation_keys", []) or [])
+                if (
+                    annotation_key in adata.obs.columns
+                    and annotation_key not in scagent_written
+                    and not overwrite
+                ):
+                    _base = f"{annotation_key}_scagent"
+                    _new = _base
+                    _i = 2
+                    while _new in adata.obs.columns:
+                        _new = f"{_base}_{_i}"
+                        _i += 1
+                    annotation_key_redirected_from = annotation_key
+                    annotation_key = _new
 
             _validation_report = _validate_annotation_evidence(
                 adata=adata,
@@ -13166,6 +15275,19 @@ def process_tool_call(
 
 
             if validation_failures:
+                # Only echo per-cluster detail for the FAILING clusters — the
+                # actionable set the model must fix. Replaying all 60 clusters'
+                # evidence on every failed finalize is a context-overflow driver
+                # (and the full record is on adata.uns / the saved reports anyway).
+                _failing_ids = {
+                    m.group(1)
+                    for f in validation_failures
+                    for m in [re.match(r"Cluster (\S+?):", str(f))]
+                    if m
+                }
+                _failing_per_cluster = {
+                    cid: pc for cid, pc in per_cluster_validation.items() if cid in _failing_ids
+                } or per_cluster_validation  # fall back if no ids parsed
                 return _error_result(
                     tool="finalize_annotation",
                     message="Evidence validation failed: " + _format_validation_failures_per_cluster(validation_failures),
@@ -13181,8 +15303,9 @@ def process_tool_call(
                     ],
                     extra={
                         "validation_failures": validation_failures,
-                        "per_cluster_validation": per_cluster_validation,
-                        "auto_fixes": auto_fixes,
+                        "per_cluster_validation": _failing_per_cluster,
+                        "per_cluster_validation_scope": "failing_only",
+                        "n_auto_fixes": len(auto_fixes),
                         "missing_reference_sources": missing_reference_sources,
                         "reference_source_unavailable_tool_recorded": tool_recorded_unavailable_sources,
                         "reference_source_unavailable_manual": manual_unavailable_sources,
@@ -13252,9 +15375,9 @@ def process_tool_call(
                         "cluster_key": cluster_key,
                         "n_clusters_validated": len(cluster_to_label_preview),
                         "label_counts": label_counts_preview,
-                        "annotation_validation": validation_payload_preview,
+                        "annotation_validation": _slim_annotation_validation(validation_payload_preview),
                         "used_staged_evidence": used_staged_evidence,
-                        "auto_fixes": auto_fixes,
+                        "n_auto_fixes": len(auto_fixes),
                         "state": make_state(adata),
                     },
                     adata,
@@ -13300,6 +15423,15 @@ def process_tool_call(
                     )
                 series = series.fillna("Unassigned")
                 adata.obs[annotation_key] = _pd.Categorical(series.values)
+                # Remember which columns scagent wrote, so a later finalize refreshes
+                # its own column in place instead of spawning '<key>_scagent_2'.
+                try:
+                    _sk = list(adata.uns.get("scagent_annotation_keys", []) or [])
+                    if annotation_key not in _sk:
+                        _sk.append(annotation_key)
+                    adata.uns["scagent_annotation_keys"] = _sk
+                except Exception:
+                    pass
             except Exception as e:
                 return _error_result(
                     tool="finalize_annotation",
@@ -13492,17 +15624,20 @@ def process_tool_call(
                     )
                 )
 
+            # Full validation_payload is on adata.uns + saved to disk (above); the
+            # RESULT carries only the slim summary so 60 clusters' evidence doesn't
+            # re-enter (and recur in) the conversation and overflow context.
             result = {
                 "status": "ok",
                 "tool": "finalize_annotation",
                 "annotation_key": annotation_key,
+                "annotation_key_redirected_from": annotation_key_redirected_from,
                 "cluster_key": cluster_key,
                 "n_clusters_labeled": len(cluster_to_label),
                 "label_counts": label_counts,
-                "cell_type_breakdown": label_counts,
-                "annotation_validation": validation_payload,
+                "annotation_validation": _slim_annotation_validation(validation_payload),
                 "used_staged_evidence": used_staged_evidence,
-                "auto_fixes": auto_fixes,
+                "n_auto_fixes": len(auto_fixes),
                 "annotation_validation_json": (
                     annotation_json_path if run_manager else None
                 ),
@@ -13511,12 +15646,18 @@ def process_tool_call(
                 ),
                 "state": make_state(adata),
             }
+            _redirect_note = (
+                f" (wrote to '{annotation_key}' to preserve the pre-existing "
+                f"'{annotation_key_redirected_from}' annotation for comparison)"
+                if annotation_key_redirected_from else ""
+            )
             return _finalize_result(
                 result, adata,
                 dataset_changed=True,
                 summary=(
                     f"Wrote final annotation '{annotation_key}' for {len(cluster_to_label)} clusters "
                     f"({len(label_counts)} unique labels) with conditional annotation validation."
+                    + _redirect_note
                 ),
                 artifacts_created=[artifact for artifact in artifacts if artifact],
                 verification=_build_verification(

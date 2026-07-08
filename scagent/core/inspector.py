@@ -6,7 +6,6 @@ and recommends what analysis steps are needed to reach a user's goal.
 """
 
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -210,32 +209,6 @@ NUMERIC_SEMANTIC_ROLES = {
     "doublet_score",
 }
 
-CELL_TYPE_VALUE_PATTERNS = [
-    r"\bt\s*cell\b",
-    r"\bb\s*cell\b",
-    r"\bnk\b",
-    r"\bcd4\b",
-    r"\bcd8\b",
-    r"\bmonocyte\b",
-    r"\bmacrophage\b",
-    r"\bdendritic\b",
-    r"\bplasma\b",
-    r"\bmast\b",
-    r"\bneutrophil\b",
-    r"\bgranulocyte\b",
-    r"\bepithelial\b",
-    r"\bendothelial\b",
-    r"\bfibroblast\b",
-    r"\bastrocyte\b",
-    r"\bmicroglia\b",
-    r"\bneuron\b",
-    r"\bhepatocyte\b",
-    r"\bkeratinocyte\b",
-    r"\bmyeloid\b",
-    r"\blymphocyte\b",
-]
-
-
 @dataclass
 class MetadataCandidate:
     """Ranked candidate metadata column for collaborative decisions."""
@@ -275,6 +248,9 @@ class ClusteringRecord:
     is_primary: bool = False
     source_key: Optional[str] = None
     created_by: str = "inferred"
+    # Representation the clustering was computed on (e.g. "X_pca", "X_scVI").
+    # Used to enforce that annotation binds to a post-integration clustering.
+    use_rep: Optional[str] = None
 
 
 @dataclass
@@ -293,6 +269,7 @@ class DataState:
     has_raw_layer: bool = False
     raw_layer_name: str = ""
     has_raw: bool = False          # True if adata.raw is set
+    raw_is_counts: bool = False    # True if adata.raw.X holds integer-valued counts
     raw_n_vars: int = 0            # Number of genes in adata.raw (often > n_genes after HVG)
     is_counts: bool = False        # True if X contains integer counts
 
@@ -380,6 +357,8 @@ def clustering_record_to_dict(record: ClusteringRecord) -> Dict[str, Any]:
         payload["resolution"] = float(record.resolution)
     if record.source_key:
         payload["source_key"] = record.source_key
+    if record.use_rep:
+        payload["use_rep"] = record.use_rep
     return payload
 
 
@@ -425,30 +404,59 @@ def metadata_resolution_to_dict(resolution: MetadataResolution) -> Dict[str, Any
     }
 
 
-def _is_integer_matrix(X) -> bool:
-    """Check if matrix contains integer values (counts).
+def _sample_matrix_values(X, n: int = 20000, seed: int = 0) -> np.ndarray:
+    """Return a representative sample of a matrix's values as a host numpy array.
 
-    Uses the dtype as a fast shortcut — integer dtypes are definitely counts,
-    float dtypes with a log1p-range max are definitely not.  Only falls back
-    to sampling when the dtype is ambiguous (float that could still be counts).
-    Sampling uses a cheap head-slice instead of np.random.choice to avoid
-    allocating an index array the size of the full NNZ count.
+    Samples RANDOMLY across the full data rather than taking a head slice: the
+    first stored values of a CSR matrix are just the first few cells, so a head
+    slice can misjudge integer-ness / range for the matrix as a whole. For sparse
+    matrices only the stored (nonzero) values are sampled — zeros are trivially
+    integer and irrelevant to "are these counts / are there decimals". Returns an
+    empty array when there is nothing to sample.
     """
-    # Fast dtype shortcut: integer dtypes are always counts
+    # cupy/cupyx arrays (e.g. left in a layer by an interrupted GPU step) are not
+    # recognised by scipy.issparse and have no .ravel(); pull to host first.
+    if type(X).__module__.split(".", 1)[0] in ("cupy", "cupyx"):
+        try:
+            gpu = X.data if hasattr(X, "data") else X.reshape(-1)
+            data = np.asarray(gpu.get())
+        except Exception:
+            return np.array([])
+    elif sp.issparse(X):
+        data = X.data
+    else:
+        # Dense array, or an exotic/backed matrix type. Guard the conversion so an
+        # object we can't materialise (e.g. a backed _CSRDataset) yields an empty
+        # sample rather than crashing inspection.
+        try:
+            data = np.asarray(X).ravel()
+        except Exception:
+            return np.array([])
+
+    m = len(data)
+    if m == 0:
+        return np.array([])
+    if m <= n:
+        return np.asarray(data)
+    idx = np.sort(np.random.default_rng(seed).choice(m, size=n, replace=False))
+    return np.asarray(data[idx])
+
+
+def _is_integer_matrix(X) -> bool:
+    """Check whether a matrix holds integer-valued counts.
+
+    The decision is made from VALUES, not dtype: float32 that is entirely
+    integer-valued (e.g. 1.0, 20.0, 5643.0 — common for CELLxGENE raw counts) is
+    treated as counts. Only an integer dtype is a fast shortcut; float dtypes are
+    always sampled (representatively) and tested for integer-ness. Empty matrices
+    are treated as counts (conservative, non-fatal).
+    """
     dtype = getattr(X, "dtype", None)
     if dtype is not None and np.issubdtype(dtype, np.integer):
         return True
-
-    if sp.issparse(X):
-        data = X.data
-    else:
-        data = X.ravel()
-
-    if len(data) == 0:
+    sample = _sample_matrix_values(X)
+    if len(sample) == 0:
         return True
-
-    # Cheap head-slice — avoids O(nnz) np.random.choice for large matrices
-    sample = data[:min(10000, len(data))]
     return bool(np.allclose(sample, np.round(sample)))
 
 
@@ -487,58 +495,32 @@ def _normalize_column_name(column: str) -> str:
 def _column_name_role_scores(
     column: str,
     aliases_by_role: Optional[Dict[str, Iterable[str]]] = None,
-    *,
-    fuzzy: bool = False,
 ) -> Dict[str, float]:
-    """Score how strongly a column name suggests each metadata role."""
+    """Score a column name against known role aliases by EXACT match only.
+
+    Recognizes canonical scanpy/Seurat/CELLxGENE column names (e.g. 'leiden',
+    'pct_counts_mt', 'cell_type', 'batch', 'sample_id') exactly, ignoring only
+    case and punctuation ('percent.mt' == 'percent_mt' == 'percent_MT').
+
+    It deliberately performs NO approximate matching — no shared-token overlap, no
+    edit-distance / fuzzy ratio, no substring containment, no '_id'-token
+    guessing. Approximate name matching was a source of false role verdicts (a
+    cell-type column 'scanvi_label' scored 0.63 for the 'doublet_label' role
+    purely because of the shared 'label' token). A column whose name is not a
+    known alias gets no name signal; its role is then judged from content facts,
+    and ultimately by the model from the facts surfaced to it. To recognize a new
+    canonical name, add it to the relevant alias set — never widen the matcher.
+    """
     aliases_by_role = aliases_by_role or METADATA_ROLE_ALIASES
     normalized = _normalize_column_name(column)
     compact = normalized.replace("_", "")
-    tokens = set(filter(None, normalized.split("_")))
     scores: Dict[str, float] = {}
 
     for role, aliases in aliases_by_role.items():
         normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
         compact_aliases = {alias.replace("_", "") for alias in normalized_aliases}
-        if normalized in normalized_aliases:
+        if normalized in normalized_aliases or (compact and compact in compact_aliases):
             scores[role] = 1.0
-            continue
-        if compact in compact_aliases:
-            scores[role] = max(scores.get(role, 0.0), 0.96)
-            continue
-
-        alias_tokens = {
-            token
-            for alias in normalized_aliases
-            for token in alias.split("_")
-            if token
-        }
-        overlap = len(tokens & alias_tokens)
-        if overlap:
-            scores[role] = min(0.85, 0.45 + 0.18 * overlap)
-
-        if compact and fuzzy:
-            best_ratio = max(
-                (SequenceMatcher(None, compact, alias).ratio() for alias in compact_aliases),
-                default=0.0,
-            )
-            if best_ratio >= 0.88:
-                scores[role] = max(scores.get(role, 0.0), min(0.92, best_ratio))
-            elif best_ratio >= 0.80 and len(compact) >= 5:
-                scores[role] = max(scores.get(role, 0.0), 0.72)
-
-        if len(compact) >= 5:
-            for alias in compact_aliases:
-                if len(alias) >= 5 and (compact in alias or alias in compact):
-                    scores[role] = max(scores.get(role, 0.0), 0.78)
-
-    if normalized.endswith("_id"):
-        if "sample" in normalized or "orig" in normalized:
-            scores["sample"] = max(scores.get("sample", 0.0), 0.85)
-        elif any(token in normalized for token in ("donor", "patient", "subject", "individual")):
-            scores["donor"] = max(scores.get("donor", 0.0), 0.85)
-        elif any(token in normalized for token in ("batch", "library", "lane", "run", "channel")):
-            scores["batch"] = max(scores.get("batch", 0.0), 0.85)
 
     return scores
 
@@ -593,6 +575,13 @@ def _categorical_structure_score(series, n_obs: int, role: str) -> float:
         return 0.0
 
     unique_fraction = n_unique / max(1, n_obs)
+    # Identifier-like columns (cell barcodes, per-cell IDs) are never label
+    # columns, no matter how their name scores. A cell_type/cluster column is a
+    # categorical label with bounded cardinality; a near-unique column is an
+    # identifier. Without this, e.g. `cell_barcode` (≈unique per cell) gets a
+    # cell_type role solely from sharing the token "cell" with the role aliases.
+    if role in {"cell_type", "cluster"} and unique_fraction >= 0.65:
+        return 0.0
     dtype_name = str(series.dtype)
     score = 0.0
     if dtype_name == "category" or dtype_name == "bool" or "string" in dtype_name or dtype_name == "object":
@@ -657,18 +646,11 @@ def _semantic_value_score(series, role: str) -> float:
     if not values:
         return 0.0
 
-    if role == "cell_type":
-        text = " | ".join(values)
-        matches = sum(1 for pattern in CELL_TYPE_VALUE_PATTERNS if re.search(pattern, text))
-        if matches >= 3:
-            return 0.45
-        if matches == 2:
-            return 0.34
-        if matches == 1:
-            return 0.22
-        if any("cell" in value for value in values):
-            return 0.14
-
+    # No hardcoded biology here: the harness does not carry a list of cell-type
+    # names to pattern-match values against (that is domain knowledge that belongs
+    # to the model). cell_type is recognized structurally (categorical label
+    # column of bounded cardinality) plus an exact canonical name; the model reads
+    # the actual label values from the facts and decides.
     if role == "cluster":
         numeric_like = 0
         for value in values:
@@ -683,9 +665,16 @@ def _semantic_value_score(series, role: str) -> float:
 
     if role == "doublet_label":
         normalized_values = {value.replace(" ", "_") for value in values}
-        known = {"true", "false", "0", "1", "doublet", "singlet", "multiplet", "negative", "positive"}
-        if normalized_values and normalized_values <= known:
-            return 0.35
+        doublet_vocab = {"doublet", "singlet", "multiplet"}
+        generic_binary = {"true", "false", "0", "1", "negative", "positive"}
+        # Definitive: the values literally are doublet calls (singlet/doublet/...).
+        # This is a fact read from the data, not a name guess, so it can identify
+        # the role even under a non-canonical column name.
+        if normalized_values & doublet_vocab and normalized_values <= (doublet_vocab | generic_binary):
+            return 1.0
+        # A bare boolean flag (true/false/0/1) is ambiguous — any binary column
+        # looks like this — so it is NOT sufficient on its own.
+        return 0.0
 
     return 0.0
 
@@ -712,7 +701,6 @@ def _score_obs_semantic_candidate(
     name_score = _column_name_role_scores(
         column,
         SEMANTIC_OBS_ROLE_ALIASES,
-        fuzzy=True,
     ).get(role, 0.0)
     if role in NUMERIC_SEMANTIC_ROLES and name_score < 0.7:
         return None
@@ -724,12 +712,26 @@ def _score_obs_semantic_candidate(
         structure_score = _categorical_structure_score(series, n_obs, role)
         value_score = _semantic_value_score(series, role)
 
+    # doublet_label is a small, closed vocabulary (singlet/doublet/true/false/0/1).
+    # Require the VALUES to actually look like doublet calls — not just a fuzzy
+    # name match. Otherwise a cell-type column like 'scanvi_label' matches on the
+    # "label" substring (name_score 0.63) and falsely flips has_doublets=True with
+    # no real doublet call (run_2026_07_02_150701 screenshot). The canonical named
+    # columns ('predicted_doublet', 'doublet_score') are matched exactly elsewhere.
+    if role == "doublet_label" and value_score == 0.0:
+        return None
+
     if structure_score == 0.0 and name_score < 0.9:
         return None
 
     confidence = min(0.99, 0.56 * name_score + 0.27 * structure_score + 0.17 * value_score)
     if name_score == 0.0:
         confidence *= 0.72
+    # Definitive content (value_score ~1.0, e.g. literal singlet/doublet values)
+    # identifies the role by itself — trust the data over a missing canonical
+    # name. Only value scorers that return a definitive 1.0 reach this.
+    if value_score >= 0.99 and structure_score > 0:
+        confidence = max(confidence, 0.9)
     if confidence < _semantic_min_confidence(role):
         return None
 
@@ -964,10 +966,13 @@ def resolve_batch_metadata(
 
 
 def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
-    """Detect if a raw counts layer exists in adata.layers.
+    """Detect a genuine raw-counts LAYER in adata.layers.
 
-    Note: adata.raw is checked separately in inspect_data and reported via
-    has_raw / raw_n_vars fields.
+    Only reports real named layers. adata.raw is deliberately NOT reported here:
+    it is tracked separately via has_raw / raw_is_counts / raw_n_vars. Folding
+    adata.raw in as a fake "__raw__" layer used to make inspection claim "raw
+    counts in layer '__raw__'", a layer that does not exist — which sent the model
+    chasing a non-existent layer (run_2026_07_02_150701 burned ~5 iterations).
     """
     common_raw_names = ["raw_counts", "raw_data", "counts", "raw"]
 
@@ -975,13 +980,67 @@ def _detect_raw_layer(adata: AnnData) -> Tuple[bool, str]:
         if name in adata.layers and _is_integer_matrix(adata.layers[name]):
             return True, name
 
-    # Check adata.raw — but only if it actually contains integer counts.
-    # adata.raw is often log-normalized data stored before HVG selection,
-    # not true raw counts. Verify before reporting it as a raw counts source.
-    if adata.raw is not None and _is_integer_matrix(adata.raw.X):
-        return True, "__raw__"
-
     return False, ""
+
+
+# Preferred layer names to search for a raw-counts matrix, most-specific first.
+_COUNTS_LAYER_NAMES = ["counts", "raw_counts", "raw_data", "soupx_counts", "spliced"]
+
+
+def find_counts_matrix(adata: AnnData, prefer_layer: Optional[str] = None):
+    """Locate a raw-counts matrix and the ``var`` frame that matches it.
+
+    Counts can live in a named layer, in ``adata.raw`` (which carries its *own*
+    ``var`` — often more genes than ``adata.var`` after HVG subsetting), or in
+    ``adata.X`` itself. This resolver returns whichever is integer-VALUED — the
+    check is on the values, not the dtype, because counts are frequently stored
+    as ``float32`` (a naive "X is float ⇒ no counts" test misses ``adata.raw``
+    entirely, which is exactly how SCimilarity was fed log-normalized data).
+
+    Parameters
+    ----------
+    adata : AnnData
+    prefer_layer : str, optional
+        A specific layer to use if it exists and is integer-valued.
+
+    Returns
+    -------
+    dict or None
+        ``{"X", "var", "source", "n_vars"}`` where ``source`` is
+        ``"layer:<name>"``, ``"raw"``, or ``"X"``; or None if no integer-valued
+        counts matrix is found anywhere.
+    """
+    candidates: List[str] = []
+    if prefer_layer:
+        candidates.append(prefer_layer)
+    candidates += [n for n in _COUNTS_LAYER_NAMES if n != prefer_layer]
+
+    for name in candidates:
+        if name in adata.layers and _is_integer_matrix(adata.layers[name]):
+            return {
+                "X": adata.layers[name],
+                "var": adata.var,
+                "source": f"layer:{name}",
+                "n_vars": adata.n_vars,
+            }
+
+    if adata.raw is not None and _is_integer_matrix(adata.raw.X):
+        return {
+            "X": adata.raw.X,
+            "var": adata.raw.var,
+            "source": "raw",
+            "n_vars": adata.raw.n_vars,
+        }
+
+    if _is_integer_matrix(adata.X):
+        return {
+            "X": adata.X,
+            "var": adata.var,
+            "source": "X",
+            "n_vars": adata.n_vars,
+        }
+
+    return None
 
 
 def _detect_gene_id_format(adata: AnnData) -> Tuple[str, bool, bool, List[str]]:
@@ -1038,8 +1097,13 @@ def _characterize_features(adata: AnnData) -> dict:
     entrez_count = sum(1 for g in stripped if entrez_re.match(g))
     symbol_count = sum(1 for g in stripped if symbol_re.match(g) and not ensembl_re.match(g))
 
-    has_symbols_col = "gene_symbols" in adata.var.columns or "gene_name" in adata.var.columns
-    has_ensembl_col = "gene_ids" in adata.var.columns or "ensembl_id" in adata.var.columns
+    # Content-validated column detection (recognizes feature_name/gene_symbols/…
+    # and rejects mislabelled columns). See core.genes.
+    from . import genes as _genes
+    symbol_col = _genes.find_symbol_column(adata)
+    ensembl_col = _genes.find_ensembl_column(adata)
+    has_symbols_col = symbol_col is not None
+    has_ensembl_col = ensembl_col is not None
 
     if ensembl_count > sample_size * 0.5:
         fmt = "ensembl"
@@ -1099,6 +1163,11 @@ def _characterize_features(adata: AnnData) -> dict:
         "gene_id_format": fmt,
         "has_gene_symbols": has_symbols_col or fmt == "symbol",
         "has_ensembl_ids": has_ensembl_col or fmt == "ensembl",
+        # Which var column carries symbols/IDs, and whether var_names can be
+        # converted to gene symbols offline (needed by SCimilarity/CellTypist).
+        "symbol_column": symbol_col,
+        "ensembl_column": ensembl_col,
+        "convertible_to_symbols": fmt == "symbol" or symbol_col is not None,
         "sample_gene_names": gene_names[:10],
         # extended info for LLM — raw facts, no pre-interpreted flags
         "genome_prefix": genome_prefix,
@@ -1137,19 +1206,13 @@ def _detect_normalization(adata: AnnData) -> Tuple[bool, bool, str]:
     if dtype is not None and np.issubdtype(dtype, np.integer):
         return False, False, ""
 
-    # --- Fallback: sample a small prefix of X.data (cheap head-slice) ---
-    if sp.issparse(adata.X):
-        data = adata.X.data
-        if len(data) == 0:
-            return False, False, ""
-        sample_data = data[:min(10000, len(data))]
-        max_val = float(sample_data.max())
-    else:
-        flat = adata.X.ravel()
-        if len(flat) == 0:
-            return False, False, ""
-        sample_data = flat[:10000]
-        max_val = float(sample_data.max())
+    # --- Fallback: representative value sample (not a head slice) ---
+    # Decide from values, not dtype: float X that is entirely integer-valued is
+    # raw counts, not normalized data.
+    sample_data = _sample_matrix_values(adata.X)
+    if len(sample_data) == 0:
+        return False, False, ""
+    max_val = float(sample_data.max())
 
     has_floats = not np.allclose(sample_data, np.round(sample_data))
     is_log = max_val < 15 and has_floats
@@ -1270,6 +1333,7 @@ def get_clustering_registry(adata: AnnData) -> List[ClusteringRecord]:
                 is_primary=(key == default_cluster_key_for_method(method)),
                 source_key=payload.get("source_key"),
                 created_by=str(payload.get("created_by", "tool")),
+                use_rep=payload.get("use_rep"),
             )
 
     for inferred in _infer_obs_clustering_entries(adata):
@@ -1301,6 +1365,7 @@ def register_clustering(
     resolution: Optional[float],
     created_by: str = "tool",
     source_key: Optional[str] = None,
+    use_rep: Optional[str] = None,
 ) -> None:
     """Register a clustering result in adata.uns for later inspection."""
     namespace = _ensure_scagent_uns(adata)
@@ -1310,6 +1375,7 @@ def register_clustering(
         "resolution": float(resolution) if resolution is not None else None,
         "source_key": source_key,
         "created_by": created_by,
+        "use_rep": use_rep,
     }
 
 
@@ -1320,6 +1386,7 @@ def promote_clustering_to_primary(
     method: str,
     resolution: Optional[float],
     created_by: str = "tool",
+    use_rep: Optional[str] = None,
 ) -> str:
     """Promote a clustering result to the compatibility alias for its method."""
     normalized_method = normalize_clustering_method(method)
@@ -1340,6 +1407,7 @@ def promote_clustering_to_primary(
         method=normalized_method,
         resolution=resolution,
         created_by=created_by,
+        use_rep=use_rep,
     )
     register_clustering(
         adata,
@@ -1348,8 +1416,26 @@ def promote_clustering_to_primary(
         resolution=resolution,
         created_by=created_by,
         source_key=cluster_key,
+        use_rep=use_rep,
     )
     return alias
+
+
+# Obsm keys produced by batch-integration methods, in the same precedence
+# inspect_data uses. Single source of truth for "an integrated embedding exists"
+# (method convention, not biology). bbknn corrects the neighbor graph, not an
+# embedding, so it is not listed here.
+_INTEGRATION_EMBEDDING_KEYS = ("X_scanorama", "X_pca_harmony", "X_scVI")
+
+
+def integrated_embedding_keys(adata: AnnData) -> List[str]:
+    """Return the obsm keys of any batch-corrected embeddings present.
+
+    Used to enforce that, once integration has produced a corrected embedding,
+    downstream clustering/annotation binds to it rather than to a stale
+    pre-integration representation.
+    """
+    return [key for key in _INTEGRATION_EMBEDDING_KEYS if key in adata.obsm]
 
 
 def _detect_clustering(
@@ -1397,6 +1483,7 @@ def inspect_data(adata: AnnData) -> DataState:
     if adata.raw is not None:
         state.has_raw = True
         state.raw_n_vars = adata.raw.n_vars
+        state.raw_is_counts = _is_integer_matrix(adata.raw.X)
     state.is_counts = _is_integer_matrix(adata.X)
 
     gene_fmt, has_sym, has_ens, sample_genes = _detect_gene_id_format(adata)
@@ -1607,7 +1694,10 @@ def summarize_state(state: DataState) -> str:
     processing = []
     if state.has_raw:
         extra = f", {state.raw_n_vars:,} genes" if state.raw_n_vars != state.n_genes else ""
-        processing.append(f"raw counts in adata.raw{extra}")
+        if state.raw_is_counts:
+            processing.append(f"raw counts in adata.raw{extra}")
+        else:
+            processing.append(f"adata.raw present{extra} (non-integer values — not raw counts)")
     if state.has_raw_layer:
         processing.append(f"raw counts in layer '{state.raw_layer_name}'")
     if state.has_qc_metrics:
@@ -1737,3 +1827,143 @@ def obs_columns_detail(obs_df, n_obs: int, max_values: int = 8) -> dict:
                 detail[col] = {"dtype": dtype_str, "n_unique": n_unique}
 
     return {"columns": detail, "total_obs_cols": total}
+
+
+def _truncate_value(value: Any, limit: int = 60) -> str:
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _column_facts(series, n_ref: int, max_values: int = 10) -> dict:
+    """Judgment-free factual summary of one obs/var column.
+
+    Reports dtype, cardinality, missingness, and either a value-count
+    distribution (categorical / low-cardinality) or numeric stats. Deliberately
+    makes NO role decision — e.g. a near-unique column reports
+    ``unique_fraction`` close to 1.0 and lets the consumer conclude it is an
+    identifier rather than baking that judgment in here.
+    """
+    import pandas as pd
+
+    dtype_str = str(series.dtype)
+    n_missing = int(series.isna().sum())
+    non_null = series.dropna()
+    n_unique = int(non_null.nunique())
+    facts: dict = {
+        "dtype": dtype_str,
+        "n_unique": n_unique,
+        "n_missing": n_missing,
+        "unique_fraction": round(n_unique / n_ref, 4) if n_ref else 0.0,
+    }
+    if n_unique == 0:
+        return facts
+
+    is_numeric = pd.api.types.is_numeric_dtype(series)
+    if is_numeric and n_unique > max_values:
+        try:
+            vals = non_null.to_numpy(dtype=float)
+            finite = vals[np.isfinite(vals)]
+            if len(finite):
+                facts.update(
+                    {
+                        "min": round(float(finite.min()), 4),
+                        "max": round(float(finite.max()), 4),
+                        "mean": round(float(finite.mean()), 4),
+                        "all_integer": bool(np.allclose(finite, np.round(finite))),
+                    }
+                )
+        except Exception:
+            pass
+        return facts
+
+    # Categorical / low-cardinality: a value-count distribution. For an
+    # identifier column the top values each have count 1, which together with
+    # unique_fraction makes "this is a barcode, not a label" self-evident.
+    try:
+        value_counts = non_null.value_counts()
+        facts["top_values"] = [
+            {"value": _truncate_value(idx), "count": int(count)}
+            for idx, count in value_counts.head(max_values).items()
+        ]
+        if n_unique > max_values:
+            facts["values_truncated"] = True
+    except Exception:
+        pass
+    return facts
+
+
+def _x_facts(X, sample_n: int = 20000) -> dict:
+    """Factual characterization of a matrix from a representative value sample.
+
+    Reports the VALUE evidence needed to decide "are these raw counts?" without a
+    verdict: the fraction of sampled values that are integer-valued, min/max, and
+    whether any are negative. dtype is reported too, but the fraction is what
+    matters — float32 that is 100% integer-valued (fraction_integer_valued ≈ 1.0,
+    min ≥ 0) is raw counts despite the float dtype. For sparse matrices the sample
+    is over stored (nonzero) values.
+    """
+    facts: dict = {"dtype": str(getattr(X, "dtype", "unknown")), "is_sparse": bool(sp.issparse(X))}
+    try:
+        sample = _sample_matrix_values(X, n=sample_n)
+        if len(sample):
+            integer_valued = np.isclose(sample, np.round(sample))
+            facts["n_sampled"] = int(len(sample))
+            facts["sample_min"] = round(float(sample.min()), 4)
+            facts["sample_max"] = round(float(sample.max()), 4)
+            facts["fraction_integer_valued"] = round(float(np.mean(integer_valued)), 6)
+            facts["all_integer_sample"] = bool(integer_valued.all())
+            facts["has_negative_sample"] = bool(float(sample.min()) < 0)
+    except Exception:
+        pass
+    return facts
+
+
+def _gene_namespace_facts(adata: AnnData, sample_n: int = 5000) -> dict:
+    """Raw gene-identifier signals (counts only, no species conclusion)."""
+    names = [str(name) for name in adata.var_names[:sample_n]]
+    if not names:
+        return {}
+    return {
+        "n_checked": len(names),
+        "ensembl_human_ensg": sum(1 for n in names if n.startswith("ENSG")),
+        "ensembl_mouse_ensmusg": sum(1 for n in names if n.startswith("ENSMUSG")),
+        "uppercase_symbol_like": sum(1 for n in names if re.match(r"^[A-Z0-9-]{2,}$", n)),
+        "title_symbol_like": sum(1 for n in names if re.match(r"^[A-Z][a-z0-9-]{1,}$", n)),
+        "mt_prefixed": sum(1 for n in names if n.upper().startswith("MT-")),
+    }
+
+
+def dataset_facts(adata: AnnData, max_values: int = 10) -> dict:
+    """Comprehensive, judgment-free fact sheet for an AnnData object.
+
+    Everything observable without interpretation: shape, X characteristics,
+    layers / embeddings / uns keys, raw availability, per-column obs & var facts,
+    gene-namespace signals, and example var names. Contains NO role / species /
+    "is this cell types" decisions — those belong to the judgment layer, which
+    consumes this sheet. Keeping facts and judgments separate is the point:
+    facts are cheap, deterministic, and testable; judgments are not.
+    """
+    n_obs, n_vars = int(adata.n_obs), int(adata.n_vars)
+    return {
+        "shape": {"n_obs": n_obs, "n_vars": n_vars},
+        "X": _x_facts(adata.X),
+        "layers": list(adata.layers.keys()),
+        # Per-layer value facts so the model can see which matrix (if any) holds
+        # integer counts, rather than trusting a pre-computed verdict.
+        "layer_facts": {name: _x_facts(adata.layers[name]) for name in adata.layers.keys()},
+        "obsm_keys": list(adata.obsm.keys()),
+        "varm_keys": list(adata.varm.keys()),
+        "uns_keys": list(adata.uns.keys()),
+        "raw": {
+            "present": adata.raw is not None,
+            "n_vars": int(adata.raw.n_vars) if adata.raw is not None else 0,
+            # Value facts for adata.raw.X (min/max/all_integer_sample) — lets the
+            # model tell "float32 but integer-valued counts" from log-normalized
+            # data via the actual values (decimal points), not the dtype alone.
+            "X": _x_facts(adata.raw.X) if adata.raw is not None else {},
+        },
+        "obs_columns": {col: _column_facts(adata.obs[col], n_obs, max_values) for col in adata.obs.columns},
+        "var_columns": {col: _column_facts(adata.var[col], n_vars, max_values) for col in adata.var.columns},
+        "var_names_examples": [str(name) for name in adata.var_names[:8]],
+        "gene_namespace": _gene_namespace_facts(adata),
+    }

@@ -32,6 +32,9 @@ GPUS=${3:-"auto"}
 THINKING=${THINKING:-0}
 SPEC=${SPEC:-"auto"}
 LONG_CTX=${LONG_CTX:-0}
+# Restrict to specific GPU indices on a shared node, e.g. GPU_IDS=0,1,5,7
+# (tensor-parallel size becomes the count). Empty = let vLLM use the first TP GPUs.
+GPU_IDS=${GPU_IDS:-""}
 
 # Waterfall benchmark overrides — set these to isolate the effect of each
 # optimization. Normal usage leaves all three unset (default behaviour).
@@ -72,6 +75,8 @@ MODEL_TABLE=(
   "RedHatAi/gemma-4-31B-it-FP8-Dynamic      | gemma-4-31b-it              |  31 | 1120 | gemma4      | 256 | fp8"
   "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-32B     |  64 | 256  | hermes      | 128 |"
   "THUDM/glm-4-9b-chat                      | glm-4-9b-chat               |  18 |  64  | glm45       | 128 |"
+  "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 | Nemotron-3-Ultra      | 328 | 128  | qwen3_coder | 256 | nvfp4 | nemotron_v3"
+  "zai-org/GLM-5.2-FP8                      | glm-5.2-fp8                 | 704 |  89  | glm47       | 400  | fp8 | glm45"
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -97,6 +102,45 @@ for entry in "${MODEL_TABLE[@]}"; do
     break
   fi
 done
+
+# ── Per-model serve-flag extras ──────────────────────────────────────────────
+# Most models need nothing beyond the table. A few (hybrid/MoE architectures)
+# need extra serve flags and/or a newer container. Keep those quirks isolated
+# here so the table stays simple and every other model is unaffected.
+#   MODEL_EXTRA          — extra `vllm serve` flags for this model (empty otherwise)
+#   SKIP_THINKING_KWARG  — 1 to NOT inject Qwen-style enable_thinking=false
+MODEL_EXTRA=()
+SKIP_THINKING_KWARG=0
+case "$MODEL" in
+  nvidia/NVIDIA-Nemotron-3-Ultra-*)
+    # Hybrid Mamba-MoE in NVFP4 — needs vLLM>=0.22 (NVFP4 + Mamba kernels),
+    # custom modeling code, Mamba cache/backend flags, and NVFP4 perf flags.
+    SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_v0.22.0.sif"}
+    MODEL_EXTRA+=(
+      --trust-remote-code
+      --mamba-backend triton
+      --mamba-ssm-cache-dtype float32
+      --enable-flashinfer-autotune
+      --async-scheduling
+      --max-num-batched-tokens 32768
+    )
+    SKIP_THINKING_KWARG=1   # reasoning-budget model; enable_thinking kwarg doesn't apply
+    ;;
+  zai-org/GLM-5.2-FP8|zai-org/GLM-5.2)
+    # GLM-5.2 (744B/40B MoE) FP8 — needs vLLM>=0.23 (GLM-5 arch + glm47/glm45 parsers).
+    SIF=${VLLM_SIF:-"/data1/peerd/ibrahih3/vllm-openai_v0.23.0.sif"}
+    SKIP_THINKING_KWARG=1   # GLM reasoning is template-native; enable_thinking kwarg N/A
+    # GLM-5.2 large MoE on multi-GPU (vLLM 0.23, 8xH200):
+    #  - WITHOUT --enable-expert-parallel: expert/DSA collectives deadlock (ranks
+    #    spin at 100% during warmup; the "only N of 8 GPUs" hang). EP is required.
+    #  - --disable-custom-all-reduce: NCCL all-reduce is the stable path here.
+    #  - --enforce-eager: CUDA-graph capture ALSO deadlocks on glm_moe_dsa even with
+    #    EP (hangs at capture). Eager is the only working mode today — but it's slow
+    #    (~21 tok/s vs ~250+ expected with graphs). REMOVE --enforce-eager once a
+    #    newer vLLM fixes glm_moe_dsa graph capture; that should restore full speed.
+    MODEL_EXTRA+=(--enable-expert-parallel --disable-custom-all-reduce --enforce-eager)
+    ;;
+esac
 
 # ── GPU detection ─────────────────────────────────────────────────────────────
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
@@ -140,10 +184,10 @@ echo "Class:    $HW_CLASS"
 
 # Reject FP8 weights on Ampere — Marlin would silently dequantize to BF16 on every
 # forward pass. Slower than just running BF16 directly with no benefit.
-if [[ "$HW_CLASS" == "ampere" && "$MODEL_QUANT" == "fp8" ]]; then
+if [[ "$HW_CLASS" == "ampere" && ( "$MODEL_QUANT" == "fp8" || "$MODEL_QUANT" == "nvfp4" ) ]]; then
   echo ""
-  echo "ERROR: FP8 model on A100 has no native FP8 support (compute capability 8.0)."
-  echo "       Marlin would dequantize to BF16 on every forward pass — slower than BF16 direct."
+  echo "ERROR: ${MODEL_QUANT^^} weights need a Hopper/Blackwell GPU; this is an A100 (cc 8.0)."
+  echo "       On Ampere they'd dequantize every forward pass — slower than BF16 direct."
   case "$MODEL" in
     Qwen/Qwen3.6-27B-FP8)
       echo "       Use the BF16 sibling instead:"
@@ -160,7 +204,10 @@ fi
 # ── GPU count autoselect ──────────────────────────────────────────────────────
 UTIL=90  # percent
 
-if [[ "$GPUS" == "auto" ]]; then
+if [[ -n "$GPU_IDS" ]]; then
+  TP=$(echo "$GPU_IDS" | tr ',' '\n' | grep -c .)
+  echo "GPUs:     pinned to GPU_IDS=$GPU_IDS  (tensor-parallel-size=$TP)"
+elif [[ "$GPUS" == "auto" ]]; then
   for n in 1 2 4 8; do
     USABLE=$(( n * GPU_VRAM * UTIL / 100 ))
     KV_BUDGET=$(( USABLE - MODEL_VRAM ))
@@ -257,7 +304,7 @@ EXTRA_FLAGS+=("--max-num-seqs" "8")
 
 # Thinking mode: off by default for speed (3-10× faster TTFT for routine tool calls).
 # Override: THINKING=1 bash start_vllm.sh <model>   or   export THINKING=1
-if [[ "$THINKING" == "0" ]]; then
+if [[ "$THINKING" == "0" && "$SKIP_THINKING_KWARG" != "1" ]]; then
   EXTRA_FLAGS+=("--default-chat-template-kwargs" '{"enable_thinking": false}')
 fi
 
@@ -292,6 +339,14 @@ if [[ "$THINKING" == "0" && "$SPEC" != "0" ]]; then
         EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":1}')
         echo "Speculative: MTP (k=1, native to Qwen3.6)"
       fi
+      ;;
+    nvidia/NVIDIA-Nemotron-3-Ultra-*)
+      EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":5}')
+      echo "Speculative: MTP (k=5, native to Nemotron 3 Ultra)"
+      ;;
+    zai-org/GLM-5.2-FP8|zai-org/GLM-5.2)
+      EXTRA_FLAGS+=("--speculative-config" '{"method":"mtp","num_speculative_tokens":5}')
+      echo "Speculative: MTP (k=5, native to GLM-5.2)"
       ;;
     *)
       if [[ "$SPEC" == "1" ]]; then
@@ -360,11 +415,27 @@ if [[ ! -d "$MODEL_CACHE" ]]; then
   exit 1
 fi
 
+# Fail fast if the port is already taken. Otherwise the new server can't bind it,
+# but the readiness probe below gets answered by WHATEVER already owns the port
+# (e.g. a stale vLLM or a TRT-LLM server) and we'd falsely report "ready".
+if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -q ":$PORT "; then
+  echo "ERROR: port $PORT is already in use — another server is bound to it."
+  echo "       Health checks would be answered by that server and mask this one."
+  echo "       Free it (find it via:  ss -ltnp | grep :$PORT) or pick a different PORT."
+  exit 1
+fi
+
 # Persistent compile cache — keyed by model AND hardware class so A100/H100 caches
 # don't collide. Without this, a cache hit from a different GPU class can cause a
 # crash during CUDA graph capture (compiled kernels reference unavailable instructions).
 MODEL_TAG="$(echo "$MODEL" | sed 's|/|_|g')_${HW_CLASS}"
 mkdir -p "$HF_DIR/vllm_compile_cache/$MODEL_TAG"
+
+# Pin to specific GPUs on a shared node. Must be `export` (not an inline VAR=val
+# prefix): a parameter-expanded assignment isn't treated as an assignment by bash.
+if [[ -n "$GPU_IDS" ]]; then
+  export SINGULARITYENV_CUDA_VISIBLE_DEVICES="$GPU_IDS"
+fi
 
 SINGULARITYENV_HF_HUB_CACHE=/hf_cache/hub \
 SINGULARITYENV_HF_HUB_OFFLINE=1 \
@@ -385,6 +456,7 @@ singularity exec --nv \
     --gpu-memory-utilization "$MEM_UTIL" \
     --max-model-len "$CTX" \
     "${EXTRA_FLAGS[@]}" \
+    "${MODEL_EXTRA[@]}" \
     --enable-auto-tool-choice \
     --tool-call-parser "$PARSER" \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \

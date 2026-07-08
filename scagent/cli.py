@@ -146,8 +146,8 @@ Examples:
     analyze_parser.add_argument(
         "--max-iterations",
         type=int,
-        default=75,
-        help="Max tool calls per turn before an explicit resumable pause (default: 75)"
+        default=100,
+        help="Max tool calls per turn before an explicit resumable pause (default: 100)"
     )
     analyze_parser.add_argument(
         "--quiet", "-q",
@@ -283,23 +283,66 @@ def _maybe_save_on_exit(agent, console) -> None:
     if agent.adata is None:
         return
     from pathlib import Path
-    from scagent.terminal import read_user_input
+    from scagent.terminal import DecisionChoice, prompt_for_decision
+
     run_dir = agent.run_manager.run_dir if agent.run_manager else Path(agent.output_dir)
     default_path = str(run_dir / "final_result.h5ad")
     try:
-        console.print(f"\n[yellow]You have data in memory. Save before exiting?[/yellow] [dim](Enter path, or press Enter for default: {default_path}, or n to skip)[/dim]")
-        response = read_user_input("> ").strip()
+        selection = prompt_for_decision(
+            f"You have data in memory. Save before exiting?\nDefault: {default_path}",
+            [
+                DecisionChoice("Save to the default path", "save_default"),
+                DecisionChoice("Save to another path", "custom"),
+                DecisionChoice("Exit without saving", "skip"),
+            ],
+            default_index=0,
+            allow_custom=False,
+        )
     except (EOFError, KeyboardInterrupt):
         return
-    if response.lower() in ("n", "no", "skip"):
+    if selection.action == "skip":
         return
-    save_path = response if response and response.lower() not in ("y", "yes") else default_path
+    save_path = selection.value if selection.action == "custom" else default_path
     try:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        agent.adata.write_h5ad(save_path)
+        from .agent.tools import write_h5ad_safe
+
+        write_h5ad_safe(agent.adata, save_path)
         console.print(f"[green]Saved to {save_path}[/green]")
     except Exception as e:
         console.print(f"[red]Save failed: {e}[/red]")
+
+
+def _analyze_with_decisions(agent, **analyze_kwargs):
+    """Run a turn and immediately resolve any structured checkpoints.
+
+    The agent turn (model + tool loop) runs under an Esc listener so the user can
+    abort a running tool with Esc — same effect as Ctrl+C. The listener is NOT
+    active around the interactive decision prompt, which needs canonical input.
+    """
+    from scagent.terminal import EscInterruptListener
+
+    max_iterations = analyze_kwargs.get("max_iterations", 100)
+    with EscInterruptListener():
+        result = agent.analyze(**analyze_kwargs)
+    while agent.has_pending_decision:
+        selection = agent.prompt_pending_decision()
+        if selection is None:
+            break
+        decision_request = agent.structured_decision_request(selection)
+        # Some choices collect context and intentionally open a refined version
+        # of the same decision. Re-render it immediately without asking the
+        # model to interpret an intermediate, non-final strategy selection.
+        if agent.has_pending_decision:
+            continue
+        with EscInterruptListener():
+            result = agent.analyze(
+                request=decision_request,
+                data_path=None,
+                max_iterations=max_iterations,
+                continue_conversation=True,
+            )
+    return result
 
 
 def run_start(args):
@@ -333,6 +376,47 @@ def run_start(args):
     # Welcome panel
     cwd = os.path.abspath(args.output)
     data_line = f"  Data:     {os.path.abspath(args.data)}" if args.data else "  Data:     none loaded yet"
+    # Vision line — make it obvious whether figures will actually be analyzed,
+    # since a text-only main model silently depends on the sidecar.
+    if agent._supports_vision():
+        vision_desc, vision_style = "native (main model is multimodal)", "white"
+    elif agent._use_sidecar_for_images():
+        _sc = agent._vision_sidecar
+        vision_desc = f"sidecar -> {_sc.model} @ {_sc.cfg.base_url or '<openai default>'}"
+        vision_style = "white"
+    else:
+        vision_desc = "none - text-only model; figures will NOT be analyzed (set SCAGENT_VISION_MODEL)"
+        vision_style = "yellow"
+    # Show the main model's endpoint too when it's a local/self-hosted server,
+    # matching the Vision line. Cloud providers have no useful host:port to show.
+    _main_base = str(getattr(agent.client, "base_url", "") or "")
+    _cloud_hosts = (
+        "api.openai.com", "api.anthropic.com", "api.groq.com", "api.deepseek.com",
+        "generativelanguage.googleapis.com", "aiplatform.googleapis.com",
+    )
+    main_loc = "" if (not _main_base or any(h in _main_base for h in _cloud_hosts)) else f"  @ {_main_base}"
+    # GPU line — surface the scVI training device config (resolved from env, the
+    # same way run_scvi resolves it) and which physical GPUs are eligible, so it's
+    # obvious at a glance whether training will fan out and onto which devices.
+    # Derived from env vars only — we deliberately do NOT import torch/cupy here, to
+    # keep a CUDA context out of the main process (scVI trains in a subprocess).
+    from scagent.batch.scvi import _resolve_n_devices
+
+    _cvd = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    _visible = _cvd if _cvd else "all"
+    _n_dev = _resolve_n_devices(None)
+    if _n_dev == 1:
+        _scvi_desc = "scVI single GPU (auto least-busy)"
+        gpu_style = "white"
+    elif _n_dev < 0:
+        _scvi_desc = "scVI all GPUs (DDP, multi-GPU)"
+        gpu_style = "green"
+    else:
+        _scvi_desc = f"scVI up to {_n_dev} GPUs (DDP, multi-GPU)"
+        gpu_style = "green"
+    gpu_desc = f"{_scvi_desc}  ·  visible: {_visible}"
+    if (os.environ.get("SCAGENT_GPU") or "").strip().lower() in ("1", "true", "yes", "on"):
+        gpu_desc += "  ·  RAPIDS accel: on"
     welcome_text = Text.assemble(
         ("scagent", "bold cyan"),
         " — single-cell RNA-seq analysis agent\n\n",
@@ -340,7 +424,13 @@ def run_start(args):
         (cwd, "white"),
         "\n",
         ("  Provider:   ", "dim"),
-        (f"{agent.provider}:{agent.model}", "white"),
+        (f"{agent.provider}:{agent.model}{main_loc}", "white"),
+        "\n",
+        ("  Vision:     ", "dim"),
+        (vision_desc, vision_style),
+        "\n",
+        ("  GPU:        ", "dim"),
+        (gpu_desc, gpu_style),
         "\n",
         ("  Data:       ", "dim"),
         (os.path.abspath(args.data) if args.data else "none loaded yet", "white"),
@@ -359,13 +449,14 @@ def run_start(args):
     if args.data:
         console.print()
         try:
-            agent.analyze(
+            _analyze_with_decisions(
+                agent,
                 request="Load and inspect this data. Describe what you find — shape, processing state, metadata, and biology.",
                 data_path=args.data,
                 run_name=run_name,
             )
         except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted.[/yellow]")
+            console.print("\n[yellow]Interrupted — state preserved. Continue with a new instruction or type exit.[/yellow]")
         run_name = None  # run dir already created; don't rename on follow-ups
 
     # REPL
@@ -388,14 +479,15 @@ def run_start(args):
             break
 
         try:
-            agent.analyze(
+            _analyze_with_decisions(
+                agent,
                 request=user_input,
                 data_path=None,
                 run_name=run_name,
                 continue_conversation=True,
             )
         except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted. You can continue or type exit to quit.[/yellow]")
+            console.print("\n[yellow]Interrupted (Esc/Ctrl+C) — state preserved. Continue with a new instruction or type exit to quit.[/yellow]")
         run_name = None  # run dir created after first turn
 
     return 0
@@ -406,7 +498,13 @@ def run_analyze(args):
     from scagent.agent import SCAgent
     from scagent.terminal import read_user_input
 
-    if not sys.stdin.isatty():
+    # Smart autonomous mode runs headless (e.g. under NAT eval / batch jobs); only
+    # collaborative mode needs a TTY so the agent can pause for decisions. (This mirrors
+    # the guard in SCAgent.run, which only blocks collaborative + non-smart + no-TTY.)
+    smart = getattr(args, 'smart_autonomous', None)
+    if smart is None:
+        smart = True  # default to smart mode when neither --smart nor --collaborative given
+    if not smart and not sys.stdin.isatty():
         print(
             "Collaborative agent mode requires an interactive terminal. "
             "Run `scagent analyze` from a TTY so the agent can pause for decisions."
@@ -425,10 +523,7 @@ def run_analyze(args):
             "annotation. Provide a summary of your findings."
         )
 
-    # Create agent
-    smart = getattr(args, 'smart_autonomous', None)
-    if smart is None:
-        smart = True  # default to smart mode when neither --smart nor --collaborative given
+    # Create agent  (smart resolved above)
     agent = SCAgent(
         provider=args.provider,
         model=args.model,
@@ -449,7 +544,8 @@ def run_analyze(args):
 
     # First analysis
     try:
-        result = agent.analyze(
+        result = _analyze_with_decisions(
+            agent,
             request=request,
             data_path=args.data,
             run_name=args.name,
@@ -481,7 +577,8 @@ def run_analyze(args):
 
                 # Continue analysis with the same agent (preserves state and conversation)
                 try:
-                    result = agent.analyze(
+                    result = _analyze_with_decisions(
+                        agent,
                         request=user_input,
                         data_path=None,  # Use existing loaded data
                         max_iterations=args.max_iterations,
@@ -530,7 +627,9 @@ def run_qc(args):
 
     run_qc_pipeline(adata, mt_threshold=args.mt_threshold)
 
-    adata.write_h5ad(args.output_path)
+    from .agent.tools import write_h5ad_safe
+
+    write_h5ad_safe(adata, args.output_path)
     print(f"Filtered: {n_before} -> {adata.n_obs} cells")
     print(f"Saved to: {args.output_path}")
 

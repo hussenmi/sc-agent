@@ -1,0 +1,191 @@
+general:
+  use_uvloop: null
+  telemetry:
+    logging: {}
+    tracing:
+      phoenix:
+        type: phoenix
+        project: scagent-nat-eval
+        endpoint: http://localhost:6006/v1/traces
+        batch_size: 100
+        flush_interval: 5.0
+        max_queue_size: 1000
+        drop_on_overflow: false
+        shutdown_timeout: 10.0
+        timeout: 30.0
+        api_key: ''
+  per_user_workflow_timeout: PT30M
+  per_user_workflow_cleanup_interval: PT5M
+  enable_per_user_monitoring: false
+  front_end:
+    type: fastapi
+    root_path: ''
+    host: localhost
+    port: 8000
+    reload: false
+    workers: 1
+    scheduler_address: null
+    db_url: null
+    max_running_async_jobs: 10
+    dask_workers: processes
+    dask_log_level: WARNING
+    dask_worker_memory_limit: '0'
+    dask_threads_per_worker: 1
+    step_adaptor:
+      mode: default
+      custom_event_types: []
+    workflow:
+      method: POST
+      description: 'Executes the default NAT workflow from the loaded configuration '
+      path: /v1/workflow
+      websocket_path: /websocket
+      openai_api_path: /v1/chat
+      openai_api_v1_path: /v1/chat/completions
+      legacy_path: /generate
+      legacy_openai_api_path: /chat
+    evaluate:
+      method: POST
+      description: Evaluates the performance and accuracy of the workflow on a dataset
+      path: /evaluate
+      websocket_path: null
+      openai_api_path: null
+      openai_api_v1_path: null
+      legacy_path: null
+      legacy_openai_api_path: null
+    evaluate_item:
+      method: POST
+      description: Evaluate a single item with a specified evaluator
+      path: /evaluate/item
+      websocket_path: null
+      openai_api_path: null
+      openai_api_v1_path: null
+      legacy_path: null
+      legacy_openai_api_path: null
+    oauth2_callback_path: /auth/redirect
+    endpoints: []
+    cors:
+      allow_origins: null
+      allow_origin_regex: null
+      allow_methods:
+      - GET
+      allow_headers: []
+      allow_credentials: false
+      expose_headers: []
+      max_age: 600
+    use_gunicorn: false
+    runner_class: null
+    object_store: null
+    disable_legacy_routes: false
+    enable_interactive_extensions: false
+functions: {}
+function_groups: {}
+middleware: {}
+llms: {}
+embedders: {}
+memory: {}
+object_stores: {}
+optimizer:
+  output_path: null
+  eval_metrics: null
+  reps_per_param_set: 3
+  target: null
+  multi_objective_combination_mode: harmonic
+  numeric:
+    type: numeric
+    enabled: true
+    n_trials: 20
+    sampler: null
+  prompt:
+    type: ga
+    enabled: false
+    prompt_population_init_function: null
+    prompt_recombination_function: null
+    ga_population_size: 24
+    ga_generations: 15
+    ga_crossover_rate: 0.8
+    ga_mutation_rate: 0.3
+    ga_elitism: 2
+    ga_selection_method: tournament
+    ga_tournament_size: 3
+    ga_parallel_evaluations: 8
+    ga_diversity_lambda: 0.0
+    oracle_feedback_mode: never
+    oracle_feedback_worst_n: 5
+    oracle_feedback_max_chars: 4000
+    oracle_feedback_fitness_threshold: 0.3
+    oracle_feedback_stagnation_generations: 3
+    oracle_feedback_fitness_variance_threshold: 0.01
+    oracle_feedback_diversity_threshold: 0.5
+retrievers: {}
+ttc_strategies: {}
+workflow:
+  type: scagent_analyze
+  name: null
+  middleware: []
+  scagent_bin: /usersoftware/peerd/ibrahih3/envs/scagent/bin/scagent
+  scagent_repo: /data1/peerd/ibrahih3/cs_agent
+  provider: openai
+  model: Qwen3.6-27B
+  base_url: http://localhost:8000/v1
+  api_key: EMPTY
+  output_root: /data1/peerd/ibrahih3/cs_agent/nat_runs
+  max_iterations: 75
+  timeout_s: 5400
+  trace: true
+  otlp_endpoint: http://localhost:6006
+  trace_project: scagent-nat-eval
+authentication: {}
+eval:
+  general:
+    max_concurrency: 1
+    workflow_alias: null
+    output_dir: /data1/peerd/ibrahih3/cs_agent/nat_eval_out_smoke
+    output: null
+    dataset:
+      type: jsonl
+      id_key: id
+      structure:
+        disable: false
+        question_key: question
+        answer_key: answer
+        generated_answer_key: generated_answer
+        trajectory_key: intermediate_steps
+        expected_trajectory_key: expected_intermediate_steps
+      filter:
+        allowlist: null
+        denylist: null
+      s3: null
+      remote_file_path: null
+      file_path: /data1/peerd/ibrahih3/cs_agent/nat_integration/data/annotation_eval_smoke.jsonl
+    profiler: null
+    validate_llm_endpoints: false
+    per_input_user_id: true
+  evaluators:
+    annotation_ari:
+      type: annotation_ari
+      cluster_key: leiden
+      fallback_key: cell_type
+      min_overlap: 50
+trainers: {}
+trainer_adapters: {}
+trajectory_builders: {}
+finetuning:
+  enabled: false
+  trainer: null
+  trajectory_builder: null
+  trainer_adapter: null
+  reward_function: null
+  target_functions:
+  - <workflow>
+  target_model: null
+  curriculum_learning:
+    enabled: false
+    initial_percentile: 0.3
+    increment_percentile: 0.2
+    expansion_interval: 5
+    min_reward_diff: 0.1
+    sort_ascending: false
+    random_subsample: null
+  num_epochs: 1
+  output_dir: .tmp/nat/finetuning
+  run_configuration: null

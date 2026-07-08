@@ -8,6 +8,7 @@ Creates structured output directories with:
 - Machine-readable manifest for reproducibility
 """
 
+import copy
 import os
 import json
 import socket
@@ -236,11 +237,17 @@ class RunManager:
         self._save_manifest()
 
     def append_world_state_snapshot(self, snapshot: Dict[str, Any]):
-        """Append a compact snapshot of the agent world state."""
+        """Append a compact snapshot of the agent world state.
+
+        Deep-copy the snapshot before storing. ``world_state.snapshot()`` returns
+        live references (e.g. ``user_preferences``), and the whole manifest is
+        re-serialized on every save — so without freezing, every stored snapshot
+        would alias the latest state and the per-step history would be a lie.
+        """
         self.manifest.world_state_snapshots.append(
             {
                 "timestamp": datetime.now().isoformat(),
-                "snapshot": snapshot,
+                "snapshot": copy.deepcopy(snapshot),
             }
         )
         self._save_manifest()
@@ -304,7 +311,8 @@ class RunManager:
             # Include key metrics, not full result
             step["metrics"] = {
                 k: v for k, v in result.items()
-                if k in ["before", "after", "n_clusters", "n_hvg", "doublet_rate", "status"]
+                if k in ["before", "after", "n_clusters", "n_hvg", "doublet_rate",
+                         "status", "backend"]
             }
 
         self.manifest.steps_completed.append(step)
@@ -383,6 +391,23 @@ class RunManager:
         ``report_path`` links the turn entry to the comprehensive analysis report.
         """
         self.manifest.status = "completed"
+
+        # Soft check: every generated artifact README that requires a
+        # dataset-specific interpretation should have one. Missing ones become
+        # non-blocking warnings so the run still completes.
+        try:
+            from ..core.artifact_docs import scan_incomplete_interpretations
+
+            for rel in scan_incomplete_interpretations(self.run_dir):
+                warning = (
+                    f"Artifact documentation {rel} has no dataset-specific "
+                    "interpretation — call annotate_artifact_group to add one."
+                )
+                if warning not in self.manifest.warnings:
+                    self.manifest.warnings.append(warning)
+        except Exception:
+            pass  # documentation coverage must never block completion
+
         self._save_manifest()
 
         # Collect tools used in this turn from recent steps

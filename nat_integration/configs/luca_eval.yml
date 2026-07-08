@@ -1,0 +1,65 @@
+# NAT eval (UNIFIED): profiling layer (NAT's job) + accuracy via our own LuCA
+# scorer wrapped as a NAT evaluator (so accuracy lands in NAT artifacts while the
+# logic stays in compare_run_to_atlas.py). One run -> per-step profile + accuracy.
+#
+#   /usersoftware/peerd/ibrahih3/envs/nvidia-nat/bin/nat eval \
+#     --config_file /data1/peerd/ibrahih3/cs_agent/nat_integration/configs/luca_eval.yml \
+#     --override workflow.base_url http://iscp001:8000/v1 --reps 3
+#
+# --reps N gives the consistency distribution (accuracy + per-step timings across runs).
+
+general:
+  telemetry:
+    tracing:
+      # Weave only (cloud, shareable; Phoenix dropped — node-local + needs tunnel).
+      # Weave needs WANDB_API_KEY exported into the nat eval process env (it does
+      # NOT read scagent's .env), e.g.:
+      #   export WANDB_API_KEY=$(grep ^WANDB_API_KEY= .env | cut -d= -f2- | tr -d '"')
+      weave:
+        _type: weave
+        project: scagent-nat-luca
+
+workflow:
+  _type: scagent_analyze
+  scagent_bin: /usersoftware/peerd/ibrahih3/envs/scagent/bin/scagent
+  scagent_repo: /data1/peerd/ibrahih3/cs_agent
+  provider: openai
+  model: Nemotron-3-Ultra
+  base_url: http://iscp001:8000/v1
+  output_root: /data1/peerd/ibrahih3/cs_agent/nat_runs
+  max_iterations: 75
+  trace: false   # Weave-only via NAT telemetry; no Phoenix/OTLP sink running
+  otlp_endpoint: http://localhost:6006
+  trace_project: scagent-nat-luca
+  # Capture full LLM I/O per run -> distillation/flywheel dataset (collect-now-or-lose-it).
+  collect_trajectory: true
+
+eval:
+  general:
+    output_dir: /data1/peerd/ibrahih3/cs_agent/nat_luca_out_nemotron
+    max_concurrency: 1
+    dataset:
+      _type: jsonl
+      file_path: /data1/peerd/ibrahih3/cs_agent/nat_integration/data/luca_eval.jsonl
+    profiler:
+      base_metrics: true
+      workflow_runtime_forecast: true
+      compute_llm_metrics: true
+      token_usage_forecast: true
+      token_uniqueness_forecast: true
+      csv_exclude_io_text: true
+      bottleneck_analysis:
+        enable_simple_stack: true
+        enable_nested_stack: true
+      concurrency_spike_analysis:
+        enable: true
+        spike_threshold: 1
+      prefix_span_analysis:
+        enable: true
+        min_support: 2
+  evaluators:
+    # Accuracy via our own scorer (compare_run_to_atlas.py), surfaced through NAT.
+    luca_atlas:
+      _type: luca_atlas
+      annotation_col: cell_type
+      primary_metric: major

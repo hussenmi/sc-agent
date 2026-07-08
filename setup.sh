@@ -98,9 +98,13 @@ ${UV_CMD} pip install -e ".[all]" --quiet
 # Set environment variables
 # =============================================================================
 export SCAGENT_HOME="${SCAGENT_DIR}"
-export SCIMILARITY_MODEL_PATH="/data1/peerd/ibrahih3/scimilarity/docs/notebooks/models/model_v1.1"
-if [ -x "/usersoftware/peerd/ibrahih3/envs/cellbender/bin/cellbender" ]; then
-    export SCAGENT_CELLBENDER="/usersoftware/peerd/ibrahih3/envs/cellbender/bin/cellbender"
+# SCimilarity v2 models + CellBender from the shared sail tree (world-readable),
+# same as the Lmod module. scagent picks human vs mouse by detected organism.
+export SCIMILARITY_MODEL_PATH="/data1/collab002/sail/shared/models/sci/human_v2"
+export SCIMILARITY_MODEL_PATH_MOUSE="/data1/collab002/sail/shared/models/sci/mouse_v1"
+_SCAGENT_CB="/data1/collab002/sail/shared/tools/cellbender/.pixi/envs/default/bin/cellbender"
+if [ -x "${_SCAGENT_CB}" ]; then
+    export SCAGENT_CELLBENDER="${_SCAGENT_CB}"
 fi
 export PYTHONPATH="${SCAGENT_DIR}:${PYTHONPATH}"
 
@@ -139,6 +143,7 @@ echo ""
 echo "Environment variables set:"
 echo "  SCAGENT_HOME=${SCAGENT_HOME}"
 echo "  SCIMILARITY_MODEL_PATH=${SCIMILARITY_MODEL_PATH}"
+echo "  SCIMILARITY_MODEL_PATH_MOUSE=${SCIMILARITY_MODEL_PATH_MOUSE}"
 if [ -n "${SCAGENT_CELLBENDER}" ]; then
     echo "  SCAGENT_CELLBENDER=${SCAGENT_CELLBENDER}"
 fi

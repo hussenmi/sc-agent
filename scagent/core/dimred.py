@@ -14,6 +14,7 @@ from anndata import AnnData
 import logging
 
 from ..config.defaults import DIMRED_DEFAULTS
+from .gpu import on_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -65,15 +66,29 @@ def run_pca(
 
     logger.info(f"Running PCA with {n_comps} components")
 
-    sc.tl.pca(
-        adata,
-        n_comps=n_comps,
-        mask_var=mask_var,
-        svd_solver=svd_solver,
-        random_state=random_state,
-    )
+    with on_gpu(adata) as gpu:
+        if gpu:
+            import rapids_singlecell as rsc
 
-    logger.info(f"PCA complete. Variance explained: {adata.uns['pca']['variance_ratio'].sum():.2%}")
+            # cuml uses its own SVD solver; 'arpack' is scanpy-specific, so omit it.
+            rsc.pp.pca(
+                adata,
+                n_comps=n_comps,
+                mask_var=mask_var,
+                random_state=random_state,
+            )
+        else:
+            sc.tl.pca(
+                adata,
+                n_comps=n_comps,
+                mask_var=mask_var,
+                svd_solver=svd_solver,
+                random_state=random_state,
+            )
+
+    # float() coerces a possible cupy scalar (nested GPU session) to host.
+    var_explained = float(adata.uns["pca"]["variance_ratio"].sum())
+    logger.info(f"PCA complete. Variance explained: {var_explained:.2%}")
 
     if not inplace:
         return adata
@@ -121,14 +136,27 @@ def compute_neighbors(
 
     logger.info(f"Computing neighbors with k={n_neighbors} using {use_rep}")
 
-    sc.pp.neighbors(
-        adata,
-        n_neighbors=n_neighbors,
-        n_pcs=n_pcs,
-        use_rep=use_rep,
-        metric=metric,
-        key_added=key_added,
-    )
+    with on_gpu(adata) as gpu:
+        if gpu:
+            import rapids_singlecell as rsc
+
+            rsc.pp.neighbors(
+                adata,
+                n_neighbors=n_neighbors,
+                n_pcs=n_pcs,
+                use_rep=use_rep,
+                metric=metric,
+                key_added=key_added,
+            )
+        else:
+            sc.pp.neighbors(
+                adata,
+                n_neighbors=n_neighbors,
+                n_pcs=n_pcs,
+                use_rep=use_rep,
+                metric=metric,
+                key_added=key_added,
+            )
 
     logger.info("Neighbor graph computed")
 
@@ -179,14 +207,27 @@ def compute_umap(
 
     logger.info(f"Computing UMAP with min_dist={min_dist}")
 
-    sc.tl.umap(
-        adata,
-        min_dist=min_dist,
-        spread=spread,
-        n_components=n_components,
-        neighbors_key=neighbors_key,
-        random_state=random_state,
-    )
+    with on_gpu(adata) as gpu:
+        if gpu:
+            import rapids_singlecell as rsc
+
+            rsc.tl.umap(
+                adata,
+                min_dist=min_dist,
+                spread=spread,
+                n_components=n_components,
+                neighbors_key=neighbors_key,
+                random_state=random_state,
+            )
+        else:
+            sc.tl.umap(
+                adata,
+                min_dist=min_dist,
+                spread=spread,
+                n_components=n_components,
+                neighbors_key=neighbors_key,
+                random_state=random_state,
+            )
 
     logger.info("UMAP computed")
 
@@ -272,16 +313,20 @@ def run_dimensionality_reduction(
 
     logger.info("Running dimensionality reduction pipeline...")
 
-    # PCA
-    run_pca(adata, n_comps=n_pcs, svd_solver=svd_solver, random_state=random_state, inplace=True)
+    # Keep PCA -> neighbors -> UMAP on the GPU for a single host<->device
+    # round-trip when SCAGENT_GPU is enabled (the nested on_gpu calls inside each
+    # step become no-ops). On CPU this context is transparent.
+    with on_gpu(adata):
+        # PCA
+        run_pca(adata, n_comps=n_pcs, svd_solver=svd_solver, random_state=random_state, inplace=True)
 
-    # Neighbors
-    compute_neighbors(adata, n_neighbors=n_neighbors, inplace=True)
+        # Neighbors
+        compute_neighbors(adata, n_neighbors=n_neighbors, inplace=True)
 
-    # UMAP
-    compute_umap(adata, min_dist=umap_min_dist, random_state=random_state, inplace=True)
+        # UMAP
+        compute_umap(adata, min_dist=umap_min_dist, random_state=random_state, inplace=True)
 
-    # Optional FDL
+    # Optional FDL — scanpy-only (no rapids path), so run on host after the session.
     if compute_fdl:
         compute_force_directed_layout(adata, random_state=random_state, inplace=True)
 

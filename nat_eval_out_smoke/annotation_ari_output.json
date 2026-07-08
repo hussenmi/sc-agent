@@ -1,0 +1,11 @@
+{
+  "average_score": 0.6076248015626997,
+  "eval_output_items": [
+    {
+      "id": "gse155249_smoke",
+      "score": 0.6076248015626997,
+      "reasoning": "ARI=0.608, NMI=0.799 on 8590 shared cells (pred key='leiden', 31 clusters vs 28 GT labels 'Cluster')",
+      "error": null
+    }
+  ]
+}

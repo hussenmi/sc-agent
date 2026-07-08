@@ -125,27 +125,42 @@ def prepare_for_scimilarity(
     model_path, _ = get_model_path(adata, model_path, organism=organism)
     ca = CellAnnotation(model_path=model_path)
 
-    # Find raw counts
-    if raw_layer is None:
-        for layer in ['raw_counts', 'raw_data', 'counts']:
-            if layer in adata.layers:
-                raw_layer = layer
-                break
+    # Find raw counts — check named layers AND adata.raw (which carries its own
+    # var). Detection is on integer VALUES, not dtype, since counts are commonly
+    # stored as float32; a naive "X is float ⇒ no counts" test silently fed
+    # SCimilarity log-normalized data. See core.inspector.find_counts_matrix.
+    from ..core.inspector import find_counts_matrix
+    from ..core.genes import convert_var_to_symbols, infer_id_format
 
-    if raw_layer is not None:
-        logger.info(f"Using raw counts from layer '{raw_layer}'")
-        X = adata.layers[raw_layer]
+    counts = find_counts_matrix(adata, prefer_layer=raw_layer)
+    if counts is None:
+        logger.warning(
+            "No integer-valued counts found in layers, adata.raw, or adata.X; "
+            "falling back to adata.X (SCimilarity expects raw counts)."
+        )
+        X, counts_var = adata.X, adata.var
     else:
-        logger.warning("No raw counts layer found, using adata.X")
-        X = adata.X
+        X, counts_var = counts["X"], counts["var"]
+        logger.info(
+            f"Using raw counts from {counts['source']} ({counts['n_vars']} genes)"
+        )
 
-    # Create minimal AnnData for Scimilarity — copy all obs/var so any cluster
-    # key (leiden, phenograph, etc.) is available for centroid queries.
+    # Create minimal AnnData for Scimilarity. obs comes from the main object (any
+    # cluster key must be available for centroid queries); var MUST match the
+    # counts matrix — adata.raw has its own var, often more genes than adata.var.
     adata_sci = AnnData(
         X,
         obs=adata.obs.copy(),
-        var=adata.var.copy(),
+        var=counts_var.copy(),
     )
+
+    # Ensure var_names are gene symbols. SCimilarity aligns against a symbol gene
+    # space and raises "Gene overlap of 0 ... check that var.index uses gene
+    # symbols" when handed Ensembl IDs. Conversion is offline (uses the dataset's
+    # own symbol column when present).
+    if infer_id_format(adata_sci.var_names) != "symbol":
+        adata_sci, gene_report = convert_var_to_symbols(adata_sci, inplace=True)
+        logger.info(f"Gene-id conversion for SCimilarity: {gene_report.message}")
 
     # Copy UMAP if available
     if 'X_umap' in adata.obsm:

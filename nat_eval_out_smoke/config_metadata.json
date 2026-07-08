@@ -1,0 +1,17 @@
+{
+  "config_file": "/data1/peerd/ibrahih3/cs_agent/nat_integration/configs/annotation_eval_smoke.yml",
+  "config_file_type": "Path",
+  "overrides": [],
+  "dataset": null,
+  "result_json_path": "$",
+  "skip_workflow": false,
+  "skip_completed_entries": false,
+  "reps": 1,
+  "endpoint": null,
+  "endpoint_timeout": 300,
+  "adjust_dataset_size": false,
+  "num_passes": 0,
+  "export_timeout": 60.0,
+  "user_id": "nat_eval_user_id",
+  "timestamp": "2026-06-16T20:59:08.163529+00:00"
+}

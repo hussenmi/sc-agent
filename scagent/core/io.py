@@ -9,7 +9,7 @@ Supports multiple input formats:
 
 import os
 from pathlib import Path
-from typing import Union, Optional, List
+from typing import Any, Union, Optional, List
 import scanpy as sc
 from anndata import AnnData
 import logging
@@ -250,6 +250,8 @@ def concat_datasets(
     datasets: List[AnnData],
     batch_key: str = 'batch_id',
     batch_names: Optional[List[str]] = None,
+    join: str = 'outer',
+    **kwargs: Any,
 ) -> AnnData:
     """
     Concatenate multiple AnnData objects.
@@ -262,6 +264,17 @@ def concat_datasets(
         Key to store batch information in obs.
     batch_names : List[str], optional
         Names for each batch. If None, uses integer indices.
+    join : {'outer', 'inner'}, default 'outer'
+        Outer keeps every gene observed in any dataset. Inner keeps only genes
+        shared by every dataset.
+    **kwargs
+        Tolerated ``anndata.concat``-style aliases so a near-miss call form does
+        not dead-end the load step (callers frequently conflate the two APIs):
+        ``label=`` (alias for ``batch_key``), ``keys=`` (alias for
+        ``batch_names``), and ``fill_value=`` (honored; otherwise 0 for outer
+        joins, None for inner). Structural kwargs this helper manages itself
+        (``axis``, ``index_unique``, ``merge``) are accepted and ignored. Any
+        other unexpected kwarg raises a TypeError naming the accepted parameters.
 
     Returns
     -------
@@ -270,20 +283,138 @@ def concat_datasets(
     """
     import anndata
 
+    # Tolerate the anndata.concat-style kwargs models commonly reach for, so a
+    # single near-miss does not cascade into hand-rolled concat fallbacks.
+    if batch_key == 'batch_id' and kwargs.get('label'):
+        batch_key = kwargs.pop('label')
+    else:
+        kwargs.pop('label', None)
+    if batch_names is None and kwargs.get('keys') is not None:
+        batch_names = kwargs.pop('keys')
+    else:
+        kwargs.pop('keys', None)
+    has_fill_override = 'fill_value' in kwargs
+    fill_value_override = kwargs.pop('fill_value', None)
+    for _structural in ('axis', 'index_unique', 'merge'):
+        kwargs.pop(_structural, None)
+    if kwargs:
+        raise TypeError(
+            f"concat_datasets() got unexpected keyword argument(s) {sorted(kwargs)}. "
+            "Accepted: datasets, batch_key, batch_names, join ('outer'/'inner'). "
+            "anndata.concat aliases label=, keys=, fill_value= are tolerated; "
+            "axis/index_unique/merge are managed internally."
+        )
+
+    if not datasets:
+        raise ValueError("datasets must contain at least one AnnData object")
+
     if batch_names is None:
         batch_names = [str(i) for i in range(len(datasets))]
+    else:
+        batch_names = [str(name).strip() for name in batch_names]
+
+    if len(batch_names) != len(datasets):
+        raise ValueError(
+            f"batch_names has {len(batch_names)} entries for {len(datasets)} datasets"
+        )
+    if any(not name for name in batch_names):
+        raise ValueError("batch_names cannot contain empty values")
+    if len(set(batch_names)) != len(batch_names):
+        raise ValueError("batch_names must be unique")
+    if join not in {"outer", "inner"}:
+        raise ValueError("join must be either 'outer' or 'inner'")
+
+    expected_counts = {}
+    for dataset, name in zip(datasets, batch_names, strict=True):
+        dataset.var_names_make_unique()
+        expected_counts[name] = int(dataset.n_obs)
 
     logger.info(f"Concatenating {len(datasets)} datasets")
 
+    fill_value = fill_value_override if has_fill_override else (0 if join == "outer" else None)
     adata = anndata.concat(
         datasets,
         axis=0,
-        join='outer',
+        join=join,
         label=batch_key,
         keys=batch_names,
         index_unique='-',
-        fill_value=0,
+        fill_value=fill_value,
+        merge='same',
     )
+
+    observed_counts = {
+        str(name): int(count)
+        for name, count in adata.obs[batch_key].value_counts().to_dict().items()
+    }
+    if observed_counts != expected_counts:
+        raise RuntimeError(
+            f"Concatenation produced unexpected '{batch_key}' labels: "
+            f"expected {expected_counts}, observed {observed_counts}"
+        )
+    if not adata.var_names.is_unique:
+        adata.var_names_make_unique()
+    if adata.obs_names.duplicated().any():
+        raise RuntimeError("Concatenation produced duplicate cell barcodes")
 
     logger.info(f"Concatenated shape: {adata.n_obs:,} cells x {adata.n_vars:,} genes")
     return adata
+
+
+def discover_data_inputs(path: Union[str, Path]) -> dict:
+    """Describe supported single-cell inputs without loading them."""
+    root = Path(path).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Input path does not exist: {root}")
+
+    def _format_for(candidate: Path) -> Optional[str]:
+        lower = candidate.name.lower()
+        if lower.endswith(".h5ad.gz"):
+            return "h5ad_gz"
+        if lower.endswith(".h5ad"):
+            return "h5ad"
+        if lower.endswith(".h5"):
+            return "10x_h5"
+        if lower.endswith(".loom"):
+            return "loom"
+        if lower.endswith(".mtx") or lower.endswith(".mtx.gz"):
+            return "mtx"
+        return None
+
+    def _likely_combined(candidate: Path) -> bool:
+        name = candidate.name.lower()
+        return any(token in name for token in ("combined", "concatenated", "merged"))
+
+    candidates = [root] if root.is_file() else sorted(root.iterdir())
+    datasets = []
+    for candidate in candidates:
+        data_format = _format_for(candidate) if candidate.is_file() else None
+        if candidate.is_dir() and any(candidate.glob("matrix.mtx*")):
+            data_format = "10x_mtx_directory"
+        if data_format is None:
+            continue
+        datasets.append({
+            "path": str(candidate),
+            "name": candidate.name,
+            "format": data_format,
+            "size_bytes": candidate.stat().st_size if candidate.is_file() else None,
+            "likely_combined_output": _likely_combined(candidate),
+        })
+
+    source_datasets = [
+        dataset for dataset in datasets
+        if not dataset["likely_combined_output"]
+    ]
+    if not source_datasets:
+        source_datasets = list(datasets)
+    return {
+        "path": str(root),
+        "datasets": datasets,
+        "source_datasets": source_datasets,
+        "likely_combined_outputs": [
+            dataset for dataset in datasets
+            if dataset["likely_combined_output"]
+        ],
+        "n_datasets": len(datasets),
+        "n_source_datasets": len(source_datasets),
+    }

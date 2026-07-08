@@ -1,0 +1,33 @@
+# NAT concurrency/profiling sweep config: profiler ONLY (no telemetry exporters,
+# no accuracy evaluator) to keep overhead minimal and the latency signal clean.
+# The runner (run_concurrency_sweep.sh) overrides max_concurrency + output_dir per
+# level and runs with --reps to generate concurrent load.
+
+workflow:
+  _type: scagent_analyze
+  scagent_bin: /usersoftware/peerd/ibrahih3/envs/scagent/bin/scagent
+  scagent_repo: /data1/peerd/ibrahih3/cs_agent
+  provider: openai
+  model: Qwen3.6-27B
+  base_url: http://localhost:8000/v1
+  output_root: /data1/peerd/ibrahih3/cs_agent/nat_runs
+  max_iterations: 75
+
+eval:
+  general:
+    output_dir: /data1/peerd/ibrahih3/cs_agent/nat_sweep_out
+    max_concurrency: 1
+    dataset:
+      _type: jsonl
+      file_path: /data1/peerd/ibrahih3/cs_agent/nat_integration/data/luca_profiling.jsonl
+    profiler:
+      base_metrics: true
+      compute_llm_metrics: true
+      workflow_runtime_forecast: true
+      csv_exclude_io_text: true
+      bottleneck_analysis:
+        enable_simple_stack: true
+        enable_nested_stack: true
+      concurrency_spike_analysis:
+        enable: true
+        spike_threshold: 1

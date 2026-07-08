@@ -15,6 +15,7 @@ import pandas as pd
 import logging
 
 from ..config.defaults import CLUSTERING_DEFAULTS
+from .gpu import on_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -59,16 +60,29 @@ def run_leiden(
 
     logger.info(f"Running Leiden clustering with resolution={resolution}")
 
-    sc.tl.leiden(
-        adata,
-        resolution=resolution,
-        random_state=random_state,
-        key_added=key_added,
-        neighbors_key=neighbors_key,
-        flavor="igraph",
-        n_iterations=2,
-        directed=False,
-    )
+    with on_gpu(adata) as gpu:
+        if gpu:
+            import rapids_singlecell as rsc
+
+            # cugraph Leiden: no 'flavor'/'directed' knobs (those are igraph-specific).
+            rsc.tl.leiden(
+                adata,
+                resolution=resolution,
+                random_state=random_state,
+                key_added=key_added,
+                neighbors_key=neighbors_key,
+            )
+        else:
+            sc.tl.leiden(
+                adata,
+                resolution=resolution,
+                random_state=random_state,
+                key_added=key_added,
+                neighbors_key=neighbors_key,
+                flavor="igraph",
+                n_iterations=2,
+                directed=False,
+            )
 
     n_clusters = adata.obs[key_added].nunique()
     logger.info(f"Leiden clustering complete: {n_clusters} clusters")
@@ -217,13 +231,25 @@ def run_louvain(
 
     logger.info(f"Running Louvain clustering with resolution={resolution}")
 
-    sc.tl.louvain(
-        adata,
-        resolution=resolution,
-        random_state=random_state,
-        key_added=key_added,
-        neighbors_key=neighbors_key,
-    )
+    with on_gpu(adata) as gpu:
+        if gpu:
+            import rapids_singlecell as rsc
+
+            # cugraph Louvain takes no random_state.
+            rsc.tl.louvain(
+                adata,
+                resolution=resolution,
+                key_added=key_added,
+                neighbors_key=neighbors_key,
+            )
+        else:
+            sc.tl.louvain(
+                adata,
+                resolution=resolution,
+                random_state=random_state,
+                key_added=key_added,
+                neighbors_key=neighbors_key,
+            )
 
     n_clusters = adata.obs[key_added].nunique()
     logger.info(f"Louvain clustering complete: {n_clusters} clusters")

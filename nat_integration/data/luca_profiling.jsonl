@@ -1,0 +1,1 @@
+{"id": "lung_t06_profile", "question": "{\"instruction\": \"Run quality control, clustering, and cell-type annotation on this lung cancer scRNA-seq dataset.\", \"data_path\": \"/data1/peerd/ibrahih3/cs_agent/test_data/salcher/LUNG_T06_raw.h5ad\"}", "answer": "n/a"}

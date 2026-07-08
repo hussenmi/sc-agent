@@ -7,13 +7,13 @@ interpretation can depend on more than technical state alone.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
 import re
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 from anndata import AnnData
 
-from ..core.inspector import inspect_data, rank_obs_semantic_candidates
+from ..core.inspector import inspect_data
 
 
 @dataclass
@@ -24,23 +24,24 @@ class BiologicalContext:
     species: str = "unknown"
     condition: str = "unknown"
     sample_type: str = "unknown"
-    expected_celltypes: Optional[List[str]] = None
 
-    inferred_tissue: Optional[str] = None
     confidence: float = 0.0
 
-    provenance: Dict[str, str] = field(default_factory=dict)
-    user_provided: Dict[str, Any] = field(default_factory=dict)
-    metadata_derived: Dict[str, Any] = field(default_factory=dict)
-    marker_inferred: Dict[str, Any] = field(default_factory=dict)
-    notes: List[str] = field(default_factory=list)
+    provenance: dict[str, str] = field(default_factory=dict)
+    user_provided: dict[str, Any] = field(default_factory=dict)
+    # Derived from a context string the *model/tool* supplied (e.g. the `context`
+    # arg of load_data/inspect_data), NOT from the user. Kept separate so the
+    # model can't mistake its own guessed context for user ground truth.
+    context_supplied: dict[str, Any] = field(default_factory=dict)
+    metadata_derived: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         return {k: v for k, v in payload.items() if v not in (None, [], {}, "")}
 
 
-def _normalize_text(text: Optional[str]) -> str:
+def _normalize_text(text: str | None) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
 
@@ -69,7 +70,7 @@ def _metadata_species(adata: AnnData) -> tuple[str, str]:
     return "unknown", "unknown"
 
 
-def _genome_column_species(adata: AnnData) -> tuple[str, str, List[str]]:
+def _genome_column_species(adata: AnnData) -> tuple[str, str, list[str]]:
     """Infer species from the ``genome`` column 10x CellRanger writes into ``var``.
 
     CellRanger ``.h5`` outputs tag each feature with the reference assembly
@@ -107,9 +108,9 @@ def _genome_column_species(adata: AnnData) -> tuple[str, str, List[str]]:
     return "unknown", "unknown", values
 
 
-def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, Dict[str, Any]]:
+def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, dict[str, Any]]:
     """Infer species from user text, metadata, the genome column, and gene identifiers."""
-    evidence: Dict[str, Any] = {}
+    evidence: dict[str, Any] = {}
 
     text_species, text_source = _species_from_text(text_context)
     if text_source == "user_provided":
@@ -136,7 +137,7 @@ def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, Di
         return "unknown", genome_source, evidence
 
     sample_names = [str(name) for name in adata.var_names[:50000]]
-    sample_var_values: List[str] = []
+    sample_var_values: list[str] = []
     for key in ("gene_ids", "ensembl_id", "gene_symbols", "gene_name"):
         if key in adata.var.columns:
             sample_var_values.extend([str(v) for v in adata.var[key].astype(str).head(50000).tolist()])
@@ -149,7 +150,10 @@ def _infer_species(adata: AnnData, text_context: str = "") -> tuple[str, str, Di
     title_symbol_like = sum(1 for name in sample_names if re.match(r"^[A-Z][a-z0-9-]{1,}$", name))
     ensg = sum(1 for value in combined if value.startswith("ENSG"))
     ensmusg = sum(1 for value in combined if value.startswith("ENSMUSG"))
-    h2_genes = sum(1 for name in sample_names if re.match(r"^H2[-A-Za-z0-9]*", name))
+    # Mouse MHC genes are hyphenated (H2-K1, H2-D1, H2-Aa). Require the hyphen so
+    # this does NOT match human histone genes (H2AFZ, H2AC6, H2BC12), which are
+    # abundant and would otherwise collide with HLA to read as "conflicting".
+    h2_genes = sum(1 for name in sample_names if re.match(r"^H2-[A-Za-z0-9]+", name))
     hla_genes = sum(1 for name in sample_names if re.match(r"^HLA[-A-Za-z0-9]*", name))
 
     evidence.update({
@@ -191,7 +195,7 @@ def _infer_sample_type(text_context: str, detected_type: str) -> tuple[str, str]
     return "unknown", "unknown"
 
 
-def _infer_tissue_from_text(text_context: str) -> tuple[Optional[str], Optional[str]]:
+def _infer_tissue_from_text(text_context: str) -> tuple[str | None, str | None]:
     mapping = [
         ("pbmc", "PBMC"),
         ("peripheral blood", "PBMC"),
@@ -230,75 +234,11 @@ def _infer_condition_from_text(text_context: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 
-def _infer_tissue_from_annotations(adata: AnnData) -> tuple[Optional[str], Dict[str, Any]]:
-    """
-    Infer broad tissue context from annotation composition.
-
-    This stays intentionally conservative. The goal is to identify obvious
-    PBMC-like mixtures, not to guess specific tissue identity from weak clues.
-    """
-    ranked = rank_obs_semantic_candidates(adata, roles={"cell_type"}).get("cell_type", [])
-    annotation_key = ranked[0].column if ranked else None
-
-    if annotation_key is None:
-        return None, {}
-
-    labels = adata.obs[annotation_key].astype(str).str.lower()
-    immune_hits = {
-        "t_cell": labels.str.contains("t cell|alpha-beta|gamma-delta|mait|regulatory t").any(),
-        "nk": labels.str.contains("nk|natural killer").any(),
-        "b_cell": labels.str.contains("b cell|plasma").any(),
-        "myeloid": labels.str.contains("monocyte|macrophage|dendritic|dc").any(),
-        "platelet": labels.str.contains("platelet|megakary").any(),
-    }
-    nonimmune_hits = {
-        "epithelial": labels.str.contains("epithelial").any(),
-        "fibroblast": labels.str.contains("fibroblast").any(),
-        "endothelial": labels.str.contains("endothelial").any(),
-        "hepatocyte": labels.str.contains("hepatocyte").any(),
-        "neuron": labels.str.contains("neuron|glia|astrocyte|oligodendro").any(),
-    }
-
-    broad_immune_lineages = sum(bool(v) for v in immune_hits.values())
-    broad_nonimmune_lineages = sum(bool(v) for v in nonimmune_hits.values())
-
-    evidence = {
-        "annotation_key": annotation_key,
-        "immune_lineages": [k for k, v in immune_hits.items() if v],
-        "nonimmune_lineages": [k for k, v in nonimmune_hits.items() if v],
-    }
-
-    if broad_immune_lineages >= 3 and broad_nonimmune_lineages == 0:
-        return "PBMC", evidence
-    return None, evidence
-
-
-def _expected_celltypes_for_tissue(tissue: str) -> Optional[List[str]]:
-    normalized = (tissue or "").lower()
-    if normalized == "pbmc":
-        return [
-            "T cells",
-            "NK cells",
-            "B cells",
-            "monocytes",
-            "dendritic cells",
-            "platelets",
-        ]
-    if normalized == "tumor":
-        return [
-            "T cells",
-            "NK cells",
-            "myeloid cells",
-            "tumor cells",
-            "stromal cells",
-        ]
-    return None
-
-
 def infer_biological_context(
     adata: AnnData,
     *,
-    text_context: Optional[str] = None,
+    text_context: str | None = None,
+    hint_context: str | None = None,
     _precomputed_state=None,
 ) -> BiologicalContext:
     """
@@ -316,7 +256,13 @@ def infer_biological_context(
     state = _precomputed_state if _precomputed_state is not None else inspect_data(adata)
     context = BiologicalContext()
 
+    # `text_context` is genuine user text (the request); `hint_context` is text a
+    # tool/model supplied (e.g. load_data's `context` arg). Species/sample_type
+    # use only the user text, so a model-guessed hint can't masquerade as a
+    # user_provided species. Tissue/condition fall back to the hint text but are
+    # then labeled `context_supplied`, never `user_provided`.
     normalized_text = _normalize_text(text_context)
+    normalized_hint = _normalize_text(hint_context)
 
     species, species_source, species_evidence = _infer_species(adata, normalized_text)
     context.species = species
@@ -343,40 +289,50 @@ def infer_biological_context(
             context.metadata_derived["sample_type"] = sample_type
 
     tissue, tissue_source = _infer_tissue_from_text(normalized_text)
+    if not tissue and normalized_hint:
+        hint_tissue, _ = _infer_tissue_from_text(normalized_hint)
+        if hint_tissue:
+            tissue, tissue_source = hint_tissue, "context_supplied"
     if tissue:
         context.tissue = tissue
         context.provenance["tissue"] = tissue_source or "user_provided"
-        context.user_provided["tissue"] = tissue
-    else:
-        inferred_tissue, evidence = _infer_tissue_from_annotations(adata)
-        if inferred_tissue:
-            context.tissue = inferred_tissue
-            context.inferred_tissue = inferred_tissue
-            context.provenance["tissue"] = "marker_inferred"
-            context.marker_inferred["tissue"] = inferred_tissue
-            if evidence:
-                context.marker_inferred["tissue_evidence"] = evidence
+        if tissue_source == "context_supplied":
+            context.context_supplied["tissue"] = tissue
+        else:
+            context.user_provided["tissue"] = tissue
+    # No tissue guessing from annotation composition: the harness does not carry a
+    # cell-type biology vocabulary to pattern-match labels against (that is domain
+    # knowledge that belongs to the model). When tissue is not stated explicitly it
+    # stays "unknown"; the model reads the annotation values from the facts and
+    # judges tissue itself. The "not explicit" note below flags this for it.
 
     condition, condition_source = _infer_condition_from_text(normalized_text)
+    if condition_source == "unknown" and normalized_hint:
+        hint_condition, hint_condition_source = _infer_condition_from_text(normalized_hint)
+        if hint_condition_source != "unknown":
+            condition, condition_source = hint_condition, "context_supplied"
     context.condition = condition
     if condition_source != "unknown":
         context.provenance["condition"] = condition_source
-        context.user_provided["condition"] = condition
-
-    context.expected_celltypes = _expected_celltypes_for_tissue(context.tissue)
+        if condition_source == "context_supplied":
+            context.context_supplied["condition"] = condition
+        else:
+            context.user_provided["condition"] = condition
 
     confidence = 0.0
     if context.provenance.get("tissue") == "user_provided":
         confidence += 0.35
-    elif context.provenance.get("tissue") == "marker_inferred":
-        confidence += 0.2
-        context.notes.append("Tissue context is inferred from broad annotation composition and should be treated as provisional.")
+    elif context.provenance.get("tissue") == "context_supplied":
+        confidence += 0.15
+        context.notes.append("Tissue came from a supplied context string, not the user — treat as provisional and verify against gene/annotation evidence.")
     if context.provenance.get("species") in {"user_provided", "metadata_derived", "gene_identifier", "marker_gene_evidence"}:
         confidence += 0.25
     if context.provenance.get("sample_type") in {"user_provided", "metadata_derived"}:
         confidence += 0.15
     if context.provenance.get("condition") == "user_provided":
         confidence += 0.15
+    elif context.provenance.get("condition") == "context_supplied":
+        confidence += 0.07
     if context.tissue == "unknown":
         context.notes.append("Tissue context was not explicit; literature search may be broader than ideal.")
     if context.condition == "unknown":
@@ -386,7 +342,7 @@ def infer_biological_context(
     return context
 
 
-def context_query_hint(context: BiologicalContext | Dict[str, Any]) -> str:
+def context_query_hint(context: BiologicalContext | dict[str, Any]) -> str:
     """Render a compact context string for literature search or reports."""
     if isinstance(context, dict):
         tissue = context.get("tissue", "unknown")

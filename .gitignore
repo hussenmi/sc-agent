@@ -10,7 +10,7 @@ __pycache__/
 *$py.class
 *.so
 
-# Markdown files except README.md
+# Markdown files except project docs
 *.md
 !README.md
 
@@ -62,19 +62,36 @@ test_output/
 workshop_slides/
 skills/
 runs/
-run*
+run*/
 analysis/
+!scagent/analysis/
+!scagent/analysis/batch_diagnostic.py
 test_data/
 pbmc_auto/
 logs/
 .claude/
 treg_project/
 andrew_data/
-tests/
+lightning_logs/
+# Track test code. Compiled cache (__pycache__/) and data fixtures (*.h5ad) are
+# already ignored by the global rules above; keep other large binary fixtures
+# out so tests/ stays code-only.
+tests/**/*.h5
+tests/**/*.loom
+tests/**/*.mtx
 cellbender_test/
 results/
 article_figures/
 two_replicates/
+startup_ideas/
+config/
+
+# NAT eval run artifacts (regeneratable; nat_runs is GBs of per-run h5ad).
+# Summarized results live in the committed RESULTS_*.md docs + nat_eval_figs/.
+nat_runs/
+nat_luca_out*/
+nat_profiling_out/
+nat_sweep_*/
 
 # macOS metadata files
 ._*
@@ -89,3 +106,8 @@ sc-agent-490721-01596696572f.json
 *.bin
 openai_client.py
 agent_demo.py
+*.h5ad
+*.rd
+*_truth.csv
+LUNG_*
+!docs/nvidia_collab.md

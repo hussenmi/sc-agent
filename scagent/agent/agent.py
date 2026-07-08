@@ -6,22 +6,32 @@ Returns structured JSON from tools for reliable LLM reasoning.
 Creates run directories with manifests for reproducibility.
 """
 
-import os
-import sys
 import json
-import random
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Literal
 import logging
-from datetime import datetime
+import os
+import random
 import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
 
+from . import (
+    tracing as _tracing,  # optional OpenTelemetry per-step tracing (no-op unless SCAGENT_TRACE)
+)
 from .codex_bridge import CODEX_DECISION_SCHEMA, CodexCLIClient, CodexCLIError
-from .tools import get_tools, get_openai_tools, process_tool_call, encode_image_base64, get_image_mime_type
-from .prompts import SYSTEM_PROMPT
-from .run_manager import RunManager, create_run
 from .decision_policy import (
     decision_for_clustering_selection,
+)
+from .prompts import SYSTEM_PROMPT
+from .run_manager import RunManager, create_run
+from .tools import (
+    encode_image_base64,
+    get_image_mime_type,
+    get_openai_tools,
+    get_tools,
+    process_tool_call,
+    write_h5ad_safe,
 )
 from .vision_sidecar import VisionSidecar
 from .world_state import AgentWorldState, artifact_id_from_path
@@ -39,13 +49,32 @@ You are running in smart autonomous mode. **Drive the analysis forward without p
 ### How to work
 
 **Narrate the WHY, not just the WHAT.** Before each tool call, write one sentence that includes your reasoning — not just the action. Examples:
-- "Running PCA on 30 components — standard for this cell count and matches our lab defaults."
+- "Running PCA on 50 components; I'll keep PCs up to 75% cumulative variance (capped at 50) for the neighbor graph."
 - "Using Leiden at resolution 1.0 as a starting point; I'll report cluster count and you can adjust if needed."
 - "Running CellTypist with Immune_All_High — this dataset looks like immune cells based on the marker genes."
 
 **Do NOT present numbered options at the end of every turn.** After completing a phase, give a brief status summary (what you found, what's next) and continue unless there's a real reason to stop. Options menus are for decisions, not routine narration.
 
+When a real decision is needed, explain the evidence and call `pause_and_ask`
+with concise labels and stable action identifiers. The runtime renders the
+interactive selector; do not duplicate its numbered menu in prose.
+
 **Proceed without pausing for:** standard preprocessing (normalization, HVG, PCA, neighbors, UMAP), algorithm parameter choices with established best practices, reversible steps you can re-run with different settings.
+
+**Multi-sample data is the one exception that overrides autonomous mode.** When
+inspection finds multiple sample-like groups and no `multi_sample_strategy` has
+been selected, the runtime raises a `multi_sample_strategy` checkpoint and
+**blocks the preprocessing tools until it is resolved.** Your single next action
+is to present the choice with `pause_and_ask` (investigate / integrate with scVI
+/ keep combined uncorrected / analyze separately / describe the experiment) and
+end your turn. Do not deliberate about whether you can run QC or normalization
+first — you cannot, they are blocked — so there is nothing to weigh. Do not infer
+that correction is required from metadata names or group count. **"Investigate"
+is an option you OFFER, not something you do before asking**: only after the user
+selects `investigate_integration` do you run the uncorrected first pass
+(PCA → neighbors → UMAP → clustering) and `diagnose_batch_effect`, after which the
+runtime re-opens the decision. Explicit integration uses scVI unless the user or
+a source workflow specifies another method.
 
 ### When to use `pause_and_ask`
 
@@ -71,7 +100,7 @@ load_data
   → inspect_data
   → run_qc                    [narrate: MT% range, doublet rate, n_genes shape — 2 sentences max]
   → normalize_and_hvg         [narrate: "X HVGs selected."]
-  → run_pca                   [narrate: "PCA done, 30 components."]
+  → run_pca                   [narrate: "PCA done, 50 components; default n_pcs from 75% cumulative variance (cap 50)."]
   → run_neighbors             [narrate: "Neighbor graph built."]
   → run_umap                  [narrate: "UMAP computed." → then run_code for QC overlay → then run_clustering]
   → run_clustering(res=1.5)   [narrate: "N clusters."]
@@ -141,6 +170,10 @@ SUCCESS_OVERRIDE_PATTERNS = [
     r"\b1[\.\)]\s+\w+\b.*\b2[\.\)]\s+\w+\b",
 ]
 AUTO_RECOVERY_ATTEMPTS = 2
+# Bounded re-prompts when the run tries to END with a scientific-spine obligation
+# unmet (e.g. annotation staged-but-not-finalized). After these, the terminal gate
+# stops nudging and forces a safe fallback so the run never ends silently incomplete.
+OBLIGATION_NUDGES = 2
 
 ACTION_TOOL_NAMES = {
     "load_data",
@@ -157,6 +190,7 @@ ACTION_TOOL_NAMES = {
     "prepare_annotation",
     "stage_annotation_evidence",
     "finalize_annotation",
+    "diagnose_batch_effect",
     "run_batch_correction",
     "score_integration",
     "benchmark_integration",
@@ -190,6 +224,7 @@ INSPECTION_TOOL_NAMES = {
     "review_figure",
     "review_artifact",
     "inspect_run_state",
+    "inspect_data_inputs",
     "inspect_workspace",
     "read_file",
     "search_papers",
@@ -197,29 +232,128 @@ INSPECTION_TOOL_NAMES = {
     "web_search",
     "research_findings",
     "describe_image",
+    "record_inspection",
+}
+
+# Analysis steps that should follow a recorded inspection when model-driven
+# inspection is enabled. The model is nudged to call record_inspection before the
+# first of these; load_data (precedes inspection) and run_code (the inspection
+# escape hatch) are deliberately excluded.
+INSPECTION_GATED_TOOLS = {
+    "run_qc",
+    "run_cellbender",
+    "normalize_and_hvg",
+    "run_pca",
+    "run_neighbors",
+    "run_umap",
+    "run_clustering",
+    "run_batch_correction",
+    "diagnose_batch_effect",
+    "run_celltypist",
+    "run_scimilarity",
+    "run_deg",
 }
 
 # Load .env file if present
 def _load_dotenv():
-    """Load .env file from current directory or package root."""
+    """Load .env config, merging from lowest to highest precedence.
+
+    Order: the package/repo root, then the current working directory, then
+    ``$SCAGENT_HOME/.env`` last. Every existing file is loaded (not first-wins)
+    with ``override=True``, so the one read last wins. ``$SCAGENT_HOME/.env`` is
+    last on purpose: when scagent is installed as a shared module, that is the
+    centrally-managed lab config, and editing it must control every user's setup
+    regardless of which directory they run from. A local ``./.env`` can still add
+    vars the shared file doesn't set, but cannot override it.
+    """
     try:
         from dotenv import load_dotenv
-        # Try multiple locations
-        search_paths = [
-            Path.cwd() / ".env",
-            Path(__file__).parent.parent.parent / ".env",  # scagent/agent -> scagent -> project root
-            Path(os.environ.get("SCAGENT_HOME", "")) / ".env",
-        ]
-        for path in search_paths:
-            if path.exists():
-                load_dotenv(path, override=True)
-                logger.info(f"Loaded config from {path}")
-                return True
     except ImportError:
-        pass  # python-dotenv not installed
-    return False
+        return False  # python-dotenv not installed
+
+    scagent_home = os.environ.get("SCAGENT_HOME", "").strip()
+    # Lowest precedence first; $SCAGENT_HOME/.env last so it wins.
+    candidates = [
+        Path(__file__).parent.parent.parent / ".env",  # scagent/agent -> scagent -> project root
+        Path.cwd() / ".env",
+    ]
+    if scagent_home:
+        candidates.append(Path(scagent_home) / ".env")
+
+    loaded = False
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not path.exists():
+            continue  # skip duplicates (e.g. cwd == SCAGENT_HOME in dev)
+        seen.add(resolved)
+        load_dotenv(path, override=True)
+        logger.info(f"Loaded config from {path}")
+        loaded = True
+    return loaded
 
 _load_dotenv()
+
+
+def _model_get(obj, name):
+    """Read a single field from a /v1/models entry, backend- and SDK-agnostically.
+
+    The OpenAI Python SDK parses each model into a pydantic object with
+    ``extra="allow"``, so server-specific fields (``max_model_len``, ``meta``,
+    ``aliases``, …) are reachable both as attributes and via ``model_extra``.
+    Tests and some servers hand us plain dicts instead. Handle all three:
+    plain dict, attribute, and ``model_extra`` fallback. Returns None if absent.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    val = getattr(obj, name, None)
+    if val is not None:
+        return val
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(name)
+    return None
+
+
+def _coerce_positive_int(value):
+    """Coerce to a positive int, or return None.
+
+    Servers report these limits as ints, but be tolerant of strings ("262144")
+    and floats — and reject zero/negative/garbage so a bogus advertisement can
+    never widen the context window past what the server actually allocated.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _server_context_limit(model):
+    """Resolve the per-request context limit a serving backend advertises.
+
+    Returns ``(limit, source)`` or ``(None, None)``. Two backends, two fields:
+
+      * vLLM advertises top-level ``max_model_len`` — the GPU-constrained limit.
+      * llama.cpp advertises ``meta.n_ctx`` — the *per-slot* context, i.e.
+        already divided by ``--parallel``, which is exactly the per-request cap.
+
+    Both are the real, memory-bound per-request limit. ``max_model_len`` wins
+    when both are present (vLLM never sets ``meta``; this just makes precedence
+    explicit and order-independent).
+    """
+    limit = _coerce_positive_int(_model_get(model, "max_model_len"))
+    if limit:
+        return limit, "max_model_len"
+    n_ctx = _coerce_positive_int(_model_get(_model_get(model, "meta"), "n_ctx"))
+    if n_ctx:
+        return n_ctx, "meta.n_ctx"
+    return None, None
 
 
 class SCAgent:
@@ -260,6 +394,11 @@ class SCAgent:
     >>> agent = SCAgent(provider="openai")
     >>> result = agent.analyze("QC and cluster this PBMC data", data_path="pbmc.h5")
     """
+
+    # After this many genuine finalize_annotation attempts fail validation, the
+    # annotation save guard stops hard-blocking and lets save_data write a
+    # clearly-marked UNVALIDATED dataset, so a run never ends with nothing saved.
+    MAX_FINALIZE_ATTEMPTS_BEFORE_UNVALIDATED_SAVE = 2
 
     def __init__(
         self,
@@ -316,6 +455,11 @@ class SCAgent:
             "asked_questions": [],
         }
         self._pending_checkpoint: Optional[Dict[str, Any]] = None
+        # Model-driven-inspection safety net (SCAGENT_MODEL_INSPECTION): nudge the
+        # model to record_inspection once before the first analysis step; if it
+        # still skips, fall back to the heuristic (logged once).
+        self._inspection_nudged: bool = False
+        self._inspection_fallback_logged: bool = False
         self._active_cleanup_authorization: Optional[Dict[str, Any]] = None
         self._context_limit: int = 128_000  # overwritten by _init_* below
         self._vertex_key_file: Optional[str] = None
@@ -324,6 +468,10 @@ class SCAgent:
         self._vertex_token_expiry: float = 0.0
         self._last_estimated_tokens: int = 0
         self._last_actual_tokens: int = 0   # exact count from API response usage field
+        # Per-response output cap, applied to every LLM call AND used as the context
+        # completion reserve (kept in sync). 4096 truncated long report/finalize
+        # outputs; raise via SCAGENT_MAX_OUTPUT_TOKENS for heavier write workloads.
+        self._max_output_tokens: int = int(os.environ.get("SCAGENT_MAX_OUTPUT_TOKENS", "8192"))
         self._context_display_tokens: int = 0
         self._context_display_source: str = ""
         self._context_display_trim_target: int = 0
@@ -398,9 +546,10 @@ class SCAgent:
 
     def close(self) -> None:
         """Shut down MCP connections and any other resources. Safe to call multiple times."""
-        if self._mcp_client is not None:
+        mcp_client = getattr(self, "_mcp_client", None)
+        if mcp_client is not None:
             try:
-                self._mcp_client.stop()
+                mcp_client.stop()
             except Exception:
                 pass
             self._mcp_client = None
@@ -535,7 +684,7 @@ class SCAgent:
             api_key=api_key,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
-        self.model = model or "gemini-3.1-flash"
+        self.model = model or "gemini-3.5-flash"
         self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = self._resolve_context_limit()
         self._tool_schema_tokens = self._estimate_tokens(self.tools)
@@ -583,7 +732,7 @@ class SCAgent:
         self.client = OpenAI(api_key=token, base_url=base_url)
         self._vertex_token_expiry = __import__("time").time() + 3600
 
-        m = model or "gemini-3.1-flash"
+        m = model or "gemini-3.5-flash"
         self.model = m if m.startswith("google/") else f"google/{m}"
         self.tools = get_openai_tools(include_describe_image=self._use_sidecar_for_images())
         self._context_limit = int(os.environ.get("SCAGENT_CONTEXT_LIMIT", "1000000"))
@@ -754,8 +903,67 @@ class SCAgent:
             else:
                 console.print(message)
 
-    def _print_thinking(self, message: str):
-        """Print agent narration before a tool call."""
+    @staticmethod
+    def _looks_like_partial_tool_call(text: str) -> bool:
+        """Heuristic: did a length-truncated response leave a partial tool-call
+        fragment in the content channel? GLM emits tool calls as
+        ``<tool_call>name<arg_key>…<arg_value>…``; other local models use
+        ``<tool_call>``/``<tools>``. A *complete* call is parsed into structured
+        ``tool_calls``, so seeing these markers in content on a length truncation
+        means the call was cut off mid-emission and should not be printed raw.
+        """
+        if not text:
+            return False
+        markers = ("<tool_call>", "</tool_call>", "<arg_key>", "<arg_value>", "<tools>")
+        return any(marker in text for marker in markers)
+
+    def _split_reasoning_channels(self, message):
+        """Split a tool-calling assistant message into (narration, chain_of_thought).
+
+        Reasoning models emit two separate channels per turn: the user-facing
+        narration in `content`, and the raw chain-of-thought under
+        `reasoning_content` (Gemini/DeepSeek) or `reasoning` (vLLM parsers like
+        nemotron_v3/glm45). Both raw values are returned (narration/CoT, or None
+        when empty); display and persistence decisions are left to the caller.
+        """
+        extra = getattr(message, "model_extra", None) or {}
+        cot = (
+            extra.get("reasoning_content")
+            or extra.get("reasoning")
+            or getattr(message, "reasoning", None)
+        )
+        content = getattr(message, "content", None)
+        narration = content if (content and content.strip()) else None
+        return narration, (cot if (cot and cot.strip()) else None)
+
+    def _save_thinking(self, cot: str, iteration: int):
+        """Append a chain-of-thought trace to <run_dir>/reasoning.log.
+
+        Returns the log path if written, else None. Gated by SCAGENT_SAVE_THINKING
+        (default on); a no-op when saving is disabled, there is no run directory,
+        or the trace is empty after artifact stripping.
+        """
+        if os.environ.get("SCAGENT_SAVE_THINKING", "1") != "1":
+            return None
+        rm = getattr(self, "run_manager", None)
+        run_dir = getattr(rm, "run_dir", None) if rm is not None else None
+        if run_dir is None:
+            return None
+        cot = self._strip_model_artifacts(cot)
+        if not cot or not cot.strip():
+            return None
+        log_path = run_dir / "reasoning.log"
+        header = f"\n{'=' * 60}\n# iteration {iteration} · {self.model}\n{'=' * 60}\n"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(header + cot.rstrip() + "\n")
+        return log_path
+
+    def _print_thinking(self, message: str, dim: bool = False):
+        """Print agent narration before a tool call.
+
+        dim=True greys the text out — used for raw chain-of-thought
+        (reasoning_content), shown only when SCAGENT_SHOW_THINKING=1.
+        """
         if not message or not message.strip():
             return
         from rich.console import Console
@@ -765,13 +973,20 @@ class SCAgent:
         message = self._delatex(message)
         if not message.strip():
             return
+        marker = "[dim]…[/dim]" if dim else "[cyan]…[/cyan]"
         # Render as markdown if it contains markdown patterns, otherwise inline
         md_patterns = ["**", "##", "```", "- ", "1. "]
         if any(p in message for p in md_patterns):
-            console.print("[cyan]…[/cyan]")
-            console.print(Markdown(message))
+            console.print(marker)
+            if dim:
+                console.print(Markdown(message), style="dim")
+            else:
+                console.print(Markdown(message))
         else:
-            console.print(f"[cyan]…[/cyan] {message}")
+            if dim:
+                console.print(f"{marker} [dim]{message}[/dim]")
+            else:
+                console.print(f"{marker} {message}")
 
     def _print_error(self, message: str):
         """Print error message."""
@@ -857,11 +1072,14 @@ class SCAgent:
           SCAGENT_THINKING=0  → disable thinking entirely.
           SCAGENT_THINKING_EFFORT=high|max  → reasoning depth (default: high).
 
-        Gemini (cloud): thinking OFF by default.
-          SCAGENT_THINKING=1  → enable via thinking_config.
-          SCAGENT_THINKING_BUDGET=N  → token budget (default: 8000).
+        Gemini (cloud): provider default unless explicitly configured.
+          SCAGENT_THINKING=1  → set OpenAI-compatible reasoning_effort.
+          SCAGENT_THINKING_EFFORT=minimal|low|medium|high.
+          SCAGENT_THINKING_BUDGET=N  → legacy budget mapped to an effort level.
 
-        vLLM local models (Qwen/Gemma): thinking OFF by default (server default).
+        vLLM / TensorRT-LLM local models (Qwen/Gemma): thinking OFF by default,
+        sent explicitly via chat_template_kwargs (not relying on a server-side
+        default, which TensorRT-LLM's trtllm-serve does not provide).
           SCAGENT_THINKING=1  → enable via chat_template_kwargs.
         """
         if not self._is_thinking_model():
@@ -878,13 +1096,21 @@ class SCAgent:
             return kwargs
         if "gemini" in m:
             if os.environ.get("SCAGENT_THINKING", "0") == "1":
-                budget = int(os.environ.get("SCAGENT_THINKING_BUDGET", "8000"))
-                return {"extra_body": {"thinking_config": {"thinking_budget": budget, "include_thoughts": True}}}
+                effort = os.environ.get("SCAGENT_THINKING_EFFORT")
+                if effort not in {"minimal", "low", "medium", "high"}:
+                    budget = int(os.environ.get("SCAGENT_THINKING_BUDGET", "8000"))
+                    effort = "low" if budget <= 1024 else "medium" if budget <= 8192 else "high"
+                return {"reasoning_effort": effort}
             return {}
-        # vLLM local models (Qwen/Gemma)
-        if os.environ.get("SCAGENT_THINKING", "0") == "1":
-            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
-        return {}
+        # vLLM / TensorRT-LLM local models (Qwen/Gemma): send enable_thinking
+        # EXPLICITLY in both directions. vLLM can default this server-side
+        # (start_vllm.sh --default-chat-template-kwargs), but TensorRT-LLM's
+        # trtllm-serve has no such flag — relying on a server default leaves
+        # thinking ON, which leaks chain-of-thought into content and starves the
+        # tool call of tokens. Being explicit is backend-agnostic and matches the
+        # vLLM behavior either way.
+        enable_thinking = os.environ.get("SCAGENT_THINKING", "0") == "1"
+        return {"extra_body": {"chat_template_kwargs": {"enable_thinking": enable_thinking}}}
 
     def _is_action_tool(self, tool_name: str) -> bool:
         # MCP tools never mutate adata — treat them as inspection tools
@@ -936,6 +1162,24 @@ class SCAgent:
         if not (is_final_save or is_final_report_code):
             return None
 
+        # Escape hatch: never let the run end with no dataset on disk. Once the
+        # agent has genuinely attempted finalize_annotation and it keeps failing
+        # validation (or the caller explicitly passes allow_unvalidated), stop
+        # hard-blocking and let the save proceed. save_data then degrades it to
+        # an honestly-labeled UNVALIDATED file (uns flag + filename suffix +
+        # manifest warning) rather than silently saving a "clean" dataset.
+        finalize_attempts = int(validation.get("finalize_attempts", 0) or 0)
+        allow_unvalidated = is_final_save and bool(tool_input.get("allow_unvalidated"))
+        if allow_unvalidated or finalize_attempts >= self.MAX_FINALIZE_ATTEMPTS_BEFORE_UNVALIDATED_SAVE:
+            return None
+
+        attempts_note = (
+            f" ({finalize_attempts} genuine finalize attempt(s) so far; after "
+            f"{self.MAX_FINALIZE_ATTEMPTS_BEFORE_UNVALIDATED_SAVE} the save is allowed as a "
+            f"clearly-marked UNVALIDATED file)"
+            if finalize_attempts
+            else ""
+        )
         return {
             "status": "needs_validation",
             "tool": tool_name,
@@ -943,7 +1187,7 @@ class SCAgent:
                 "Cell-type annotation candidates are present, but the annotation consensus "
                 "has not been finalized. Do not save or report the analysis as complete from "
                 "CellTypist/Scimilarity/PanglaoDB snippets alone; run the full consensus path "
-                "and finalize a curated annotation first."
+                "and finalize a curated annotation first." + attempts_note
             ),
             "annotation_validation": validation,
             "required_next_steps": [
@@ -953,21 +1197,39 @@ class SCAgent:
                 "Query PanglaoDB only for clusters flagged as requiring external adjudication, including plausible competitors and staged reverse marker lookup genes.",
                 "Use search_papers/web_search as supporting context for ambiguous labels, but PanglaoDB remains the structured external adjudicator in v1.",
                 "Stage per-cluster evidence with stage_annotation_evidence, then call finalize_annotation.",
+                "If finalize genuinely cannot pass after honest attempts, call save_data with allow_unvalidated=true to write a clearly-marked UNVALIDATED dataset instead of losing the analysis.",
             ],
         }
 
     def _supports_vision(self) -> bool:
-        """Return False for models whose API doesn't accept image_url content (e.g. DeepSeek v4).
+        """True iff the main model's API accepts image_url content.
 
-        Honors SCAGENT_FORCE_TEXT_VISION=1 as a testing override so the sidecar
-        path can be exercised against a multimodal main model.
+        Resolution order (first match wins):
+          1. SCAGENT_FORCE_TEXT_VISION=1 — test override, always text-only.
+          2. SCAGENT_MAIN_HAS_VISION (0/1) — authoritative per-model override.
+             This is the reliable knob: a served model name does NOT encode
+             modality, so set it in .env whenever the heuristic can't be trusted.
+          3. Name allowlist of known-multimodal families. Default is text-only
+             (route to the sidecar) when unknown — that degrades gracefully,
+             whereas wrongly sending image_url to a text-only server hard-errors.
+
+        Text-only main models (Nemotron, GLM-5.2, DeepSeek, Llama-3.x, most Qwen
+        text variants, …) therefore correctly return False and use the sidecar.
         """
         if os.environ.get("SCAGENT_FORCE_TEXT_VISION", "").lower() in ("1", "true", "yes"):
             return False
+        override = (os.environ.get("SCAGENT_MAIN_HAS_VISION") or "").strip().lower()
+        if override:
+            return override in ("1", "true", "yes")
         m = (self.model or "").lower()
-        if "deepseek" in m:
-            return False
-        return True
+        # Known multimodal families (cloud + self-hosted). "-vl" catches the
+        # Qwen/Intern *-VL variants generically.
+        VISION_FAMILIES = (
+            "gpt-4o", "gpt-4-turbo", "gpt-5", "claude", "gemini",
+            "gemma-4", "qwen3.6", "qwen3.5", "-vl", "qwen2.5-vl",
+            "internvl", "pixtral", "llama-4", "molmo",
+        )
+        return any(k in m for k in VISION_FAMILIES)
 
     def _use_sidecar_for_images(self) -> bool:
         """True iff main model is text-only AND a vision sidecar is configured."""
@@ -1110,9 +1372,478 @@ class SCAgent:
         return deduped[:5]
 
     def _set_pending_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        checkpoint = dict(checkpoint)
+        options = [str(option) for option in checkpoint.get("options", []) or []]
+        actions = [str(action) for action in checkpoint.get("option_actions", []) or []]
+        if len(actions) != len(options):
+            actions = self._stable_option_actions(options)
+        checkpoint["options"] = options
+        checkpoint["option_actions"] = actions
+        checkpoint.setdefault("decision_key", checkpoint.get("kind", "pending_decision"))
+        checkpoint.setdefault("allow_custom", True)
         self._pending_checkpoint = checkpoint
         if self.run_manager:
             self.run_manager.append_event("checkpoint_pending", checkpoint)
+
+    @property
+    def has_pending_decision(self) -> bool:
+        return self._pending_checkpoint is not None
+
+    @staticmethod
+    def _stable_option_actions(options: List[str]) -> List[str]:
+        """Generate deterministic action ids when a caller supplied labels only."""
+        actions: List[str] = []
+        seen: Dict[str, int] = {}
+        for index, option in enumerate(options, 1):
+            slug = re.sub(r"[^a-z0-9]+", "_", option.lower()).strip("_")
+            slug = slug[:64] or f"option_{index}"
+            seen[slug] = seen.get(slug, 0) + 1
+            if seen[slug] > 1:
+                slug = f"{slug}_{seen[slug]}"
+            actions.append(slug)
+        return actions
+
+    @staticmethod
+    def _multi_sample_partition_from_result(
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract the best sample-like partition from an inspection result."""
+        batch = result_data.get("batch") or {}
+        candidates = batch.get("candidates") or result_data.get("metadata_candidates") or []
+        candidate = candidates[0] if candidates else {}
+        column = (
+            batch.get("confirmed_batch_key")
+            or batch.get("inferred_batch_key")
+            or batch.get("recommended_batch_key")
+            or candidate.get("column")
+        )
+        n_groups = int(batch.get("n_batches") or candidate.get("n_unique") or 0)
+        if not column or n_groups < 2:
+            return None
+        return {
+            "column": str(column),
+            "n_groups": n_groups,
+            "role": batch.get("recommended_role") or candidate.get("role") or "sample",
+            "status": batch.get("status") or "candidate",
+            "needs_key_confirmation": bool(batch.get("needs_confirmation")),
+            "reason": batch.get("reason") or candidate.get("rationale") or "",
+            "examples": candidate.get("examples") or [],
+        }
+
+    def _multi_sample_partition_from_state(self) -> Optional[Dict[str, Any]]:
+        """Build a sample-like partition from the recorded world state.
+
+        Unlike ``_multi_sample_partition_from_result``, this reads the confirmed
+        batch key and group count the runtime already tracks. It works after
+        ``record_inspection`` (whose tool result carries no batch-candidate
+        block) and when a model-authored ``pause_and_ask`` has to be redirected
+        to the canonical selector — cases where no inspection ``result_data`` is
+        available to parse.
+        """
+        ws = getattr(self, "world_state", None)
+        if ws is None:
+            return None
+        ds = ws.data_summary or {}
+        column = (
+            ws.get_confirmed_value("batch_key")
+            or ds.get("batch_key")
+            or ds.get("recommended_batch_key")
+        )
+        n_groups = int(ws._multi_sample_group_count() or 0)
+        if not column or n_groups < 2:
+            return None
+        return {
+            "column": str(column),
+            "n_groups": n_groups,
+            "role": "sample",
+            "needs_key_confirmation": False,
+        }
+
+    def _multi_sample_strategy_checkpoint(
+        self,
+        partition: Dict[str, Any],
+        *,
+        post_investigation: bool = False,
+    ) -> Dict[str, Any]:
+        """Build the user-owned strategy decision for multi-sample data.
+
+        With ``post_investigation=True`` this re-asks the same
+        ``multi_sample_strategy`` decision after the uncorrected first pass is
+        complete: the ``investigate_integration`` option is dropped (the
+        investigation has already run) and the framing asks the user to commit
+        to integrate / keep / separate based on the diagnostic. Because it
+        reuses ``decision_key="multi_sample_strategy"``, the user's answer
+        overwrites the recorded strategy so the downstream guards take over.
+        """
+        column = partition["column"]
+        n_groups = partition["n_groups"]
+        experiment_design = self.world_state.get_confirmed_value("experiment_design")
+        if post_investigation:
+            context = (
+                "I finished the uncorrected first pass (PCA → neighbors → UMAP → "
+                "clustering) you asked for to investigate whether integration is "
+                f"needed for the {n_groups} groups in `{column}`. Review the "
+                "sample-colored UMAP and per-cluster sample composition: if clusters "
+                "separate by sample beyond the biology you expect, integration is "
+                "justified; if the samples already mix, keep them combined. Metadata "
+                "alone does not justify correction — this is your call."
+            )
+        else:
+            context = (
+                f"I found {n_groups} groups in the {partition.get('role', 'sample')}-like "
+                f"column `{column}`. Their presence does not by itself justify batch correction, "
+                "so I will not integrate them automatically."
+            )
+        if experiment_design:
+            context += f"\n\nExperiment context you provided:\n{experiment_design}"
+
+        if post_investigation:
+            option_specs = [
+                ("Integrate the samples with scVI", "integrate_scvi"),
+                ("Keep samples combined without integration", "keep_unintegrated"),
+                ("Analyze samples separately", "analyze_separately"),
+                ("Describe the experiment first", "describe_experiment"),
+            ]
+            question = "Investigation complete — how should I handle the samples now?"
+        else:
+            option_specs = [
+                ("Investigate whether integration is needed (recommended)", "investigate_integration"),
+                ("Integrate the samples with scVI", "integrate_scvi"),
+                ("Keep samples combined without integration", "keep_unintegrated"),
+                ("Analyze samples separately", "analyze_separately"),
+                ("Describe the experiment first", "describe_experiment"),
+            ]
+            question = "How should I handle these samples?"
+        options, option_actions = self._checkpoint_options(option_specs)
+        return {
+            "kind": "multi_sample_strategy",
+            "decision_key": "multi_sample_strategy",
+            "question": question,
+            "context": context,
+            "summary": context,
+            "options": options,
+            "option_actions": option_actions,
+            "default": options[0],
+            "recommendation": options[0],
+            "allow_custom": True,
+            "custom_label": "Type something else...",
+            "custom_prompt": "Describe another strategy: ",
+            "custom_placeholder": (
+                "For example: integrate within each condition, but keep conditions separate"
+            ),
+            "text_input_actions": {
+                "describe_experiment": {
+                    "prompt": "Describe the experiment: ",
+                    "placeholder": (
+                        "Samples, donors, conditions, tissues, protocols, known technical "
+                        "batches, and the comparisons that matter. You can paste a table."
+                    ),
+                }
+            },
+            "partition": partition,
+            "action_inputs": {
+                "investigate_integration": {
+                    "batch_key": column,
+                    "mode": "progressive",
+                },
+                "integrate_scvi": {
+                    "batch_key": column,
+                    "method": "scvi",
+                    "batch_key_needs_confirmation": partition.get("needs_key_confirmation", False),
+                },
+                "keep_unintegrated": {"batch_key": column},
+                "analyze_separately": {"sample_key": column},
+            },
+            "artifacts": [],
+        }
+
+    def _build_multi_sample_strategy_checkpoint(
+        self,
+        tool_name: str,
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if result_data.get("status") != "ok":
+            return None
+        # Post-investigation re-ask: once the uncorrected first pass + diagnostic
+        # complete, re-open the strategy so the USER authorizes integrate/keep/
+        # separate — concluding "integration is needed" is not self-authorization
+        # to integrate. This is a mandatory gate, so it lives in this UNGUARDED
+        # dispatch builder rather than _build_checkpoint_payload, which returns
+        # early (and thus never raises the re-ask) in the default smart-autonomous
+        # mode. When it was trapped there the checkpoint silently never fired and
+        # the model hand-rolled the decision — numbered-text options whose pick was
+        # never recorded (so integration stayed blocked), or a pause_and_ask loop
+        # that never ended the turn so the selector never rendered.
+        if tool_name == "diagnose_batch_effect":
+            checkpoint = self._post_investigation_strategy_checkpoint()
+            if checkpoint is not None:
+                artifacts = self._checkpoint_artifact_paths(result_data)
+                if artifacts:
+                    checkpoint["artifacts"] = artifacts
+            return checkpoint
+        if tool_name not in ("inspect_data", "record_inspection"):
+            return None
+        if self.world_state.get_confirmed_value("multi_sample_strategy"):
+            return None
+        if (result_data.get("batch") or {}).get("batch_correction_applied"):
+            return None
+        partition = self._multi_sample_partition_from_result(result_data)
+        if partition is None:
+            # record_inspection's result carries no batch-candidate block, so
+            # derive the partition from the world state it has just updated with
+            # the confirmed batch key. This lets the runtime raise the canonical
+            # strategy selector even when the model records inspection directly
+            # instead of calling inspect_data.
+            partition = self._multi_sample_partition_from_state()
+        if partition is None:
+            return None
+        return self._multi_sample_strategy_checkpoint(partition)
+
+    def _post_investigation_strategy_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Re-ask the integration decision once the investigation first pass is done.
+
+        Fires when the recorded ``multi_sample_strategy`` is
+        ``investigate_integration`` and the uncorrected first pass has produced
+        a structured batch-effect diagnostic without applying correction.
+        Returning the user to a concrete integrate / keep / separate choice is
+        what stops the agent from treating "I investigated and concluded
+        integration is needed" as self-authorization to integrate on its own.
+        """
+        selected_strategy = self.world_state.get_confirmed_value("multi_sample_strategy")
+        strategy_action = (
+            selected_strategy.get("action")
+            if isinstance(selected_strategy, dict)
+            else selected_strategy
+        )
+        if strategy_action != "investigate_integration":
+            return None
+        ds = self.world_state.data_summary or {}
+        if ds.get("batch_correction_applied"):
+            return None
+        diagnostic = {}
+        if getattr(self, "adata", None) is not None:
+            try:
+                diagnostic = dict(self.adata.uns.get("batch_effect_diagnostic") or {})
+            except Exception:
+                diagnostic = {}
+        if diagnostic.get("status") != "ok":
+            return None
+        column = ds.get("batch_key") or ds.get("recommended_batch_key")
+        column = column or diagnostic.get("batch_key")
+        n_groups = int(ds.get("n_batches") or 0)
+        if not n_groups:
+            n_groups = int(diagnostic.get("n_batches") or 0)
+        if not column or n_groups < 2:
+            return None
+        checkpoint = self._multi_sample_strategy_checkpoint(
+            {
+                "column": str(column),
+                "n_groups": n_groups,
+                "role": "sample",
+                "needs_key_confirmation": False,
+            },
+            post_investigation=True,
+        )
+        evidence_bits = []
+        verdict = diagnostic.get("verdict")
+        if verdict:
+            evidence_bits.append(f"Diagnostic verdict: {verdict}.")
+        recommendation = diagnostic.get("recommendation")
+        if recommendation:
+            evidence_bits.append(f"Recommendation: {recommendation}")
+        support = diagnostic.get("support_reasons") or []
+        if support:
+            evidence_bits.append("Support: " + "; ".join(map(str, support[:4])) + ".")
+        cautions = diagnostic.get("caution_reasons") or []
+        if cautions:
+            evidence_bits.append("Cautions: " + "; ".join(map(str, cautions[:4])) + ".")
+        shared = diagnostic.get("shared_cross_cell_type_signatures") or []
+        if shared:
+            evidence_bits.append(
+                f"Shared sample-associated signatures: {len(shared)} recurring gene/direction entries."
+            )
+        cluster_summary = diagnostic.get("cluster_sample_summary") or {}
+        if cluster_summary:
+            evidence_bits.append(
+                "Sample-dominated clusters: "
+                f"{cluster_summary.get('n_sample_dominated_clusters', 0)} "
+                f"({cluster_summary.get('fraction_cells_in_sample_dominated_clusters', 0)} of cells)."
+            )
+        if evidence_bits:
+            context = checkpoint.get("context") or ""
+            checkpoint["context"] = context + "\n\nBatch-effect diagnostic evidence:\n" + "\n".join(
+                f"- {bit}" for bit in evidence_bits
+            )
+            checkpoint["summary"] = checkpoint["context"]
+        checkpoint["diagnostic"] = {
+            "verdict": diagnostic.get("verdict"),
+            "recommendation": diagnostic.get("recommendation"),
+            "support_reasons": support[:6],
+            "caution_reasons": cautions[:6],
+            "evidence_limits": (diagnostic.get("evidence_limits") or [])[:6],
+            "artifacts_created": diagnostic.get("artifacts_created") or [],
+        }
+        if diagnostic.get("verdict") == "batch_effect_supported":
+            checkpoint["recommendation"] = checkpoint["options"][0]
+        elif diagnostic.get("verdict") == "no_correction_needed" and len(checkpoint["options"]) > 1:
+            checkpoint["recommendation"] = checkpoint["options"][1]
+        else:
+            checkpoint["recommendation"] = checkpoint["options"][0]
+        return checkpoint
+
+    def _build_post_concatenation_strategy_checkpoint(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Open the integration decision immediately after a successful concat."""
+        if tool_name != "run_code" or result_data.get("status") != "ok":
+            return None
+        code = str(tool_input.get("code") or "")
+        if not re.search(r"\b(?:anndata|ad)\.concat\s*\(|\bconcat_datasets\s*\(", code):
+            return None
+        if self.world_state.get_confirmed_value("multi_sample_strategy"):
+            return None
+
+        summary = self.world_state.data_summary or {}
+        candidates = self.world_state.metadata_candidates or []
+        candidate = candidates[0] if candidates else {}
+
+        # Prefer the batch column the concat code itself named (anndata.concat
+        # uses label=, concat_datasets uses batch_key=), then fall back to
+        # anything a prior inspect_data recorded in world_state. Relying only on
+        # world_state fails when the concat runs before any successful
+        # inspect_data — which is exactly the case this safety net must cover.
+        column = None
+        m = re.search(r"\b(?:label|batch_key)\s*=\s*['\"]([^'\"]+)['\"]", code)
+        if m:
+            column = m.group(1)
+        column = (
+            column
+            or summary.get("batch_key")
+            or summary.get("recommended_batch_key")
+            or candidate.get("column")
+        )
+
+        # Resolve the group count from the live concatenated AnnData (the source
+        # of truth right after the concat), falling back to recorded metadata.
+        # If we still have no column, sniff obs for a sample-like column the
+        # concat may have created (e.g. anndata.concat's default 'batch' label).
+        n_groups = 0
+        obs = getattr(getattr(self, "adata", None), "obs", None)
+        if obs is not None:
+            if not column:
+                for cand_col in ("batch", "sample", "replicate", "donor", "library", "dataset"):
+                    if cand_col in obs.columns:
+                        column = cand_col
+                        break
+            if column and column in obs.columns:
+                try:
+                    n_groups = int(obs[column].nunique())
+                except Exception:
+                    n_groups = 0
+        if not n_groups:
+            n_groups = int(summary.get("n_batches") or candidate.get("n_unique") or 0)
+
+        if not column or n_groups < 2:
+            return None
+        return self._multi_sample_strategy_checkpoint({
+            "column": str(column),
+            "n_groups": n_groups,
+            "role": candidate.get("role") or "sample",
+            "status": "post_concatenation",
+            "needs_key_confirmation": False,
+            "reason": candidate.get("rationale") or "",
+            "examples": candidate.get("examples") or [],
+        })
+
+    def _multi_dataset_loading_checkpoint(
+        self,
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Ask how multiple files should become analysis objects before loading."""
+        source_datasets = result_data.get("source_datasets") or []
+        if len(source_datasets) < 2:
+            return None
+        if self.world_state.get_confirmed_value("multi_dataset_loading_strategy"):
+            return None
+
+        names = [str(dataset.get("name") or dataset.get("path")) for dataset in source_datasets]
+        preview = "\n".join(f"- {name}" for name in names[:8])
+        if len(names) > 8:
+            preview += f"\n- ... and {len(names) - 8} more"
+        context = (
+            f"I found {len(source_datasets)} source datasets.\n\n{preview}\n\n"
+            "Outer join is the recommended default for compatible replicate matrices: "
+            "it keeps the union of genes and fills genes absent from a dataset with zero. "
+            "If these datasets use different assays, panels, or feature definitions, "
+            "separate analysis or custom handling may be safer."
+        )
+        likely_outputs = result_data.get("likely_combined_outputs") or []
+        if likely_outputs:
+            output_names = ", ".join(
+                str(item.get("name") or item.get("path")) for item in likely_outputs[:4]
+            )
+            context += (
+                "\n\nI also found file(s) that look like previous combined outputs and "
+                f"excluded them from the source count: {output_names}."
+            )
+
+        options, option_actions = self._checkpoint_options([
+            (
+                "Concatenate with an outer join (recommended; keep all genes from all datasets)",
+                "concatenate_outer",
+            ),
+            (
+                "Concatenate with an inner join (keep only genes shared by every dataset)",
+                "concatenate_inner",
+            ),
+            ("Analyze each dataset separately", "analyze_separately"),
+        ])
+        return {
+            "kind": "multi_dataset_loading",
+            "decision_key": "multi_dataset_loading_strategy",
+            "question": "How should I handle these datasets before analysis?",
+            "context": context,
+            "summary": context,
+            "options": options,
+            "option_actions": option_actions,
+            "default": options[0],
+            "recommendation": options[0],
+            "allow_custom": True,
+            "custom_label": "Type something else...",
+            "custom_prompt": "Describe how these datasets should be handled: ",
+            "custom_placeholder": (
+                "For example: concatenate Rep1 and Rep2, but analyze the control separately"
+            ),
+            "datasets": source_datasets,
+            "action_inputs": {
+                "concatenate_outer": {
+                    "join": "outer",
+                    "keep_genes": "union",
+                    "datasets": source_datasets,
+                },
+                "concatenate_inner": {
+                    "join": "inner",
+                    "keep_genes": "intersection",
+                    "datasets": source_datasets,
+                },
+                "analyze_separately": {
+                    "datasets": source_datasets,
+                },
+            },
+            "artifacts": [],
+        }
+
+    def _build_multi_dataset_loading_checkpoint(
+        self,
+        tool_name: str,
+        result_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if tool_name != "inspect_data_inputs" or result_data.get("status") != "ok":
+            return None
+        return self._multi_dataset_loading_checkpoint(result_data)
 
     def _checkpoint_options(
         self,
@@ -1122,13 +1853,224 @@ class SCAgent:
         actions = [action for _, action in entries]
         return options, actions
 
-    def _clear_pending_checkpoint(self, user_response: Optional[str] = None) -> None:
+    def _clear_pending_checkpoint(self, user_response: Any = None) -> None:
         if self._pending_checkpoint and self.run_manager:
             payload = dict(self._pending_checkpoint)
             if user_response is not None:
                 payload["user_response"] = user_response
             self.run_manager.append_event("checkpoint_resolved", payload)
         self._pending_checkpoint = None
+
+    def prompt_pending_decision(self, *, force_text_fallback: bool = False):
+        """Render the current checkpoint and return a normalized selection."""
+        if not self._pending_checkpoint:
+            return None
+        from ..terminal import DecisionChoice, prompt_for_decision
+
+        checkpoint = self._pending_checkpoint
+        options = checkpoint.get("options", []) or []
+        actions = checkpoint.get("option_actions", []) or []
+        text_input_actions = checkpoint.get("text_input_actions") or {}
+        choices = []
+        for index, label in enumerate(options):
+            action = actions[index]
+            text_input = text_input_actions.get(action) or {}
+            choices.append(
+                DecisionChoice(
+                    label=label,
+                    action=action,
+                    requires_text=bool(text_input),
+                    text_prompt=text_input.get("prompt", "Your response: "),
+                    placeholder=text_input.get("placeholder", ""),
+                )
+            )
+        default = checkpoint.get("default")
+        default_index = options.index(default) if default in options else 0
+        context = str(checkpoint.get("context") or checkpoint.get("summary") or "").strip()
+        question = str(checkpoint.get("question") or "How should I proceed?").strip()
+        if context:
+            question = f"{context}\n\n{question}"
+        return prompt_for_decision(
+            question,
+            choices,
+            default_index=default_index,
+            allow_custom=bool(checkpoint.get("allow_custom", True)),
+            custom_label=checkpoint.get("custom_label", "Type something else..."),
+            custom_prompt=checkpoint.get("custom_prompt", "Your response: "),
+            custom_placeholder=checkpoint.get("custom_placeholder", ""),
+            force_text_fallback=force_text_fallback,
+        )
+
+    def resolve_pending_decision_text(self, response: str):
+        """Resolve a plain-text reply against the newest pending decision."""
+        if not self._pending_checkpoint:
+            return None
+        from ..terminal import DecisionChoice, resolve_decision_response
+
+        checkpoint = self._pending_checkpoint
+        options = checkpoint.get("options", []) or []
+        actions = checkpoint.get("option_actions", []) or []
+        choices = [
+            DecisionChoice(label=label, action=actions[index])
+            for index, label in enumerate(options)
+        ]
+        default = checkpoint.get("default")
+        default_index = options.index(default) if default in options else None
+        return resolve_decision_response(
+            response,
+            choices,
+            default_index=default_index,
+            allow_custom=bool(checkpoint.get("allow_custom", True)),
+        )
+
+    def resolve_pending_decision(self, selection) -> Dict[str, Any]:
+        """Commit a normalized selection and return the payload given to the model."""
+        if not self._pending_checkpoint:
+            raise RuntimeError("No pending decision to resolve.")
+        checkpoint = dict(self._pending_checkpoint)
+        selected_action = selection.action
+        selected_value = selection.value
+
+        if checkpoint.get("kind") == "cluster_qc_cleanup":
+            self._authorize_pending_cleanup_from_user(selected_action)
+
+        decision_key = checkpoint.get("decision_key", checkpoint.get("kind", "pending_decision"))
+        reprompt_checkpoint = None
+        custom_needs_resolution = False
+        if (
+            checkpoint.get("kind") == "multi_sample_strategy"
+            and selected_action == "describe_experiment"
+        ):
+            self.world_state.resolve_decision(
+                "experiment_design",
+                selected_value,
+                source="user",
+                message=selected_value,
+            )
+            self.world_state.add_context_hint(f"Experiment design: {selected_value}", source="user")
+            decision_key = "experiment_design"
+            reprompt_checkpoint = self._multi_sample_strategy_checkpoint(
+                checkpoint.get("partition") or {}
+            )
+        else:
+            real_options = [
+                a for a in (checkpoint.get("option_actions") or []) if a not in ("custom",)
+            ]
+            # A free-text reply to a genuine multiple-choice decision is NOT a branch
+            # selection. Capture it as a side-instruction and leave the decision
+            # UNRESOLVED, so the model must map it to a listed option or re-ask —
+            # never silently fall back to a default (the batch-question bug: a "skip
+            # scrublet" reply was allowed to close the integration decision). General
+            # to every checkpoint with >=2 real options.
+            custom_needs_resolution = selected_action == "custom" and len(real_options) >= 2
+            if custom_needs_resolution:
+                if selected_value:
+                    self.world_state.add_context_hint(
+                        f'User\'s free-text reply to "{checkpoint.get("question", "the decision")}": '
+                        f"{selected_value}",
+                        source="user",
+                    )
+            else:
+                applied_value: Any = selected_action or selected_value
+                if selected_action == "custom":
+                    applied_value = {
+                        "action": "custom",
+                        "details": selected_value,
+                    }
+                self.world_state.resolve_decision(
+                    decision_key,
+                    applied_value,
+                    source="user",
+                    message=selected_value,
+                )
+        payload = {
+            "decision_key": decision_key,
+            "checkpoint_kind": checkpoint.get("kind"),
+            "question": checkpoint.get("question", ""),
+            "options": checkpoint.get("options", []),
+            "custom_needs_resolution": custom_needs_resolution,
+            "selected_action": selected_action,
+            "selected_label": selection.label,
+            "selected_index": selection.index,
+            "selected_value": selected_value,
+            "raw_response": selection.raw_response,
+            "input_mode": selection.input_mode,
+            "custom": selection.custom,
+            "action_input": (checkpoint.get("action_inputs") or {}).get(selected_action),
+            "context": checkpoint.get("context") or checkpoint.get("summary") or "",
+        }
+        if checkpoint.get("proposal") is not None:
+            payload["proposal"] = checkpoint["proposal"]
+        if self._pending_checkpoint is not None:
+            self._clear_pending_checkpoint(payload)
+        if reprompt_checkpoint is not None:
+            payload["reprompt"] = True
+            self._set_pending_checkpoint(reprompt_checkpoint)
+        return payload
+
+    def _attach_run_log_handler(self) -> None:
+        """Mirror scagent WARNING+ logs into ``<run_dir>/logs/scagent.log``.
+
+        Persists warnings/errors per run so issues can be diagnosed after the
+        fact without re-running with stderr captured. Attaches once per run; a
+        no-op without a run_manager.
+        """
+        rm = self.run_manager
+        if rm is None or getattr(self, "_run_log_handler", None) is not None:
+            return
+        import logging as _logging
+        log_path = rm._ensure(rm.dirs["logs"]) / "scagent.log"
+        handler = _logging.FileHandler(str(log_path))
+        handler.setLevel(_logging.WARNING)
+        handler.setFormatter(
+            _logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        _logging.getLogger("scagent").addHandler(handler)
+        self._run_log_handler = handler
+
+    def structured_decision_request(self, selection) -> str:
+        """Turn a selector result into an unambiguous model-facing user message."""
+        payload = self.resolve_pending_decision(selection)
+        if payload.get("custom_needs_resolution"):
+            # The user typed a free-text reply instead of picking an option. Don't let
+            # it silently close the decision: apply any side-instruction, then require
+            # the model to either map it to a listed option or re-ask — never default.
+            opts = payload.get("options") or []
+            opt_str = "; ".join(str(o) for o in opts)
+            instruction = (
+                "The user did NOT pick one of the listed options — they wrote a "
+                "free-text reply (see selected_value). Do BOTH, in order:\n"
+                "1. Apply any side-instructions or constraints it states (e.g. a "
+                "parameter preference like skipping a step) to the rest of the run.\n"
+                f'2. Decide whether the reply actually answers THIS question: "{payload.get("question", "")}" '
+                f"(options: {opt_str}). If it clearly selects or specifies one of those "
+                "options, proceed with it and state which option you inferred and why. If "
+                "it does NOT resolve this decision — it is off-topic, only a side-"
+                "instruction, partial, or ambiguous — you MUST re-ask this exact question "
+                "(same options) before proceeding. Do NOT assume a default and do NOT "
+                "skip the decision."
+            )
+            return (
+                "[Structured user decision]\n"
+                f"{json.dumps(payload, indent=2, default=str)}\n\n"
+                f"{instruction}"
+            )
+        instruction = (
+            "Treat selected_action as authoritative. Carry out that choice, using "
+            "selected_value as the user's text only when custom is true."
+        )
+        if payload.get("selected_action") == "investigate_integration":
+            instruction += (
+                " For investigate_integration, run the uncorrected first pass only "
+                "(PCA, neighbors, UMAP, clustering), then call diagnose_batch_effect "
+                "with the selected batch_key. Do not run batch correction until the "
+                "post-diagnostic selector records a new integration decision."
+            )
+        return (
+            "[Structured user decision]\n"
+            f"{json.dumps(payload, indent=2, default=str)}\n\n"
+            f"{instruction}"
+        )
 
     def _run_nested_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
         result_json = self._execute_tool(tool_name, tool_input)
@@ -1294,6 +2236,8 @@ class SCAgent:
     CHECKPOINT_EXEMPT_TOOLS = {
         "run_code",  # Flexible fallback - always allow
         "inspect_data",
+        "record_inspection",  # Read-only judgment record; never mutates adata.
+        "inspect_data_inputs",
         "inspect_session",
         "list_artifacts",
         "get_cluster_sizes",
@@ -1304,6 +2248,7 @@ class SCAgent:
         "review_figure",
         "review_artifact",
         "run_cluster_structure_qc",  # Refines an existing cleanup checkpoint.
+        "diagnose_batch_effect",  # Produces evidence before the post-investigation selector.
         "generate_figure",  # Visualization doesn't change state
         "write_report",  # Writing a report doesn't change state
         "write_json",  # Writing a JSON file doesn't change state
@@ -1314,6 +2259,62 @@ class SCAgent:
         "web_search",
         "research_findings",
     }
+
+    def _multi_dataset_loading_guard(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+    ) -> Optional[str]:
+        """Prevent silent concatenation or a join that differs from the user's choice."""
+        if tool_name != "run_code":
+            return None
+        code = str(tool_input.get("code") or "")
+        concatenates = bool(re.search(
+            r"\b(?:anndata|ad)\.concat\s*\(|\bconcat_datasets\s*\(",
+            code,
+        ))
+        if not concatenates:
+            return None
+
+        strategy = self.world_state.get_confirmed_value("multi_dataset_loading_strategy")
+        action = strategy.get("action") if isinstance(strategy, dict) else strategy
+        if not action:
+            return json.dumps({
+                "status": "error",
+                "tool": "run_code",
+                "message": (
+                    "Multiple datasets cannot be concatenated before the user chooses how "
+                    "to handle them. Run inspect_data_inputs on the input directory first."
+                ),
+                "requires_user_decision": True,
+                "decision_key": "multi_dataset_loading_strategy",
+            }, indent=2)
+        if action == "analyze_separately":
+            return json.dumps({
+                "status": "error",
+                "tool": "run_code",
+                "message": "The user selected separate analyses, so concatenation is not allowed.",
+                "selected_strategy": action,
+            }, indent=2)
+
+        expected_join = {
+            "concatenate_outer": "outer",
+            "concatenate_inner": "inner",
+        }.get(action)
+        if expected_join:
+            join_pattern = rf"\bjoin\s*=\s*['\"]{expected_join}['\"]"
+            if not re.search(join_pattern, code):
+                return json.dumps({
+                    "status": "error",
+                    "tool": "run_code",
+                    "message": (
+                        f"The user selected a {expected_join} join. The concatenation code "
+                        f"must explicitly pass join='{expected_join}'."
+                    ),
+                    "selected_strategy": action,
+                    "required_join": expected_join,
+                }, indent=2)
+        return None
 
     def _checkpoint_context_for_tool(self, tool_name: str) -> Optional[Dict[str, Any]]:
         """Return checkpoint context without blocking the tool call."""
@@ -1336,7 +2337,48 @@ class SCAgent:
                     "state-changing step."
                 ),
                 "pending_checkpoint": checkpoint,
-                "required_next_action": "ask_user",
+                "required_next_action": "resolve_pending_decision",
+            },
+            indent=2,
+        )
+
+    def _inspection_gate_action(self, tool_name: str) -> Optional[str]:
+        """Model-inspection safety-net decision for an about-to-run tool.
+
+        Returns "nudge" (steer to record_inspection once), "fallback" (proceed on
+        the heuristic and log the skip once), or None (no gating). A pure
+        decision; the caller performs the side effects. Gating applies unless
+        SCAGENT_MODEL_INSPECTION=0 (default on), the tool is an analysis step that
+        should follow inspection, data is loaded, and no inspection was recorded.
+        """
+        if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") == "0":
+            return None
+        if tool_name not in INSPECTION_GATED_TOOLS or self.adata is None:
+            return None
+        if self.world_state.get_confirmed_value("inspection") is not None:
+            return None
+        return "nudge" if not self._inspection_nudged else "fallback"
+
+    def _inspection_nudge_result(self, tool_name: str) -> str:
+        """One-time steer: record the inspection before the first analysis step.
+
+        Returned in place of executing ``tool_name`` the first time the model
+        reaches an inspection-gated step without having recorded its
+        interpretation. Re-running the step after this (with or without calling
+        record_inspection) proceeds — the heuristic is the fallback.
+        """
+        return json.dumps(
+            {
+                "status": "error",
+                "tool": tool_name,
+                "message": (
+                    "Model-driven inspection is enabled, but you have not recorded your "
+                    "interpretation yet. Call record_inspection first — report the column "
+                    "roles (cell_type/batch/donor/sample/cluster) and species from the "
+                    "inspect_data fact sheet — then re-run this step. If you have not called "
+                    "inspect_data yet, do that first."
+                ),
+                "required_next_action": "record_inspection",
             },
             indent=2,
         )
@@ -1521,6 +2563,25 @@ class SCAgent:
                     "artifacts": artifacts,
                 }
             else:
+                selected_strategy = self.world_state.get_confirmed_value("multi_sample_strategy")
+                strategy_action = (
+                    selected_strategy.get("action")
+                    if isinstance(selected_strategy, dict)
+                    else selected_strategy
+                )
+                if strategy_action == "investigate_integration":
+                    try:
+                        diagnostic_done = bool(
+                            getattr(self, "adata", None) is not None
+                            and self.adata.uns.get("batch_effect_diagnostic", {}).get("status") == "ok"
+                        )
+                    except Exception:
+                        diagnostic_done = False
+                    if not diagnostic_done:
+                        return None
+                post_investigation = self._post_investigation_strategy_checkpoint()
+                if post_investigation is not None:
+                    return post_investigation
                 cluster_key = result_data.get("cluster_key", "clustering")
                 n_clusters = result_data.get("n_clusters", "?")
                 summary = f"Clustering produced {n_clusters} clusters in '{cluster_key}'."
@@ -1574,6 +2635,13 @@ class SCAgent:
                     },
                     "artifacts": artifacts,
                 }
+
+        elif tool_name == "diagnose_batch_effect":
+            # Handled unconditionally in _build_multi_sample_strategy_checkpoint,
+            # which runs earlier in the dispatch chain and — unlike this guarded
+            # builder — fires in smart-autonomous mode too. The post-investigation
+            # re-ask is a required authorization gate, not a soft workflow prompt.
+            pass
 
         elif tool_name in {"run_celltypist", "run_scimilarity"}:
             n_types = result_data.get("n_types", "?")
@@ -1826,6 +2894,12 @@ class SCAgent:
     def _build_system_prompt(self) -> str:
         """Attach runtime state to the static system prompt."""
         prompt = SYSTEM_PROMPT
+        # Ground-truth compute backend (GPU/rapids vs scanpy CPU), the scagent
+        # analog of the environment context a coding agent gets about its own
+        # runtime — so the model states the backend instead of guessing.
+        from ..core.gpu import gpu_capability_report
+        from .prompts import backend_prompt_block
+        prompt += backend_prompt_block(gpu_capability_report())
         if self._is_gemma_model():
             # Gemma 4 puts all output inside thinking blocks and produces no narration
             # text outside them. This instruction mirrors how Claude/GPT behave: brief
@@ -1848,6 +2922,9 @@ class SCAgent:
             )
         if self.smart_autonomous:
             prompt += _SMART_AUTONOMOUS_PROMPT
+        if os.environ.get("SCAGENT_MODEL_INSPECTION", "1") != "0":
+            from .prompts import MODEL_INSPECTION_PROMPT
+            prompt += MODEL_INSPECTION_PROMPT
         if self._use_sidecar_for_images():
             sidecar_model = self._vision_sidecar.model if self._vision_sidecar else "(unconfigured)"
             prompt += (
@@ -1870,10 +2947,6 @@ class SCAgent:
     def _current_capabilities(self) -> Dict[str, Any]:
         return (self.world_state.data_summary or {}).get("capabilities", {})
 
-    def _is_yes_response(self, value: str) -> bool:
-        text = (value or "").strip().lower()
-        return text in {"y", "yes", "1", "ok", "okay", "sure", "continue", "do it", "run it", "compute it"}
-
     def _checkpoint_action_from_user_response(
         self,
         checkpoint: Dict[str, Any],
@@ -1884,6 +2957,10 @@ class SCAgent:
         text = text.strip(" .,!?:;")
         option_actions = checkpoint.get("option_actions") or []
         options = checkpoint.get("options") or []
+
+        for action in option_actions:
+            if text == str(action).strip().lower():
+                return action
 
         numbered_match = re.match(r"^(?:option|choice|number|#)?\s*([1-9][0-9]*)\b", text)
         if text.isdigit() or numbered_match:
@@ -2255,25 +3332,6 @@ class SCAgent:
             }
         return None
 
-    def _run_reconciled_action(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a tool and return parsed result. Used for checkpoint option handling."""
-        result_json = self._execute_tool(tool_name, tool_input)
-        try:
-            return json.loads(result_json)
-        except json.JSONDecodeError:
-            return {"status": "error", "tool": tool_name, "message": "Invalid JSON result"}
-
-    def _format_reconciled_response(self, intro: str, steps: List[Dict[str, Any]], final_result: Optional[Dict[str, Any]] = None) -> str:
-        """Format a response from executed steps. Used for checkpoint option handling."""
-        lines = [intro]
-        for step in steps:
-            summary = step.get("summary") or step.get("message") or ""
-            if summary:
-                lines.append(f"  {summary}")
-        if final_result and final_result.get("output_path"):
-            lines.append(f"Output: {final_result['output_path']}")
-        return "\n".join(lines)
-
     def _sync_world_state(self, extra_text: Optional[str] = None) -> None:
         """Refresh the unified world state from the active AnnData and request context."""
         self.world_state.set_active_request(self._active_request)
@@ -2321,6 +3379,15 @@ class SCAgent:
     def _remember_user_preferences(self, message: str) -> None:
         """Persist explicit user corrections so later tools can reuse them mechanically."""
         if not message:
+            return
+
+        # Structured decision messages (built by structured_decision_request) echo
+        # the option LABELS — e.g. "Integrate the samples with scVI" — and an
+        # instruction mentioning integration. They are NOT free-form user input:
+        # the authoritative choice was already committed by resolve_pending_decision.
+        # Scraping them re-matches those labels and clobbers the real selection
+        # (Bug A: an "investigate" pick overwritten by integrate_scvi). Skip them.
+        if message.lstrip().startswith("[Structured user decision]"):
             return
 
         text = " ".join(message.lower().split())
@@ -2389,6 +3456,102 @@ class SCAgent:
                         "user_message": message,
                     }
                 )
+
+        loading_strategy = None
+        if re.search(
+            r"\b(concatenate|concat|combine|merge)\b.*\bouter(?:\s+join)?\b"
+            r"|\bouter\s+join\b.*\b(concatenate|concat|combine|merge)\b",
+            text,
+        ):
+            loading_strategy = "concatenate_outer"
+        elif re.search(
+            r"\b(concatenate|concat|combine|merge)\b.*\binner(?:\s+join)?\b"
+            r"|\binner\s+join\b.*\b(concatenate|concat|combine|merge)\b",
+            text,
+        ):
+            loading_strategy = "concatenate_inner"
+        elif re.search(
+            r"\b(analy[sz]e|process|run)\b.*\b(datasets?|files?)\b.*\bseparately\b",
+            text,
+        ):
+            loading_strategy = "analyze_separately"
+        if loading_strategy:
+            self.world_state.resolve_decision(
+                "multi_dataset_loading_strategy",
+                loading_strategy,
+                source="user",
+                message=message,
+            )
+
+        strategy_patterns = [
+            (
+                "integrate_scvi",
+                [
+                    r"\b(integrate|batch[- ]?correct)\b.*\bscvi\b",
+                    r"\buse\s+scvi\b.*\b(integrat|batch)",
+                    r"\bintegrate\s+(?:the\s+)?(?:samples?|datasets?)\b",
+                ],
+            ),
+            (
+                "keep_unintegrated",
+                [
+                    r"\b(do not|don't|dont|no)\s+(integrate|batch[- ]?correct)\b",
+                    r"\bkeep\b.*\b(unintegrated|uncorrected)\b",
+                    r"\bleave\b.*\b(unintegrated|uncorrected|as is)\b",
+                ],
+            ),
+            (
+                "investigate_integration",
+                [
+                    r"\binvestigate\b.*\b(batch|integrat)",
+                    r"\b(check|assess|decide)\b.*\b(whether|if)\b.*\b(integrat|batch[- ]?correct)",
+                ],
+            ),
+            (
+                "analyze_separately",
+                [
+                    r"\b(analy[sz]e|process|run)\b.*\b(samples?|datasets?)\b.*\bseparately\b",
+                    r"\bseparate\b.*\b(sample|dataset)[- ]specific\b.*\banalys",
+                ],
+            ),
+        ]
+        for strategy, patterns in strategy_patterns:
+            if not any(re.search(pattern, text) for pattern in patterns):
+                continue
+            self.world_state.resolve_decision(
+                "multi_sample_strategy",
+                strategy,
+                source="user",
+                message=message,
+            )
+            if self.run_manager:
+                self.run_manager.add_user_decision(
+                    {
+                        "key": "multi_sample_strategy",
+                        "policy_action": "recommend_and_confirm",
+                        "status": "user_corrected",
+                        "applied_value": strategy,
+                        "user_message": message,
+                    }
+                )
+            break
+
+        explicit_method_match = re.search(r"\b(harmony|bbknn|scanorama)\b", text)
+        if explicit_method_match and re.search(
+            r"\b(use|run|apply|integrate|integration|integrating|batch[- ]?correct)\b",
+            text,
+        ):
+            method = explicit_method_match.group(1)
+            self.world_state.resolve_decision(
+                "multi_sample_strategy",
+                {
+                    "action": "custom",
+                    "details": f"Integrate using {method}.",
+                    "method": method,
+                },
+                source="user",
+                message=message,
+            )
 
         batch_patterns = [
             r"\buse\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s+(?:the\s+)?batch(?:\s+key|\s+column)?\b",
@@ -2581,6 +3744,14 @@ class SCAgent:
     ) -> Dict[str, Any]:
         after_snapshot = self.world_state.snapshot()
 
+        # Report the compute backend(s) this tool actually exercised, read from
+        # the ledger the compute layer wrote (on_gpu / run_scvi) — not a guess
+        # from the tool name. A tool that touched no backend gets no field.
+        from ..core.gpu import backends_used
+        used = backends_used()
+        if used and result_data.get("status") == "ok":
+            result_data.setdefault("backend", used[0] if len(used) == 1 else used)
+
         if tool_name == "bc_get_panglaodb_marker_genes":
             result_data.setdefault(
                 "marker_query",
@@ -2653,26 +3824,6 @@ class SCAgent:
             result_data["decisions_raised"] = existing_decisions
         else:
             result_data["decisions_raised"] = self._generic_decisions_from_result(tool_name, tool_input, result_data)
-        if (
-            tool_name == "ask_user"
-            and result_data.get("decision_key")
-            and result_data.get("user_response")
-            and result_data.get("user_response") not in {"proceed", "no response"}
-        ):
-            self.world_state.resolve_decision(
-                result_data["decision_key"],
-                result_data["user_response"],
-                source="user",
-                message=result_data.get("question", ""),
-            )
-            result_data["decisions_raised"] = [
-                decision
-                for decision in self.world_state.resolved_decisions[-1:]
-            ]
-            result_data["decisions_raised"] = [
-                decision.to_dict() if hasattr(decision, "to_dict") else decision
-                for decision in result_data["decisions_raised"]
-            ]
         result_data["verification"] = self._generic_verification(tool_name, tool_input, result_data)
         return result_data
 
@@ -2755,6 +3906,88 @@ class SCAgent:
 
         return False, auto_recovery_attempts
 
+    def _maybe_continue_for_obligations(
+        self,
+        messages: List[Dict[str, Any]],
+        obligation_attempts: int,
+    ):
+        """Floor: don't let the run END while a scientific-spine obligation is unmet.
+
+        The save/report guard (`_annotation_validation_guard`) already hard-blocks
+        the *tool-exit* door (save_data/write_report before finalize). This closes the
+        other door — a no-tool-call ``stop``/``length`` turn that calls `_complete_run`
+        directly and bypasses that guard (the verified GLM non-convergence exit).
+
+        Mechanism mirrors `_maybe_continue_after_failure`: re-prompt with the unmet
+        obligation's guidance, bounded by `OBLIGATION_NUDGES`. Per "blocking > nudging",
+        the bound is enforced: once exhausted, a *completion* obligation triggers a
+        forced safe fallback (`save_data(allow_unvalidated=true)`) so the run never
+        ends silently incomplete. Returns (should_continue, next_attempt).
+        """
+        # If the agent is correctly paused at a collaborative checkpoint, it has
+        # SURFACED a decision (e.g. pause_and_ask for multi_sample_strategy) and is
+        # awaiting the user — ending the turn to wait is the right behavior, not a
+        # silent exit. Do not override it (this is the interactive case; in
+        # autonomous mode pause_and_ask auto-resolves so no checkpoint lingers).
+        # The GLM completion bug had NO pending checkpoint, so it is still caught.
+        if getattr(self, "_pending_checkpoint", None):
+            return False, obligation_attempts
+        ws = getattr(self, "world_state", None)
+        if ws is None or not hasattr(ws, "unmet_obligations"):
+            return False, obligation_attempts
+        blocking = [o for o in ws.unmet_obligations() if o.get("blocks_terminal")]
+        if not blocking:
+            return False, obligation_attempts
+
+        if obligation_attempts < OBLIGATION_NUDGES:
+            next_attempt = obligation_attempts + 1
+            keys = ", ".join(o.get("key", "?") for o in blocking)
+            logger.warning(
+                "Run tried to end with unmet spine obligation(s) [%s]; nudge %s/%s",
+                keys, next_attempt, OBLIGATION_NUDGES,
+            )
+            if hasattr(ws, "note_spine_intervention"):
+                ws.note_spine_intervention([o.get("key", "?") for o in blocking], "nudge")
+            guidance = "\n".join(f"- {o['guidance']}" for o in blocking)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You are ending the run, but a required step is not complete:\n"
+                    f"{guidance}\n\n"
+                    "Do not stop here. Take the action above now (emit the tool call)."
+                ),
+            })
+            self._conversation_history = messages
+            return True, next_attempt
+
+        # Bound exhausted: force a safe fallback for completion obligations so the
+        # analysis is never silently lost (worst case: an explicit UNVALIDATED save,
+        # never a null result). Entry obligations have no harness-side fallback here.
+        completion_unmet = any(o.get("kind") == "completion" for o in blocking)
+        if completion_unmet:
+            logger.warning(
+                "Spine obligation still unmet after %s nudges; forcing "
+                "save_data(allow_unvalidated=true).", OBLIGATION_NUDGES,
+            )
+            if hasattr(ws, "note_spine_intervention"):
+                ws.note_spine_intervention(
+                    [o.get("key", "?") for o in blocking if o.get("kind") == "completion"],
+                    "forced_fallback",
+                )
+            try:
+                result_json = self._execute_tool("save_data", {"allow_unvalidated": True})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Auto-saved an UNVALIDATED dataset because a required step was "
+                        "not completed after repeated prompts:\n" + result_json
+                    ),
+                })
+                self._conversation_history = messages
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Forced unvalidated save failed: %s", exc)
+        return False, obligation_attempts
+
     def _ask_continue(self, error_msg: str, suggestions: list = None) -> str:
         """Ask user how to proceed after automatic recovery was not enough."""
         from rich.console import Console
@@ -2773,16 +4006,24 @@ class SCAgent:
             for i, s in enumerate(suggestions, 1):
                 console.print(f"  {i}. {s}")
 
-        console.print("\n[bold]What would you like to do?[/bold]")
-        console.print("  • Type a new instruction")
-        console.print("  • Press Enter to let the agent try to recover")
-        console.print("  • Type 'quit' to stop")
-
         try:
-            from ..terminal import read_user_input
+            from ..terminal import DecisionChoice, prompt_for_decision
 
-            response = read_user_input("\n> ")
-            return response if response else "try to recover from the error"
+            selection = prompt_for_decision(
+                "What would you like to do?",
+                [
+                    DecisionChoice("Try automatic recovery again", "retry"),
+                    DecisionChoice("Enter a new instruction", "custom"),
+                    DecisionChoice("Stop this analysis", "stop"),
+                ],
+                default_index=0,
+                allow_custom=False,
+            )
+            if selection.action == "retry":
+                return "try to recover from the error"
+            if selection.action == "stop":
+                return "quit"
+            return selection.value
         except (EOFError, KeyboardInterrupt):
             return "quit"
 
@@ -2874,7 +4115,7 @@ class SCAgent:
         request: str,
         data_path: Optional[str] = None,
         run_name: Optional[str] = None,
-        max_iterations: int = 75,
+        max_iterations: int = 100,
         continue_conversation: bool = False,
     ) -> str:
         """
@@ -2896,7 +4137,7 @@ class SCAgent:
             If None and self.adata exists, uses already-loaded data.
         run_name : str, optional
             Name for the run directory.
-        max_iterations : int, default 75
+        max_iterations : int, default 100
             Maximum number of tool calls per turn before an explicit resumable pause.
         continue_conversation : bool, default False
             If True, continue from previous conversation history.
@@ -2955,13 +4196,16 @@ class SCAgent:
             )
             self.run_manager.append_event("follow_up_request", {"request": request})
 
-        # Clear any stale checkpoint - the LLM's response options take precedence
-        # First translate explicit user confirmation into a one-shot cleanup
-        # authorization. Otherwise the LLM's response options take precedence.
+        self._attach_run_log_handler()
+
+        # Resolve text-only clients against the newest pending checkpoint before
+        # the request enters the provider conversation.
         if self._pending_checkpoint:
-            if not self._authorize_pending_cleanup_from_user(request):
-                if self._pending_checkpoint.get("kind") != "cluster_qc_cleanup":
-                    self._clear_pending_checkpoint("superseded by new response")
+            selection = self.resolve_pending_decision_text(request)
+            if selection is not None:
+                request = self.structured_decision_request(selection)
+                self._active_request = request
+                self.world_state.set_active_request(request)
 
         # Build initial message
         user_message = request
@@ -2983,24 +4227,29 @@ class SCAgent:
                 self.run_manager.fail(message)
             raise RuntimeError(message)
 
-        # Route to provider-specific implementation
-        if self.provider == "anthropic":
-            return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
-        elif self.provider in {"openai", "groq", "gemini", "vertex"}:
-            return self._analyze_openai(user_message, max_iterations, continue_conversation)
-        elif self.provider == "codex":
-            return self._analyze_codex(user_message, max_iterations, continue_conversation)
-        raise RuntimeError(f"Unsupported provider: {self.provider}")
+        # Route to provider-specific implementation, wrapped in a tracing root span so
+        # per-iteration LLM/tool spans nest under one trace (and under NAT's eval
+        # workflow span when a W3C traceparent is propagated in via the environment).
+        _tracing.start_root("scagent.analyze", {
+            "scagent.provider": self.provider,
+            "scagent.model": str(self.model),
+        })
+        try:
+            if self.provider == "anthropic":
+                return self._analyze_anthropic(user_message, max_iterations, continue_conversation)
+            elif self.provider in {"openai", "groq", "gemini", "vertex"}:
+                return self._analyze_openai(user_message, max_iterations, continue_conversation)
+            elif self.provider == "codex":
+                return self._analyze_codex(user_message, max_iterations, continue_conversation)
+            raise RuntimeError(f"Unsupported provider: {self.provider}")
+        finally:
+            _tracing.end_root()
 
     def _codex_tool_specs(self) -> List[Dict[str, Any]]:
         """Return compact tool specs for the Codex decision prompt."""
         specs: List[Dict[str, Any]] = []
         for tool in self.tools:
             function = tool.get("function", {})
-            if function.get("name") == "ask_user":
-                # In CLI mode, user questions should be normal final responses.
-                # The next interactive turn will capture the user's choice.
-                continue
             specs.append({
                 "name": function.get("name"),
                 "description": function.get("description", ""),
@@ -3041,11 +4290,10 @@ class SCAgent:
             "- For final responses, set tool_name and tool_input_json to null. For tool calls, set "
             "content to null.\n\n"
             "When a tool result or runtime state says checkpoint_required or pending_checkpoint, "
-            "do not call an ask-user tool. Return kind='final' with a clear, conversational summary "
-            "of what just happened and 2-4 numbered next-step options. Do not mention internal "
-            "checkpoint fields such as default, recommendation, option_actions, or decision_key. "
-            "Do not say 'You selected option N' unless that is the actual scientific result; just "
-            "carry out the selected action or ask what to do next.\n\n"
+            "return kind='final' with a clear explanation of the evidence and why a decision is "
+            "needed. The runtime renders the options as an interactive selector, so do not "
+            "duplicate them as a numbered menu. When the next request contains a Structured "
+            "user decision, treat selected_action as authoritative.\n\n"
             "## Current Request, History, Runtime State, and Tools\n"
             f"{json.dumps(payload, indent=2, default=str)}"
         )
@@ -3140,6 +4388,77 @@ class SCAgent:
             lambda: self.client.complete_json(prompt, CODEX_DECISION_SCHEMA)
         )
 
+    # Note appended as the tool_result of a tool aborted mid-run by the user, so
+    # the conversation stays valid and the model knows to re-check state.
+    _INTERRUPT_TOOL_NOTE = (
+        "⚠️ Interrupted by the user before this tool returned. The dataset (adata) "
+        "may be partially modified or unchanged — call inspect_data to check the "
+        "current state before continuing."
+    )
+
+    @staticmethod
+    def _message_tool_calls(message):
+        """tool_calls off an OpenAI message, whether a pydantic object or a dict."""
+        if isinstance(message, dict):
+            return message.get("tool_calls") or []
+        return getattr(message, "tool_calls", None) or []
+
+    @staticmethod
+    def _tool_call_id(tool_call):
+        if isinstance(tool_call, dict):
+            return tool_call.get("id")
+        return getattr(tool_call, "id", None)
+
+    def _repair_openai_dangling_tool_calls(self, messages: List[Dict[str, Any]]) -> None:
+        """Ensure every committed tool_call has a tool result.
+
+        The OpenAI loop appends the assistant `tool_calls` message BEFORE running
+        the tools, so an interrupt mid-tool leaves tool_calls without matching
+        `role: tool` results — which the API rejects on the next turn. Fill any
+        missing results with the interrupt note so `continue` resumes cleanly.
+        """
+        last_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if self._message_tool_calls(messages[i]):
+                last_idx = i
+                break
+        if last_idx is None:
+            return
+        call_ids = [self._tool_call_id(tc) for tc in self._message_tool_calls(messages[last_idx])]
+        answered = {
+            m.get("tool_call_id")
+            for m in messages[last_idx + 1:]
+            if isinstance(m, dict) and m.get("role") == "tool"
+        }
+        for cid in call_ids:
+            if cid and cid not in answered:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": cid,
+                    "content": self._INTERRUPT_TOOL_NOTE,
+                })
+
+    def _preserve_interrupted_turn(self, messages: List[Dict[str, Any]], message_format: str) -> None:
+        """Persist an interrupted turn so `continue` resumes cleanly.
+
+        Repairs a dangling OpenAI tool-call turn (Anthropic/Codex commit the
+        assistant message only after tools finish, so their lists stay valid),
+        saves the live message list as the conversation history, and records an
+        `interrupted` manifest event. Never raises — the caller re-raises the
+        original KeyboardInterrupt.
+        """
+        try:
+            if message_format == "openai":
+                self._repair_openai_dangling_tool_calls(messages)
+        except Exception:
+            pass
+        self._conversation_history = messages
+        if self.run_manager is not None:
+            try:
+                self.run_manager.append_event("interrupted", {"n_messages": len(messages)})
+            except Exception:
+                pass
+
     def _analyze_codex(
         self,
         user_message: str,
@@ -3155,6 +4474,7 @@ class SCAgent:
         final_result = ""
         tool_names = {tool.get("name") for tool in self._codex_tool_specs()}
         auto_recovery_attempts = 0
+        obligation_nudge_attempts = 0
 
         try:
             for _iteration in range(max_iterations):
@@ -3219,8 +4539,13 @@ class SCAgent:
                     )
                     if should_continue:
                         continue
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
+                    )
+                    if should_continue:
+                        continue
                     self._conversation_history = messages
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
@@ -3232,6 +4557,9 @@ class SCAgent:
                 max_iterations,
                 message_format="openai",
             )
+        except KeyboardInterrupt:
+            self._preserve_interrupted_turn(messages, "codex")
+            raise
         except Exception as e:
             if self.run_manager:
                 self.run_manager.fail(str(e))
@@ -3250,6 +4578,7 @@ class SCAgent:
             messages = [{"role": "user", "content": user_message}]
         final_result = ""
         auto_recovery_attempts = 0
+        obligation_nudge_attempts = 0
 
         try:
             for iteration in range(max_iterations):
@@ -3259,11 +4588,12 @@ class SCAgent:
                     messages, anthropic=True,
                     trim_target=trim_target, hard_limit=hard_limit,
                 )
+                _t0_llm = _tracing.now_ns()
                 try:
                     response = self._with_llm_status(
                         lambda: self.client.messages.create(
                             model=self.model,
-                            max_tokens=4096,
+                            max_tokens=self._max_output_tokens,
                             system=system_prompt,
                             tools=self.tools,
                             messages=messages,
@@ -3276,7 +4606,7 @@ class SCAgent:
                             response = self._with_llm_status(
                                 lambda: self.client.messages.create(
                                     model=self.model,
-                                    max_tokens=4096,
+                                    max_tokens=self._max_output_tokens,
                                     system=self._build_system_prompt(),
                                     tools=self.tools,
                                     messages=messages,
@@ -3315,6 +4645,15 @@ class SCAgent:
                             min(_new_ratio, 4.0),
                         )
 
+                _usage = getattr(response, "usage", None)
+                _tracing.record_llm(
+                    iteration, self.model,
+                    getattr(_usage, "input_tokens", None) if _usage else None,
+                    getattr(_usage, "output_tokens", None) if _usage else None,
+                    _t0_llm,
+                )
+                _tracing.record_llm_io(iteration, self.model, messages, response.content, _t0_llm)
+
                 if response.stop_reason == "tool_use":
                     tool_results = []
                     assistant_content = []
@@ -3326,7 +4665,9 @@ class SCAgent:
 
                         elif content.type == "tool_use":
                             assistant_content.append(content)
+                            _t0_tool = _tracing.now_ns()
                             result_json = self._execute_tool(content.name, content.input)
+                            _tracing.record_tool(content.name, iteration, _t0_tool)
 
                             tool_results.append({
                                 "type": "tool_result",
@@ -3372,10 +4713,16 @@ class SCAgent:
                     if should_continue:
                         continue
 
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
+                    )
+                    if should_continue:
+                        continue
+
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
@@ -3395,6 +4742,9 @@ class SCAgent:
                 message_format="anthropic",
             )
 
+        except KeyboardInterrupt:
+            self._preserve_interrupted_turn(messages, "anthropic")
+            raise
         except Exception as e:
             if self.run_manager:
                 self.run_manager.fail(str(e))
@@ -3411,7 +4761,8 @@ class SCAgent:
           3. Bare JSON: {"name": ..., "arguments": ...}  (no wrapper)
         Returns list of dicts with 'id', 'name', 'arguments' keys, or empty list.
         """
-        import re, uuid
+        import re
+        import uuid
 
         def _extract(raw):
             try:
@@ -3456,7 +4807,9 @@ class SCAgent:
 
         Priority order (highest wins):
           1. SCAGENT_CONTEXT_LIMIT env var — user override
-          2. vLLM /v1/models max_model_len — actual GPU-constrained limit
+          2. Self-hosted /v1/models limit — the actual GPU-constrained, per-request
+             window reported by the serving backend (vLLM `max_model_len` or
+             llama.cpp `meta.n_ctx`). See _server_context_limit.
           3. K-size parsed from model name (e.g. "262k", "128k")
           4. Cloud model name dict — known limits by provider
           5. Generic Qwen fallback — 32K with a visible warning
@@ -3479,7 +4832,7 @@ class SCAgent:
 
         model = (self.model or "").lower()
 
-        # --- Priority 2: vLLM /v1/models max_model_len ---
+        # --- Priority 2: self-hosted /v1/models limit (vLLM or llama.cpp) ---
         try:
             base_url = str(getattr(self.client, 'base_url', ''))
             cloud_hosts = (
@@ -3493,19 +4846,22 @@ class SCAgent:
             is_cloud = any(h in base_url for h in cloud_hosts)
             if not is_cloud and base_url:
                 for m in self.client.models.list().data:
-                    if m.id == self.model:
-                        limit = getattr(m, 'max_model_len', None)
-                        if limit and int(limit) > 0:
-                            logger.info(
-                                f"Context limit from vLLM (max_model_len): {int(limit):,} tokens"
-                            )
-                            self._print(
-                                f"[dim]Context limit from vLLM: {int(limit):,} tokens[/dim]"
-                            )
-                            return int(limit)
+                    if _model_get(m, "id") != self.model:
+                        continue
+                    limit, source = _server_context_limit(m)
+                    if limit:
+                        backend = "vLLM" if source == "max_model_len" else "llama.cpp"
+                        logger.info(
+                            f"Context limit from {backend} ({source}): {limit:,} tokens"
+                        )
+                        self._print(
+                            f"[dim]Context limit from {backend}: {limit:,} tokens[/dim]"
+                        )
+                        return limit
+                    break  # matched our model, but it advertised no usable limit
         except Exception as e:
             logger.warning(
-                f"vLLM model query failed ({e}); falling through to name-based detection"
+                f"Self-hosted model query failed ({e}); falling through to name-based detection"
             )
 
         # --- Priority 3: parse K-size from model name ---
@@ -3547,6 +4903,13 @@ class SCAgent:
         # Legacy aliases (deepseek-chat / deepseek-reasoner) point at v4-flash.
         if "deepseek" in model:
             return _known(1_000_000, self.model)
+        # Qwen3.5 / Qwen3.6 family: 262,144 (256K) native window
+        # (max_position_embeddings). Sits below the vLLM probe (priority 2) on
+        # purpose — vLLM still reports the exact GPU-constrained limit; this only
+        # fires for OpenAI-compatible servers that don't advertise max_model_len
+        # (e.g. TensorRT-LLM's trtllm-serve, which serves it at max_seq_len=262144).
+        if "qwen3.6" in model or "qwen3.5" in model or "qwen3_5" in model:
+            return _known(262_144, self.model)
 
         # --- Priority 5: generic Qwen fallback ---
         if "qwen" in model:
@@ -3636,7 +4999,7 @@ class SCAgent:
         history_messages = self._history_messages_for_budget(messages or [], anthropic=anthropic)
         history_estimate = self._calibrated_estimate(history_messages)
         overhead = tool_schema_tokens + system_tokens
-        completion_reserve = 4096
+        completion_reserve = self._max_output_tokens  # in sync with the per-call output cap
         safety_margin = max(2000, int(self._context_limit * 0.03))
         hard_prompt_limit = max(0, self._context_limit - completion_reserve - safety_margin)
 
@@ -3694,7 +5057,7 @@ class SCAgent:
           trim_target  — aim to be below this before the API call (proactive trim)
           hard_limit   — absolute ceiling; triggers emergency trim if exceeded
         """
-        COMPLETION_RESERVE = 4096
+        COMPLETION_RESERVE = self._max_output_tokens  # in sync with the per-call output cap
         system_tokens = int((len(system_prompt) // 4) * self._token_estimate_calibration)
         tool_schema_tokens = int(self._tool_schema_tokens * self._token_estimate_calibration)
         safety_margin = max(2000, int(self._context_limit * 0.03))
@@ -4205,6 +5568,7 @@ class SCAgent:
             ]
         final_result = ""
         auto_recovery_attempts = 0
+        obligation_nudge_attempts = 0
         thinking_extra = self._thinking_extra()
 
         try:
@@ -4216,11 +5580,12 @@ class SCAgent:
                 messages = self._trim_messages_if_needed(
                     messages, trim_target=trim_target, hard_limit=hard_limit,
                 )
+                _t0_llm = _tracing.now_ns()
                 try:
                     response = self._with_llm_status(
                         lambda: self.client.chat.completions.create(
                             model=self.model,
-                            max_completion_tokens=4096,
+                            max_completion_tokens=self._max_output_tokens,
                             tools=self.tools,
                             messages=messages,
                             **thinking_extra,
@@ -4235,7 +5600,7 @@ class SCAgent:
                             response = self._with_llm_status(
                                 lambda: self.client.chat.completions.create(
                                     model=self.model,
-                                    max_completion_tokens=4096,
+                                    max_completion_tokens=self._max_output_tokens,
                                     tools=self.tools,
                                     messages=messages,
                                     **thinking_extra,
@@ -4278,24 +5643,53 @@ class SCAgent:
                             min(_new_ratio, 4.0),
                         )
 
+                _usage = getattr(response, "usage", None)
+                _tracing.record_llm(
+                    iteration, self.model,
+                    getattr(_usage, "prompt_tokens", None) if _usage else None,
+                    getattr(_usage, "completion_tokens", None) if _usage else None,
+                    _t0_llm,
+                )
+                _tracing.record_llm_io(iteration, self.model, messages, message, _t0_llm)
+
                 if choice.finish_reason == "tool_calls" and message.tool_calls:
                     # Add assistant message with tool calls
                     messages.append(message)
 
-                    # Print any reasoning/text content from the agent.
-                    # reasoning_content is a non-standard field used by Gemini and DeepSeek
-                    # via their OpenAI-compatible APIs to expose thinking tokens.
-                    _reasoning = (
-                        (getattr(message, "model_extra", None) or {}).get("reasoning_content")
-                        or message.content
-                    )
-                    if _reasoning:
-                        self._print_thinking(_reasoning)
+                    # Reasoning models emit two separate channels per turn:
+                    #   reasoning_content / reasoning → raw chain-of-thought
+                    #   content                       → user-facing narration
+                    # OpenAI-compatible backends name the CoT field differently:
+                    # Gemini/DeepSeek use `reasoning_content`, vLLM reasoning
+                    # parsers (nemotron_v3, glm45, …) use `reasoning`.
+                    #
+                    # Print the narration (content) always; the chain-of-thought
+                    # is noisy and hidden unless SCAGENT_SHOW_THINKING=1, in which
+                    # case it's rendered dimmed. Previously these were collapsed
+                    # with `or`, so the CoT was dumped verbatim AND the real
+                    # narration was dropped on tool-calling turns.
+                    _narration, _cot = self._split_reasoning_channels(message)
+                    # Causal order: the model reasons first, then states intent,
+                    # then acts. Print/persist the chain-of-thought BEFORE the
+                    # narration so the transcript reads top-to-bottom as it happened.
+                    if _cot:
+                        _cot_log = self._save_thinking(_cot, iteration)
+                        if os.environ.get("SCAGENT_SHOW_THINKING", "0") == "1":
+                            self._print_thinking(_cot, dim=True)
+                        elif _cot_log is not None:
+                            self._print(
+                                f"[dim]… reasoning hidden ({len(_cot)} chars) — "
+                                f"{_cot_log}[/dim]"
+                            )
+                    if _narration:
+                        self._print_thinking(_narration)
 
                     # Process each tool call
                     for tool_call in message.tool_calls:
                         tool_input = json.loads(tool_call.function.arguments)
+                        _t0_tool = _tracing.now_ns()
                         result_json = self._execute_tool(tool_call.function.name, tool_input)
+                        _tracing.record_tool(tool_call.function.name, iteration, _t0_tool)
 
                         messages.append({
                             "role": "tool",
@@ -4365,23 +5759,60 @@ class SCAgent:
                     if should_continue:
                         continue
 
+                    # Spine floor: don't end with a scientific obligation unmet (the
+                    # no-tool-call exit that bypasses the save/report guard).
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
+                    )
+                    if should_continue:
+                        continue
+
                     # Save conversation history for potential follow-ups
                     self._conversation_history = messages
 
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
 
                     return final_result
 
                 elif choice.finish_reason == "length":
-                    # Response was truncated due to length
-                    self._print("\n[Warning: Response truncated due to length]")
-                    final_result = message.content or ""
-                    messages.append({"role": "assistant", "content": final_result})
-                    self._print(final_result)
+                    # Response truncated at the output-token cap. If it was cut off
+                    # mid-tool-call, message.content holds a partial, unparseable
+                    # tool-call fragment (e.g. "<tool_call>write_json<arg_key>…") —
+                    # a complete call would have been parsed into structured
+                    # tool_calls. Printing it dumps a wall of broken JSON, so detect
+                    # that case, suppress the raw dump, and let the next turn retry.
+                    raw_content = message.content or ""
+                    if self._looks_like_partial_tool_call(raw_content):
+                        self._print(
+                            "\n[Response hit the output-token limit mid-tool-call and was "
+                            "discarded — retrying with a smaller step. If this recurs, raise "
+                            "SCAGENT_MAX_OUTPUT_TOKENS.]"
+                        )
+                        final_result = ""
+                        messages.append({
+                            "role": "assistant",
+                            "content": (
+                                "[Previous response was truncated mid-tool-call and discarded. "
+                                "Re-issue the call, splitting a large argument into smaller pieces.]"
+                            ),
+                        })
+                    else:
+                        self._print("\n[Warning: Response truncated due to length]")
+                        final_result = raw_content
+                        messages.append({"role": "assistant", "content": final_result})
+                        self._print(final_result)
+
+                    # Same spine floor on the length-truncation exit.
+                    should_continue, obligation_nudge_attempts = self._maybe_continue_for_obligations(
+                        messages, obligation_nudge_attempts,
+                    )
+                    if should_continue:
+                        continue
+
                     self._conversation_history = messages
-                    if self.run_manager:
+                    if self.run_manager and not self._pending_checkpoint:
                         self._complete_run(final_result)
                         self._print(f"\n[dim]Run manifest: {self.run_manager.run_dir}/manifest.json[/dim]")
                     return final_result
@@ -4401,6 +5832,9 @@ class SCAgent:
                 message_format="openai",
             )
 
+        except KeyboardInterrupt:
+            self._preserve_interrupted_turn(messages, "openai")
+            raise
         except Exception as e:
             if self.run_manager:
                 self.run_manager.fail(str(e))
@@ -4444,6 +5878,8 @@ class SCAgent:
         "install_package":      "Installing package",
         "generate_figure":      "Generating figure",
         "inspect_data":         "Inspecting data",
+        "record_inspection":    "Recording data interpretation",
+        "inspect_data_inputs":  "Inspecting data inputs",
         "search_papers":        "Searching papers",
         "research_findings":    "Searching literature",
         "web_search":           "Searching web",
@@ -4512,6 +5948,7 @@ class SCAgent:
         "prepare_annotation",     # runs rank_genes_groups, can be slow
         "stage_annotation_evidence",
         "run_batch_correction",   # scVI tqdm training bar, Scanorama verbose
+        "diagnose_batch_effect",  # multi-step diagnostic; leave a durable done line
         "run_umap",               # UMAP can take minutes on large datasets
         "run_qc",                 # Scrublet progress on large datasets
         "score_integration",
@@ -4560,21 +5997,101 @@ class SCAgent:
             return True
         return bool(self._mcp_client and self._mcp_client.has_tool(tool_name))
 
+    def _print_terminal_summary(self, tool_name: str, result_data: dict) -> None:
+        """Surface a reasoning/diagnostic tool's own findings to the terminal.
+
+        Tools opt in by returning ``terminal_summary`` (a list of short strings,
+        or a single string) in their result — e.g. diagnose_batch_effect's
+        verdict + evidence + recommendation, or run_cluster_structure_qc's
+        per-cluster decisions. This lets the user see the analytical reasoning
+        rather than only a spinner and a checkmark. No-op if the field is absent.
+        """
+        summary = result_data.get("terminal_summary")
+        if not summary:
+            return
+        if isinstance(summary, str):
+            summary = [summary]
+        from rich.console import Console
+
+        console = Console()
+        try:
+            console.print(f"[dim]  ⤷ {tool_name}:[/dim]")
+            for line in summary:
+                # markup=False: finding text may contain brackets/markup chars.
+                console.print(f"    {line}", style="dim", markup=False)
+        except Exception:  # pragma: no cover - display must never break a run
+            pass
+
+    @staticmethod
+    def _cluster_qc_terminal_summary(result_data: dict) -> list[str] | None:
+        """Compose terminal findings for the cluster-QC tools from their already
+        post-processed result (per-cluster decisions + the synthesized cleanup
+        recommendation). Returns None when there is nothing meaningful to show."""
+        decisions = result_data.get("cluster_decisions") or {}
+        lines: list[str] = []
+        if decisions:
+            from collections import Counter
+
+            actions = Counter(str(d.get("recommended_action", "keep")) for d in decisions.values())
+            lines.append(
+                f"{len(decisions)} clusters reviewed: "
+                + ", ".join(f"{n} {a}" for a, n in actions.items())
+            )
+            for clu, d in decisions.items():
+                action = str(d.get("recommended_action", "keep"))
+                if action == "keep":
+                    continue
+                reasons = d.get("reasons") or []
+                detail = "; ".join(str(r) for r in reasons[:2]) if reasons else str(d.get("severity", ""))
+                lines.append(f"cluster {clu}: {action} ({detail})")
+        rec = (
+            result_data.get("recommended_next_action")
+            or result_data.get("metric_qc_interpretation")
+        )
+        if result_data.get("cleanup_resolved"):
+            lines.append(f"resolved: {result_data['cleanup_resolved']}")
+        if rec:
+            lines.append(f"→ {rec}")
+        return lines[:25] or None
+
     def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
         """Execute a tool and return JSON result."""
+        from pathlib import Path
+
         from rich.console import Console
         from rich.status import Status
-        from pathlib import Path
 
         console = Console()
         logger.debug("Tool call: %s with %s", tool_name, tool_input)
 
         # Only block truly pipeline-progressing tools when checkpoint pending
         # Allow flexible tools (run_code, inspection, visualization) to proceed
-        if self._pending_checkpoint and self._is_action_tool(tool_name) and tool_name != "ask_user":
+        if self._pending_checkpoint and self._is_action_tool(tool_name):
+            if (
+                self._pending_checkpoint.get("kind") == "multi_dataset_loading"
+                and tool_name in {"run_code", "load_data"}
+            ):
+                return self._blocked_by_checkpoint_result(tool_name)
+            if (
+                self._pending_checkpoint.get("kind") == "multi_sample_strategy"
+                and tool_name == "run_code"
+            ):
+                return self._blocked_by_checkpoint_result(tool_name)
             if tool_name not in self.CHECKPOINT_EXEMPT_TOOLS:
                 return self._blocked_by_checkpoint_result(tool_name)
             # For exempt tools, we'll include checkpoint context in the result later
+
+        # Model-driven-inspection safety net (see _inspection_gate_action): nudge
+        # once toward record_inspection before the first analysis step; if the
+        # model still skips it, fall back to the heuristic (logged once). Enabling
+        # the flag by default can never leave a run worse off than the heuristic.
+        _insp_action = self._inspection_gate_action(tool_name)
+        if _insp_action == "nudge":
+            self._inspection_nudged = True
+            return self._inspection_nudge_result(tool_name)
+        if _insp_action == "fallback" and not self._inspection_fallback_logged:
+            self._inspection_fallback_logged = True
+            self.world_state.note_spine_intervention(["model_inspection"], "heuristic_fallback")
 
         def _sanitize_name(value: str) -> str:
             value = value or tool_name
@@ -4689,6 +6206,9 @@ class SCAgent:
                 tool_input["output_path"] = self.run_manager.get_intermediate_path(_sanitize_name(tool_name))
 
         _prepare_tool_paths()
+        loading_guard = self._multi_dataset_loading_guard(tool_name, tool_input)
+        if loading_guard is not None:
+            return loading_guard
         auto_checkpoint_path = self._maybe_auto_checkpoint(tool_name, tool_input)
         self._apply_world_state_overrides(tool_name, tool_input)
         # Don't re-sync here — we already synced at the start of analyze() and after
@@ -4703,18 +6223,7 @@ class SCAgent:
             if hint:
                 self.world_state.add_context_hint(str(hint))
 
-        # ask_user is no longer in the tool list — the agent uses a turn-based
-        # model and presents options in its final text response instead.
-        # This branch is a safety net in case an older serialized conversation
-        # replays the tool; treat it as a no-op so the turn continues cleanly.
-        if tool_name == "ask_user":
-            result_json = json.dumps({
-                "status": "ok",
-                "tool": "ask_user",
-                "message": "ask_user is no longer used — present options in your final response text.",
-                "user_response": "proceed",
-            }, indent=2)
-        elif tool_name == "pause_and_ask":
+        if tool_name == "pause_and_ask":
             result_json = self._handle_pause_and_ask(tool_input)
         # Special handling for install_package - requires approval
         elif tool_name == "install_package":
@@ -4783,6 +6292,11 @@ class SCAgent:
                     except Exception:
                         pass
                 return _rj, _ad
+
+            # Clear the compute-backend ledger so what on_gpu/run_scvi record
+            # below reflects only this tool call (read in _ensure_standard_tool_result).
+            from ..core.gpu import reset_backends_used
+            reset_backends_used()
 
             if self.verbose and self._should_print_persistent_tool_progress(tool_name):
                 # Streaming tools produce their own tqdm/progress output. Using
@@ -4946,21 +6460,45 @@ class SCAgent:
                     else:
                         checkpoint = refined_checkpoint
             if checkpoint is None:
+                checkpoint = self._build_multi_dataset_loading_checkpoint(
+                    tool_name,
+                    result_data,
+                )
+            if checkpoint is None:
+                checkpoint = self._build_post_concatenation_strategy_checkpoint(
+                    tool_name,
+                    tool_input,
+                    result_data,
+                )
+            if checkpoint is None:
+                checkpoint = self._build_multi_sample_strategy_checkpoint(
+                    tool_name,
+                    result_data,
+                )
+            if checkpoint is None:
                 checkpoint = self._build_checkpoint_payload(tool_name, tool_input, result_data)
             if checkpoint is None:
                 checkpoint = self._build_recovery_checkpoint(tool_name, tool_input, result_data)
-            if tool_name == "ask_user":
-                prior_checkpoint = self._pending_checkpoint
-                selected_action = result_data.get("selected_action")
-                self._clear_pending_checkpoint(result_data.get("user_response"))
-                auto_execution = self._execute_checkpoint_action(selected_action, prior_checkpoint or {}) if prior_checkpoint else None
-                if auto_execution is not None:
-                    result_data["auto_execution"] = auto_execution
             if checkpoint is not None:
                 result_data["checkpoint_required"] = True
                 result_data["checkpoint"] = checkpoint
                 self._set_pending_checkpoint(checkpoint)
             self.world_state.apply_tool_result(tool_name, result_data, adata=self.adata)
+
+            # Surface a reasoning/diagnostic tool's own findings to the terminal.
+            # diagnose_batch_effect emits result["terminal_summary"] itself; the
+            # cluster-QC tools' decisions are composed here from post-processed
+            # fields. Any tool that sets terminal_summary gets printed.
+            if (
+                tool_name in ("run_cluster_qc", "run_cluster_structure_qc")
+                and "terminal_summary" not in result_data
+            ):
+                cqc = self._cluster_qc_terminal_summary(result_data)
+                if cqc:
+                    result_data["terminal_summary"] = cqc
+            if self.verbose:
+                self._print_terminal_summary(tool_name, result_data)
+
             result_json = json.dumps(result_data, indent=2)
 
             if self.run_manager:
@@ -5017,11 +6555,6 @@ class SCAgent:
                                 "kind": "umap",
                                 "color_by": comparison.get("cluster_key"),
                             })
-                elif tool_name == "ask_user":
-                    self._interaction_state["asked_questions"].append({
-                        "question": result_data.get("question", ""),
-                        "options": result_data.get("options", []),
-                    })
                 # Show key results inline
                 details = []
                 if "after" in result_data:
@@ -5034,8 +6567,6 @@ class SCAgent:
                     details.append(f"{result_data['shape']['n_cells']} cells")
                 if details:
                     self._print(f"    → {', '.join(details)}")
-            elif status == "needs_input":
-                pass  # Handled by ask_user
             elif status == "error":
                 err_msg = result_data.get('message') or result_data.get('error', '')
                 err_short = err_msg[:120] + ("…" if len(err_msg) > 120 else "")
@@ -5276,8 +6807,6 @@ class SCAgent:
             md_lines.append(f"- Species: `{biological_context.get('species', 'unknown')}`")
             md_lines.append(f"- Sample type: `{biological_context.get('sample_type', 'unknown')}`")
             md_lines.append(f"- Condition: `{biological_context.get('condition', 'unknown')}`")
-            if biological_context.get("expected_celltypes"):
-                md_lines.append(f"- Expected cell types: {', '.join(biological_context['expected_celltypes'])}")
             if biological_context.get("confidence") is not None:
                 md_lines.append(f"- Context confidence: {biological_context['confidence']:.2f}")
             provenance = biological_context.get("provenance", {})
@@ -5530,109 +7059,9 @@ class SCAgent:
             "gsea_evidence_json": json_path,
         }
 
-    def _handle_ask_user(self, tool_input: Dict[str, Any]) -> str:
-        """Handle ask_user tool - prompt user for input."""
-        if self._pending_checkpoint:
-            checkpoint = self._pending_checkpoint
-            # Prefer the canonical checkpoint text over model-invented wording.
-            tool_input = {
-                **tool_input,
-                "question": checkpoint.get("question", tool_input.get("question", "")),
-                "options": checkpoint.get("options", tool_input.get("options", [])),
-                "option_actions": checkpoint.get("option_actions", tool_input.get("option_actions", [])),
-                "default": checkpoint.get("default", tool_input.get("default", "")),
-                "decision_key": checkpoint.get("decision_key", tool_input.get("decision_key", "")),
-                "summary": checkpoint.get("summary", tool_input.get("summary", "")),
-            }
-
-        question = tool_input["question"]
-        options = tool_input.get("options", [])
-        option_actions = tool_input.get("option_actions", [])
-        default = tool_input.get("default", "")
-        decision_key = tool_input.get("decision_key", "")
-        summary = tool_input.get("summary", "")
-
-        if self.collaborative and not sys.stdin.isatty():
-            return json.dumps({
-                "status": "error",
-                "tool": "ask_user",
-                "question": question,
-                "options": options,
-                "option_actions": option_actions,
-                "default": default,
-                "decision_key": decision_key,
-                "message": "Collaborative checkpoints require an interactive terminal.",
-            }, indent=2)
-        if not self.collaborative:
-            response = default or "proceed"
-            return json.dumps({
-                "status": "ok",
-                "tool": "ask_user",
-                "question": question,
-                "options": options,
-                "option_actions": option_actions,
-                "default": default,
-                "decision_key": decision_key,
-                "user_response": response,
-                "auto_selected": True,
-            }, indent=2)
-
-        print()
-        if summary:
-            print(summary)
-            print()
-        print(question)
-        if options and not re.search(r"(^|\n)\s*1\.\s", question):
-            for idx, option in enumerate(options, 1):
-                print(f"{idx}. {option}")
-        if default:
-            print("Press Enter to use the suggested option.")
-
-        # Get user input
-        try:
-            from ..terminal import read_user_input
-
-            response = read_user_input("> ")
-            if not response and default:
-                response = default
-        except (EOFError, KeyboardInterrupt):
-            response = default or "no response"
-
-        raw_response = response
-        selected_option = None
-        selected_action = None
-        selected_index = None
-        if options and response.isdigit():
-            option_index = int(response) - 1
-            if 0 <= option_index < len(options):
-                selected_option = options[option_index]
-                selected_index = option_index
-                if option_index < len(option_actions):
-                    selected_action = option_actions[option_index]
-                response = selected_option
-        elif response in options:
-            selected_index = options.index(response)
-            if selected_index < len(option_actions):
-                selected_action = option_actions[selected_index]
-
-        return json.dumps({
-            "status": "ok",
-            "tool": "ask_user",
-            "question": question,
-            "options": options,
-            "option_actions": option_actions,
-            "default": default,
-            "decision_key": decision_key,
-            "user_response": response,
-            "raw_user_response": raw_response,
-            "selected_option": selected_option,
-            "selected_action": selected_action,
-            "selected_index": selected_index,
-        }, indent=2)
-
     def _handle_pause_and_ask(self, tool_input: Dict[str, Any]) -> str:
         """Handle pause_and_ask tool — create a pending checkpoint from LLM-initiated pause."""
-        if (self._pending_checkpoint or {}).get("kind") == "cluster_qc_cleanup":
+        if self._pending_checkpoint:
             checkpoint = self._pending_checkpoint or {}
             return json.dumps({
                 "status": "ok",
@@ -5641,15 +7070,88 @@ class SCAgent:
                 "question": checkpoint.get("question", tool_input.get("question", "")),
                 "context": checkpoint.get("summary", tool_input.get("context", "")),
                 "options": checkpoint.get("options", tool_input.get("options", [])),
+                "option_actions": checkpoint.get("option_actions", []),
+                "decision_key": checkpoint.get("decision_key", ""),
+                "kind": checkpoint.get("kind"),
+                "action_inputs": checkpoint.get("action_inputs", {}),
                 "message": (
-                    "Analysis paused at the existing cluster cleanup checkpoint. "
-                    "Present the question in your response and end your turn."
+                    "Analysis is already paused at a structured runtime checkpoint. "
+                    "End the turn; the runtime renders the existing choices."
                 ),
             }, indent=2)
 
         question = tool_input.get("question", "")
         context = tool_input.get("context", "")
         options = tool_input.get("options") or []
+        post_investigation = self._post_investigation_strategy_checkpoint()
+        if post_investigation is not None:
+            decision_text = " ".join(
+                [str(question), str(context)]
+                + [str(option) for option in options]
+                + [str(action) for action in (tool_input.get("option_actions") or [])]
+            ).lower()
+            if re.search(r"\b(scvi|integrat|batch[- ]?correct|uncorrected|keep)\b", decision_text):
+                self._set_pending_checkpoint(post_investigation)
+                return json.dumps({
+                    "status": "ok",
+                    "tool": "pause_and_ask",
+                    "paused": True,
+                    "question": post_investigation.get("question", question),
+                    "context": post_investigation.get("context", context),
+                    "options": post_investigation.get("options", options),
+                    "option_actions": post_investigation.get("option_actions", []),
+                    "decision_key": post_investigation.get("decision_key", "multi_sample_strategy"),
+                    "kind": post_investigation.get("kind", "multi_sample_strategy"),
+                    "action_inputs": post_investigation.get("action_inputs", {}),
+                    "message": (
+                        "Using the structured post-diagnostic multi-sample strategy "
+                        "checkpoint instead of an ad hoc integration pause."
+                    ),
+                }, indent=2)
+        # Initial multi-sample strategy decision. If the data is multi-sample and
+        # no strategy is set yet, the model must NOT hand-roll this choice with
+        # free-text options: their slugged action ids (e.g.
+        # "investigate_first_run_uncorrected_analysis_then_diagnose_batch_e") never
+        # match the canonical enum the downstream gates check for
+        # (investigate_integration, integrate_scvi, keep_unintegrated,
+        # analyze_separately), so diagnose_batch_effect and the integration path
+        # stay permanently blocked. Substitute the runtime's canonical selector so
+        # the user's pick maps to a recognized strategy value.
+        if self.world_state is not None and self.world_state.multi_sample_decision_unresolved():
+            strategy_text = " ".join(
+                [str(question), str(context)]
+                + [str(option) for option in options]
+                + [str(action) for action in (tool_input.get("option_actions") or [])]
+            ).lower()
+            if re.search(
+                r"\b(sample|samples|batch|batches|integrat|scvi|harmony|bbknn|"
+                r"dataset|datasets|donor|donors|uncorrected|corrected|combined|separately)\b",
+                strategy_text,
+            ):
+                partition = self._multi_sample_partition_from_state()
+                if partition is not None:
+                    canonical = self._multi_sample_strategy_checkpoint(partition)
+                    self._set_pending_checkpoint(canonical)
+                    return json.dumps({
+                        "status": "ok",
+                        "tool": "pause_and_ask",
+                        "paused": True,
+                        "question": canonical.get("question", question),
+                        "context": canonical.get("context", context),
+                        "options": canonical.get("options", options),
+                        "option_actions": canonical.get("option_actions", []),
+                        "decision_key": canonical.get("decision_key", "multi_sample_strategy"),
+                        "kind": canonical.get("kind", "multi_sample_strategy"),
+                        "action_inputs": canonical.get("action_inputs", {}),
+                        "message": (
+                            "Using the runtime's canonical multi-sample strategy selector "
+                            "instead of ad hoc free-text options, so the user's choice maps "
+                            "to a recognized strategy (investigate / integrate with scVI / "
+                            "keep uncorrected / analyze separately). End the turn; the runtime "
+                            "renders the choices."
+                        ),
+                    }, indent=2)
+
         cleanup_text = " ".join([str(question), str(context)] + [str(option) for option in options]).lower()
         if (
             re.search(r"\b(remove|drop|filter|exclude|subset)\b", cleanup_text)
@@ -5669,7 +7171,9 @@ class SCAgent:
                     "If the user explicitly asks for stricter cleanup, run a new structure-aware proposal instead of inventing a keep-mask removal.",
                 ],
             }, indent=2)
-        option_actions = ["custom"] * len(options)
+        option_actions = tool_input.get("option_actions") or self._stable_option_actions(options)
+        if len(option_actions) != len(options):
+            option_actions = self._stable_option_actions(options)
 
         checkpoint = {
             "kind": "llm_pause",
@@ -5678,7 +7182,8 @@ class SCAgent:
             "options": options,
             "option_actions": option_actions,
             "summary": context,
-            "decision_key": "llm_pause",
+            "decision_key": tool_input.get("decision_key") or "llm_pause",
+            "allow_custom": bool(tool_input.get("allow_custom", True)),
             "artifacts": [],
         }
         self._set_pending_checkpoint(checkpoint)
@@ -5689,7 +7194,12 @@ class SCAgent:
             "question": question,
             "context": context,
             "options": options,
-            "message": "Analysis paused. Present the question in your response and end your turn.",
+            "option_actions": option_actions,
+            "decision_key": checkpoint["decision_key"],
+            "message": (
+                "Analysis paused. Explain why input is needed and end the turn; "
+                "the runtime renders the choices."
+            ),
         }, indent=2)
 
     def _maybe_auto_checkpoint(self, tool_name: str, tool_input: Dict[str, Any]) -> Optional[str]:
@@ -5712,9 +7222,11 @@ class SCAgent:
 
             if self.verbose:
                 print(f"▶ Saving checkpoint {label}...")
-            self.adata.write_h5ad(out_path)
+            save_details = write_h5ad_safe(self.adata, out_path)
             if self.verbose:
                 print(f"✓ Checkpoint saved: {out_path}")
+                for warning in save_details.get("warnings", []):
+                    print(f"  {warning}")
             return out_path
         except Exception as exc:
             logger.warning("Auto-checkpoint save failed for %s: %s", label, exc)
@@ -5847,7 +7359,6 @@ class SCAgent:
         package = tool_input["package"]
         reason = tool_input["reason"]
 
-        # Ask for approval
         print(f"\n{'='*50}")
         print(f"PACKAGE INSTALL REQUEST")
         print(f"Package: {package}")
@@ -5855,13 +7366,22 @@ class SCAgent:
         print('='*50)
 
         try:
-            from ..terminal import read_user_input
+            from ..terminal import DecisionChoice, prompt_for_decision
 
-            response = read_user_input("Approve? [y/N]: ").lower()
+            selection = prompt_for_decision(
+                "Approve this package installation?",
+                [
+                    DecisionChoice("Do not install", "deny"),
+                    DecisionChoice(f"Install {package}", "approve"),
+                ],
+                default_index=0,
+                allow_custom=False,
+            )
+            approved = selection.action == "approve"
         except (EOFError, KeyboardInterrupt):
-            response = "n"
+            approved = False
 
-        if response in ("y", "yes"):
+        if approved:
             # Try uv first (faster, works with uv-managed venvs), fall back to pip
             python_path = sys.executable
             install_commands = [
@@ -5928,7 +7448,7 @@ class SCAgent:
             response = self._with_llm_status(
                 lambda: self.client.messages.create(
                     model=self.model,
-                    max_tokens=4096,
+                    max_tokens=self._max_output_tokens,
                     system=self._build_system_prompt(),
                     messages=[{"role": "user", "content": message}],
                 )
@@ -5942,7 +7462,7 @@ class SCAgent:
             response = self._with_llm_status(
                 lambda: self.client.chat.completions.create(
                     model=self.model,
-                    max_completion_tokens=4096,
+                    max_completion_tokens=self._max_output_tokens,
                     messages=[
                         {"role": "system", "content": self._build_system_prompt()},
                         {"role": "user", "content": message},
