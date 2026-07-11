@@ -14,7 +14,7 @@ it **before** any Python, tests, or `scagent` command:
 |---|---|---|
 | **Iris — CPU / dev** | `source setup.sh` | uv venv (Py 3.10), editable install, tests + lint. No GPU. |
 | **Iris — GPU** | `source setup_gpu.sh` | conda `scagent_rapids` (Py 3.14, RAPIDS), `SCAGENT_GPU=1`; scVI + CellBender + scimilarity. |
-| **Spark — GPU** | `pixi shell -e gpu` | pixi gpu env (RAPIDS + scVI + CellTypist), `SCAGENT_GPU=1`. No scimilarity (ARM). |
+| **Spark — GPU** | `pixi shell -e gpu` | pixi gpu env (RAPIDS + scVI + CellTypist + scimilarity), `SCAGENT_GPU=1`. |
 
 `source setup.sh` accepts `--local` (venv in `./.venv` instead of
 `/usersoftware`). On the Spark, `pixi shell` **alone** is CPU/agent-only — use

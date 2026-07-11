@@ -116,7 +116,7 @@ These are worth knowing because each behaves differently across hosts.
 |---|---|---|---|
 | **scVI** | subprocess in the **same env** (`sys.executable -m scagent.batch._scvi_worker`), purely to isolate the CUDA context | ✅ | ✅ (scvi-tools in the gpu env) |
 | **CellBender** | subprocess to a **separate env** via the `SCAGENT_CELLBENDER` binary path | ✅ (shared sail pixi env) | ⚠️ not set up yet (optional; only for ambient-RNA removal) |
-| **scimilarity** | in-process import; model at `SCIMILARITY_MODEL_PATH` | ✅ | ❌ ARM-blocked (`tiledb-vector-search` has no aarch64 build) |
+| **scimilarity** | in-process import; model at `SCIMILARITY_MODEL_PATH` | ✅ | ✅ annotation only — via a vendored `tiledb-vector-search` stub + `zarr<3` pin (CellQuery/cell-search unavailable on ARM) |
 | **CellTypist** | in-process import | ✅ | ✅ |
 
 Notes:
@@ -127,9 +127,16 @@ Notes:
   because its deps conflict with the RAPIDS/scanpy stack. To enable it on the
   Spark, add a dedicated pixi env and export `SCAGENT_CELLBENDER` to its
   `cellbender` binary (mirror the Iris shared env).
-- **scimilarity** is unavailable on the Spark; annotation there leans on
-  CellTypist + PanglaoDB/biocontext markers. Everything still runs, just with one
-  fewer evidence source than Iris.
+- **scimilarity** works on the Spark for **annotation** (`CellAnnotation`, which
+  uses hnswlib). Its only ARM-less dependency, `tiledb-vector-search`, is imported
+  unconditionally but only *used* for the tiledb `CellQuery` path — so a vendored
+  metadata+shim stub (`vendor/tiledb-vector-search-stub/`, a `tiledb.vector_search`
+  whose `IVFFlatIndex` raises if called) satisfies the import, and pinning
+  `zarr>=2.18.7,<3` matches scimilarity's zarr-2 API. The model weights are the
+  annotation subset of `hussenmi/scimilarity_expanded_model` on HF (the 108 GB
+  `cellsearch/` tiledb DB is skipped — it backs the unavailable `CellQuery`), at
+  `SCIMILARITY_MODEL_PATH`. Large-scale cell **search** (`query_cells`) stays
+  unavailable on the Spark; annotation is fully functional.
 
 ---
 
