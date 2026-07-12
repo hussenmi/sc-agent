@@ -4649,9 +4649,18 @@ def process_tool_call(
     adata=None,
     world_state=None,
     run_manager=None,
+    sandbox=None,
 ) -> tuple:
     """
     Process a tool call and return structured JSON result.
+
+    Parameters
+    ----------
+    sandbox : OpenShellSandbox, optional
+        When provided, ``run_code`` executes inside this isolated OpenShell
+        sandbox instead of the in-process ``exec``. ``None`` (the default) keeps
+        the in-process path — the mode is decided once at agent startup by
+        :func:`scagent.agent.sandbox.build_from_env`.
 
     Returns
     -------
@@ -6675,52 +6684,109 @@ def process_tool_call(
                     ]
                 return _register_artifact_record(path, role=role, metadata=meta or None)
 
-            # Execute in controlled namespace
-            # Note: Path and ensure_dir are provided - no need to import os
-            namespace = {
-                "adata": adata,
-                "sc": sc,
-                "np": np,
-                "pd": pd,
-                "plt": plt,
-                "scanpy": sc,
-                "matplotlib": matplotlib,
-                "output_dir": str(_run_dir),
-                "Path": _Path,
-                "ensure_dir": ensure_dir,
-                "write_report": write_report,
-                "register_artifact": register_artifact,
-            }
-
-            # Capture stdout so LLM can see print outputs
-            import io
-            import sys
-            stdout_capture = io.StringIO()
-            old_stdout = sys.stdout
-
-            # Capture any figures created
-            plt.close('all')
-
-            import warnings as _warnings
-            exec_error = None
-            _caught = []
-            _orig_cwd = os.getcwd()
-            try:
-                sys.stdout = stdout_capture
-                os.chdir(_run_dir)
-                with _warnings.catch_warnings(record=True) as _caught:
-                    _warnings.simplefilter("always")
-                    exec(code, namespace)
-            except Exception as _exec_err:
-                exec_error = _exec_err
-            finally:
-                sys.stdout = old_stdout
+            # Execution: an isolated OpenShell sandbox when the agent resolved one
+            # at startup, otherwise the in-process exec. Both branches converge on
+            # the same locals (captured_output, _caught, exec_error, namespace) so
+            # every result-shaping step below is shared, not forked.
+            _sandbox_active = sandbox is not None
+            _sandbox_reassigned = False
+            if _sandbox_active:
+                import types as _types
+                import builtins as _builtins
+                from .sandbox import SandboxInfraError as _SandboxInfraError
                 try:
-                    os.chdir(_orig_cwd)
-                except Exception:
-                    pass
+                    _sb = sandbox.run_code(code=code, adata=adata, run_dir=_run_dir)
+                except _SandboxInfraError as _infra:
+                    return _error_result(
+                        tool="run_code",
+                        message=f"OpenShell sandbox failed (infrastructure, not your code): {_infra}",
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Retry — the sandbox is per-session and may recover.",
+                            "If it persists, restart with SCAGENT_SANDBOX=off to run in-process (no isolation).",
+                        ],
+                    )
+                captured_output = _sb["stdout"]
+                # Register downloaded artifacts host-side via the SAME recorder the
+                # in-process path uses, so result.artifacts_created is identical.
+                for _a in _sb["artifacts"]:
+                    _register_artifact_record(_a["path"], role=_a.get("role"), metadata=_a.get("metadata"))
+                # Rebuild warnings as WarningMessage-like objects for the shared
+                # cosmetic-filter loop below.
+                _caught = [
+                    _types.SimpleNamespace(
+                        category=type(str(_w.get("category") or "Warning"), (Warning,), {}),
+                        message=str(_w.get("message") or ""),
+                    )
+                    for _w in _sb["warnings"]
+                ]
+                # Reconstruct the exception so the shared error path + type-hints work.
+                if _sb["error"]:
+                    _etype = getattr(_builtins, str(_sb["error"].get("type") or ""), None)
+                    if not (isinstance(_etype, type) and issubclass(_etype, BaseException)):
+                        _etype = RuntimeError
+                    exec_error = _etype(str(_sb["error"].get("message") or ""))
+                    _tb = _sb["error"].get("traceback")
+                    if _tb:
+                        captured_output = (captured_output + "\n" + _tb).strip()
+                else:
+                    exec_error = None
+                _sandbox_reassigned = bool(_sb.get("adata_reassigned"))
+                # Commit adata from the sandbox write-back on success; discard on
+                # error (matches the in-process all-or-nothing reassignment rule).
+                if exec_error is None and _sb.get("adata_out_path"):
+                    namespace = {"adata": sc.read_h5ad(_sb["adata_out_path"])}
+                else:
+                    namespace = {"adata": adata}
+                if _sb.get("output_path"):
+                    namespace["output_path"] = _sb["output_path"]
+            else:
+                # Execute in controlled namespace
+                # Note: Path and ensure_dir are provided - no need to import os
+                namespace = {
+                    "adata": adata,
+                    "sc": sc,
+                    "np": np,
+                    "pd": pd,
+                    "plt": plt,
+                    "scanpy": sc,
+                    "matplotlib": matplotlib,
+                    "output_dir": str(_run_dir),
+                    "Path": _Path,
+                    "ensure_dir": ensure_dir,
+                    "write_report": write_report,
+                    "register_artifact": register_artifact,
+                }
 
-            captured_output = stdout_capture.getvalue()
+                # Capture stdout so LLM can see print outputs
+                import io
+                import sys
+                stdout_capture = io.StringIO()
+                old_stdout = sys.stdout
+
+                # Capture any figures created
+                plt.close('all')
+
+                import warnings as _warnings
+                exec_error = None
+                _caught = []
+                _orig_cwd = os.getcwd()
+                try:
+                    sys.stdout = stdout_capture
+                    os.chdir(_run_dir)
+                    with _warnings.catch_warnings(record=True) as _caught:
+                        _warnings.simplefilter("always")
+                        exec(code, namespace)
+                except Exception as _exec_err:
+                    exec_error = _exec_err
+                finally:
+                    sys.stdout = old_stdout
+                    try:
+                        os.chdir(_orig_cwd)
+                    except Exception:
+                        pass
+
+                captured_output = stdout_capture.getvalue()
 
             # Append actionable warnings to captured output so the agent sees and acts on them.
             # Suppress purely cosmetic pandas FutureWarnings that require no action.
@@ -6736,7 +6802,10 @@ def process_tool_call(
             if exec_error is not None:
                 err_type = type(exec_error).__name__
                 err_msg = str(exec_error)
-                reassigned_adata_discarded = namespace.get("adata", adata) is not adata
+                reassigned_adata_discarded = (
+                    _sandbox_reassigned if _sandbox_active
+                    else namespace.get("adata", adata) is not adata
+                )
 
                 # Give the LLM targeted guidance based on the error type
                 if err_type in ("TypeError", "AttributeError") or "unexpected keyword" in err_msg or "got an unexpected" in err_msg:

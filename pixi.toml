@@ -1,0 +1,94 @@
+[workspace]
+channels = ["conda-forge"]
+name = "scagent"
+platforms = ["linux-aarch64"]
+version = "0.1.0"
+
+# Environment strategy on the DGX Spark (GB10 / aarch64 / sm_121):
+#   Conda-forge provides Python *with dev headers* + a C++ compiler, so the few
+#   PyPI packages that build native extensions on ARM (notably `annoy`, pulled in
+#   by bbknn) compile cleanly — the exact thing that broke a plain `uv`/`pip`
+#   install, which used the system python that lacks python3.12-dev headers.
+#   Everything else comes from PyPI via the editable scagent install below.
+#
+# Tiers are pixi features so torch's ARM/CUDA-13 install risk stays isolated from
+# the always-needed agent stack:
+#   - default env  -> scagent[agent]  (analysis + agent loop; no torch)
+#   - `gpu` env    -> adds torch (cu130) + scimilarity/scvi        [added later]
+
+[dependencies]
+python = "3.12.*"
+cxx-compiler = "*"    # clean conda toolchain so pip can build `annoy` (bbknn dep): C++ + conda's Python.h
+# Compiled scientific stack from conda-forge — prebuilt aarch64, mutually consistent.
+# Pulling these from conda stops uv/pip from back-tracking to ancient source-only
+# versions on ARM (e.g. numba 0.53.1, which guards python<3.10 and fails to build).
+# Once installed here, the PyPI scagent install below sees them satisfied and skips them.
+scanpy = ">=1.9"          # brings numba, scikit-learn, statsmodels, h5py, pytables, numpy, scipy, pandas, matplotlib
+anndata = ">=0.8"
+seaborn = ">=0.12"
+numba = "*"               # explicit: guarantee a modern aarch64 build, not a source back-track
+leidenalg = ">=0.9"
+python-igraph = ">=0.10"
+scikit-misc = "*"         # seurat_v3 HVG; needs Fortran to build — take the prebuilt aarch64 conda pkg
+# NOTE: scrublet/scanorama/harmonypy/bbknn/annoy/phenograph have NO conda-forge aarch64 build but are
+# pure-Python (annoy compiles cleanly given the toolchain above), so they come via PyPI below.
+
+[pypi-dependencies]
+scagent = { path = ".", editable = true, extras = ["agent"] }
+
+# NOTE: no top-level [activation.env]. The default env is CPU-only and needs no
+# CUDA vars. CUDA activation lives in [feature.gpu.activation.env] below — and
+# deliberately does NOT set LD_LIBRARY_PATH=/usr/local/cuda/lib64: forcing the
+# system CUDA libs ahead of the env's own makes conda RAPIDS load the wrong
+# libcublas (undefined-symbol crash at first cuBLAS call). RAPIDS's conda libs
+# resolve correctly via their RPATH when we leave the loader path alone.
+
+# ── GPU tier ──────────────────────────────────────────────────────────────────
+# The `setup_gpu.sh` equivalent: scagent + RAPIDS (GPU-accelerated PCA/neighbors/
+# UMAP/clustering) + the torch-based annotation/integration paths (scimilarity, scvi).
+# Activate with:  pixi shell -e gpu   (interpreter: .pixi/envs/gpu/bin/python)
+[feature.gpu]
+channels = ["rapidsai", "conda-forge"]
+
+[feature.gpu.dependencies]
+zarr = ">=2.18.7,<3"     # scimilarity 0.4.0 uses the zarr-2 API (zarr.core.Array); anndata 0.12 allows >=2.18.7 (!=3.0.*), scanpy/rapids unconstrained.
+cuda-version = "13.*"     # match the Spark's CUDA 13 / GB10
+cuml = "*"                # RAPIDS ML (cuda13 aarch64) — pulls cudf, libcuml, rmm
+cugraph = "*"             # GPU graph (Leiden/Louvain clustering in rapids_singlecell)
+cuvs = "*"                # GPU vector search (KNN/neighbors in rapids_singlecell)
+cupy = "*"
+dask = "*"                # rapids_singlecell imports dask.array but doesn't hard-require it via PyPI
+
+[feature.gpu.pypi-dependencies]
+# torch from the CUDA-13 index (same source gpu-sandbox validated on this box).
+torch = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+rapids-singlecell = "*"   # no conda-forge aarch64 build → PyPI (pure-Python over cuml/cupy)
+scvi-tools = ">=1.0"      # deep-learning batch integration (needs torch)
+# scimilarity annotation IS runnable on ARM: its `tiledb-vector-search` dep
+# (no aarch64 build) is imported lazily and only for the non-default knn_type;
+# annotation uses hnswlib + base tiledb (both ARM-ok). The local stub below
+# satisfies scimilarity's declared dep so uv stops trying to build the real one.
+scimilarity = ">=0.4"
+tiledb-vector-search = { path = "vendor/tiledb-vector-search-stub" }
+
+[feature.gpu.activation.env]
+SCAGENT_GPU = "1"                              # enable scagent's RAPIDS compute path
+SCIMILARITY_MODEL_PATH = "/home/hussen/models/sci/human_v2"  # SCimilarity expanded model, annotation subset (cellsearch omitted: ARM-unusable). Pulled from HF hussenmi/scimilarity_expanded_model.
+# Preload the env's own conda cuBLAS/cuBLASLt so RAPIDS' libcublas finds its
+# newer libcublasLt symbols instead of binding to pip-torch's bundled nvidia-cu13
+# copy (mismatch -> rapids_singlecell import fails -> scagent silently falls back
+# to scanpy_cpu). Inherited by scagent's GPU-probe + scVI subprocesses. Spark
+# analog of the Iris setup_gpu.sh LD_PRELOAD.
+LD_PRELOAD = "$CONDA_PREFIX/lib/libcublas.so.13:$CONDA_PREFIX/lib/libcublasLt.so.13"
+CUDA_HOME = "/usr/local/cuda"                  # for tools that shell out to nvcc/ptxas
+TORCH_CUDA_ARCH_LIST = "12.1a"                 # GB10 = sm_121 (torch JIT/compile target)
+TRITON_PTXAS_PATH = "/usr/local/cuda/bin/ptxas"
+# Intentionally NO LD_LIBRARY_PATH override here — see note above.
+
+[environments]
+# gpu env = default feature (scagent[agent] + science stack) + gpu feature
+gpu = ["gpu"]
+
+[tasks]
+smoke = "python -c 'import scagent; print(\"scagent\", scagent.__version__, \"OK\")'"
+gpu-check = { cmd = "python -c 'import torch, cupy, cuml, rapids_singlecell as rsc; print(\"torch cuda:\", torch.cuda.is_available(), \"| cuml\", cuml.__version__, \"| rsc\", rsc.__version__)'", env = { }, description = "verify the gpu env sees the GB10" }

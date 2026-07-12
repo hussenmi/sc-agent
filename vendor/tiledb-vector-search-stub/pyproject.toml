@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiledb-vector-search"
+version = "0.11.0"
+description = "Local stub satisfying scimilarity's tiledb-vector-search dep on aarch64 (no upstream build). Provides an importable tiledb.vector_search whose IVFFlatIndex raises only if used; scimilarity's hnswlib annotation path imports it but never calls it."
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["tiledb*"]
+namespaces = true

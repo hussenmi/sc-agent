@@ -4,7 +4,7 @@
 > or a human picking up the NVIDIA collaboration work — including on the **DGX
 > Spark**. It distills the goal, the pieces we're building, what we've found, and
 > what's blocked on hardware. Host-specific facts are labeled **[Iris]** (the
-> MSKCC HPC where most of this was built) vs **[Spark]** (the loaned DGX Spark).
+> MSKCC HPC where most of this was built) vs **[Spark]** (the gifted DGX Spark).
 > When they conflict, the Spark is the newer, more capable host — prefer it for
 > anything the Iris section marks as blocked.
 
@@ -83,6 +83,11 @@ as scagent's LLM backend, plus a vision sidecar for figures.
   `bench_toolcall.py`.
 
 ### 3. OpenShell / NemoClaw (secure sandbox runtime) — the Spark's headline job
+
+> **Active work + findings live in [`openshell_integration.md`](openshell_integration.md).**
+> Runtime spike is done on the Spark (round-trip + isolation verified); the
+> scagent-side integration hasn't started. Read that doc to continue.
+
 
 scagent's `run_code` is a hand-rolled in-process sandbox (blocks `os`/`sys`/
 `subprocess`; injects helpers). **NemoClaw = a thin wrapper; the real engine is
