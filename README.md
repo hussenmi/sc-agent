@@ -51,6 +51,21 @@ ANTHROPIC_API_KEY=...
 
 Supported provider paths include Anthropic, OpenAI-compatible/vLLM, Groq, Gemini, and Codex.
 
+### MCP servers (optional)
+
+The optional external-database tools (biocontext, PubMed) are launched from
+`.mcp.json`, which is **not tracked** because it holds absolute paths that differ
+per host. Set it up once per machine:
+
+```bash
+cp .mcp.json.example .mcp.json
+# then replace each /ABSOLUTE/PATH/TO/... with the real path on this host, e.g.
+which biocontext_kb   # -> paste into the "biocontext" command
+which pubmedmcp       # -> paste into the "pubmed" command
+```
+
+Skip this if you are not using the MCP database tools.
+
 ## Basic Use
 
 ```bash
