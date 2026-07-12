@@ -3365,6 +3365,15 @@ class SCAgent:
                 )
         except Exception:
             report_path = None
+        # Index and explain the figures produced this run so the folder is
+        # self-navigable (naming/folder convention + a glossary of each figure kind).
+        try:
+            from ..core.artifact_docs import write_figures_readme
+            fig_readme = write_figures_readme(self.run_manager.run_dir / "figures")
+            if fig_readme is not None:
+                self.run_manager.add_output(str(fig_readme))
+        except Exception:
+            pass
         self.run_manager.complete(
             summary=final_result,
             request=self._active_request,

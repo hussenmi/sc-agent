@@ -771,6 +771,109 @@ def _slim_annotation_validation(validation_payload: Dict[str, Any]) -> Dict[str,
     return slim
 
 
+# Plain-language names for the tools that appear in the pipeline table, so a
+# reader who does not know scagent's internal tool names still understands what
+# each step did. This is process vocabulary (what the step does), never biology.
+_TOOL_LABELS: Dict[str, str] = {
+    "load_data": "Load dataset",
+    "inspect_data": "Inspect dataset",
+    "run_qc": "Quality-control metrics",
+    "normalize_and_hvg": "Normalize + select variable genes",
+    "run_pca": "PCA (linear dimensionality reduction)",
+    "run_neighbors": "Build neighbor graph",
+    "run_umap": "UMAP embedding (2-D layout)",
+    "run_clustering": "Cluster cells",
+    "compare_clusterings": "Compare clustering resolutions",
+    "run_cluster_qc": "Per-cluster quality control",
+    "run_cluster_structure_qc": "Cluster coherence (structure) QC",
+    "run_batch_correction": "Batch correction / integration",
+    "diagnose_batch_effect": "Batch-effect diagnostic",
+    "score_integration": "Score integration quality",
+    "benchmark_integration": "Benchmark integration (scIB)",
+    "run_deg": "Differential expression (marker genes)",
+    "run_gsea": "Gene-set enrichment",
+    "run_celltypist": "CellTypist reference annotation",
+    "run_scimilarity": "Scimilarity reference annotation",
+    "prepare_annotation": "Prepare annotation scaffold",
+    "stage_annotation_evidence": "Stage annotation evidence",
+    "finalize_annotation": "Finalize cell-type labels",
+    "generate_figure": "Generate figure",
+    "run_code": "Custom analysis code",
+    "save_data": "Save dataset checkpoint",
+}
+
+# One-line explanations of the recurring parameter/outcome terms that show up in
+# the pipeline table's raw values, so the abbreviations are not a mystery.
+_PIPELINE_TERM_GLOSSARY: List[tuple] = [
+    ("resolution", "Leiden/Louvain granularity knob — higher splits cells into more, finer clusters."),
+    ("n_clusters", "Number of clusters the step produced."),
+    ("n_comps / n_pcs", "Number of principal components computed / used downstream."),
+    ("n_neighbors", "Neighbors per cell in the kNN graph (k)."),
+    ("use_rep", "Which cell embedding the step read from (e.g. X_pca, or a corrected space like X_scVI)."),
+    ("mask_var", "Gene subset the step restricted to (e.g. highly_variable = HVGs only)."),
+    ("target_sum", "Counts each cell was scaled to during normalization (e.g. 10000 = counts-per-10k)."),
+    ("log_transform / log1p", "Whether a log(1+x) transform was applied after normalization."),
+    ("batch_key", "The obs column identifying sample/batch of origin used for integration."),
+    ("corrected_embedding", "The batch-corrected cell embedding produced (e.g. X_scVI)."),
+    ("side_effects", "Which downstream results this step invalidated/recomputed (PCA, neighbors, UMAP, clustering)."),
+    ("neighbor_graph_preserved", "True = the existing neighbor graph was reused, not rebuilt."),
+]
+
+# Legend rendered beneath the per-cluster QC table.
+_QC_TABLE_LEGEND: List[tuple] = [
+    ("Action", "The recommended fate of the cluster: **keep** or **remove** (this record does not itself remove anything)."),
+    ("Severity", "How concerning the cluster looks: **clean** (normal), through more severe grades when metrics are off."),
+    ("Reasons", "Plain-language evidence behind the action — e.g. low library size, elevated %MT/%ribosomal, high doublet score, or 'within expected ranges'."),
+]
+
+# Legend rendered beneath the per-cluster annotation table.
+_ANNOTATION_TABLE_LEGEND: List[tuple] = [
+    ("Label", "The cell-type name assigned to the cluster."),
+    ("Confidence", "How strong the evidence is (**high** / **medium** / **low**). Weak single-source support, broad-only external matches, and QC caveats automatically cap it."),
+    ("Tier", "Which evidence combination drove the call. Reads as a recipe: *reference_consensus* = the reference tools (CellTypist, Scimilarity) agreed; *reference_partial* = only one agreed; *cytopus* / *panglaodb* = an external marker database supported it; *deg_primary* = driven mainly by this cluster's own differentially-expressed genes; *_plus_deg* = additionally backed by those DE genes."),
+    ("Supporting genes", "The marker genes (from this cluster's differential expression) that justify the label."),
+    ("PanglaoDB", "The external marker-database label used, and whether PanglaoDB was actually queried for this cluster ('not queried' means the call did not need database adjudication)."),
+    ("Competing", "Other cell types the reference tools also proposed — the alternatives that were weighed and set aside."),
+    ("Reasoning", "The narrative justification the analysis wrote for this cluster."),
+]
+
+
+def _render_glossary(pairs: List[tuple]) -> List[str]:
+    """Render a list of (term, explanation) pairs as a markdown bullet legend."""
+    out: List[str] = []
+    for term, desc in pairs:
+        out.append(f"- **{term}** — {desc}")
+    return out
+
+
+def _analysis_record_intro() -> List[str]:
+    """The 'How to read this record' preface — orients a non-expert reader before
+    the dense tables below. Purely explanatory; contains no dataset-specific claim."""
+    lines = [
+        "## How to read this record",
+        "",
+        "This is an automatically assembled, plain-provenance log of the whole "
+        "analysis — every processing step, in order, with the exact settings used "
+        "and the quality-control and cell-type decisions that followed. It is "
+        "generated from stored session state, not from memory, so it faithfully "
+        "reflects what actually ran.",
+        "",
+        "The sections are:",
+        "",
+        "- **Dataset Overview** — the current size of the data and which processing stages are complete.",
+        "- **Analysis Pipeline** — every step in the order it ran, with its key settings and outcome.",
+        "- **Quality Control** — initial QC and the per-cluster keep/remove decisions.",
+        "- **Normalization & Feature Selection**, **Clustering**, **Batch Correction** — the settings for each of those stages.",
+        "- **Differential Expression Tables** — where the marker-gene tables were saved (see the CSV's companion README for column definitions).",
+        "- **Cell-Type Annotation** — the label assigned to each cluster and the evidence behind it.",
+        "",
+        "Each dense table has a short **legend** directly beneath it explaining its columns. "
+        "Values shown as `NA`/`none` mean the step did not set that field.",
+        "",
+    ]
+    return lines
+
+
 def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str:
     """Build a comprehensive, deterministic markdown record of every decision the
     agent made this session — QC thresholds and what was removed/kept and why,
@@ -837,13 +940,22 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
     if step_log:
         lines.append("## Analysis Pipeline (chronological)")
         lines.append("")
-        lines.append("| # | Step | Key parameters / outcome |")
-        lines.append("|---|---|---|")
+        lines.append("Every step in the order it ran. **Step** is scagent's internal "
+                     "tool name; **What ran** says it in plain language; **Key settings "
+                     "/ outcome** are the exact arguments and results for that step.")
+        lines.append("")
+        lines.append("| # | Step | What ran | Key settings / outcome |")
+        lines.append("|---|---|---|---|")
         for i, s in enumerate(step_log, 1):
             tool = s.get("tool", "?")
+            friendly = _TOOL_LABELS.get(tool, tool.replace("_", " "))
             detail_keys = [k for k in s.keys() if k not in {"tool", "timestamp"}]
             detail = {k: s[k] for k in detail_keys[:6]}
-            lines.append(f"| {i} | {tool} | {_report_fmt(detail, limit=300)} |")
+            lines.append(f"| {i} | `{tool}` | {friendly} | {_report_fmt(detail, limit=300)} |")
+        lines.append("")
+        lines.append("**What the recurring settings mean:**")
+        lines.append("")
+        lines.extend(_render_glossary(_PIPELINE_TERM_GLOSSARY))
         lines.append("")
 
     # --- Quality control ---
@@ -913,6 +1025,10 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
                     f"{_report_fmt(dec.get('severity'))} | "
                     f"{_report_fmt(dec.get('reasons'))} |"
                 )
+            lines.append("")
+            lines.append("_Column guide:_")
+            lines.append("")
+            lines.extend(_render_glossary(_QC_TABLE_LEGEND))
         lines.append("")
 
     # --- Normalization & feature selection ---
@@ -1019,9 +1135,16 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
                     f"{_report_fmt(ev.get('competing_labels_considered'))} | "
                     f"{_report_fmt(ev.get('reasoning'), limit=300)} |"
                 )
+            lines.append("")
+            lines.append("_Column guide:_")
+            lines.append("")
+            lines.extend(_render_glossary(_ANNOTATION_TABLE_LEGEND))
         lines.append("")
 
-    return "\n".join(lines).strip()
+    body = "\n".join(lines).strip()
+    if not body:
+        return ""
+    return "\n".join(_analysis_record_intro()) + "\n" + body
 
 
 def _save_deg_table_csv(adata: Any, key: str, run_manager: Any = None, *, groupby: Optional[str] = None):
@@ -1075,7 +1198,70 @@ def _save_deg_table_csv(adata: Any, key: str, run_manager: Any = None, *, groupb
         run_manager.add_output(path)
     except Exception:
         return None, 0
+    # Write a companion column-glossary README so a reader knows what each column
+    # means (what a log2fc / adjusted p-value / score is) without prior knowledge.
+    try:
+        _write_deg_column_doc(path, df, groupby=groupby, run_manager=run_manager)
+    except Exception:
+        pass
     return path, int(len(df))
+
+
+# Plain-language definitions of the columns in the DEG CSV. These describe the
+# standard scanpy rank_genes_groups outputs (statistics/method), not biology.
+_DEG_COLUMN_DOCS: Dict[str, str] = {
+    "cluster": "The cluster whose marker genes this row belongs to. Markers are found one-vs-rest: this cluster compared against all other cells.",
+    "gene": "Gene symbol.",
+    "log2fc": "Log2 fold-change of the gene's mean expression in this cluster vs. all other cells. Positive = higher in this cluster; +1 ≈ 2× higher, +2 ≈ 4× higher.",
+    "pval_adj": "Multiple-testing-corrected p-value (Benjamini–Hochberg FDR). Judge significance from THIS column, not `pval` — e.g. < 0.05.",
+    "pval": "Raw, uncorrected p-value from the ranking test (Wilcoxon rank-sum by default). Not corrected for the many genes tested.",
+    "score": "The test statistic scanpy ranks genes by (z-score-like for Wilcoxon). Larger = more strongly and specifically up in this cluster; the table is sorted by it.",
+    "pct_in_group": "Fraction of cells IN this cluster that express the gene (nonzero counts). Near 1.0 = expressed by almost all cells in the cluster.",
+    "pct_in_reference": "Fraction of cells in all OTHER clusters that express the gene. A good marker is high `pct_in_group` and low `pct_in_reference`.",
+}
+
+
+def _write_deg_column_doc(csv_path: str, df: Any, *, groupby: Optional[str], run_manager: Any) -> None:
+    """Write a `<csv_stem>.README.md` next to a DEG CSV documenting its columns."""
+    from ..core import artifact_docs as ad
+
+    stem = Path(csv_path).stem
+    fdoc = ad.FileDoc(
+        filename=Path(csv_path).name,
+        purpose=(
+            f"Differential-expression (marker-gene) table: for each cluster in "
+            f"`{groupby or 'the clustering'}`, the genes most specifically up-regulated "
+            f"in that cluster relative to all other cells, one row per cluster×gene."
+        ),
+        computation=(
+            "Produced by scanpy's `rank_genes_groups` (one-vs-rest per cluster). Rows are "
+            "sorted by cluster, then by descending score."
+        ),
+        how_to_read=(
+            "A strong, trustworthy marker has a large positive `log2fc`, a small `pval_adj`, "
+            "high `pct_in_group`, and low `pct_in_reference`. The top few rows per cluster are "
+            "usually the genes used to name the cell type."
+        ),
+        columns={c: _DEG_COLUMN_DOCS[c] for c in df.columns if c in _DEG_COLUMN_DOCS},
+    )
+    doc = ad.ArtifactGroupDoc(
+        group="run_deg",
+        title=f"`{Path(csv_path).name}` — marker-gene table column guide",
+        overview=(
+            "This file documents the columns of the differential-expression CSV saved "
+            "alongside it. It is a reference doc; the biological interpretation of the "
+            "markers lives in the analysis report."
+        ),
+        files=[fdoc],
+        interpretation_required=False,
+    )
+    text = ad.render_readme(doc, frames={fdoc.filename: df})
+    out = Path(csv_path).with_name(f"{stem}.README.md")
+    out.write_text(text)
+    try:
+        run_manager.add_output(str(out))
+    except Exception:
+        pass
 
 
 def _natural_cluster_sort(values: List[str]) -> List[str]:
@@ -3489,7 +3675,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
-                    "output_path": {"type": "string", "description": "Path to save PNG figure"},
+                    "output_path": {"type": "string", "description": "Path to save the PNG, under the run's figures/ directory. Use a DESCRIPTIVE, self-describing filename that names what distinguishes this figure from the others you will make — never a generic 'umap.png' or 'leiden.png'. Encode the distinguishing dimensions: what it is colored by, the clustering resolution, and the analysis phase (e.g. pre- vs post-batch-correction/integration). Organize related figures into phase subfolders rather than one flat directory, e.g. 'figures/pre_integration/umap_donor_res1.0.png' and 'figures/post_integration/umap_donor_res1.0.png'. Parent folders are created automatically, and a reused name is auto-uniquified (never overwrites), so distinct names + folders keep every figure and make comparisons obvious."},
                     "plot_type": {"type": "string", "enum": ["umap", "tsne", "violin", "dotplot", "heatmap"], "description": "Plot type. Use 'tsne' when the dataset has obsm['X_tsne'] but no UMAP (e.g. when reproducing a paper that uses t-SNE)."},
                     "color_by": {"type": "string", "description": "Column or gene to color by"},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"},
@@ -3690,7 +3876,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on the flagged/ambiguous (or baseline) clusters — gene-gene covariance modules, clustered correlation heatmaps, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`) and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite both in the QC reasoning report.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on the flagged/ambiguous (or baseline) clusters — gene-gene covariance modules, clustered correlation heatmaps, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`), a cluster-colored UMAP of this clustering to figures/cluster_qc/<cluster_key>/umap_<cluster_key>_pass_NNN.png (in `cluster_umap_figure`, auto-titled with the resolution — this is the Leiden/cluster UMAP for the clustering, generated for you so you do not need a separate generate_figure call for it), and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite all three in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -5248,6 +5434,12 @@ def process_tool_call(
         # across resolutions, or pre/post integration) gets _2/_3. Callers must use
         # the returned result["output_path"], which reflects the file written here.
         output_path = unique_output_path(output_path)
+        # Allow phase-based subfolders (e.g. figures/pre_integration/...): create the
+        # parent so a descriptive nested path saves instead of failing.
+        try:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        except Exception:
+            pass
 
         genes = genes or []
         if plot_type == "umap":
@@ -11061,6 +11253,38 @@ def process_tool_call(
                 if _pl:
                     artifacts_created.append(_pl)
             diagnostic["overlay_figures"] = overlay_paths
+            # Also paint the uncorrected clustering itself on the UMAP. The diagnostic
+            # reasons about clusters, so a cluster-colored view of the pre-integration
+            # embedding (not just the donor/entropy overlays) makes the sample-segregated
+            # clusters visible. Saved to the pre_integration/ phase folder and generated
+            # here so it always exists — the model does not have to remember to plot it.
+            cluster_umap_path = None
+            if "X_umap" in adata.obsm and cluster_key in adata.obs.columns:
+                _safe_ck = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
+                _pre_dir = (
+                    Path(run_manager.run_dir) if run_manager is not None else Path(".")
+                ) / "figures" / "pre_integration"
+                try:
+                    _cu = _render_figure(
+                        adata,
+                        plot_type="umap",
+                        output_path=str(_pre_dir / f"umap_{_safe_ck}_clusters.png"),
+                        color_by=cluster_key,
+                        include_image=False,
+                    )
+                    cluster_umap_path = _cu.get("output_path")
+                    if cluster_umap_path and run_manager is not None:
+                        run_manager.add_output(cluster_umap_path)
+                    _pl = _artifact_payload(
+                        cluster_umap_path,
+                        role="figure",
+                        metadata={"kind": "pre_integration_cluster_umap", "cluster_key": cluster_key},
+                    )
+                    if _pl:
+                        artifacts_created.append(_pl)
+                except Exception:
+                    cluster_umap_path = None
+            diagnostic["cluster_umap_figure"] = cluster_umap_path
             diagnostic["artifacts_created"] = artifacts_created
             # Point the model at the auto-written README so it records the
             # dataset-specific interpretation via annotate_artifact_group.
@@ -12403,6 +12627,7 @@ def process_tool_call(
             # figures/cluster_qc/<cluster_key>/ alongside structure-QC figures,
             # with a pass number so re-runs on the same key don't overwrite.
             qc_metrics_figure = None
+            cluster_umap_figure = None
             try:
                 safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
                 if run_manager is not None:
@@ -12443,6 +12668,25 @@ def process_tool_call(
                 )
                 if qc_metrics_figure and run_manager is not None:
                     run_manager.add_output(qc_metrics_figure)
+                # Also emit a cluster-colored UMAP for this clustering, next to its
+                # QC outputs, so every QC'd clustering is guaranteed a visual of its
+                # clusters (self-titled with the resolution) — no reliance on the
+                # model remembering to plot it. Skipped only if no UMAP exists yet.
+                if "X_umap" in adata.obsm:
+                    _umap_out = str(qc_fig_dir / f"umap_{safe_key}_pass_{pass_n:03d}.png")
+                    try:
+                        _umap_res = _render_figure(
+                            adata,
+                            plot_type="umap",
+                            output_path=_umap_out,
+                            color_by=cluster_key,
+                            include_image=False,
+                        )
+                        cluster_umap_figure = _umap_res.get("output_path")
+                        if cluster_umap_figure and run_manager is not None:
+                            run_manager.add_output(cluster_umap_figure)
+                    except Exception:
+                        cluster_umap_figure = None
             except Exception:
                 qc_metrics_figure = None
 
@@ -12492,6 +12736,7 @@ def process_tool_call(
                 "cells_remaining_if_removed": cells_total - cells_proposed,
                 "checkpoint_path": checkpoint_path,
                 "qc_metrics_figure": qc_metrics_figure,
+                "cluster_umap_figure": cluster_umap_figure,
                 "thresholds_used": {
                     "mt_threshold": mt_threshold,
                     "ribo_threshold": ribo_threshold,
@@ -12591,6 +12836,12 @@ def process_tool_call(
                     qc_metrics_figure,
                     role="figure",
                     metadata={"kind": "per_cluster_qc_metrics", "cluster_key": cluster_key},
+                ))
+            if cluster_umap_figure:
+                artifacts.append(_artifact_payload(
+                    cluster_umap_figure,
+                    role="figure",
+                    metadata={"kind": "cluster_umap", "cluster_key": cluster_key},
                 ))
             return _finalize_result(
                 result, adata,

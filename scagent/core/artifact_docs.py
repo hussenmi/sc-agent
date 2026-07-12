@@ -144,10 +144,16 @@ def render_readme(doc: ArtifactGroupDoc, frames: dict[str, Any] | None = None) -
     filename (or stem) -> DataFrame used to fill real column names and dtypes.
     """
     lines: list[str] = [DOC_MARKER, "", f"# {doc.title}", "", doc.overview.strip(), ""]
-    lines.append(
-        f"_Produced by `{doc.group}`. This README is auto-generated; the "
-        f"**Interpretation** section at the end is written by the analysis agent._"
-    )
+    if doc.interpretation_required:
+        lines.append(
+            f"_Produced by `{doc.group}`. This README is auto-generated; the "
+            f"**Interpretation** section at the end is written by the analysis agent._"
+        )
+    else:
+        lines.append(
+            f"_Produced by `{doc.group}`. This README is auto-generated and "
+            f"explanatory only._"
+        )
     lines.append("")
 
     if doc.params:
@@ -256,6 +262,179 @@ def set_interpretation(readme_text: str, interpretation: str) -> str:
         sep = "" if head.endswith("\n") else "\n"
         return head + sep + "\n" + INTERPRETATION_HEADING + new_body
     return head + new_body
+
+
+# --- figures index README -------------------------------------------------------
+
+# Plain-language "what it shows / how to read it" blurbs for the figure kinds this
+# pipeline produces, keyed by substrings that appear in the saved filenames. These
+# explain the plot TYPE (a method/reference explanation), never a dataset-specific
+# conclusion — the reading of a specific figure lives in the analysis report.
+# Order matters: earlier, more-specific keys win over later, generic ones.
+FIGURE_TYPE_GLOSSARY: list[tuple[tuple[str, ...], str, str]] = [
+    (
+        ("qc_metrics_by_cluster", "cluster_qc"),
+        "Per-cluster QC box plots",
+        "One panel per QC metric (library size, genes/cell, %MT, %ribosomal, doublet score), "
+        "each showing that metric's distribution within every cluster, with flagged clusters "
+        "highlighted. Look for a cluster that sits apart from the rest on a metric — that is the "
+        "evidence behind a keep/remove call.",
+    ),
+    (
+        ("correlation",),
+        "Gene–gene correlation heatmap",
+        "A clustered matrix of how the top variable genes co-vary within one cluster. Strong "
+        "off-diagonal blocks = coherent co-expression modules (a real population); a flat, "
+        "block-free map = an unstructured mixture (possible doublets/noise).",
+    ),
+    (
+        ("scvi_training", "training_loss", "training_history"),
+        "scVI training curve",
+        "Model loss (ELBO) versus training epoch. A curve that flattens into a plateau indicates "
+        "the model converged; a validation loss that turns back up signals over-training.",
+    ),
+    (
+        ("pca_variance", "variance_explained", "scree", "elbow"),
+        "PCA variance-explained (scree/elbow) plot",
+        "Variance captured by each principal component, largest first. The 'elbow' where the curve "
+        "flattens guides how many PCs carry real signal versus noise.",
+    ),
+    (
+        ("qc_violin", "violin"),
+        "Violin plot",
+        "The distribution of a metric (a QC measure or a gene) across groups; the width of each "
+        "'violin' shows where cells pile up. Long thin tails flag outlier populations.",
+    ),
+    (
+        ("histogram", "_hist"),
+        "Histogram",
+        "The distribution of a single per-cell metric. Two humps (bimodality) often separate a "
+        "high-quality population from a low-quality tail.",
+    ),
+    (
+        ("scatter",),
+        "Scatter plot",
+        "Two per-cell metrics plotted against each other (e.g. counts vs. genes, or %MT vs. %ribo) "
+        "to reveal relationships and outliers.",
+    ),
+    (
+        ("dotplot",),
+        "Dot plot",
+        "Marker genes across groups: dot COLOR is mean expression and dot SIZE is the fraction of "
+        "cells in the group expressing the gene. A large dark dot = a strong, widely-expressed marker.",
+    ),
+    (
+        ("heatmap",),
+        "Heatmap",
+        "A matrix of values shown as color — e.g. gene expression across groups. Read the color scale, "
+        "and look for blocks of high signal.",
+    ),
+    (
+        ("umap",),
+        "UMAP embedding",
+        "A 2-D layout where cells with similar expression sit near each other; color encodes a cluster, "
+        "sample/batch, gene, or per-cell metric. Nearby structure is meaningful, but distances between "
+        "far-apart groups are not quantitative. For batch-colored UMAPs, well-mixed colors = little batch "
+        "effect; color-segregated islands = a batch effect (or genuine sample-private biology).",
+    ),
+    (
+        ("tsne",),
+        "t-SNE embedding",
+        "A 2-D layout where cells with similar expression sit near each other; like UMAP, local structure "
+        "is meaningful but between-cluster distances are not.",
+    ),
+]
+
+
+def _figure_type_for(filename: str) -> tuple[str, str] | None:
+    """Return (type name, how-to-read) for a figure filename, or None if unknown."""
+    low = filename.lower()
+    for keys, name, blurb in FIGURE_TYPE_GLOSSARY:
+        if any(k in low for k in keys):
+            return name, blurb
+    return None
+
+
+def build_figures_readme(figures_dir: Any) -> str | None:
+    """Render a README that indexes and explains the figures in ``figures_dir``.
+
+    Returns markdown, or None if the directory has no figures. The README explains
+    the naming/folder convention, defines each figure TYPE present (method-level,
+    not dataset-specific), and lists every figure grouped by subfolder. It carries
+    no Interpretation section — per-figure reading lives in the analysis report."""
+    root = Path(figures_dir)
+    if not root.exists():
+        return None
+    exts = {".png", ".jpg", ".jpeg", ".svg", ".pdf"}
+    figures = sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in exts
+    )
+    if not figures:
+        return None
+
+    lines: list[str] = [
+        DOC_MARKER,
+        "",
+        "# Figures — how they are organized and what each kind shows",
+        "",
+        "This folder holds every figure the analysis produced. Filenames are chosen to be "
+        "self-describing — they name what distinguishes each figure (what it is colored by, the "
+        "clustering resolution, and the analysis phase such as pre- vs post-batch-correction). "
+        "Related figures are grouped into subfolders by phase. Figure saves never overwrite: if a "
+        "name is reused, a numeric suffix (`_2`, `_3`, …) is added so no output is lost.",
+        "",
+        "_This README is auto-generated and explanatory only. The reading of any specific figure "
+        "for THIS dataset is in the analysis report (`reports/analysis_record.md` and any "
+        "narrative report)._",
+        "",
+    ]
+
+    # --- figure-type glossary, only for the kinds actually present ---
+    present: list[tuple[str, str]] = []
+    seen_types: set = set()
+    for fig in figures:
+        info = _figure_type_for(fig.name)
+        if info and info[0] not in seen_types:
+            seen_types.add(info[0])
+            present.append(info)
+    if present:
+        lines.append("## Figure types in this run")
+        lines.append("")
+        for name, blurb in present:
+            lines.append(f"- **{name}.** {blurb}")
+        lines.append("")
+
+    # --- index of the actual files, grouped by subfolder ---
+    lines.append("## Files")
+    lines.append("")
+    groups: dict[str, list[Path]] = {}
+    for fig in figures:
+        rel = fig.relative_to(root)
+        folder = str(rel.parent) if str(rel.parent) != "." else "(top level)"
+        groups.setdefault(folder, []).append(fig)
+    for folder in sorted(groups):
+        lines.append(f"### `{folder}`")
+        lines.append("")
+        for fig in groups[folder]:
+            info = _figure_type_for(fig.name)
+            kind = f" — {info[0]}" if info else ""
+            lines.append(f"- `{fig.name}`{kind}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_figures_readme(figures_dir: Any) -> Path | None:
+    """Write ``figures_dir/README.md`` from :func:`build_figures_readme`.
+
+    Returns the path written, or None if there were no figures to document."""
+    text = build_figures_readme(figures_dir)
+    if text is None:
+        return None
+    path = Path(figures_dir) / "README.md"
+    path.write_text(text)
+    return path
 
 
 def scan_incomplete_interpretations(run_dir: Any) -> list[str]:
