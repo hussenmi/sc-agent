@@ -308,11 +308,18 @@ class RunManager:
         }
 
         if result:
-            # Include key metrics, not full result
+            # Include key metrics, not full result. Beyond shape/status/backend,
+            # keep normalization/log provenance (target_sum, log_transform, the
+            # normalization uns dict, resolved source) — otherwise whether log1p
+            # was applied is invisible in the manifest and only lives in the
+            # output h5ad's adata.uns. Keys absent from a tool's result are simply
+            # skipped, so this is a no-op for tools that don't emit them.
             step["metrics"] = {
                 k: v for k, v in result.items()
                 if k in ["before", "after", "n_clusters", "n_hvg", "doublet_rate",
-                         "status", "backend"]
+                         "status", "backend",
+                         "target_sum", "log_transform", "normalization",
+                         "resolved_source", "normalization_source"]
             }
 
         self.manifest.steps_completed.append(step)
