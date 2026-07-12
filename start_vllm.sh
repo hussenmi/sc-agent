@@ -69,6 +69,7 @@ MODEL_TABLE=(
   "Qwen/Qwen3-30B-A3B                       | Qwen3-30B-A3B               |  60 | 192  | qwen3_coder | 128 |"
   "Qwen/Qwen3.6-27B                         | Qwen3.6-27B                 |  56 | 256  | qwen3_coder | 256 |     | qwen3"
   "Qwen/Qwen3.6-27B-FP8                     | Qwen3.6-27B                 |  31 | 256  | qwen3_coder | 256 | fp8 | qwen3"
+  "Qwen/Qwen3.6-35B-A3B-FP8                 | Qwen3.6-35B-A3B             |  38 |  80  | qwen3_coder | 256 | fp8 | qwen3"
   "meta-llama/Llama-3.3-70B-Instruct        | Llama-3.3-70B-Instruct      | 140 | 640  | llama3_json | 128 |"
   "meta-llama/Llama-3.1-70B-Instruct        | Llama-3.1-70B-Instruct      | 140 | 640  | llama3_json | 128 |"
   "google/gemma-4-31b-it                    | gemma-4-31b-it              |  62 | 1120 | gemma4      | 256 |"
