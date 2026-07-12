@@ -437,6 +437,19 @@ class SCAgent:
         self.adata = None
         self.run_manager: Optional[RunManager] = None
         self.world_state = AgentWorldState()
+        # run_code execution sandbox — resolved ONCE at startup: an isolated
+        # OpenShell sandbox where available, else the in-process path. Lazily
+        # creates its container on first run_code; torn down in close(). The
+        # resolved mode is surfaced in the CLI welcome box.
+        from .sandbox import build_from_env as _build_sandbox
+        try:
+            self._sandbox_info: Dict[str, Any] = _build_sandbox()
+        except Exception as _sbx_err:  # never let sandbox detection break startup
+            self._sandbox_info = {
+                "mode": "off", "sandbox": None, "isolated": False,
+                "reason": f"in-process (sandbox init failed: {_sbx_err})", "fatal": None,
+            }
+        self._sandbox = self._sandbox_info.get("sandbox")
         self.biological_context: Optional[Dict[str, Any]] = None
         self._pending_images: List[Dict[str, str]] = []  # For vision support (list of figure dicts)
         # Vision sidecar — used only when the main model is text-only AND
@@ -553,6 +566,16 @@ class SCAgent:
             except Exception:
                 pass
             self._mcp_client = None
+
+        # Delete the per-session OpenShell sandbox (idempotent; no-op if the
+        # container was never created).
+        sandbox = getattr(self, "_sandbox", None)
+        if sandbox is not None:
+            try:
+                sandbox.delete()
+            except Exception:
+                pass
+            self._sandbox = None
 
     def __del__(self) -> None:
         self.close()
@@ -6281,6 +6304,7 @@ class SCAgent:
                         self.adata,
                         world_state=self.world_state,
                         run_manager=self.run_manager,
+                        sandbox=self._sandbox,
                     )
                 if _caught:
                     try:

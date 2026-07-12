@@ -417,6 +417,22 @@ def run_start(args):
     gpu_desc = f"{_scvi_desc}  ·  visible: {_visible}"
     if (os.environ.get("SCAGENT_GPU") or "").strip().lower() in ("1", "true", "yes", "on"):
         gpu_desc += "  ·  RAPIDS accel: on"
+    # Sandbox line — surface how run_code executes: an isolated OpenShell sandbox
+    # where available, else in-process. Resolved once at agent construction.
+    _sbx_info = getattr(agent, "_sandbox_info", None) or {}
+    if _sbx_info.get("fatal"):
+        # SCAGENT_SANDBOX=openshell was forced but OpenShell is unavailable.
+        console.print(
+            f"[red]OpenShell sandbox required (SCAGENT_SANDBOX=openshell) but unavailable: "
+            f"{_sbx_info['fatal']}[/red]\n[red]Build the image (docker build -t scagent-sbx:cpu "
+            f"docker/scagent-sandbox) or set SCAGENT_SANDBOX=off to run in-process.[/red]"
+        )
+        agent.close()
+        return 1
+    if _sbx_info.get("isolated"):
+        sandbox_desc, sandbox_style = _sbx_info.get("reason", "OpenShell (isolated)"), "green"
+    else:
+        sandbox_desc, sandbox_style = _sbx_info.get("reason", "in-process (no isolation)"), "yellow"
     welcome_text = Text.assemble(
         ("scagent", "bold cyan"),
         " — single-cell RNA-seq analysis agent\n\n",
@@ -431,6 +447,9 @@ def run_start(args):
         "\n",
         ("  GPU:        ", "dim"),
         (gpu_desc, gpu_style),
+        "\n",
+        ("  Sandbox:    ", "dim"),
+        (sandbox_desc, sandbox_style),
         "\n",
         ("  Data:       ", "dim"),
         (os.path.abspath(args.data) if args.data else "none loaded yet", "white"),
@@ -490,6 +509,7 @@ def run_start(args):
             console.print("\n[yellow]Interrupted (Esc/Ctrl+C) — state preserved. Continue with a new instruction or type exit to quit.[/yellow]")
         run_name = None  # run dir created after first turn
 
+    agent.close()  # tear down the per-session sandbox + MCP connections
     return 0
 
 
@@ -591,6 +611,7 @@ def run_analyze(args):
                 print("\nExiting interactive mode.")
                 break
 
+    agent.close()  # tear down the per-session sandbox + MCP connections
     return 0
 
 
