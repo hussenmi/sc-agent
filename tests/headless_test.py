@@ -49,6 +49,10 @@ class _FakeAgent:
         self.provider = kwargs.get("provider") or "openai"
         self.model = kwargs.get("model") or "m"
 
+    def close(self):
+        # run_analyze calls agent.close() to tear down the sandbox/MCP connections.
+        pass
+
 
 # ── cli.run_analyze guard ────────────────────────────────────────────────────
 

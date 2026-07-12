@@ -11330,6 +11330,19 @@ def process_tool_call(
             cluster_umap_path = None
             if "X_umap" in adata.obsm and cluster_key in adata.obs.columns:
                 _safe_ck = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
+                # Encode the clustering resolution in the filename so pre-integration
+                # UMAPs at different resolutions are distinguishable at a glance — the
+                # cluster key alone (e.g. "leiden") does not carry it.
+                _res_tag = ""
+                try:
+                    from ..core.inspector import get_clustering_registry
+                    for _rec in get_clustering_registry(adata):
+                        if (getattr(_rec, "cluster_key", None) == cluster_key
+                                and getattr(_rec, "resolution", None) is not None):
+                            _res_tag = "_res" + str(_rec.resolution).replace(".", "_")
+                            break
+                except Exception:
+                    _res_tag = ""
                 _pre_dir = (
                     Path(run_manager.run_dir) if run_manager is not None else Path(".")
                 ) / "figures" / "pre_integration"
@@ -11337,7 +11350,7 @@ def process_tool_call(
                     _cu = _render_figure(
                         adata,
                         plot_type="umap",
-                        output_path=str(_pre_dir / f"umap_{_safe_ck}_clusters.png"),
+                        output_path=str(_pre_dir / f"umap_{_safe_ck}{_res_tag}_clusters.png"),
                         color_by=cluster_key,
                         include_image=False,
                     )
