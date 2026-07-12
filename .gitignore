@@ -111,3 +111,10 @@ agent_demo.py
 *_truth.csv
 LUNG_*
 !docs/nvidia_collab.md
+!docs/openshell_integration.md
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# local env backups
+*.bak_*

@@ -18,12 +18,25 @@ The goal is a practical analysis partner: inspect the data, run QC, normalize, e
 
 ## Setup
 
-On Iris:
+### Environment
+
+scagent runs on two hosts — the **Iris HPC** (x86_64) and the **DGX Spark** (aarch64/GB10). Activate the environment for your host/mode from the repo root **before** running anything:
+
+| Host / mode | Activate | For |
+|---|---|---|
+| Iris — CPU / dev | `source setup.sh` | tests, lint, quick iteration (no GPU) |
+| Iris — GPU | `source setup_gpu.sh` | RAPIDS-accelerated runs; scVI + CellBender + scimilarity |
+| Spark — GPU | `pixi shell -e gpu` | RAPIDS on the GB10; scVI + CellTypist + scimilarity |
+
+Confirm the GPU backend is actually live before a long run — a silent CPU fallback only shows up as `"backend": "scanpy_cpu"` in `manifest.json`:
 
 ```bash
-cd /data1/peerd/ibrahih3/cs_agent
-source setup.sh
+python -c "from scagent.core.gpu import gpu_capability_report as g; print(g())"
 ```
+
+See [`docs/environments.md`](docs/environments.md) for the full per-host reference: what each env provides, the `LD_PRELOAD` requirements, heavy-tool availability (scVI / CellBender / scimilarity), and serving.
+
+### Provider / model
 
 Configure provider/model settings in `.env`:
 
