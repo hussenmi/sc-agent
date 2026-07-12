@@ -124,32 +124,40 @@ def test_inspection_yields_to_post_annotation_celltype():
     assert ws.data_summary["processing"]["has_celltypes"] is True
 
 
-def test_record_inspection_rejects_missing_cluster_column():
+def test_record_inspection_drops_missing_cluster_column():
+    # Partial-accept: an invalid column is dropped with a warning, not rejected —
+    # a single guessed field no longer forces a retry loop.
     adata = _adata()
     ws = _synced_ws(adata)
     out = ws.record_inspection({"cluster_col": "no_such_clusters"}, adata=adata)
-    assert out["status"] == "error"
-    assert any("no_such_clusters" in e for e in out["errors"])
-    assert ws.get_confirmed_value("inspection") is None
+    assert out["status"] == "ok"
+    assert any("no_such_clusters" in w for w in out["warnings"])
+    # The invalid field is dropped (recorded as omitted); the inspection is stored.
+    assert out["inspection"]["cluster_col"] is None
+    assert ws.get_confirmed_value("inspection") is not None
 
 
-def test_record_inspection_rejects_missing_column():
+def test_record_inspection_drops_missing_column_but_keeps_valid():
     adata = _adata()
     ws = _synced_ws(adata)
-    out = ws.record_inspection({"cell_type_col": "does_not_exist"}, adata=adata)
-    assert out["status"] == "error"
-    assert any("does_not_exist" in e for e in out["errors"])
-    # Nothing stored on rejection.
-    assert ws.get_confirmed_value("inspection") is None
-    assert "inspection" not in ws.data_summary
+    out = ws.record_inspection(
+        {"cell_type_col": "does_not_exist", "species": "human"}, adata=adata
+    )
+    assert out["status"] == "ok"
+    assert any("does_not_exist" in w for w in out["warnings"])
+    # Invalid field dropped, valid field (species) still recorded.
+    assert out["inspection"]["cell_type_col"] is None
+    assert out["inspection"]["species"] == "human"
+    assert ws.get_confirmed_value("inspection") is not None
 
 
-def test_record_inspection_rejects_bad_species():
+def test_record_inspection_coerces_bad_species_to_unknown():
     adata = _adata()
     ws = _synced_ws(adata)
     out = ws.record_inspection({"species": "martian"}, adata=adata)
-    assert out["status"] == "error"
-    assert ws.get_confirmed_value("inspection") is None
+    assert out["status"] == "ok"
+    assert out["inspection"]["species"] == "unknown"
+    assert any("martian" in w for w in out["warnings"])
 
 
 def test_tool_exposed_by_default_and_gated_off(monkeypatch):

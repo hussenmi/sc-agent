@@ -1,13 +1,11 @@
-"""Regression tests: PanglaoDB external adjudication is OPTIONAL, not a gate.
+"""Regression tests: PanglaoDB is OPTIONAL supplementary evidence, never a gate.
 
-When a cluster genuinely needs external adjudication that PanglaoDB cannot
-provide (references disagree + Cytopus doesn't cover the label — e.g. progenitor
-types like CMP), the validator must accept it on reference+DEG evidence with
-confidence capped to low, instead of hard-failing and looping finalize. Clusters
-that ARE resolvable by references/Cytopus/DEG must be unaffected.
-
-Reproduces the blocking pattern from run_2026_06_11_112506 (clusters 4/14: label
-CMP, reasons flagged_ambiguous + reference_sources_disagree + cytopus_uncovered_label).
+A cluster the references/Cytopus don't resolve rests on its own DEGs
+(``deg_primary`` tier). It is a valid, honest call — NOT flagged for a PanglaoDB
+query and NOT penalised to low confidence for lacking one. Clusters resolvable by
+references/Cytopus/DEG keep their stronger tiers. (Earlier versions forced such
+clusters to low confidence and flagged them ``needs_external_adjudication``; that
+PanglaoDB penalty is gone — DEGs are the decision basis.)
 """
 
 from __future__ import annotations
@@ -81,24 +79,23 @@ def _validate(proposal, evidence):
     )
 
 
-def test_unresolved_adjudication_passes_not_blocks():
+def test_unresolved_rests_on_degs_not_flagged():
     rep = _validate(_hard_cluster_proposal(), _hard_cluster_evidence())
     assert rep["validation_failures"] == []
     pc = rep["per_cluster_validation"]["0"]
-    assert pc["validation_tier"] == "reference_deg_unadjudicated"
-    assert pc["external_adjudication_status"] == "attempted_unresolved"
-    assert set(pc["panglaodb_required_reasons"]) == {
-        "flagged_ambiguous", "reference_sources_disagree", "cytopus_uncovered_label"
-    }
-    assert "0" in rep["panglaodb_required_clusters"]  # still reported for provenance
+    # references disagree + no Cytopus → the label rests on its DEGs
+    assert pc["validation_tier"] == "deg_primary"
+    # no cluster is ever flagged as requiring a PanglaoDB query
+    assert "0" not in rep["panglaodb_required_clusters"]
 
 
-def test_unresolved_adjudication_caps_confidence_to_low():
-    # both a high and a medium starting confidence end at low
+def test_unresolved_no_longer_capped_to_low():
+    # The old PanglaoDB penalty (force unresolved clusters to low) is gone —
+    # a DEG-grounded call keeps its confidence.
     for conf in ("high", "medium"):
         rep = _validate(_hard_cluster_proposal(), _hard_cluster_evidence(confidence=conf))
         assert rep["validation_failures"] == []
-        assert rep["per_cluster_validation"]["0"]["confidence"] == "low"
+        assert rep["per_cluster_validation"]["0"]["confidence"] != "low"
 
 
 def test_no_panglaodb_queried_must_be_true_failure():
@@ -115,7 +112,8 @@ def test_incompatible_panglaodb_claim_dropped_not_failed():
     )
     assert not any("biologically compatible" in f for f in rep["validation_failures"])
     assert rep["validation_failures"] == []
-    assert rep["per_cluster_validation"]["0"]["confidence"] == "low"
+    # the incompatible PanglaoDB claim is dropped, not turned into a low-confidence penalty
+    assert rep["per_cluster_validation"]["0"].get("panglaodb_queried") in (False, None)
 
 
 def test_resolvable_cluster_unaffected():

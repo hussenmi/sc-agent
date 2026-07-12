@@ -771,6 +771,109 @@ def _slim_annotation_validation(validation_payload: Dict[str, Any]) -> Dict[str,
     return slim
 
 
+# Plain-language names for the tools that appear in the pipeline table, so a
+# reader who does not know scagent's internal tool names still understands what
+# each step did. This is process vocabulary (what the step does), never biology.
+_TOOL_LABELS: Dict[str, str] = {
+    "load_data": "Load dataset",
+    "inspect_data": "Inspect dataset",
+    "run_qc": "Quality-control metrics",
+    "normalize_and_hvg": "Normalize + select variable genes",
+    "run_pca": "PCA (linear dimensionality reduction)",
+    "run_neighbors": "Build neighbor graph",
+    "run_umap": "UMAP embedding (2-D layout)",
+    "run_clustering": "Cluster cells",
+    "compare_clusterings": "Compare clustering resolutions",
+    "run_cluster_qc": "Per-cluster quality control",
+    "run_cluster_structure_qc": "Cluster coherence (structure) QC",
+    "run_batch_correction": "Batch correction / integration",
+    "diagnose_batch_effect": "Batch-effect diagnostic",
+    "score_integration": "Score integration quality",
+    "benchmark_integration": "Benchmark integration (scIB)",
+    "run_deg": "Differential expression (marker genes)",
+    "run_gsea": "Gene-set enrichment",
+    "run_celltypist": "CellTypist reference annotation",
+    "run_scimilarity": "Scimilarity reference annotation",
+    "prepare_annotation": "Prepare annotation scaffold",
+    "stage_annotation_evidence": "Stage annotation evidence",
+    "finalize_annotation": "Finalize cell-type labels",
+    "generate_figure": "Generate figure",
+    "run_code": "Custom analysis code",
+    "save_data": "Save dataset checkpoint",
+}
+
+# One-line explanations of the recurring parameter/outcome terms that show up in
+# the pipeline table's raw values, so the abbreviations are not a mystery.
+_PIPELINE_TERM_GLOSSARY: List[tuple] = [
+    ("resolution", "Leiden/Louvain granularity knob — higher splits cells into more, finer clusters."),
+    ("n_clusters", "Number of clusters the step produced."),
+    ("n_comps / n_pcs", "Number of principal components computed / used downstream."),
+    ("n_neighbors", "Neighbors per cell in the kNN graph (k)."),
+    ("use_rep", "Which cell embedding the step read from (e.g. X_pca, or a corrected space like X_scVI)."),
+    ("mask_var", "Gene subset the step restricted to (e.g. highly_variable = HVGs only)."),
+    ("target_sum", "Counts each cell was scaled to during normalization (e.g. 10000 = counts-per-10k)."),
+    ("log_transform / log1p", "Whether a log(1+x) transform was applied after normalization."),
+    ("batch_key", "The obs column identifying sample/batch of origin used for integration."),
+    ("corrected_embedding", "The batch-corrected cell embedding produced (e.g. X_scVI)."),
+    ("side_effects", "Which downstream results this step invalidated/recomputed (PCA, neighbors, UMAP, clustering)."),
+    ("neighbor_graph_preserved", "True = the existing neighbor graph was reused, not rebuilt."),
+]
+
+# Legend rendered beneath the per-cluster QC table.
+_QC_TABLE_LEGEND: List[tuple] = [
+    ("Action", "The recommended fate of the cluster: **keep** or **remove** (this record does not itself remove anything)."),
+    ("Severity", "How concerning the cluster looks: **clean** (normal), through more severe grades when metrics are off."),
+    ("Reasons", "Plain-language evidence behind the action — e.g. low library size, elevated %MT/%ribosomal, high doublet score, or 'within expected ranges'."),
+]
+
+# Legend rendered beneath the per-cluster annotation table.
+_ANNOTATION_TABLE_LEGEND: List[tuple] = [
+    ("Label", "The cell-type name assigned to the cluster."),
+    ("Confidence", "How strong the evidence is (**high** / **medium** / **low**). Weak single-source support, broad-only external matches, and QC caveats automatically cap it."),
+    ("Tier", "Which evidence combination drove the call. Reads as a recipe: *reference_consensus* = the reference tools (CellTypist, Scimilarity) agreed; *reference_partial* = only one agreed; *cytopus* / *panglaodb* = an external marker database supported it; *deg_primary* = driven mainly by this cluster's own differentially-expressed genes; *_plus_deg* = additionally backed by those DE genes."),
+    ("Supporting genes", "The marker genes (from this cluster's differential expression) that justify the label."),
+    ("PanglaoDB", "The external marker-database label used, and whether PanglaoDB was actually queried for this cluster ('not queried' means the call did not need database adjudication)."),
+    ("Competing", "Other cell types the reference tools also proposed — the alternatives that were weighed and set aside."),
+    ("Reasoning", "The narrative justification the analysis wrote for this cluster."),
+]
+
+
+def _render_glossary(pairs: List[tuple]) -> List[str]:
+    """Render a list of (term, explanation) pairs as a markdown bullet legend."""
+    out: List[str] = []
+    for term, desc in pairs:
+        out.append(f"- **{term}** — {desc}")
+    return out
+
+
+def _analysis_record_intro() -> List[str]:
+    """The 'How to read this record' preface — orients a non-expert reader before
+    the dense tables below. Purely explanatory; contains no dataset-specific claim."""
+    lines = [
+        "## How to read this record",
+        "",
+        "This is an automatically assembled, plain-provenance log of the whole "
+        "analysis — every processing step, in order, with the exact settings used "
+        "and the quality-control and cell-type decisions that followed. It is "
+        "generated from stored session state, not from memory, so it faithfully "
+        "reflects what actually ran.",
+        "",
+        "The sections are:",
+        "",
+        "- **Dataset Overview** — the current size of the data and which processing stages are complete.",
+        "- **Analysis Pipeline** — every step in the order it ran, with its key settings and outcome.",
+        "- **Quality Control** — initial QC and the per-cluster keep/remove decisions.",
+        "- **Normalization & Feature Selection**, **Clustering**, **Batch Correction** — the settings for each of those stages.",
+        "- **Differential Expression Tables** — where the marker-gene tables were saved (see the CSV's companion README for column definitions).",
+        "- **Cell-Type Annotation** — the label assigned to each cluster and the evidence behind it.",
+        "",
+        "Each dense table has a short **legend** directly beneath it explaining its columns. "
+        "Values shown as `NA`/`none` mean the step did not set that field.",
+        "",
+    ]
+    return lines
+
+
 def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str:
     """Build a comprehensive, deterministic markdown record of every decision the
     agent made this session — QC thresholds and what was removed/kept and why,
@@ -837,13 +940,22 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
     if step_log:
         lines.append("## Analysis Pipeline (chronological)")
         lines.append("")
-        lines.append("| # | Step | Key parameters / outcome |")
-        lines.append("|---|---|---|")
+        lines.append("Every step in the order it ran. **Step** is scagent's internal "
+                     "tool name; **What ran** says it in plain language; **Key settings "
+                     "/ outcome** are the exact arguments and results for that step.")
+        lines.append("")
+        lines.append("| # | Step | What ran | Key settings / outcome |")
+        lines.append("|---|---|---|---|")
         for i, s in enumerate(step_log, 1):
             tool = s.get("tool", "?")
+            friendly = _TOOL_LABELS.get(tool, tool.replace("_", " "))
             detail_keys = [k for k in s.keys() if k not in {"tool", "timestamp"}]
             detail = {k: s[k] for k in detail_keys[:6]}
-            lines.append(f"| {i} | {tool} | {_report_fmt(detail, limit=300)} |")
+            lines.append(f"| {i} | `{tool}` | {friendly} | {_report_fmt(detail, limit=300)} |")
+        lines.append("")
+        lines.append("**What the recurring settings mean:**")
+        lines.append("")
+        lines.extend(_render_glossary(_PIPELINE_TERM_GLOSSARY))
         lines.append("")
 
     # --- Quality control ---
@@ -913,6 +1025,10 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
                     f"{_report_fmt(dec.get('severity'))} | "
                     f"{_report_fmt(dec.get('reasons'))} |"
                 )
+            lines.append("")
+            lines.append("_Column guide:_")
+            lines.append("")
+            lines.extend(_render_glossary(_QC_TABLE_LEGEND))
         lines.append("")
 
     # --- Normalization & feature selection ---
@@ -1019,9 +1135,16 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
                     f"{_report_fmt(ev.get('competing_labels_considered'))} | "
                     f"{_report_fmt(ev.get('reasoning'), limit=300)} |"
                 )
+            lines.append("")
+            lines.append("_Column guide:_")
+            lines.append("")
+            lines.extend(_render_glossary(_ANNOTATION_TABLE_LEGEND))
         lines.append("")
 
-    return "\n".join(lines).strip()
+    body = "\n".join(lines).strip()
+    if not body:
+        return ""
+    return "\n".join(_analysis_record_intro()) + "\n" + body
 
 
 def _save_deg_table_csv(adata: Any, key: str, run_manager: Any = None, *, groupby: Optional[str] = None):
@@ -1075,7 +1198,70 @@ def _save_deg_table_csv(adata: Any, key: str, run_manager: Any = None, *, groupb
         run_manager.add_output(path)
     except Exception:
         return None, 0
+    # Write a companion column-glossary README so a reader knows what each column
+    # means (what a log2fc / adjusted p-value / score is) without prior knowledge.
+    try:
+        _write_deg_column_doc(path, df, groupby=groupby, run_manager=run_manager)
+    except Exception:
+        pass
     return path, int(len(df))
+
+
+# Plain-language definitions of the columns in the DEG CSV. These describe the
+# standard scanpy rank_genes_groups outputs (statistics/method), not biology.
+_DEG_COLUMN_DOCS: Dict[str, str] = {
+    "cluster": "The cluster whose marker genes this row belongs to. Markers are found one-vs-rest: this cluster compared against all other cells.",
+    "gene": "Gene symbol.",
+    "log2fc": "Log2 fold-change of the gene's mean expression in this cluster vs. all other cells. Positive = higher in this cluster; +1 ≈ 2× higher, +2 ≈ 4× higher.",
+    "pval_adj": "Multiple-testing-corrected p-value (Benjamini–Hochberg FDR). Judge significance from THIS column, not `pval` — e.g. < 0.05.",
+    "pval": "Raw, uncorrected p-value from the ranking test (Wilcoxon rank-sum by default). Not corrected for the many genes tested.",
+    "score": "The test statistic scanpy ranks genes by (z-score-like for Wilcoxon). Larger = more strongly and specifically up in this cluster; the table is sorted by it.",
+    "pct_in_group": "Fraction of cells IN this cluster that express the gene (nonzero counts). Near 1.0 = expressed by almost all cells in the cluster.",
+    "pct_in_reference": "Fraction of cells in all OTHER clusters that express the gene. A good marker is high `pct_in_group` and low `pct_in_reference`.",
+}
+
+
+def _write_deg_column_doc(csv_path: str, df: Any, *, groupby: Optional[str], run_manager: Any) -> None:
+    """Write a `<csv_stem>.README.md` next to a DEG CSV documenting its columns."""
+    from ..core import artifact_docs as ad
+
+    stem = Path(csv_path).stem
+    fdoc = ad.FileDoc(
+        filename=Path(csv_path).name,
+        purpose=(
+            f"Differential-expression (marker-gene) table: for each cluster in "
+            f"`{groupby or 'the clustering'}`, the genes most specifically up-regulated "
+            f"in that cluster relative to all other cells, one row per cluster×gene."
+        ),
+        computation=(
+            "Produced by scanpy's `rank_genes_groups` (one-vs-rest per cluster). Rows are "
+            "sorted by cluster, then by descending score."
+        ),
+        how_to_read=(
+            "A strong, trustworthy marker has a large positive `log2fc`, a small `pval_adj`, "
+            "high `pct_in_group`, and low `pct_in_reference`. The top few rows per cluster are "
+            "usually the genes used to name the cell type."
+        ),
+        columns={c: _DEG_COLUMN_DOCS[c] for c in df.columns if c in _DEG_COLUMN_DOCS},
+    )
+    doc = ad.ArtifactGroupDoc(
+        group="run_deg",
+        title=f"`{Path(csv_path).name}` — marker-gene table column guide",
+        overview=(
+            "This file documents the columns of the differential-expression CSV saved "
+            "alongside it. It is a reference doc; the biological interpretation of the "
+            "markers lives in the analysis report."
+        ),
+        files=[fdoc],
+        interpretation_required=False,
+    )
+    text = ad.render_readme(doc, frames={fdoc.filename: df})
+    out = Path(csv_path).with_name(f"{stem}.README.md")
+    out.write_text(text)
+    try:
+        run_manager.add_output(str(out))
+    except Exception:
+        pass
 
 
 def _natural_cluster_sort(values: List[str]) -> List[str]:
@@ -1353,9 +1539,13 @@ def _format_validation_failures_per_cluster(failures: List[str]) -> str:
 # best-case starting confidences the model would otherwise have to type in.
 _ANNOTATION_TIER_CONFIDENCE = {
     "reference_consensus_plus_deg": "high",
+    "external_adjudicated": "high",   # optional PanglaoDB cross-check was done
     "cytopus_plus_deg": "medium",
     "reference_partial_plus_deg": "medium",
+    "deg_primary": "medium",          # rests on the cluster's DEGs — a valid call, not penalised
+    # legacy tiers kept so old proposals still map sanely
     "needs_external_adjudication": "low",
+    "reference_deg_unadjudicated": "low",
 }
 
 
@@ -1389,7 +1579,7 @@ def _build_annotation_evidence_scaffold(
         if not genes:
             genes = list(summary.get("discriminating_degs") or [])[:6]
 
-        tier = summary.get("validation_tier") or "needs_external_adjudication"
+        tier = summary.get("validation_tier") or "deg_primary"
 
         # reference_annotation_support: {annotation_key: top_label} — pure provenance.
         ref_support: Dict[str, Any] = {}
@@ -2242,7 +2432,11 @@ def _validate_annotation_evidence(
         )
 
         panglaodb_required_reasons: List[str] = []
-        validation_tier = "needs_external_adjudication"
+        # PanglaoDB is OPTIONAL supplementary evidence — never required, never a
+        # gate. Every label rests on the cluster's own DEGs plus whatever
+        # reference/Cytopus signal exists. The default `deg_primary` tier is a
+        # DEG-grounded decision, not an "awaiting external adjudication" state.
+        validation_tier = "deg_primary"
 
         if (
             reference_consensus.get("has_consensus")
@@ -2257,53 +2451,34 @@ def _validate_annotation_evidence(
         ):
             validation_tier = "reference_partial_plus_deg"
         elif cytopus_confirms and n_submitted_deg_support >= 1 and not crosses_two_source_consensus:
-            # Local Cytopus markers best-match the cluster DEGs for this label —
-            # sufficient without PanglaoDB. (Thin margins cap confidence below.)
+            # Local Cytopus markers best-match the cluster DEGs for this label.
             validation_tier = "cytopus_plus_deg"
-        else:
-            # Genuinely unresolved by reference + Cytopus + DEGs → PanglaoDB.
-            if cid in ambiguous_set:
-                panglaodb_required_reasons.append("flagged_ambiguous")
-            if n_reference_source_groups == 0:
-                panglaodb_required_reasons.append("deg_only_no_reference_source")
-            if n_reference_source_groups >= 2 and not reference_consensus.get("has_consensus"):
-                panglaodb_required_reasons.append("reference_sources_disagree")
-            if crosses_two_source_consensus:
-                panglaodb_required_reasons.append("cross_lineage_or_reference_consensus_override")
-            if cytopus_available and not cytopus_adj.get("candidate_covered"):
-                panglaodb_required_reasons.append("cytopus_uncovered_label")
-            elif cytopus_available and not cytopus_confirms:
-                panglaodb_required_reasons.append("cytopus_label_not_best_match")
-            if n_submitted_deg_support < 1:
-                panglaodb_required_reasons.append("no_discriminating_deg_support")
-            if not panglaodb_required_reasons:
-                panglaodb_required_reasons.append("unresolved_by_reference_cytopus_deg")
+        # else: stays `deg_primary` — the label rests on its discriminating DEGs.
+        # PanglaoDB is an optional cross-check the analyst MAY add, not something
+        # the run needs; no cluster is flagged as requiring it.
 
-        panglaodb_required = bool(validation_tier == "needs_external_adjudication")
+        panglaodb_required = False  # never required — DEGs are the decision basis
         panglaodb_has_call_history_support = bool(label_in_history or reverse_hit)
-        if panglaodb_required and panglaodb_has_call_history_support:
-            # A compatible label was actually queried this session (it is in the
-            # PanglaoDB call history) — external adjudication genuinely happened.
-            # Accept it even if the agent forgot to set panglaodb_queried=true,
-            # rather than looping finalize on the missing flag.
-            if not pq and apply_auto_fixes:
+        panglaodb_attested_only = bool(
+            pq and not (queried_celltypes_normalized or queried_gene_symbols_normalized)
+        )
+        if panglaodb_has_call_history_support or panglaodb_attested_only:
+            # OPTIONAL bonus, never a requirement: the analyst chose to cross-check
+            # this label in PanglaoDB and a compatible label was queried (or the
+            # query was attested when the MCP was unavailable). Record that
+            # provenance — and set the flag if it was forgotten. This only
+            # annotates that an extra cross-check happened; it gates nothing.
+            if panglaodb_has_call_history_support and not pq and apply_auto_fixes:
                 ev = dict(ev)
                 ev["panglaodb_queried"] = True
                 evidence_str[cid] = ev
                 pq = True
                 checks["panglaodb_queried"] = True
                 auto_fixes.append(
-                    f"Cluster {cid}: set panglaodb_queried=true — a compatible label was queried in "
-                    "PanglaoDB this session (present in the call history), so external adjudication did occur."
+                    f"Cluster {cid}: recorded panglaodb_queried=true — a compatible label was queried in "
+                    "PanglaoDB this session (present in the call history)."
                 )
             validation_tier = "external_adjudicated"
-            panglaodb_required = False
-        elif panglaodb_required and pq and not (
-            queried_celltypes_normalized or queried_gene_symbols_normalized
-        ):
-            # PanglaoDB/MCP unavailable this session: accept the agent's attested query.
-            validation_tier = "external_adjudicated"
-            panglaodb_required = False
         checks["n_submitted_discriminating_deg_support"] = n_submitted_deg_support
         checks["panglaodb_required"] = panglaodb_required
         checks["validation_tier"] = validation_tier
@@ -2334,39 +2509,11 @@ def _validate_annotation_evidence(
                 )
             checks["panglaodb_label_incompatible_note"] = _panglao_incompatible_msg
 
-        # PanglaoDB is an OPTIONAL external adjudicator, NOT a gate. DEGs +
-        # CellTypist/Scimilarity + Cytopus are the primary drivers. When a
-        # cluster still needs external adjudication that PanglaoDB could not
-        # provide — references disagree and neither Cytopus nor PanglaoDB covers
-        # the label (common for progenitor/transitional types like CMP/MEP) —
-        # do NOT loop finalize. Accept the label on reference + DEG evidence,
-        # flag it unresolved, and cap confidence to low (below) so the result is
-        # honest rather than blocked. A cluster PanglaoDB *can* adjudicate is
-        # still upgraded above this tier via the call-history path earlier.
+        # PanglaoDB is never required and never caps confidence: a cluster that
+        # rests on its DEGs (deg_primary tier) is a legitimate, honest call, not a
+        # penalised one. (Historically an "unadjudicated" cluster was forced to
+        # low confidence here; that penalty is gone — DEGs are the decision basis.)
         external_adjudication_unresolved = False
-        if panglaodb_required:
-            panglaodb_required_clusters.append(cid)
-            external_adjudication_unresolved = True
-            validation_tier = "reference_deg_unadjudicated"
-            checks["validation_tier"] = validation_tier
-            note = (
-                "External adjudication was warranted ("
-                + (", ".join(panglaodb_required_reasons) or "needs_external_adjudication")
-                + ") but PanglaoDB could not resolve it; label rests on reference + DEG "
-                "evidence at reduced (low) confidence."
-            )
-            checks["external_adjudication_status"] = "attempted_unresolved"
-            checks["external_adjudication_note"] = note
-            if apply_auto_fixes:
-                ev = dict(ev)
-                ev["external_adjudication_status"] = "attempted_unresolved"
-                ev["external_adjudication_note"] = note
-                evidence_str[cid] = ev
-            auto_fixes.append(
-                f"Cluster {cid}: external adjudication unresolved by PanglaoDB "
-                f"({', '.join(panglaodb_required_reasons) or 'needs_external_adjudication'}); "
-                "accepted on reference + DEG evidence with confidence capped to low."
-            )
 
         if validation_tier in {"reference_consensus_plus_deg", "reference_partial_plus_deg", "cytopus_plus_deg"}:
             panglaodb_support_level = validation_tier
@@ -2540,13 +2687,17 @@ def _validate_annotation_evidence(
                     "but cluster DEGs only weakly match its markers."
                 )
             elif panglaodb_support_level == "self_attested_or_unavailable_history":
+                # DEG-only call with no reference/Cytopus corroboration and no
+                # PanglaoDB query. PanglaoDB is optional, so this is NOT penalised
+                # to low — but with nothing corroborating the DEGs, top confidence
+                # is not warranted, so cap high → medium (honest humility).
                 ev = dict(ev)
-                ev["confidence"] = "low"
+                ev["confidence"] = "medium"
                 evidence_str[cid] = ev
-                conf = "low"
+                conf = "medium"
                 auto_fixes.append(
-                    f"Cluster {cid}: auto-lowered confidence high → low because no PanglaoDB call history "
-                    "backs this label (self-attested)."
+                    f"Cluster {cid}: auto-lowered confidence high → medium — the label rests on DEGs alone "
+                    "(no reference/Cytopus corroboration); PanglaoDB is optional and not required."
                 )
         # Unresolved external adjudication → honest low confidence (any starting
         # level), since the label rests on reference + DEG evidence only.
@@ -3103,9 +3254,10 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "(1) `label`, `confidence` ∈ {high, medium, low}, explicit `panglaodb_queried` (true/false), `supporting_genes` "
                 "(non-empty, must overlap this cluster's top DEGs, must include at least one non-nuisance "
                 "marker — MT/ribosomal/hemoglobin/MALAT1 genes alone do not count). "
-                "(2) `panglaodb_queried=false` is acceptable for reference_consensus_plus_deg and "
-                "reference_partial_plus_deg clusters; clusters in needs_external_adjudication must have "
-                "PanglaoDB evidence. If queried, `panglaodb_label_used` is the PanglaoDB cell_type backing "
+                "(2) `panglaodb_queried=false` is always acceptable — PanglaoDB is optional supplementary "
+                "evidence, never required, and skipping it never lowers confidence. A cluster with no reference/"
+                "Cytopus resolution rests on its DEGs (deg_primary tier, up to medium confidence). If you did "
+                "query PanglaoDB, `panglaodb_label_used` is the PanglaoDB cell_type backing "
                 "the label and must be biologically compatible with `label`, or provide `reverse_marker_support`. "
                 "(3) Confidence is auto-capped from evidence tier: one-reference-source labels need stronger "
                 "submitted DEG support for high confidence; broad-parent PanglaoDB labels cap confidence to "
@@ -3126,13 +3278,17 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "evidence_summary": {
                         "type": ["object", "string"],
                         "description": (
-                            "Dict mapping cluster_id to annotation evidence. Each entry should include label, "
-                            "panglaodb_queried true/false, supporting_genes, confidence, reasoning, and where relevant "
-                            "competing_labels_considered. If reference annotation columns were used by "
-                            "prepare_annotation, include reference_annotation_support for each cluster; add "
-                            "reference_annotation_conflicts when CellTypist/Scimilarity disagree. May also be "
-                            "a JSON string encoding the same dict. Use external_sources for literature/web "
-                            "evidence used to resolve ambiguous cases."
+                            "Dict mapping cluster_id to annotation evidence. Send `reasoning` + OVERRIDES ONLY: "
+                            "prepare_annotation already pre-filled label, supporting_genes, confidence, "
+                            "competing_labels_considered, reference_annotation_support and source_synthesis in the "
+                            "scaffold, and this tool MERGES your submission on top of it — any field you omit is kept "
+                            "from the scaffold, not lost. So a cluster you agree with is just "
+                            "{'<cid>': {'reasoning': '...'}}. Do NOT re-type label/supporting_genes/confidence that "
+                            "already match the scaffold — re-sending the full dict for every cluster bloats the payload "
+                            "and truncates the call. Only include a field when you are CHANGING it: a corrected `label` "
+                            "(with `deg_derived_label` + `deg_override_justification` naming the genes) where the "
+                            "cluster's DEGs point elsewhere, different `supporting_genes` if the scaffold's don't fit, or "
+                            "a raised/lowered `confidence`. May also be a JSON string encoding the same dict."
                         ),
                         "additionalProperties": {"type": "object"},
                     },
@@ -3161,16 +3317,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "(2) evidence_summary maps every cluster to a label with enough evidence for its validation tier, or evidence "
                 "has already been staged with stage_annotation_evidence. "
                 "Writes adata.obs[annotation_key] and records the full evidence in adata.uns['annotation_validation']. "
-                "This is step 2 of 2 — never call this before querying PanglaoDB for clusters listed in "
-                "panglaodb_required_clusters and their required competing labels. "
+                "This is step 2 of 2. PanglaoDB is optional and never a prerequisite for finalizing. "
                 "Recommended flow: use stage_annotation_evidence (which runs the same validator and applies "
                 "auto-fixes) to surface and resolve all issues, then call finalize_annotation. If you pass "
                 "evidence directly, the same per-cluster rules apply: "
                 "(1) `label`, `confidence` ∈ {high, medium, low}, explicit `panglaodb_queried`, `supporting_genes` "
                 "(non-empty, overlapping the cluster's top DEGs, at least one non-nuisance lineage marker). "
-                "(2) `panglaodb_queried=false` is acceptable for reference_consensus_plus_deg and "
-                "reference_partial_plus_deg clusters; needs_external_adjudication clusters require "
-                "PanglaoDB call evidence. "
+                "(2) `panglaodb_queried=false` is always acceptable — PanglaoDB is optional and skipping it "
+                "never lowers confidence or blocks finalize. "
                 "(3) Confidence is auto-capped to `medium` when PanglaoDB only validated a broader parent "
                 "lineage or a one-reference-source label lacks excellent submitted DEG support; QC-derived caps "
                 "(high MT, doublets, low complexity, structure-QC review) also auto-lower confidence. "
@@ -3521,7 +3675,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
-                    "output_path": {"type": "string", "description": "Path to save PNG figure"},
+                    "output_path": {"type": "string", "description": "Path to save the PNG, under the run's figures/ directory. Use a DESCRIPTIVE, self-describing filename that names what distinguishes this figure from the others you will make — never a generic 'umap.png' or 'leiden.png'. Encode the distinguishing dimensions: what it is colored by, the clustering resolution, and the analysis phase (e.g. pre- vs post-batch-correction/integration). Organize related figures into phase subfolders rather than one flat directory, e.g. 'figures/pre_integration/umap_donor_res1.0.png' and 'figures/post_integration/umap_donor_res1.0.png'. Parent folders are created automatically, and a reused name is auto-uniquified (never overwrites), so distinct names + folders keep every figure and make comparisons obvious."},
                     "plot_type": {"type": "string", "enum": ["umap", "tsne", "violin", "dotplot", "heatmap"], "description": "Plot type. Use 'tsne' when the dataset has obsm['X_tsne'] but no UMAP (e.g. when reproducing a paper that uses t-SNE)."},
                     "color_by": {"type": "string", "description": "Column or gene to color by"},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"},
@@ -3722,7 +3876,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on the flagged/ambiguous (or baseline) clusters — gene-gene covariance modules, clustered correlation heatmaps, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`) and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite both in the QC reasoning report.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on the flagged/ambiguous (or baseline) clusters — gene-gene covariance modules, clustered correlation heatmaps, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`), a cluster-colored UMAP of this clustering to figures/cluster_qc/<cluster_key>/umap_<cluster_key>_pass_NNN.png (in `cluster_umap_figure`, auto-titled with the resolution — this is the Leiden/cluster UMAP for the clustering, generated for you so you do not need a separate generate_figure call for it), and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite all three in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -4333,11 +4487,15 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "Record your interpretation of the dataset after reading the fact sheet "
                 "from inspect_data. Report which obs column (if any) holds cell-type "
                 "labels, which holds the batch / donor / sample grouping, and the species. "
-                "OMIT a field when no column qualifies — e.g. a per-cell barcode column is "
-                "NOT cell-type labels, so leave cell_type_col unset. The runtime validates "
-                "that named columns exist and records the decision, which overrides the "
-                "heuristic guesses for the rest of the run. Call this once, right after "
-                "inspect_data, before proceeding with the analysis."
+                "Every *_col value MUST be an obs column name copied VERBATIM from the keys "
+                "of obs_columns_detail (in data_summary) — not a guessed/conventional name "
+                "like 'cell_type' or 'leiden', and never a cell VALUE like 'T cell'. "
+                "OMIT a field when no listed column qualifies — many datasets have no "
+                "cell-type or cluster column at all (e.g. obs is just barcode/donor/sample), "
+                "and inventing one is wrong; leave it unset. A per-cell barcode column is "
+                "NOT cell-type labels. Invalid column names are dropped with a warning "
+                "rather than failing the call. Call this once, right after inspect_data, "
+                "before proceeding with the analysis."
             ),
             "input_schema": {
                 "type": "object",
@@ -5276,6 +5434,12 @@ def process_tool_call(
         # across resolutions, or pre/post integration) gets _2/_3. Callers must use
         # the returned result["output_path"], which reflects the file written here.
         output_path = unique_output_path(output_path)
+        # Allow phase-based subfolders (e.g. figures/pre_integration/...): create the
+        # parent so a descriptive nested path saves instead of failing.
+        try:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        except Exception:
+            pass
 
         genes = genes or []
         if plot_type == "umap":
@@ -7489,15 +7653,20 @@ def process_tool_call(
                     dataset_changed=False,
                     summary="record_inspection rejected: invalid fields.",
                 )
+            inspection_warnings = outcome.get("warnings", [])
+            recorded_msg = (
+                "Recorded. This overrides the heuristic role/species guesses "
+                "for the rest of the run and is now reflected in the data summary."
+            )
+            if inspection_warnings:
+                recorded_msg += " " + " ".join(inspection_warnings)
             return _finalize_result(
                 {
                     "status": "ok",
                     "tool": "record_inspection",
                     "inspection": outcome["inspection"],
-                    "message": (
-                        "Recorded. This overrides the heuristic role/species guesses "
-                        "for the rest of the run and is now reflected in the data summary."
-                    ),
+                    "warnings": inspection_warnings,
+                    "message": recorded_msg,
                 },
                 adata,
                 dataset_changed=False,
@@ -11084,6 +11253,38 @@ def process_tool_call(
                 if _pl:
                     artifacts_created.append(_pl)
             diagnostic["overlay_figures"] = overlay_paths
+            # Also paint the uncorrected clustering itself on the UMAP. The diagnostic
+            # reasons about clusters, so a cluster-colored view of the pre-integration
+            # embedding (not just the donor/entropy overlays) makes the sample-segregated
+            # clusters visible. Saved to the pre_integration/ phase folder and generated
+            # here so it always exists — the model does not have to remember to plot it.
+            cluster_umap_path = None
+            if "X_umap" in adata.obsm and cluster_key in adata.obs.columns:
+                _safe_ck = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
+                _pre_dir = (
+                    Path(run_manager.run_dir) if run_manager is not None else Path(".")
+                ) / "figures" / "pre_integration"
+                try:
+                    _cu = _render_figure(
+                        adata,
+                        plot_type="umap",
+                        output_path=str(_pre_dir / f"umap_{_safe_ck}_clusters.png"),
+                        color_by=cluster_key,
+                        include_image=False,
+                    )
+                    cluster_umap_path = _cu.get("output_path")
+                    if cluster_umap_path and run_manager is not None:
+                        run_manager.add_output(cluster_umap_path)
+                    _pl = _artifact_payload(
+                        cluster_umap_path,
+                        role="figure",
+                        metadata={"kind": "pre_integration_cluster_umap", "cluster_key": cluster_key},
+                    )
+                    if _pl:
+                        artifacts_created.append(_pl)
+                except Exception:
+                    cluster_umap_path = None
+            diagnostic["cluster_umap_figure"] = cluster_umap_path
             diagnostic["artifacts_created"] = artifacts_created
             # Point the model at the auto-written README so it records the
             # dataset-specific interpretation via annotate_artifact_group.
@@ -12426,6 +12627,7 @@ def process_tool_call(
             # figures/cluster_qc/<cluster_key>/ alongside structure-QC figures,
             # with a pass number so re-runs on the same key don't overwrite.
             qc_metrics_figure = None
+            cluster_umap_figure = None
             try:
                 safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
                 if run_manager is not None:
@@ -12466,6 +12668,25 @@ def process_tool_call(
                 )
                 if qc_metrics_figure and run_manager is not None:
                     run_manager.add_output(qc_metrics_figure)
+                # Also emit a cluster-colored UMAP for this clustering, next to its
+                # QC outputs, so every QC'd clustering is guaranteed a visual of its
+                # clusters (self-titled with the resolution) — no reliance on the
+                # model remembering to plot it. Skipped only if no UMAP exists yet.
+                if "X_umap" in adata.obsm:
+                    _umap_out = str(qc_fig_dir / f"umap_{safe_key}_pass_{pass_n:03d}.png")
+                    try:
+                        _umap_res = _render_figure(
+                            adata,
+                            plot_type="umap",
+                            output_path=_umap_out,
+                            color_by=cluster_key,
+                            include_image=False,
+                        )
+                        cluster_umap_figure = _umap_res.get("output_path")
+                        if cluster_umap_figure and run_manager is not None:
+                            run_manager.add_output(cluster_umap_figure)
+                    except Exception:
+                        cluster_umap_figure = None
             except Exception:
                 qc_metrics_figure = None
 
@@ -12515,6 +12736,7 @@ def process_tool_call(
                 "cells_remaining_if_removed": cells_total - cells_proposed,
                 "checkpoint_path": checkpoint_path,
                 "qc_metrics_figure": qc_metrics_figure,
+                "cluster_umap_figure": cluster_umap_figure,
                 "thresholds_used": {
                     "mt_threshold": mt_threshold,
                     "ribo_threshold": ribo_threshold,
@@ -12614,6 +12836,12 @@ def process_tool_call(
                     qc_metrics_figure,
                     role="figure",
                     metadata={"kind": "per_cluster_qc_metrics", "cluster_key": cluster_key},
+                ))
+            if cluster_umap_figure:
+                artifacts.append(_artifact_payload(
+                    cluster_umap_figure,
+                    role="figure",
+                    metadata={"kind": "cluster_umap", "cluster_key": cluster_key},
                 ))
             return _finalize_result(
                 result, adata,
@@ -13913,18 +14141,35 @@ def process_tool_call(
                         expressed = (sub > expression_threshold).astype("float32")
                     else:
                         expressed = (_np.asarray(sub) > expression_threshold).astype("float32")
+                    n_cells_total = expressed.shape[0]
+                    n_markers = len(idxs)
+                    # Score by ENRICHMENT (in-cluster minus out-of-cluster fraction
+                    # expressing), not raw in-cluster fraction. Raw fraction lets a
+                    # gene that is expressed everywhere — e.g. ambient/soup
+                    # contamination, rampant in tissues like lung — inflate its
+                    # label's score in EVERY cluster, so an ambient-heavy label wins
+                    # the scaffold for clusters it doesn't belong to. Enrichment
+                    # cancels that: a gene expressed at the same rate in- and
+                    # out-of-cluster contributes ~0. A genuine marker (high in,
+                    # low out) still scores high. Clamped at 0. No cell type is
+                    # named — this is purely statistical.
                     for c in cluster_ids:
                         mask = cluster_masks[c]
                         n_in = int(mask.sum())
+                        n_out = n_cells_total - n_in
                         if n_in == 0:
                             score_matrix.setdefault(c, {})[label] = 0.0
                             continue
                         if sp.issparse(expressed):
-                            sub_expr = expressed[mask, :]
-                            frac = float(sub_expr.sum() / (n_in * len(idxs)))
+                            in_frac = float(expressed[mask, :].sum() / (n_in * n_markers))
+                            out_frac = (
+                                float(expressed[~mask, :].sum() / (n_out * n_markers))
+                                if n_out > 0 else 0.0
+                            )
                         else:
-                            frac = float(expressed[mask, :].mean())
-                        score_matrix.setdefault(c, {})[label] = frac
+                            in_frac = float(expressed[mask, :].mean())
+                            out_frac = float(expressed[~mask, :].mean()) if n_out > 0 else 0.0
+                        score_matrix.setdefault(c, {})[label] = max(0.0, in_frac - out_frac)
 
             if reverse_lookup_n_genes > 0:
                 for c in cluster_ids:
@@ -14376,21 +14621,19 @@ def process_tool_call(
                 cyto_resolves = cyto_confirms or cyto_confident
                 ref_two_source = bool(ref_consensus.get("has_consensus"))
 
+                # PanglaoDB is optional supplementary evidence — never required.
+                # We no longer flag any cluster as needing an external PanglaoDB
+                # query; the label rests on its DEGs plus reference/Cytopus signal.
+                # `required_reasons` is kept only as an informational hint about
+                # which clusters are least resolved by the references (the analyst
+                # MAY choose to cross-check those), and never drives a query list.
                 required_reasons: List[str] = []
                 if not (ref_two_source or cyto_resolves):
                     if summary.get("is_ambiguous"):
                         required_reasons.append("flagged_ambiguous")
-                    if not source_groups:
-                        required_reasons.append("deg_only_no_reference_source")
                     if len(source_groups) >= 2 and not ref_consensus.get("has_consensus"):
                         required_reasons.append("reference_sources_disagree")
-                    if cyto_pred.get("available") and (cyto_pred.get("best_overlap") or 0) == 0:
-                        required_reasons.append("cytopus_no_marker_overlap")
-                    elif cyto_pred.get("available"):
-                        required_reasons.append("cytopus_inconclusive")
-                    if not required_reasons:
-                        required_reasons.append("unresolved_by_reference_cytopus_deg")
-                panglaodb_required = bool(required_reasons)
+                panglaodb_required = False  # never required — DEGs are the basis
                 summary["reference_source_groups"] = source_groups
                 summary["reference_consensus"] = {
                     "has_consensus": bool(ref_consensus.get("has_consensus")),
@@ -14408,15 +14651,16 @@ def process_tool_call(
                         "margin": cyto_pred.get("margin"),
                     }
                 summary["panglaodb_required"] = panglaodb_required
-                summary["validation_tier"] = (
-                    "needs_external_adjudication"
-                    if panglaodb_required
-                    else (
-                        "reference_consensus_plus_deg"
-                        if ref_two_source
-                        else ("cytopus_plus_deg" if cyto_resolves else "reference_partial_plus_deg")
-                    )
-                )
+                if ref_two_source:
+                    summary["validation_tier"] = "reference_consensus_plus_deg"
+                elif cyto_resolves:
+                    summary["validation_tier"] = "cytopus_plus_deg"
+                elif source_groups:
+                    summary["validation_tier"] = "reference_partial_plus_deg"
+                else:
+                    # No reference/Cytopus resolution — the label rests on the
+                    # cluster's own DEGs. A valid, honest call, not a penalised one.
+                    summary["validation_tier"] = "deg_primary"
                 summary["panglaodb_required_reasons"] = required_reasons
                 cluster_summaries.append(summary)
 
@@ -14699,8 +14943,8 @@ def process_tool_call(
                     "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] with every derivable field pre-filled per cluster (label←proposed_label, supporting_genes←suggested_supporting_genes, confidence←validation_tier, reference_annotation_support, competing_labels_considered, source_synthesis). Do NOT rebuild this by hand in run_code — that reverse-engineering is exactly what the scaffold removes.",
                     "To annotate: call stage_annotation_evidence (or finalize_annotation directly) with evidence_summary containing ONLY the fields you are adding or changing per cluster. At minimum supply a `reasoning` string (>=20 chars) for every cluster; all other fields fall back to the scaffold. Reviewing each cluster and writing its reasoning IS the required judgment step.",
                     "Change a cluster's `label` (and `deg_derived_label`) only where your reading of the DEGs/references disagrees with the scaffold's proposed_label; cite genes from suggested_supporting_genes / discriminating_degs — never broad_context_degs (MHC-II like HLA-DRA/CD74, housekeeping) or nuisance_degs (MT/ribosomal/hemoglobin/MALAT1).",
-                    "Query bc_get_panglaodb_marker_genes ONLY for panglaodb_required_clusters (and panglaodb_reverse_marker_queries_required for reverse lookups); for those clusters set panglaodb_queried=true and panglaodb_label_used in your submitted evidence. Aggregate reverse hits across multiple DEGs; do not infer a label from a single gene. Everything else keeps panglaodb_queried=false.",
-                    "If a required cluster can't be resolved by PanglaoDB (label uncovered, e.g. CMP/MEP/early-erythroid, or inconclusive), submit panglaodb_queried=false + confidence='low' with a one-line caveat in reasoning — the validator accepts reference+DEG evidence and caps to low. Do not loop.",
+                    "PanglaoDB is OPTIONAL — no cluster requires it and leaving panglaodb_queried=false never lowers confidence. Only if you choose to cross-check a hard cluster, set panglaodb_queried=true and panglaodb_label_used for that cluster (aggregate reverse hits across multiple DEGs; never infer a label from a single gene). Everything else keeps panglaodb_queried=false.",
+                    "A cluster the references/Cytopus don't resolve rests on its DEGs (deg_primary tier, up to medium confidence) — a valid call. Don't consult PanglaoDB just to satisfy a rule, and never loop on it.",
                     "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in submitted evidence.",
                     "stage_annotation_evidence runs the finalize validator and returns ready_to_finalize + clusters_failing + auto_fixes; correct only the flagged clusters and re-submit. Or skip staging and call finalize_annotation once every cluster has reasoning.",
                 ],

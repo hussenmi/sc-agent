@@ -900,35 +900,52 @@ class AgentWorldState:
         (b) surfaces in the snapshot, and (c) flows to the manifest. batch_col is
         routed through the existing ``batch_key`` slot the pipeline already reads.
 
-        Returns ``{"status": "ok", "inspection": {...}}`` or
-        ``{"status": "error", "errors": [...]}``; on error nothing is stored.
+        Returns ``{"status": "ok", "inspection": {...}, "warnings": [...]}``.
+
+        Column fields that don't name a real obs column are **dropped** (treated as
+        "omitted") rather than rejecting the whole call — a single guessed column
+        no longer forces a retry loop. The dropped fields and the available column
+        list come back as warnings so the model can re-record with an exact name if
+        one of the dropped fields was actually real. Species falls back to
+        ``unknown`` if out of range. Nothing hard-fails here.
         """
         obs_cols = set(adata.obs.columns) if adata is not None else set()
-        errors: List[str] = []
-        for field_name in ("cell_type_col", "batch_col", "donor_col", "sample_col", "cluster_col"):
-            value = payload.get(field_name)
+        warnings: List[str] = []
+        col_fields = ("cell_type_col", "batch_col", "donor_col", "sample_col", "cluster_col")
+        resolved_cols = {f: payload.get(f) for f in col_fields}
+        dropped: List[str] = []
+        for field_name in col_fields:
+            value = resolved_cols[field_name]
             if value is not None and adata is not None and value not in obs_cols:
-                errors.append(
-                    f"{field_name}={value!r} is not an obs column. "
-                    f"Available: {sorted(obs_cols)}"
-                )
+                resolved_cols[field_name] = None  # drop the invalid guess
+                dropped.append(f"{field_name}={value!r}")
+        if dropped:
+            warnings.append(
+                "Dropped field(s) that don't name a real obs column: "
+                + ", ".join(dropped)
+                + f". Available obs columns: {sorted(obs_cols)}. "
+                "If one of these is the right column, call record_inspection again "
+                "with the exact name copied from obs_columns_detail; otherwise the "
+                "omission is recorded as intended."
+            )
         species = payload.get("species")
         species_norm = str(species).lower() if species is not None else None
         if species_norm is not None and species_norm not in {"human", "mouse", "unknown"}:
-            errors.append(f"species={species!r} must be one of human, mouse, unknown.")
-        if errors:
-            return {"status": "error", "errors": errors}
+            warnings.append(
+                f"species={species!r} is not one of human/mouse/unknown; recorded as 'unknown'."
+            )
+            species_norm = "unknown"
 
         def _clean_text(value):
             text = str(value).strip() if value is not None else ""
             return text or None
 
         inspection = {
-            "cell_type_col": payload.get("cell_type_col"),
-            "batch_col": payload.get("batch_col"),
-            "donor_col": payload.get("donor_col"),
-            "sample_col": payload.get("sample_col"),
-            "cluster_col": payload.get("cluster_col"),
+            "cell_type_col": resolved_cols["cell_type_col"],
+            "batch_col": resolved_cols["batch_col"],
+            "donor_col": resolved_cols["donor_col"],
+            "sample_col": resolved_cols["sample_col"],
+            "cluster_col": resolved_cols["cluster_col"],
             "species": species_norm,
             "tissue": _clean_text(payload.get("tissue")),
             "condition": _clean_text(payload.get("condition")),
@@ -943,7 +960,7 @@ class AgentWorldState:
         # Re-sync so data_summary reflects the new decision immediately.
         if adata is not None:
             self.sync_from_adata(adata, request_text=self.active_request)
-        return {"status": "ok", "inspection": inspection}
+        return {"status": "ok", "inspection": inspection, "warnings": warnings}
 
     def apply_tool_result(self, tool_name: str, result: Dict[str, Any], adata=None) -> None:
         if adata is not None:
