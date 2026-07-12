@@ -110,7 +110,7 @@ load_data
   → [loop: normalize_and_hvg → run_pca → run_neighbors → run_umap → run_clustering → run_cluster_qc → run_cluster_structure_qc → until clean]
   → run_celltypist and/or run_scimilarity when organism/model compatibility allows
   → prepare_annotation with reference annotation keys
-  → bc_get_panglaodb_marker_genes only for clusters flagged as requiring external adjudication
+  → bc_get_panglaodb_marker_genes is optional extra context for a hard cluster — never required
   → finalize_annotation with DEG + reference-label evidence, plus PanglaoDB evidence where required
   → final UMAP
 ```
@@ -1194,8 +1194,8 @@ class SCAgent:
                 "Run both run_celltypist and run_scimilarity when compatible; if one cannot run, record the concrete reason.",
                 "Run run_deg by the primary cluster key if marker DEGs are not already available.",
                 "Call prepare_annotation with CellTypist and Scimilarity columns as reference_annotation_keys.",
-                "Query PanglaoDB only for clusters flagged as requiring external adjudication, including plausible competitors and staged reverse marker lookup genes.",
-                "Use search_papers/web_search as supporting context for ambiguous labels, but PanglaoDB remains the structured external adjudicator in v1.",
+                "Decide each label from the cluster's DEGs; CellTypist/Scimilarity/Cytopus corroborate.",
+                "PanglaoDB and search_papers/web_search are optional extra context for a hard cluster — never required, never a gate.",
                 "Stage per-cluster evidence with stage_annotation_evidence, then call finalize_annotation.",
                 "If finalize genuinely cannot pass after honest attempts, call save_data with allow_unvalidated=true to write a clearly-marked UNVALIDATED dataset instead of losing the analysis.",
             ],
@@ -6392,6 +6392,17 @@ class SCAgent:
             )
             if auto_checkpoint_path and result_data.get("status") == "ok":
                 result_data["auto_checkpoint_saved"] = str(auto_checkpoint_path)
+            if tool_name == "finalize_annotation" and result_data.get("status") == "ok":
+                finalize_cp = self._maybe_post_finalize_checkpoint()
+                if finalize_cp:
+                    result_data["auto_checkpoint_saved"] = str(finalize_cp)
+            if tool_name == "save_data" and result_data.get("status") == "ok":
+                # The post-finalize checkpoint is insurance against an abrupt end
+                # BEFORE save_data. Once save_data has written the real output, the
+                # checkpoint is redundant (a second ~identical copy of the same
+                # annotated object) — remove it so a completed run has one output,
+                # not two near-duplicate h5ads.
+                self._cleanup_post_finalize_checkpoint()
             checkpoint = None
             if tool_name == "run_cluster_qc" and result_data.get("status") == "ok":
                 cleanup_checkpoint = self._cluster_cleanup_checkpoint_from_result(result_data)
@@ -6569,8 +6580,9 @@ class SCAgent:
                     self._print(f"    → {', '.join(details)}")
             elif status == "error":
                 err_msg = result_data.get('message') or result_data.get('error', '')
-                err_short = err_msg[:120] + ("…" if len(err_msg) > 120 else "")
-                self._print(f"    [red]✗ Error:[/red] {err_short}")
+                # Errors are shown in full — they carry the actionable fix, and
+                # truncating (previously 120 chars) chopped it mid-instruction.
+                self._print(f"    [red]✗ Error:[/red] {err_msg}")
                 # Show captured output before the crash if available
                 pre_crash = result_data.get('output', '')
                 if pre_crash and pre_crash.strip():
@@ -7231,6 +7243,56 @@ class SCAgent:
         except Exception as exc:
             logger.warning("Auto-checkpoint save failed for %s: %s", label, exc)
             return None
+
+    def _maybe_post_finalize_checkpoint(self) -> Optional[str]:
+        """Save adata right after finalize_annotation succeeds.
+
+        Annotation is the expensive result of a run, and it lived only in memory
+        until save_data ran. If the run was then cut off before save_data (a
+        backend death, a prose-bail exit, a Ctrl-C), the labels were lost even
+        though finalize succeeded. This persists a checkpoint the moment
+        annotation is finalized, so the result survives an abrupt end. Gated to
+        autonomous runs (same as the pre-op checkpoints); interactive users are
+        present and can save themselves.
+        """
+        if not self.smart_autonomous or self.adata is None:
+            return None
+        try:
+            if self.run_manager:
+                from pathlib import Path as _Path
+                out_path = str(_Path(self.run_manager.run_dir) / "checkpoint_post_annotation.h5ad")
+            else:
+                from pathlib import Path as _Path
+                out_path = str(_Path(self.output_dir) / "checkpoint_post_annotation.h5ad")
+            if self.verbose:
+                print("▶ Saving post-annotation checkpoint...")
+            save_details = write_h5ad_safe(self.adata, out_path)
+            if self.verbose:
+                print(f"✓ Checkpoint saved: {out_path}")
+                for warning in save_details.get("warnings", []):
+                    print(f"  {warning}")
+            return out_path
+        except Exception as exc:
+            logger.warning("Post-finalize auto-checkpoint save failed: %s", exc)
+            return None
+
+    def _cleanup_post_finalize_checkpoint(self) -> None:
+        """Delete the post-finalize checkpoint once save_data has superseded it.
+
+        Best-effort: the checkpoint only exists to protect annotations if the run
+        ended before save_data. A successful save_data makes it a redundant
+        duplicate, so remove it. Never raises — losing the cleanup is harmless.
+        """
+        try:
+            from pathlib import Path as _Path
+            base = self.run_manager.run_dir if self.run_manager else self.output_dir
+            cp = _Path(base) / "checkpoint_post_annotation.h5ad"
+            if cp.exists():
+                cp.unlink()
+                if self.verbose:
+                    print("[dim]Removed redundant post-annotation checkpoint (save_data superseded it).[/dim]")
+        except Exception as exc:  # pragma: no cover - cleanup is best-effort
+            logger.debug("Post-finalize checkpoint cleanup skipped: %s", exc)
 
     def _handle_describe_image(self, tool_input: Dict[str, Any]) -> str:
         """Run a saved figure through the vision sidecar and return text-only output.

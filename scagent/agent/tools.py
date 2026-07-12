@@ -1353,9 +1353,13 @@ def _format_validation_failures_per_cluster(failures: List[str]) -> str:
 # best-case starting confidences the model would otherwise have to type in.
 _ANNOTATION_TIER_CONFIDENCE = {
     "reference_consensus_plus_deg": "high",
+    "external_adjudicated": "high",   # optional PanglaoDB cross-check was done
     "cytopus_plus_deg": "medium",
     "reference_partial_plus_deg": "medium",
+    "deg_primary": "medium",          # rests on the cluster's DEGs — a valid call, not penalised
+    # legacy tiers kept so old proposals still map sanely
     "needs_external_adjudication": "low",
+    "reference_deg_unadjudicated": "low",
 }
 
 
@@ -1389,7 +1393,7 @@ def _build_annotation_evidence_scaffold(
         if not genes:
             genes = list(summary.get("discriminating_degs") or [])[:6]
 
-        tier = summary.get("validation_tier") or "needs_external_adjudication"
+        tier = summary.get("validation_tier") or "deg_primary"
 
         # reference_annotation_support: {annotation_key: top_label} — pure provenance.
         ref_support: Dict[str, Any] = {}
@@ -2242,7 +2246,11 @@ def _validate_annotation_evidence(
         )
 
         panglaodb_required_reasons: List[str] = []
-        validation_tier = "needs_external_adjudication"
+        # PanglaoDB is OPTIONAL supplementary evidence — never required, never a
+        # gate. Every label rests on the cluster's own DEGs plus whatever
+        # reference/Cytopus signal exists. The default `deg_primary` tier is a
+        # DEG-grounded decision, not an "awaiting external adjudication" state.
+        validation_tier = "deg_primary"
 
         if (
             reference_consensus.get("has_consensus")
@@ -2257,53 +2265,34 @@ def _validate_annotation_evidence(
         ):
             validation_tier = "reference_partial_plus_deg"
         elif cytopus_confirms and n_submitted_deg_support >= 1 and not crosses_two_source_consensus:
-            # Local Cytopus markers best-match the cluster DEGs for this label —
-            # sufficient without PanglaoDB. (Thin margins cap confidence below.)
+            # Local Cytopus markers best-match the cluster DEGs for this label.
             validation_tier = "cytopus_plus_deg"
-        else:
-            # Genuinely unresolved by reference + Cytopus + DEGs → PanglaoDB.
-            if cid in ambiguous_set:
-                panglaodb_required_reasons.append("flagged_ambiguous")
-            if n_reference_source_groups == 0:
-                panglaodb_required_reasons.append("deg_only_no_reference_source")
-            if n_reference_source_groups >= 2 and not reference_consensus.get("has_consensus"):
-                panglaodb_required_reasons.append("reference_sources_disagree")
-            if crosses_two_source_consensus:
-                panglaodb_required_reasons.append("cross_lineage_or_reference_consensus_override")
-            if cytopus_available and not cytopus_adj.get("candidate_covered"):
-                panglaodb_required_reasons.append("cytopus_uncovered_label")
-            elif cytopus_available and not cytopus_confirms:
-                panglaodb_required_reasons.append("cytopus_label_not_best_match")
-            if n_submitted_deg_support < 1:
-                panglaodb_required_reasons.append("no_discriminating_deg_support")
-            if not panglaodb_required_reasons:
-                panglaodb_required_reasons.append("unresolved_by_reference_cytopus_deg")
+        # else: stays `deg_primary` — the label rests on its discriminating DEGs.
+        # PanglaoDB is an optional cross-check the analyst MAY add, not something
+        # the run needs; no cluster is flagged as requiring it.
 
-        panglaodb_required = bool(validation_tier == "needs_external_adjudication")
+        panglaodb_required = False  # never required — DEGs are the decision basis
         panglaodb_has_call_history_support = bool(label_in_history or reverse_hit)
-        if panglaodb_required and panglaodb_has_call_history_support:
-            # A compatible label was actually queried this session (it is in the
-            # PanglaoDB call history) — external adjudication genuinely happened.
-            # Accept it even if the agent forgot to set panglaodb_queried=true,
-            # rather than looping finalize on the missing flag.
-            if not pq and apply_auto_fixes:
+        panglaodb_attested_only = bool(
+            pq and not (queried_celltypes_normalized or queried_gene_symbols_normalized)
+        )
+        if panglaodb_has_call_history_support or panglaodb_attested_only:
+            # OPTIONAL bonus, never a requirement: the analyst chose to cross-check
+            # this label in PanglaoDB and a compatible label was queried (or the
+            # query was attested when the MCP was unavailable). Record that
+            # provenance — and set the flag if it was forgotten. This only
+            # annotates that an extra cross-check happened; it gates nothing.
+            if panglaodb_has_call_history_support and not pq and apply_auto_fixes:
                 ev = dict(ev)
                 ev["panglaodb_queried"] = True
                 evidence_str[cid] = ev
                 pq = True
                 checks["panglaodb_queried"] = True
                 auto_fixes.append(
-                    f"Cluster {cid}: set panglaodb_queried=true — a compatible label was queried in "
-                    "PanglaoDB this session (present in the call history), so external adjudication did occur."
+                    f"Cluster {cid}: recorded panglaodb_queried=true — a compatible label was queried in "
+                    "PanglaoDB this session (present in the call history)."
                 )
             validation_tier = "external_adjudicated"
-            panglaodb_required = False
-        elif panglaodb_required and pq and not (
-            queried_celltypes_normalized or queried_gene_symbols_normalized
-        ):
-            # PanglaoDB/MCP unavailable this session: accept the agent's attested query.
-            validation_tier = "external_adjudicated"
-            panglaodb_required = False
         checks["n_submitted_discriminating_deg_support"] = n_submitted_deg_support
         checks["panglaodb_required"] = panglaodb_required
         checks["validation_tier"] = validation_tier
@@ -2334,39 +2323,11 @@ def _validate_annotation_evidence(
                 )
             checks["panglaodb_label_incompatible_note"] = _panglao_incompatible_msg
 
-        # PanglaoDB is an OPTIONAL external adjudicator, NOT a gate. DEGs +
-        # CellTypist/Scimilarity + Cytopus are the primary drivers. When a
-        # cluster still needs external adjudication that PanglaoDB could not
-        # provide — references disagree and neither Cytopus nor PanglaoDB covers
-        # the label (common for progenitor/transitional types like CMP/MEP) —
-        # do NOT loop finalize. Accept the label on reference + DEG evidence,
-        # flag it unresolved, and cap confidence to low (below) so the result is
-        # honest rather than blocked. A cluster PanglaoDB *can* adjudicate is
-        # still upgraded above this tier via the call-history path earlier.
+        # PanglaoDB is never required and never caps confidence: a cluster that
+        # rests on its DEGs (deg_primary tier) is a legitimate, honest call, not a
+        # penalised one. (Historically an "unadjudicated" cluster was forced to
+        # low confidence here; that penalty is gone — DEGs are the decision basis.)
         external_adjudication_unresolved = False
-        if panglaodb_required:
-            panglaodb_required_clusters.append(cid)
-            external_adjudication_unresolved = True
-            validation_tier = "reference_deg_unadjudicated"
-            checks["validation_tier"] = validation_tier
-            note = (
-                "External adjudication was warranted ("
-                + (", ".join(panglaodb_required_reasons) or "needs_external_adjudication")
-                + ") but PanglaoDB could not resolve it; label rests on reference + DEG "
-                "evidence at reduced (low) confidence."
-            )
-            checks["external_adjudication_status"] = "attempted_unresolved"
-            checks["external_adjudication_note"] = note
-            if apply_auto_fixes:
-                ev = dict(ev)
-                ev["external_adjudication_status"] = "attempted_unresolved"
-                ev["external_adjudication_note"] = note
-                evidence_str[cid] = ev
-            auto_fixes.append(
-                f"Cluster {cid}: external adjudication unresolved by PanglaoDB "
-                f"({', '.join(panglaodb_required_reasons) or 'needs_external_adjudication'}); "
-                "accepted on reference + DEG evidence with confidence capped to low."
-            )
 
         if validation_tier in {"reference_consensus_plus_deg", "reference_partial_plus_deg", "cytopus_plus_deg"}:
             panglaodb_support_level = validation_tier
@@ -2540,13 +2501,17 @@ def _validate_annotation_evidence(
                     "but cluster DEGs only weakly match its markers."
                 )
             elif panglaodb_support_level == "self_attested_or_unavailable_history":
+                # DEG-only call with no reference/Cytopus corroboration and no
+                # PanglaoDB query. PanglaoDB is optional, so this is NOT penalised
+                # to low — but with nothing corroborating the DEGs, top confidence
+                # is not warranted, so cap high → medium (honest humility).
                 ev = dict(ev)
-                ev["confidence"] = "low"
+                ev["confidence"] = "medium"
                 evidence_str[cid] = ev
-                conf = "low"
+                conf = "medium"
                 auto_fixes.append(
-                    f"Cluster {cid}: auto-lowered confidence high → low because no PanglaoDB call history "
-                    "backs this label (self-attested)."
+                    f"Cluster {cid}: auto-lowered confidence high → medium — the label rests on DEGs alone "
+                    "(no reference/Cytopus corroboration); PanglaoDB is optional and not required."
                 )
         # Unresolved external adjudication → honest low confidence (any starting
         # level), since the label rests on reference + DEG evidence only.
@@ -3103,9 +3068,10 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "(1) `label`, `confidence` ∈ {high, medium, low}, explicit `panglaodb_queried` (true/false), `supporting_genes` "
                 "(non-empty, must overlap this cluster's top DEGs, must include at least one non-nuisance "
                 "marker — MT/ribosomal/hemoglobin/MALAT1 genes alone do not count). "
-                "(2) `panglaodb_queried=false` is acceptable for reference_consensus_plus_deg and "
-                "reference_partial_plus_deg clusters; clusters in needs_external_adjudication must have "
-                "PanglaoDB evidence. If queried, `panglaodb_label_used` is the PanglaoDB cell_type backing "
+                "(2) `panglaodb_queried=false` is always acceptable — PanglaoDB is optional supplementary "
+                "evidence, never required, and skipping it never lowers confidence. A cluster with no reference/"
+                "Cytopus resolution rests on its DEGs (deg_primary tier, up to medium confidence). If you did "
+                "query PanglaoDB, `panglaodb_label_used` is the PanglaoDB cell_type backing "
                 "the label and must be biologically compatible with `label`, or provide `reverse_marker_support`. "
                 "(3) Confidence is auto-capped from evidence tier: one-reference-source labels need stronger "
                 "submitted DEG support for high confidence; broad-parent PanglaoDB labels cap confidence to "
@@ -3126,13 +3092,17 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "evidence_summary": {
                         "type": ["object", "string"],
                         "description": (
-                            "Dict mapping cluster_id to annotation evidence. Each entry should include label, "
-                            "panglaodb_queried true/false, supporting_genes, confidence, reasoning, and where relevant "
-                            "competing_labels_considered. If reference annotation columns were used by "
-                            "prepare_annotation, include reference_annotation_support for each cluster; add "
-                            "reference_annotation_conflicts when CellTypist/Scimilarity disagree. May also be "
-                            "a JSON string encoding the same dict. Use external_sources for literature/web "
-                            "evidence used to resolve ambiguous cases."
+                            "Dict mapping cluster_id to annotation evidence. Send `reasoning` + OVERRIDES ONLY: "
+                            "prepare_annotation already pre-filled label, supporting_genes, confidence, "
+                            "competing_labels_considered, reference_annotation_support and source_synthesis in the "
+                            "scaffold, and this tool MERGES your submission on top of it — any field you omit is kept "
+                            "from the scaffold, not lost. So a cluster you agree with is just "
+                            "{'<cid>': {'reasoning': '...'}}. Do NOT re-type label/supporting_genes/confidence that "
+                            "already match the scaffold — re-sending the full dict for every cluster bloats the payload "
+                            "and truncates the call. Only include a field when you are CHANGING it: a corrected `label` "
+                            "(with `deg_derived_label` + `deg_override_justification` naming the genes) where the "
+                            "cluster's DEGs point elsewhere, different `supporting_genes` if the scaffold's don't fit, or "
+                            "a raised/lowered `confidence`. May also be a JSON string encoding the same dict."
                         ),
                         "additionalProperties": {"type": "object"},
                     },
@@ -3161,16 +3131,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "(2) evidence_summary maps every cluster to a label with enough evidence for its validation tier, or evidence "
                 "has already been staged with stage_annotation_evidence. "
                 "Writes adata.obs[annotation_key] and records the full evidence in adata.uns['annotation_validation']. "
-                "This is step 2 of 2 — never call this before querying PanglaoDB for clusters listed in "
-                "panglaodb_required_clusters and their required competing labels. "
+                "This is step 2 of 2. PanglaoDB is optional and never a prerequisite for finalizing. "
                 "Recommended flow: use stage_annotation_evidence (which runs the same validator and applies "
                 "auto-fixes) to surface and resolve all issues, then call finalize_annotation. If you pass "
                 "evidence directly, the same per-cluster rules apply: "
                 "(1) `label`, `confidence` ∈ {high, medium, low}, explicit `panglaodb_queried`, `supporting_genes` "
                 "(non-empty, overlapping the cluster's top DEGs, at least one non-nuisance lineage marker). "
-                "(2) `panglaodb_queried=false` is acceptable for reference_consensus_plus_deg and "
-                "reference_partial_plus_deg clusters; needs_external_adjudication clusters require "
-                "PanglaoDB call evidence. "
+                "(2) `panglaodb_queried=false` is always acceptable — PanglaoDB is optional and skipping it "
+                "never lowers confidence or blocks finalize. "
                 "(3) Confidence is auto-capped to `medium` when PanglaoDB only validated a broader parent "
                 "lineage or a one-reference-source label lacks excellent submitted DEG support; QC-derived caps "
                 "(high MT, doublets, low complexity, structure-QC review) also auto-lower confidence. "
@@ -4333,11 +4301,15 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "Record your interpretation of the dataset after reading the fact sheet "
                 "from inspect_data. Report which obs column (if any) holds cell-type "
                 "labels, which holds the batch / donor / sample grouping, and the species. "
-                "OMIT a field when no column qualifies — e.g. a per-cell barcode column is "
-                "NOT cell-type labels, so leave cell_type_col unset. The runtime validates "
-                "that named columns exist and records the decision, which overrides the "
-                "heuristic guesses for the rest of the run. Call this once, right after "
-                "inspect_data, before proceeding with the analysis."
+                "Every *_col value MUST be an obs column name copied VERBATIM from the keys "
+                "of obs_columns_detail (in data_summary) — not a guessed/conventional name "
+                "like 'cell_type' or 'leiden', and never a cell VALUE like 'T cell'. "
+                "OMIT a field when no listed column qualifies — many datasets have no "
+                "cell-type or cluster column at all (e.g. obs is just barcode/donor/sample), "
+                "and inventing one is wrong; leave it unset. A per-cell barcode column is "
+                "NOT cell-type labels. Invalid column names are dropped with a warning "
+                "rather than failing the call. Call this once, right after inspect_data, "
+                "before proceeding with the analysis."
             ),
             "input_schema": {
                 "type": "object",
@@ -7489,15 +7461,20 @@ def process_tool_call(
                     dataset_changed=False,
                     summary="record_inspection rejected: invalid fields.",
                 )
+            inspection_warnings = outcome.get("warnings", [])
+            recorded_msg = (
+                "Recorded. This overrides the heuristic role/species guesses "
+                "for the rest of the run and is now reflected in the data summary."
+            )
+            if inspection_warnings:
+                recorded_msg += " " + " ".join(inspection_warnings)
             return _finalize_result(
                 {
                     "status": "ok",
                     "tool": "record_inspection",
                     "inspection": outcome["inspection"],
-                    "message": (
-                        "Recorded. This overrides the heuristic role/species guesses "
-                        "for the rest of the run and is now reflected in the data summary."
-                    ),
+                    "warnings": inspection_warnings,
+                    "message": recorded_msg,
                 },
                 adata,
                 dataset_changed=False,
@@ -13913,18 +13890,35 @@ def process_tool_call(
                         expressed = (sub > expression_threshold).astype("float32")
                     else:
                         expressed = (_np.asarray(sub) > expression_threshold).astype("float32")
+                    n_cells_total = expressed.shape[0]
+                    n_markers = len(idxs)
+                    # Score by ENRICHMENT (in-cluster minus out-of-cluster fraction
+                    # expressing), not raw in-cluster fraction. Raw fraction lets a
+                    # gene that is expressed everywhere — e.g. ambient/soup
+                    # contamination, rampant in tissues like lung — inflate its
+                    # label's score in EVERY cluster, so an ambient-heavy label wins
+                    # the scaffold for clusters it doesn't belong to. Enrichment
+                    # cancels that: a gene expressed at the same rate in- and
+                    # out-of-cluster contributes ~0. A genuine marker (high in,
+                    # low out) still scores high. Clamped at 0. No cell type is
+                    # named — this is purely statistical.
                     for c in cluster_ids:
                         mask = cluster_masks[c]
                         n_in = int(mask.sum())
+                        n_out = n_cells_total - n_in
                         if n_in == 0:
                             score_matrix.setdefault(c, {})[label] = 0.0
                             continue
                         if sp.issparse(expressed):
-                            sub_expr = expressed[mask, :]
-                            frac = float(sub_expr.sum() / (n_in * len(idxs)))
+                            in_frac = float(expressed[mask, :].sum() / (n_in * n_markers))
+                            out_frac = (
+                                float(expressed[~mask, :].sum() / (n_out * n_markers))
+                                if n_out > 0 else 0.0
+                            )
                         else:
-                            frac = float(expressed[mask, :].mean())
-                        score_matrix.setdefault(c, {})[label] = frac
+                            in_frac = float(expressed[mask, :].mean())
+                            out_frac = float(expressed[~mask, :].mean()) if n_out > 0 else 0.0
+                        score_matrix.setdefault(c, {})[label] = max(0.0, in_frac - out_frac)
 
             if reverse_lookup_n_genes > 0:
                 for c in cluster_ids:
@@ -14376,21 +14370,19 @@ def process_tool_call(
                 cyto_resolves = cyto_confirms or cyto_confident
                 ref_two_source = bool(ref_consensus.get("has_consensus"))
 
+                # PanglaoDB is optional supplementary evidence — never required.
+                # We no longer flag any cluster as needing an external PanglaoDB
+                # query; the label rests on its DEGs plus reference/Cytopus signal.
+                # `required_reasons` is kept only as an informational hint about
+                # which clusters are least resolved by the references (the analyst
+                # MAY choose to cross-check those), and never drives a query list.
                 required_reasons: List[str] = []
                 if not (ref_two_source or cyto_resolves):
                     if summary.get("is_ambiguous"):
                         required_reasons.append("flagged_ambiguous")
-                    if not source_groups:
-                        required_reasons.append("deg_only_no_reference_source")
                     if len(source_groups) >= 2 and not ref_consensus.get("has_consensus"):
                         required_reasons.append("reference_sources_disagree")
-                    if cyto_pred.get("available") and (cyto_pred.get("best_overlap") or 0) == 0:
-                        required_reasons.append("cytopus_no_marker_overlap")
-                    elif cyto_pred.get("available"):
-                        required_reasons.append("cytopus_inconclusive")
-                    if not required_reasons:
-                        required_reasons.append("unresolved_by_reference_cytopus_deg")
-                panglaodb_required = bool(required_reasons)
+                panglaodb_required = False  # never required — DEGs are the basis
                 summary["reference_source_groups"] = source_groups
                 summary["reference_consensus"] = {
                     "has_consensus": bool(ref_consensus.get("has_consensus")),
@@ -14408,15 +14400,16 @@ def process_tool_call(
                         "margin": cyto_pred.get("margin"),
                     }
                 summary["panglaodb_required"] = panglaodb_required
-                summary["validation_tier"] = (
-                    "needs_external_adjudication"
-                    if panglaodb_required
-                    else (
-                        "reference_consensus_plus_deg"
-                        if ref_two_source
-                        else ("cytopus_plus_deg" if cyto_resolves else "reference_partial_plus_deg")
-                    )
-                )
+                if ref_two_source:
+                    summary["validation_tier"] = "reference_consensus_plus_deg"
+                elif cyto_resolves:
+                    summary["validation_tier"] = "cytopus_plus_deg"
+                elif source_groups:
+                    summary["validation_tier"] = "reference_partial_plus_deg"
+                else:
+                    # No reference/Cytopus resolution — the label rests on the
+                    # cluster's own DEGs. A valid, honest call, not a penalised one.
+                    summary["validation_tier"] = "deg_primary"
                 summary["panglaodb_required_reasons"] = required_reasons
                 cluster_summaries.append(summary)
 
@@ -14699,8 +14692,8 @@ def process_tool_call(
                     "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] with every derivable field pre-filled per cluster (label←proposed_label, supporting_genes←suggested_supporting_genes, confidence←validation_tier, reference_annotation_support, competing_labels_considered, source_synthesis). Do NOT rebuild this by hand in run_code — that reverse-engineering is exactly what the scaffold removes.",
                     "To annotate: call stage_annotation_evidence (or finalize_annotation directly) with evidence_summary containing ONLY the fields you are adding or changing per cluster. At minimum supply a `reasoning` string (>=20 chars) for every cluster; all other fields fall back to the scaffold. Reviewing each cluster and writing its reasoning IS the required judgment step.",
                     "Change a cluster's `label` (and `deg_derived_label`) only where your reading of the DEGs/references disagrees with the scaffold's proposed_label; cite genes from suggested_supporting_genes / discriminating_degs — never broad_context_degs (MHC-II like HLA-DRA/CD74, housekeeping) or nuisance_degs (MT/ribosomal/hemoglobin/MALAT1).",
-                    "Query bc_get_panglaodb_marker_genes ONLY for panglaodb_required_clusters (and panglaodb_reverse_marker_queries_required for reverse lookups); for those clusters set panglaodb_queried=true and panglaodb_label_used in your submitted evidence. Aggregate reverse hits across multiple DEGs; do not infer a label from a single gene. Everything else keeps panglaodb_queried=false.",
-                    "If a required cluster can't be resolved by PanglaoDB (label uncovered, e.g. CMP/MEP/early-erythroid, or inconclusive), submit panglaodb_queried=false + confidence='low' with a one-line caveat in reasoning — the validator accepts reference+DEG evidence and caps to low. Do not loop.",
+                    "PanglaoDB is OPTIONAL — no cluster requires it and leaving panglaodb_queried=false never lowers confidence. Only if you choose to cross-check a hard cluster, set panglaodb_queried=true and panglaodb_label_used for that cluster (aggregate reverse hits across multiple DEGs; never infer a label from a single gene). Everything else keeps panglaodb_queried=false.",
+                    "A cluster the references/Cytopus don't resolve rests on its DEGs (deg_primary tier, up to medium confidence) — a valid call. Don't consult PanglaoDB just to satisfy a rule, and never loop on it.",
                     "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in submitted evidence.",
                     "stage_annotation_evidence runs the finalize validator and returns ready_to_finalize + clusters_failing + auto_fixes; correct only the flagged clusters and re-submit. Or skip staging and call finalize_annotation once every cluster has reasoning.",
                 ],
