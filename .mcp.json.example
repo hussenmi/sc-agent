@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "biocontext": {
+      "command": "/ABSOLUTE/PATH/TO/biocontext_kb"
+    },
+    "pubmed": {
+      "command": "/ABSOLUTE/PATH/TO/pubmedmcp"
+    }
+  }
+}
