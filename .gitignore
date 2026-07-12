@@ -117,3 +117,6 @@ LUNG_*
 # Host-specific MCP server paths — copy .mcp.json.example to .mcp.json and edit.
 # The .example template stays tracked; the real .mcp.json does not.
 .mcp.json
+
+# Local backup files (e.g. pixi.toml.bak_gpupreload, .mcp.json.bak_iris)
+*.bak*
