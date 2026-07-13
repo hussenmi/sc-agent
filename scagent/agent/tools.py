@@ -221,7 +221,22 @@ def write_h5ad_safe(current_adata, output_path: str) -> Dict[str, Any]:
     second_error_msg = None
 
     def _write(obj):
-        obj.write_h5ad(output_path, compression=compression, compression_opts=compression_opts)
+        # anndata emits an INFO line ("... storing 'col' as categorical") for every
+        # object-dtype obs column each time it writes an h5ad. Our tools save a
+        # checkpoint on nearly every step, so this floods the agent's tool output
+        # (and leaks into the model's context) with noise that looks like it belongs
+        # to whatever tool is running — e.g. "storing ... as categorical" printed
+        # inside a run_cluster_qc call. It carries no signal here, so silence the
+        # anndata logger's INFO level for the duration of the write only.
+        import logging as _logging
+
+        _ad_logger = _logging.getLogger("anndata")
+        _prev_level = _ad_logger.level
+        _ad_logger.setLevel(_logging.WARNING)
+        try:
+            obj.write_h5ad(output_path, compression=compression, compression_opts=compression_opts)
+        finally:
+            _ad_logger.setLevel(_prev_level)
 
     uns_has_nulls = _contains_none_value(getattr(current_adata, "uns", {}))
     if uns_has_nulls:
@@ -1050,9 +1065,12 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
         removals = s.get("feature_removals") or {}
         low_det = removals.get("low_detection_genes") if isinstance(removals, dict) else None
         if isinstance(low_det, dict) and low_det.get("enabled"):
+            _thr = f"fewer than {low_det.get('min_cells')} cells"
+            if low_det.get("threshold_basis") == "fraction_of_cells" and low_det.get("min_cell_fraction"):
+                _thr += f" = {float(low_det['min_cell_fraction']):.1%} of the dataset"
             lines.append(
                 f"- Low-detection genes removed: n={low_det.get('n_removed', 0)} "
-                f"(genes seen in fewer than {low_det.get('min_cells', 3)} cells)"
+                f"(genes detected in {_thr})"
             )
         ribo = removals.get("ribosomal_genes") if isinstance(removals, dict) else None
         if isinstance(ribo, dict):
@@ -3029,14 +3047,15 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "normalize_and_hvg",
-            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in a layer. Before normalization/HVG it applies two standard, guaranteed feature filters so you do NOT need a run_code block for them: (1) drops low-detection genes seen in fewer than min_cells_per_gene cells (default 3), and (2) removes ribosomal genes so they cannot drive embedding or marker interpretation. Set remove_ribosomal_genes=false to keep ribosomal genes, or min_cells_per_gene=0 to keep all genes (e.g. strict source replication).",
+            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in a layer. Before normalization/HVG it applies two standard, guaranteed feature filters so you do NOT need a run_code block for them: (1) drops low-detection genes seen in fewer than min_cell_fraction_per_gene of cells (default 0.02 = 2% of the dataset; scales with dataset size), and (2) removes ribosomal genes so they cannot drive embedding or marker interpretation. Set remove_ribosomal_genes=false to keep ribosomal genes, min_cell_fraction_per_gene=0 to keep all genes, or min_cells_per_gene=N to use an absolute cell-count threshold instead of the fraction (e.g. strict source replication).",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"},
-                    "min_cells_per_gene": {"type": "integer", "description": "Drop genes detected (nonzero counts) in fewer than this many cells before normalization/HVG (default: 3). This standard low-detection filter runs automatically — do not issue a separate run_code sc.pp.filter_genes call. Set to 0 to keep all genes (e.g. strict source/paper replication)."},
+                    "min_cell_fraction_per_gene": {"type": "number", "description": "Drop genes detected (nonzero counts) in fewer than this FRACTION of cells before normalization/HVG (default: 0.02 = 2% of the dataset). Scales the low-detection filter with dataset size and runs automatically — do not issue a separate run_code sc.pp.filter_genes call. Set to 0 to keep all genes (e.g. strict source/paper replication)."},
+                    "min_cells_per_gene": {"type": "integer", "description": "Absolute-count override for the low-detection filter: drop genes detected in fewer than this many cells. When provided it takes precedence over min_cell_fraction_per_gene (use for exact-count reproduction of a source pipeline). Leave unset to use the fraction-based default."},
                     "target_sum": {"type": "number", "description": "Target counts per cell for normalize_total (default: 10000). Use source/paper value when reproducing a workflow."},
                     "log_transform": {"type": "boolean", "description": "Apply log1p after normalize_total (default: true)."},
                     "raw_layer_name": {"type": "string", "description": "Layer used to preserve/reset raw integer counts (default: raw_counts)."},
@@ -3116,6 +3135,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "method": {"type": "string", "enum": ["leiden", "louvain", "phenograph"], "description": "Method (default: leiden)"},
                     "resolution": {"type": "number", "description": "Resolution (default: 1.0)"},
+                    "allow_nonstandard_resolution": {"type": "boolean", "description": "Expert override (default false). run_clustering enforces the 2.0 → 1.5 → 1.0 ladder (first pass 2.0, then coarsen through 1.5/1.0, never climb back up) and refuses off-ladder resolutions. Set true ONLY when the USER explicitly asked for a different resolution — their request overrides the ladder. Do not set it on your own initiative; to merely explore resolutions, use compare_clusterings instead."},
                     "k": {"type": "integer", "description": "PhenoGraph nearest-neighbor k (default: 30; ignored for Leiden)"},
                     "use_rep": {"type": "string", "description": "Representation for PhenoGraph clustering (default: X_pca; ignored for Leiden)"},
                     "random_state": {"type": "integer", "description": "Random seed for clustering when supported (default: 0)"},
@@ -3683,7 +3703,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
-                    "output_path": {"type": "string", "description": "Path to save the PNG, under the run's figures/ directory. Use a DESCRIPTIVE, self-describing filename that names what distinguishes this figure from the others you will make — never a generic 'umap.png' or 'leiden.png'. Encode the distinguishing dimensions: what it is colored by, the clustering resolution, and the analysis phase (e.g. pre- vs post-batch-correction/integration). Organize related figures into phase subfolders rather than one flat directory, e.g. 'figures/pre_integration/umap_donor_res1.0.png' and 'figures/post_integration/umap_donor_res1.0.png'. Parent folders are created automatically, and a reused name is auto-uniquified (never overwrites), so distinct names + folders keep every figure and make comparisons obvious."},
+                    "output_path": {"type": "string", "description": "Path to save the PNG, under the run's figures/ directory. Use a DESCRIPTIVE, self-describing filename that names what ACTUALLY distinguishes this figure from the others — never a generic 'umap.png' or 'leiden.png'. Encode ONLY the dimensions that genuinely change THIS figure: (1) what it is colored by, and (2) the analysis phase as a subfolder — 'figures/pre_integration/' vs 'figures/post_integration/' (the embedding differs before vs after batch correction). **Encode the clustering resolution in the name ONLY for cluster/leiden-colored UMAPs** — resolution relabels clusters, so `umap_leiden_res_2.png` vs `umap_leiden_res_1.png` are genuinely different figures. **Do NOT put a resolution in the name of a donor/batch/sample or QC-metric UMAP** (e.g. write 'figures/post_integration/umap_donor.png', not 'umap_donor_res1_5.png'): those colorings do not depend on clustering resolution at all — only on the embedding/stage — so a resolution tag there is misleading and creates false duplicates. NOTE: the harness already auto-generates the canonical cluster UMAP (per run_clustering) and the batch/donor UMAP per stage (per run_umap), so you rarely need generate_figure for those; use it for other colorings (specific marker genes, custom overlays). Parent folders are created automatically, and a reused name is auto-uniquified (never overwrites), so distinct names + folders keep every figure and make comparisons obvious."},
                     "plot_type": {"type": "string", "enum": ["umap", "tsne", "violin", "dotplot", "heatmap"], "description": "Plot type. Use 'tsne' when the dataset has obsm['X_tsne'] but no UMAP (e.g. when reproducing a paper that uses t-SNE)."},
                     "color_by": {"type": "string", "description": "For umap/tsne: an obs column or gene to color by (optional; omit for a plain embedding). For dotplot/heatmap/violin this is the REQUIRED groupby — a categorical obs column (e.g. a cluster key like 'leiden' or an annotation like 'cell_type') whose groups form the plot's rows; it is NOT optional and must be a discrete obs column, not a gene."},
                     "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes to display. REQUIRED for dotplot/heatmap (the columns) and optional for violin. Every gene must exist in adata.var_names (check symbol vs Ensembl id, and that it survived HVG/QC filtering)."},
@@ -4717,11 +4737,29 @@ def _leiden_ladder_violation(resolution: float, prior: list) -> str | None:
 
 
 def _clustering_stage_label(adata) -> str:
-    """'post_integration' once a batch-corrected embedding exists, else 'pre_integration'."""
+    """Analysis stage of the ACTIVE embedding: 'post_integration' iff it was built
+    on a batch-corrected representation, else 'pre_integration'.
+
+    Stage is a property of the *embedding/representation*, not of the clustering
+    resolution — resolution only relabels clusters, it never moves the UMAP or
+    changes which representation the neighbor graph was built on. So this keys off
+    the active neighbor graph's ``use_rep`` (falling back to the mere presence of a
+    corrected embedding only when ``use_rep`` was not recorded).
+    """
     try:
         from ..core.inspector import integrated_embedding_keys
 
-        return "post_integration" if integrated_embedding_keys(adata) else "pre_integration"
+        integrated = set(integrated_embedding_keys(adata))
+        if not integrated:
+            return "pre_integration"
+        neigh = adata.uns.get("neighbors") if hasattr(adata, "uns") else None
+        params = neigh.get("params") if isinstance(neigh, dict) else None
+        use_rep = params.get("use_rep") if isinstance(params, dict) else None
+        if use_rep is not None:
+            return "post_integration" if use_rep in integrated else "pre_integration"
+        # use_rep unrecorded but a corrected embedding exists → assume the standard
+        # post-integration path (the workflow re-embeds on the corrected rep).
+        return "post_integration"
     except Exception:
         return "pre_integration"
 
@@ -9367,16 +9405,25 @@ def process_tool_call(
             hvg_flavor = tool_input.get("hvg_flavor", "seurat_v3")
             hvg_layer = tool_input.get("hvg_layer") or None
             batch_key = tool_input.get("batch_key")
-            # Standard low-detection gene filter: drop genes seen in fewer than
-            # min_cells_per_gene cells. Default 3 (a non-controversial scRNA-seq
-            # step); set 0 to disable, e.g. for strict source replication.
-            _mcpg = tool_input.get("min_cells_per_gene", 3)
+            # Standard low-detection gene filter (applied below, before norm/HVG).
+            # The threshold scales with dataset size: keep genes detected in at
+            # least min_cell_fraction_per_gene of cells (default 0.02 = 2%). An
+            # absolute min_cells_per_gene overrides the fraction when provided
+            # (e.g. strict source replication). Set the active knob to 0 to disable.
+            _frac_raw = tool_input.get("min_cell_fraction_per_gene", 0.02)
             try:
-                min_cells_per_gene = int(_mcpg) if _mcpg is not None else 0
+                min_cell_fraction = float(_frac_raw) if _frac_raw is not None else 0.0
             except (TypeError, ValueError):
-                min_cells_per_gene = 3
-            if min_cells_per_gene < 0:
-                min_cells_per_gene = 0
+                min_cell_fraction = 0.02
+            if min_cell_fraction < 0:
+                min_cell_fraction = 0.0
+            _abs_raw = tool_input.get("min_cells_per_gene")
+            min_cells_abs_override = None
+            if _abs_raw is not None:
+                try:
+                    min_cells_abs_override = max(0, int(_abs_raw))
+                except (TypeError, ValueError):
+                    min_cells_abs_override = None
             default_ribo_patterns = [
                 r"^(RPL|RPS|MRPL|MRPS)",
                 r"^(Rpl|Rps|Mrpl|Mrps)",
@@ -9459,18 +9506,34 @@ def process_tool_call(
             # adata by the ribosomal removal below, so it stays gene-aligned.
             raw_counts_note = _ensure_raw_counts_layer(adata, raw_layer_name)
 
-            # Standard low-detection gene filter. Genes detected in fewer than
-            # min_cells_per_gene cells across the whole dataset carry no usable
-            # signal and add noise to DEG; drop them before normalization/HVG. Done
-            # here (a guaranteed floor) rather than relying on the model to issue a
-            # run_code block, which it often skips. Detection is counted on the
-            # raw-counts layer so it is correct even if X was already processed
-            # (the nonzero pattern defines "detected"). The gene slice carries all
-            # layers (incl. raw_counts) along, and adata.raw is set only later, so
-            # nothing is left misaligned.
+            # Standard low-detection gene filter. Genes detected in too few cells
+            # carry no usable signal and add noise to DEG; drop them before
+            # normalization/HVG. Done here (a guaranteed floor) rather than relying
+            # on the model to issue a run_code block, which it often skips. The
+            # threshold scales with dataset size (a fraction of cells) by default so
+            # it stays meaningful across small and large datasets; an absolute count
+            # overrides it when given. Detection is counted on the raw-counts layer
+            # so it is correct even if X was already processed (the nonzero pattern
+            # defines "detected"). The gene slice carries all layers (incl.
+            # raw_counts) along, and adata.raw is set only later, so nothing is
+            # left misaligned.
+            import math as _math_ld
+            n_cells_total = int(adata.n_obs)
+            if min_cells_abs_override is not None:
+                min_cells_per_gene = min_cells_abs_override
+                threshold_basis = "absolute_min_cells"
+            elif min_cell_fraction > 0:
+                min_cells_per_gene = int(_math_ld.ceil(min_cell_fraction * n_cells_total))
+                threshold_basis = "fraction_of_cells"
+            else:
+                min_cells_per_gene = 0
+                threshold_basis = "disabled"
             low_detection_meta = {
                 "enabled": bool(min_cells_per_gene > 0),
                 "min_cells": int(min_cells_per_gene),
+                "threshold_basis": threshold_basis,
+                "min_cell_fraction": min_cell_fraction if threshold_basis == "fraction_of_cells" else None,
+                "n_cells_total": n_cells_total,
                 "n_removed": 0,
             }
             if min_cells_per_gene > 0:
@@ -9490,7 +9553,14 @@ def process_tool_call(
                     adata = adata[:, _keep_gene].copy()
                 low_detection_meta["n_genes_after"] = int(adata.n_vars)
                 low_detection_meta["source"] = (
-                    "scagent standard low-detection gene filter before normalization/HVG"
+                    f"scagent standard low-detection gene filter before normalization/HVG "
+                    f"(≥{min_cells_per_gene} cells"
+                    + (
+                        f" = {min_cell_fraction:.1%} of {n_cells_total}"
+                        if threshold_basis == "fraction_of_cells"
+                        else ""
+                    )
+                    + ")"
                 )
             _fr = dict(adata.uns.get("feature_removals", {}))
             _fr["low_detection_genes"] = low_detection_meta
@@ -10051,6 +10121,53 @@ def process_tool_call(
             neighbors_after = _neighbors_provenance(adata)
             graph_preserved = _provenance_same(neighbors_before, neighbors_after)
 
+            # Canonical batch/donor UMAP for THIS embedding — harness-owned, so the
+            # name is honest and consistent. It is stage-labeled and carries NO
+            # resolution: donor identity and UMAP coordinates do not depend on the
+            # Leiden resolution (resolution only relabels clusters), so the only axis
+            # that changes a donor-colored plot is the embedding/stage. run_umap fires
+            # once per embedding, so this yields exactly one batch UMAP per stage — no
+            # per-resolution duplication. Skipped when there is no multi-group
+            # batch/donor variable to color by.
+            artifacts_created = []
+            batch_umap_figure = None
+            try:
+                _bres = resolve_batch_metadata(adata)
+                _bkey = (
+                    getattr(_bres, "applied_column", None)
+                    or getattr(_bres, "recommended_column", None)
+                )
+                if (
+                    _bkey
+                    and _bkey in adata.obs.columns
+                    and adata.obs[_bkey].nunique(dropna=True) > 1
+                    and "X_umap" in adata.obsm
+                ):
+                    _stage = _clustering_stage_label(adata)
+                    _safe_bkey = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(_bkey))
+                    _fig_base = (
+                        Path(run_manager.run_dir) if run_manager is not None else Path(".")
+                    ) / "figures" / _stage
+                    _bfig = _render_figure(
+                        adata,
+                        plot_type="umap",
+                        output_path=str(_fig_base / f"umap_{_safe_bkey}.png"),
+                        color_by=_bkey,
+                        include_image=False,
+                    )
+                    batch_umap_figure = _bfig.get("output_path")
+                    if batch_umap_figure and run_manager is not None:
+                        run_manager.add_output(batch_umap_figure)
+                    _bpl = _artifact_payload(
+                        batch_umap_figure,
+                        role="figure",
+                        metadata={"kind": "batch_umap", "stage": _stage, "color_by": _bkey},
+                    )
+                    if _bpl:
+                        artifacts_created.append(_bpl)
+            except Exception:
+                batch_umap_figure = None
+
             output_path = fix_output_path(tool_input.get("output_path"), "run_umap")
             if output_path:
                 write_h5ad_safe(adata, output_path)
@@ -10063,6 +10180,7 @@ def process_tool_call(
                 "min_dist": min_dist,
                 "spread": spread,
                 "n_components": n_components,
+                "batch_umap_figure": batch_umap_figure,
                 "neighbors_key": neighbors_key or "neighbors",
                 "random_state": random_state,
                 "neighbors_before": neighbors_before,
@@ -10082,6 +10200,7 @@ def process_tool_call(
                 adata,
                 dataset_changed=True,
                 summary=f"Computed UMAP only from the existing neighbor graph with min_dist={min_dist}.",
+                artifacts_created=artifacts_created,
                 verification=_build_verification(
                     "passed" if graph_preserved else "warning",
                     "UMAP was computed from the existing neighbor graph.",
@@ -10104,9 +10223,16 @@ def process_tool_call(
 
             # Resolution ladder floor (leiden only): the first clustering is 2.0 and
             # every subsequent one comes down through {1.5, 1.0}, never back up. This
-            # makes the 2.0 → 1.5 → 1.0 ladder a harness guarantee. compare_clusterings
-            # is exempt. See the module-level ladder helpers for the full contract.
-            if str(method).lower() != "phenograph":
+            # makes the 2.0 → 1.5 → 1.0 ladder a harness guarantee against MODEL drift.
+            # It is NOT a cage on the user: when the user explicitly asks for a
+            # different resolution, the model sets allow_nonstandard_resolution=true and
+            # the user's value is honored (the model judges intent — the harness only
+            # provides the escape hatch, it does not pattern-match the request).
+            # compare_clusterings is always exempt.
+            allow_nonstandard_resolution = bool(
+                tool_input.get("allow_nonstandard_resolution", False)
+            )
+            if str(method).lower() != "phenograph" and not allow_nonstandard_resolution:
                 _ladder_msg = _leiden_ladder_violation(
                     resolution, _leiden_ladder_prior(adata)
                 )
@@ -10118,6 +10244,8 @@ def process_tool_call(
                         recovery_options=[
                             "Re-run run_clustering with an on-ladder resolution "
                             "(first pass 2.0, then 1.5, then 1.0).",
+                            "If the USER explicitly asked for this resolution, set "
+                            "allow_nonstandard_resolution=true to honor their request.",
                             "To compare several resolutions instead, use compare_clusterings "
                             "(exempt from the ladder — distinct keys, never primary).",
                         ],

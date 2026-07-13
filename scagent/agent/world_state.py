@@ -1736,6 +1736,8 @@ class AgentWorldState:
                     "low_detection_genes": {
                         "enabled": low_detection_removal.get("enabled"),
                         "min_cells": low_detection_removal.get("min_cells"),
+                        "threshold_basis": low_detection_removal.get("threshold_basis"),
+                        "min_cell_fraction": low_detection_removal.get("min_cell_fraction"),
                         "n_removed": low_detection_removal.get("n_removed"),
                         "source": low_detection_removal.get("source"),
                     },
