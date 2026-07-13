@@ -3205,6 +3205,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "cluster_key": {"type": "string", "description": "obs column with cluster labels (default: leiden)"},
+                    "allow_nonstandard_final_resolution": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses unless the clustering being annotated is at resolution 1.0 — the bottom of the enforced 2.0 → 1.5 → 1.0 ladder and the standard final annotation granularity. Set true ONLY when the user explicitly wants to annotate at a non-standard final resolution, with a documented reason."},
                     "allow_precorrection_clustering": {"type": "boolean", "description": "Expert override (default false). When the dataset is batch-corrected, prepare_annotation refuses to annotate a clustering that was NOT computed on the integrated embedding (e.g. a stale pre-integration clustering). Set true only to deliberately annotate a pre-integration clustering, with a documented reason."},
                     "allow_skip_structure_qc": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until cluster STRUCTURE QC has run on this clustering (run_cluster_qc auto-runs it) — it is required evidence that distinguishes coherent clusters from doublet/noise mixtures. Set true ONLY if the user explicitly asked to skip structure QC."},
                     "allow_skip_reference_tools": {"type": "boolean", "description": "Expert override (default false). prepare_annotation refuses until Scimilarity has run (or recorded a real blocker) — reference labels are primary annotation evidence and the proposal must be built after they exist. Set true ONLY if the user explicitly opted out of reference tools."},
@@ -3684,8 +3685,8 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save the PNG, under the run's figures/ directory. Use a DESCRIPTIVE, self-describing filename that names what distinguishes this figure from the others you will make — never a generic 'umap.png' or 'leiden.png'. Encode the distinguishing dimensions: what it is colored by, the clustering resolution, and the analysis phase (e.g. pre- vs post-batch-correction/integration). Organize related figures into phase subfolders rather than one flat directory, e.g. 'figures/pre_integration/umap_donor_res1.0.png' and 'figures/post_integration/umap_donor_res1.0.png'. Parent folders are created automatically, and a reused name is auto-uniquified (never overwrites), so distinct names + folders keep every figure and make comparisons obvious."},
                     "plot_type": {"type": "string", "enum": ["umap", "tsne", "violin", "dotplot", "heatmap"], "description": "Plot type. Use 'tsne' when the dataset has obsm['X_tsne'] but no UMAP (e.g. when reproducing a paper that uses t-SNE)."},
-                    "color_by": {"type": "string", "description": "Column or gene to color by"},
-                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes for dotplot/heatmap"},
+                    "color_by": {"type": "string", "description": "For umap/tsne: an obs column or gene to color by (optional; omit for a plain embedding). For dotplot/heatmap/violin this is the REQUIRED groupby — a categorical obs column (e.g. a cluster key like 'leiden' or an annotation like 'cell_type') whose groups form the plot's rows; it is NOT optional and must be a discrete obs column, not a gene."},
+                    "genes": {"type": "array", "items": {"type": "string"}, "description": "Genes to display. REQUIRED for dotplot/heatmap (the columns) and optional for violin. Every gene must exist in adata.var_names (check symbol vs Ensembl id, and that it survived HVG/QC filtering)."},
                     "include_image": {"type": "boolean", "description": "If true, include image data for model review (default: true)"}
                 },
                 "required": ["output_path", "plot_type"]
@@ -4648,6 +4649,94 @@ def _add_outside_categorical_legend(ax, adata_obj, key: str) -> bool:
         columnspacing=1.0, borderaxespad=0.0, markerscale=1.2,
     )
     return True
+
+
+# ── Leiden resolution ladder + canonical clustering-UMAP naming ──────────────
+# Consistency contract enforced by the harness (not left to the model):
+#   * The FIRST leiden clustering of a run is resolution 2.0 — maximum
+#     granularity to expose small low-quality populations and sample-private
+#     structure (this includes the uncorrected pre-integration pass).
+#   * Every SUBSEQUENT clustering coarsens monotonically through {1.5, 1.0} and
+#     never climbs back up ("always come down, never the reverse").
+#   * The FINAL annotation clustering is resolution 1.0 — enforced at the
+#     prepare_annotation gate, not here.
+# The ladder history is tracked in adata.uns[LEIDEN_LADDER_UNS_KEY] and is
+# appended to ONLY by run_clustering (compare_clusterings sweeps are exempt —
+# they are exploratory, keyed distinctly, and never become the primary alias).
+LEIDEN_LADDER_UNS_KEY = "scagent_leiden_ladder"
+LEIDEN_LADDER_FIRST = 2.0
+LEIDEN_LADDER_COARSER = (1.5, 1.0)
+LEIDEN_LADDER_FINAL = 1.0
+
+
+def _res_approx_equal(a: float, b: float) -> bool:
+    return abs(float(a) - float(b)) < 1e-9
+
+
+def _leiden_ladder_prior(adata) -> list:
+    """Resolutions of prior run_clustering calls this run (ladder history)."""
+    try:
+        prior = adata.uns.get(LEIDEN_LADDER_UNS_KEY, [])
+        return [float(r) for r in prior]
+    except Exception:
+        return []
+
+
+def _leiden_ladder_violation(resolution: float, prior: list) -> str | None:
+    """Return a corrective message if `resolution` is off the 2.0→1.5→1.0 ladder.
+
+    `prior` is the list of resolutions already clustered this run (oldest→newest).
+    Returns None when the resolution is on-ladder.
+    """
+    res = float(resolution)
+    if not prior:
+        if not _res_approx_equal(res, LEIDEN_LADDER_FIRST):
+            return (
+                f"The first clustering of a run must be resolution {LEIDEN_LADDER_FIRST} "
+                f"(got {res}). A coarse first pass hides the small low-quality populations "
+                "cluster QC exists to catch and blurs the sample-private structure the batch "
+                "diagnostic looks for — so the run always opens at maximum granularity. "
+                f"Re-run run_clustering with resolution={LEIDEN_LADDER_FIRST}."
+            )
+        return None
+    if not any(_res_approx_equal(res, allowed) for allowed in LEIDEN_LADDER_COARSER):
+        return (
+            f"After the first pass, clustering resolution must come down the ladder to one of "
+            f"{LEIDEN_LADDER_COARSER} (got {res}). Use 1.5 for post-removal / post-integration "
+            "re-clustering and 1.0 for the final annotation clustering; explore other values "
+            "only via compare_clusterings, which is exempt from the ladder."
+        )
+    ceiling = min(prior)
+    if res > ceiling + 1e-9:
+        return (
+            f"Clustering resolution must never climb back up: the run has already reached "
+            f"resolution {ceiling}, so the next clustering must be ≤ {ceiling} (got {res}). "
+            "Always come down the 2.0 → 1.5 → 1.0 ladder, never the reverse."
+        )
+    return None
+
+
+def _clustering_stage_label(adata) -> str:
+    """'post_integration' once a batch-corrected embedding exists, else 'pre_integration'."""
+    try:
+        from ..core.inspector import integrated_embedding_keys
+
+        return "post_integration" if integrated_embedding_keys(adata) else "pre_integration"
+    except Exception:
+        return "pre_integration"
+
+
+def _resolution_token_for_key(adata, cluster_key: str) -> str | None:
+    """Filesystem-safe resolution token for `cluster_key` from the clustering registry."""
+    try:
+        from ..core.inspector import format_resolution_token, get_clustering_registry
+
+        for rec in get_clustering_registry(adata):
+            if getattr(rec, "key", None) == cluster_key and getattr(rec, "resolution", None) is not None:
+                return format_resolution_token(rec.resolution)
+    except Exception:
+        pass
+    return None
 
 
 def process_tool_call(
@@ -10012,6 +10101,27 @@ def process_tool_call(
             use_rep = tool_input.get("use_rep")
             random_state = int(tool_input.get("random_state", 0))
             requested_cluster_key = tool_input.get("cluster_key")
+
+            # Resolution ladder floor (leiden only): the first clustering is 2.0 and
+            # every subsequent one comes down through {1.5, 1.0}, never back up. This
+            # makes the 2.0 → 1.5 → 1.0 ladder a harness guarantee. compare_clusterings
+            # is exempt. See the module-level ladder helpers for the full contract.
+            if str(method).lower() != "phenograph":
+                _ladder_msg = _leiden_ladder_violation(
+                    resolution, _leiden_ladder_prior(adata)
+                )
+                if _ladder_msg is not None:
+                    return _error_result(
+                        tool="run_clustering",
+                        message=_ladder_msg,
+                        adata_obj=adata,
+                        recovery_options=[
+                            "Re-run run_clustering with an on-ladder resolution "
+                            "(first pass 2.0, then 1.5, then 1.0).",
+                            "To compare several resolutions instead, use compare_clusterings "
+                            "(exempt from the ladder — distinct keys, never primary).",
+                        ],
+                    )
             cluster_key, default_make_primary = _resolve_clustering_output_key(
                 adata,
                 method,
@@ -10038,10 +10148,59 @@ def process_tool_call(
                 random_state=random_state,
             )
 
+            artifacts_created = []
+
+            # Advance the ladder history (only run_clustering contributes) and emit
+            # the canonical per-resolution cluster UMAP: harness owns the name and
+            # folder so every resolution's Leiden UMAP always exists, is stage- and
+            # resolution-labeled, and never overwrites another. Stage folder is
+            # pre_integration until a corrected embedding exists, then post_integration.
+            cluster_umap_figure = None
+            if str(method).lower() != "phenograph":
+                try:
+                    _ladder_hist = _leiden_ladder_prior(adata)
+                    _ladder_hist.append(float(resolution))
+                    adata.uns[LEIDEN_LADDER_UNS_KEY] = _ladder_hist
+                except Exception:
+                    pass
+                if "X_umap" in adata.obsm and result_payload["cluster_key"] in adata.obs.columns:
+                    from ..core.inspector import format_resolution_token
+
+                    _stage = _clustering_stage_label(adata)
+                    _res_tok = format_resolution_token(resolution)
+                    _fig_base = (
+                        Path(run_manager.run_dir) if run_manager is not None else Path(".")
+                    ) / "figures" / _stage
+                    _umap_out = str(_fig_base / f"umap_leiden_res_{_res_tok}.png")
+                    try:
+                        _umap_res = _render_figure(
+                            adata,
+                            plot_type="umap",
+                            output_path=_umap_out,
+                            color_by=result_payload["cluster_key"],
+                            include_image=False,
+                        )
+                        cluster_umap_figure = _umap_res.get("output_path")
+                        if cluster_umap_figure and run_manager is not None:
+                            run_manager.add_output(cluster_umap_figure)
+                        _pl = _artifact_payload(
+                            cluster_umap_figure,
+                            role="figure",
+                            metadata={
+                                "kind": "cluster_umap",
+                                "stage": _stage,
+                                "resolution": float(resolution),
+                                "cluster_key": result_payload["cluster_key"],
+                            },
+                        )
+                        if _pl:
+                            artifacts_created.append(_pl)
+                    except Exception:
+                        cluster_umap_figure = None
+
             output_path = fix_output_path(tool_input.get("output_path"), "run_clustering")
             if output_path:
                 write_h5ad_safe(adata, output_path)
-            artifacts_created = []
             if output_path:
                 artifact = _artifact_payload(output_path, role="checkpoint", metadata={"format": "h5ad"})
                 if artifact is not None:
@@ -10068,6 +10227,7 @@ def process_tool_call(
                 },
                 "n_clusters": result_payload["n_clusters"],
                 "cluster_sizes": result_payload["cluster_sizes"],
+                "cluster_umap_figure": cluster_umap_figure,
                 "available_clusterings": result_payload["clusterings"],
                 "warnings": warnings,
                 "state": make_state(adata)
@@ -11389,16 +11549,8 @@ def process_tool_call(
                 # Encode the clustering resolution in the filename so pre-integration
                 # UMAPs at different resolutions are distinguishable at a glance — the
                 # cluster key alone (e.g. "leiden") does not carry it.
-                _res_tag = ""
-                try:
-                    from ..core.inspector import get_clustering_registry
-                    for _rec in get_clustering_registry(adata):
-                        if (getattr(_rec, "cluster_key", None) == cluster_key
-                                and getattr(_rec, "resolution", None) is not None):
-                            _res_tag = "_res" + str(_rec.resolution).replace(".", "_")
-                            break
-                except Exception:
-                    _res_tag = ""
+                _res_tok = _resolution_token_for_key(adata, cluster_key)
+                _res_tag = f"_res_{_res_tok}" if _res_tok else ""
                 _pre_dir = (
                     Path(run_manager.run_dir) if run_manager is not None else Path(".")
                 ) / "figures" / "pre_integration"
@@ -12382,6 +12534,70 @@ def process_tool_call(
                     ],
                     extra={"plot_type": plot_type, "requested_color_by": color_by},
                 )
+            # dotplot/heatmap/violin group expression BY a categorical obs column
+            # (cluster key, cell type, …). scanpy passes color_by straight to
+            # groupby; a missing or non-categorical value reaches it as None and
+            # raises a cryptic "'NoneType' object is not iterable". Validate up
+            # front and hand back the actual grouping columns to pick from.
+            if plot_type in ("dotplot", "heatmap", "violin"):
+                _group_candidates = [
+                    c for c in adata.obs.columns if _is_discrete_obs_color(adata, c)
+                ]
+                if color_by in (None, "") or color_by not in adata.obs.columns:
+                    _msg = (
+                        f"A {plot_type} groups genes by a categorical obs column, but "
+                        + (
+                            f"the requested group '{color_by}' is not an obs column."
+                            if color_by not in (None, "")
+                            else "no grouping column was provided (color_by is required for this plot type)."
+                        )
+                    )
+                    return _smart_unavailable_result(
+                        tool="generate_figure",
+                        message=_msg,
+                        adata_obj=adata,
+                        missing_prerequisites=["grouping_column"],
+                        recovery_options=[
+                            (
+                                "Set color_by to a categorical obs column such as: "
+                                + ", ".join(_group_candidates[:12])
+                                if _group_candidates
+                                else "Cluster or annotate the cells first so a categorical grouping column exists, then retry."
+                            ),
+                            "For a UMAP colored by a single gene instead, use plot_type='umap' with color_by=<gene>.",
+                        ],
+                        extra={
+                            "plot_type": plot_type,
+                            "requested_color_by": color_by,
+                            "available_grouping_columns": _group_candidates,
+                        },
+                    )
+                if not genes:
+                    return _smart_unavailable_result(
+                        tool="generate_figure",
+                        message=f"A {plot_type} needs a non-empty list of genes to display (the 'genes' argument was empty).",
+                        adata_obj=adata,
+                        missing_prerequisites=["genes"],
+                        recovery_options=[
+                            "Pass genes=[...] with the marker genes to plot (e.g. the top DEGs per cluster).",
+                        ],
+                        extra={"plot_type": plot_type, "color_by": color_by},
+                    )
+                _missing_genes = [g for g in genes if g not in adata.var_names]
+                if _missing_genes:
+                    return _smart_unavailable_result(
+                        tool="generate_figure",
+                        message=(
+                            f"{len(_missing_genes)} of {len(genes)} requested genes are not in the "
+                            f"dataset and would break the {plot_type}: {', '.join(map(str, _missing_genes[:15]))}."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["valid_genes"],
+                        recovery_options=[
+                            "Remove the missing genes (check symbol vs Ensembl id, and that they survived HVG/QC filtering) and retry.",
+                        ],
+                        extra={"plot_type": plot_type, "missing_genes": _missing_genes},
+                    )
             result = _render_figure(
                 adata,
                 plot_type=plot_type,
@@ -12811,7 +13027,16 @@ def process_tool_call(
                 # clusters (self-titled with the resolution) — no reliance on the
                 # model remembering to plot it. Skipped only if no UMAP exists yet.
                 if "X_umap" in adata.obsm:
-                    _umap_out = str(qc_fig_dir / f"umap_{safe_key}_pass_{pass_n:03d}.png")
+                    # Encode the resolution in the filename even when the obs key is
+                    # the bare primary alias ("leiden" for res 1.0), so the QC UMAP is
+                    # self-identifying like the non-primary keys (leiden_res_1_5).
+                    _qc_res_tok = _resolution_token_for_key(adata, cluster_key)
+                    _qc_res_tag = (
+                        f"_res_{_qc_res_tok}" if _qc_res_tok and "res_" not in safe_key else ""
+                    )
+                    _umap_out = str(
+                        qc_fig_dir / f"umap_{safe_key}{_qc_res_tag}_pass_{pass_n:03d}.png"
+                    )
                     try:
                         _umap_res = _render_figure(
                             adata,
@@ -13889,6 +14114,43 @@ def process_tool_call(
                         f"Pass an existing cluster column via cluster_key. Available columns: {list(adata.obs.columns)[:30]}",
                     ],
                 )
+
+            # --- Floor 0: the final annotation clustering must be at resolution 1.0 ---
+            # The resolution ladder (2.0 → 1.5 → 1.0) bottoms out at 1.0 for the
+            # clustering that gets labelled: it is the coarsest, most biologically
+            # interpretable granularity, and pinning it makes annotation reproducible
+            # across runs on the same data instead of drifting with whatever
+            # resolution the QC loop happened to stop at. run_clustering enforces the
+            # upper rungs; this gate enforces the bottom one. Override only when the
+            # user explicitly wants a non-standard final resolution.
+            allow_nonstandard_final = bool(
+                tool_input.get("allow_nonstandard_final_resolution", False)
+            )
+            if not allow_nonstandard_final:
+                _final_rec = next(
+                    (c for c in get_clustering_registry(adata) if c.key == cluster_key), None
+                )
+                _final_res = _final_rec.resolution if _final_rec is not None else None
+                if _final_res is not None and abs(float(_final_res) - 1.0) > 1e-9:
+                    return _smart_unavailable_result(
+                        tool="prepare_annotation",
+                        message=(
+                            f"Clustering '{cluster_key}' is at resolution {_final_res}, but the "
+                            "final annotation clustering must be at resolution 1.0 — the bottom of "
+                            "the 2.0 → 1.5 → 1.0 ladder. Annotating a finer intermediate clustering "
+                            "(e.g. a res-1.5 QC-loop pass) over-splits cell types and makes labels "
+                            "drift between runs. Re-cluster at resolution 1.0, then re-run "
+                            "prepare_annotation on that clustering."
+                        ),
+                        adata_obj=adata,
+                        missing_prerequisites=["final_resolution_1.0_clustering"],
+                        recovery_options=[
+                            "run_clustering at resolution=1.0 (on the integrated embedding if the "
+                            "dataset was batch-corrected), then prepare_annotation on its cluster_key.",
+                            "Override only with a documented reason: set "
+                            "allow_nonstandard_final_resolution=true.",
+                        ],
+                    )
 
             # --- Floor 1: annotation must bind to a post-integration clustering ---
             # If the dataset was batch-corrected, the clustering being annotated
