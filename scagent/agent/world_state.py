@@ -1707,6 +1707,7 @@ class AgentWorldState:
             exclusions = result.get("feature_exclusions") or {}
             removals = result.get("feature_removals") or {}
             ribosomal_removal = removals.get("ribosomal_genes") or {}
+            low_detection_removal = removals.get("low_detection_genes") or {}
             return {
                 "tool": "normalize_and_hvg",
                 "timestamp": ts,
@@ -1731,7 +1732,13 @@ class AgentWorldState:
                         "match_mode": ribosomal_removal.get("match_mode"),
                         "source": ribosomal_removal.get("source"),
                         "n_removed": ribosomal_removal.get("n_removed"),
-                    }
+                    },
+                    "low_detection_genes": {
+                        "enabled": low_detection_removal.get("enabled"),
+                        "min_cells": low_detection_removal.get("min_cells"),
+                        "n_removed": low_detection_removal.get("n_removed"),
+                        "source": low_detection_removal.get("source"),
+                    },
                 },
                 "hvg_method": hvg.get("method"),
                 "hvg_flavor": hvg.get("flavor"),

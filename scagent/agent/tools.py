@@ -1048,6 +1048,12 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
             f"(flavor: {_report_fmt(s.get('hvg_flavor'))})"
         )
         removals = s.get("feature_removals") or {}
+        low_det = removals.get("low_detection_genes") if isinstance(removals, dict) else None
+        if isinstance(low_det, dict) and low_det.get("enabled"):
+            lines.append(
+                f"- Low-detection genes removed: n={low_det.get('n_removed', 0)} "
+                f"(genes seen in fewer than {low_det.get('min_cells', 3)} cells)"
+            )
         ribo = removals.get("ribosomal_genes") if isinstance(removals, dict) else None
         if isinstance(ribo, dict):
             lines.append(
@@ -3023,13 +3029,14 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "normalize_and_hvg",
-            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in a layer. By default, ribosomal genes are removed from the analysis object before normalization/HVG so they cannot drive embedding or marker interpretation; set remove_ribosomal_genes=false when the user/source explicitly wants to keep them.",
+            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in a layer. Before normalization/HVG it applies two standard, guaranteed feature filters so you do NOT need a run_code block for them: (1) drops low-detection genes seen in fewer than min_cells_per_gene cells (default 3), and (2) removes ribosomal genes so they cannot drive embedding or marker interpretation. Set remove_ribosomal_genes=false to keep ribosomal genes, or min_cells_per_gene=0 to keep all genes (e.g. strict source replication).",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"},
+                    "min_cells_per_gene": {"type": "integer", "description": "Drop genes detected (nonzero counts) in fewer than this many cells before normalization/HVG (default: 3). This standard low-detection filter runs automatically — do not issue a separate run_code sc.pp.filter_genes call. Set to 0 to keep all genes (e.g. strict source/paper replication)."},
                     "target_sum": {"type": "number", "description": "Target counts per cell for normalize_total (default: 10000). Use source/paper value when reproducing a workflow."},
                     "log_transform": {"type": "boolean", "description": "Apply log1p after normalize_total (default: true)."},
                     "raw_layer_name": {"type": "string", "description": "Layer used to preserve/reset raw integer counts (default: raw_counts)."},
@@ -9271,6 +9278,16 @@ def process_tool_call(
             hvg_flavor = tool_input.get("hvg_flavor", "seurat_v3")
             hvg_layer = tool_input.get("hvg_layer") or None
             batch_key = tool_input.get("batch_key")
+            # Standard low-detection gene filter: drop genes seen in fewer than
+            # min_cells_per_gene cells. Default 3 (a non-controversial scRNA-seq
+            # step); set 0 to disable, e.g. for strict source replication.
+            _mcpg = tool_input.get("min_cells_per_gene", 3)
+            try:
+                min_cells_per_gene = int(_mcpg) if _mcpg is not None else 0
+            except (TypeError, ValueError):
+                min_cells_per_gene = 3
+            if min_cells_per_gene < 0:
+                min_cells_per_gene = 0
             default_ribo_patterns = [
                 r"^(RPL|RPS|MRPL|MRPS)",
                 r"^(Rpl|Rps|Mrpl|Mrps)",
@@ -9352,6 +9369,43 @@ def process_tool_call(
             # half-stripped object, and the materialized layer is sliced along with
             # adata by the ribosomal removal below, so it stays gene-aligned.
             raw_counts_note = _ensure_raw_counts_layer(adata, raw_layer_name)
+
+            # Standard low-detection gene filter. Genes detected in fewer than
+            # min_cells_per_gene cells across the whole dataset carry no usable
+            # signal and add noise to DEG; drop them before normalization/HVG. Done
+            # here (a guaranteed floor) rather than relying on the model to issue a
+            # run_code block, which it often skips. Detection is counted on the
+            # raw-counts layer so it is correct even if X was already processed
+            # (the nonzero pattern defines "detected"). The gene slice carries all
+            # layers (incl. raw_counts) along, and adata.raw is set only later, so
+            # nothing is left misaligned.
+            low_detection_meta = {
+                "enabled": bool(min_cells_per_gene > 0),
+                "min_cells": int(min_cells_per_gene),
+                "n_removed": 0,
+            }
+            if min_cells_per_gene > 0:
+                import scipy.sparse as _sp_ld
+                _counts = adata.layers.get(raw_layer_name)
+                if _counts is None:
+                    _counts = adata.X
+                if _sp_ld.issparse(_counts):
+                    _n_cells_per_gene = np.asarray((_counts > 0).sum(axis=0)).ravel()
+                else:
+                    _n_cells_per_gene = np.asarray((np.asarray(_counts) > 0).sum(axis=0)).ravel()
+                _keep_gene = _n_cells_per_gene >= min_cells_per_gene
+                _n_low = int((~_keep_gene).sum())
+                low_detection_meta["n_removed"] = _n_low
+                low_detection_meta["n_genes_before"] = int(adata.n_vars)
+                if _n_low:
+                    adata = adata[:, _keep_gene].copy()
+                low_detection_meta["n_genes_after"] = int(adata.n_vars)
+                low_detection_meta["source"] = (
+                    "scagent standard low-detection gene filter before normalization/HVG"
+                )
+            _fr = dict(adata.uns.get("feature_removals", {}))
+            _fr["low_detection_genes"] = low_detection_meta
+            adata.uns["feature_removals"] = _fr
 
             if remove_ribosomal_genes:
                 # Match ribosomal patterns against gene SYMBOLS, not raw var_names.
@@ -9485,6 +9539,7 @@ def process_tool_call(
                 "n_hvg": int(adata.var['highly_variable'].sum()),
                 "feature_removals": {
                     "ribosomal_genes": ribosomal_removal_meta,
+                    "low_detection_genes": low_detection_meta,
                 },
                 "hvg": {
                     "requested_flavor": hvg_meta.get("requested_flavor", hvg_flavor),
@@ -9502,6 +9557,7 @@ def process_tool_call(
                     "n_hvg_selected": int(adata.var['highly_variable'].sum()),
                     "normalized_counts_target_median": normalized_counts_target,
                     "n_removed_ribosomal_genes": int(ribosomal_removal_meta.get("n_removed", 0) or 0),
+                    "n_removed_low_detection_genes": int(low_detection_meta.get("n_removed", 0) or 0),
                     "n_excluded_features": int(exclusion_meta.get("n_excluded", 0) or 0),
                     "excluded_features_marked_hvg": int(exclusion_meta.get("excluded_hvg_after_forcing", 0) or 0),
                 },
