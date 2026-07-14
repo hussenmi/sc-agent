@@ -70,15 +70,16 @@ def test_baseline_nominated_when_doublets_missing(monkeypatch, tmp_path):
     assert "structure_qc" in r and r["structure_qc"].get("structure_qc_run_id")
 
 
-def test_structure_qc_reports_coherence_breakdown_and_caps_heatmaps(monkeypatch, tmp_path):
-    # Coherence metrics computed for every cluster; result carries a breakdown +
-    # summary, and heatmaps are capped (max_heatmaps) rather than one-per-cluster.
+def test_structure_qc_renders_one_heatmap_per_cluster(monkeypatch, tmp_path):
+    # Coherence metrics AND a covariance heatmap are produced for every analyzed
+    # cluster (coherent ones included) — the auto-run covers the whole clustering,
+    # not just a flagged/least-coherent subset.
     import json
     monkeypatch.chdir(tmp_path)
     a = _clean_clustered_adata(with_doublets=True)
     rj, _ = process_tool_call(
         "run_cluster_qc",
-        {"cluster_key": "leiden", "save_checkpoint": False, "max_heatmaps": 2},
+        {"cluster_key": "leiden", "save_checkpoint": False},
         a,
     )
     r = json.loads(rj)
@@ -86,5 +87,23 @@ def test_structure_qc_reports_coherence_breakdown_and_caps_heatmaps(monkeypatch,
     assert sq.get("structure_qc_run_id")
     assert sq.get("n_clusters_analyzed") == 3           # all clusters assessed
     assert isinstance(sq.get("coherence_breakdown"), dict)
-    assert sq.get("n_heatmaps_rendered") <= 2           # capped
+    # One heatmap per analyzed cluster — no coherent-cluster skipping, no cap.
+    assert sq.get("n_heatmaps_rendered") == 3
     assert "coherence" in (sq.get("structure_summary") or "").lower()
+
+
+def test_structure_qc_explicit_max_heatmaps_caps_rendering(monkeypatch, tmp_path):
+    # An explicit max_heatmaps still bounds how many heatmaps are drawn, even
+    # though every cluster is analyzed.
+    import json
+    monkeypatch.chdir(tmp_path)
+    a = _clean_clustered_adata(with_doublets=True)
+    rj, _ = process_tool_call(
+        "run_cluster_structure_qc",
+        {"cluster_key": "leiden", "clusters_to_analyze": ["0", "1", "2"], "max_heatmaps": 2},
+        a,
+    )
+    r = json.loads(rj)
+    assert r.get("status") in ("ok", "success")
+    assert r.get("n_clusters_analyzed") == 3            # all still analyzed
+    assert r.get("n_heatmaps_rendered") == 2            # but rendering capped

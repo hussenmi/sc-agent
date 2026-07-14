@@ -80,7 +80,11 @@ def test_scaffold_prefills_derivable_fields_leaves_reasoning_blank():
     scaffold = _build_annotation_evidence_scaffold([_consensus_summary()], REF_KEYS)
     entry = scaffold["1"]
     assert entry["label"] == "Endothelial cells"
-    assert entry["deg_derived_label"] == "Endothelial cells"
+    # deg_derived_label is the model's INDEPENDENT read of the cluster's own DEGs.
+    # It must NOT be seeded from the reference-derived proposed_label, or a cluster
+    # could pass the DEG-first floor without the markers ever being confronted
+    # (the run_2026_07_13_172738 Sst-topped-cluster-labeled-beta failure).
+    assert entry["deg_derived_label"] == ""
     assert entry["supporting_genes"] == ["CLDN5", "PECAM1", "VWF"]
     assert entry["confidence"] == "high"  # reference_consensus_plus_deg ceiling
     assert entry["panglaodb_queried"] is False
@@ -89,7 +93,7 @@ def test_scaffold_prefills_derivable_fields_leaves_reasoning_blank():
         "scimilarity_predictions_unconstrained": "endothelial cell",
     }
     assert entry["source_synthesis"]["agreement"] == "reference_consensus"
-    # reasoning + final_decision_basis are the model's job and stay blank
+    # deg_derived_label + reasoning + final_decision_basis are the model's job and stay blank
     assert entry["reasoning"] == ""
     assert entry["source_synthesis"]["final_decision_basis"] == ""
 
@@ -308,15 +312,25 @@ def test_finalize_without_reasoning_gives_targeted_message_not_persistence_error
     assert "reasoning" in r["message"].lower()
 
 
-def test_stage_with_reasoning_only_then_finalize_writes_labels():
+def _agreeing_evidence(a):
+    """Model supplies its independent deg_derived_label (agreeing with the scaffold's
+    proposed label here) + reasoning; every other field comes from the scaffold."""
+    scaffold = a.uns["annotation_evidence_scaffold"]
+    return {
+        c: {
+            "deg_derived_label": scaffold[c]["label"],
+            "reasoning": f"Cluster {c}: top DEGs read first, consistent with reference consensus; markers reviewed.",
+        }
+        for c in scaffold
+    }
+
+
+def test_stage_with_deg_label_and_reasoning_then_finalize_writes_labels():
     a = _integration_adata()
     _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
     clusters = list(a.uns["annotation_evidence_scaffold"].keys())
-    # The model supplies ONLY reasoning; every other field comes from the scaffold.
-    ev = {
-        c: {"reasoning": f"Cluster {c}: lineage from reference consensus + DEG support; markers reviewed."}
-        for c in clusters
-    }
+    # The model supplies its DEG-derived label + reasoning; other fields come from the scaffold.
+    ev = _agreeing_evidence(a)
     res, a = process_tool_call("stage_annotation_evidence", {"evidence_summary": ev}, a)
     r = json.loads(res)
     assert r["ready_to_finalize"] is True
@@ -336,8 +350,7 @@ def test_finalize_does_not_clobber_preexisting_annotation():
     a = _integration_adata()
     a.obs["cell_type"] = pd.Categorical(["SourcePaperLabel"] * a.n_obs)
     _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
-    clusters = list(a.uns["annotation_evidence_scaffold"].keys())
-    ev = {c: {"reasoning": f"Cluster {c}: lineage from reference consensus + DEG support; reviewed."} for c in clusters}
+    ev = _agreeing_evidence(a)
     _, a = process_tool_call("stage_annotation_evidence", {"evidence_summary": ev}, a)
     res, a = process_tool_call("finalize_annotation", {"cluster_key": "leiden"}, a)
     r = json.loads(res)
@@ -353,8 +366,7 @@ def test_finalize_overwrite_true_replaces_preexisting():
     a = _integration_adata()
     a.obs["cell_type"] = pd.Categorical(["SourcePaperLabel"] * a.n_obs)
     _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
-    clusters = list(a.uns["annotation_evidence_scaffold"].keys())
-    ev = {c: {"reasoning": f"Cluster {c}: lineage from reference consensus + DEG support; reviewed."} for c in clusters}
+    ev = _agreeing_evidence(a)
     _, a = process_tool_call("stage_annotation_evidence", {"evidence_summary": ev}, a)
     res, a = process_tool_call(
         "finalize_annotation", {"cluster_key": "leiden", "annotation_key": "cell_type", "overwrite": True}, a
@@ -369,7 +381,10 @@ def test_stage_reports_clusters_awaiting_reasoning():
     a = _integration_adata()
     _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
     # reasoning for only one cluster
-    ev = {"0": {"reasoning": "Cluster 0: T-cell lineage from CD3-like DEG support; reviewed."}}
+    ev = {"0": {
+        "deg_derived_label": a.uns["annotation_evidence_scaffold"]["0"]["label"],
+        "reasoning": "Cluster 0: T-cell lineage from CD3-like DEG support; reviewed.",
+    }}
     res, a = process_tool_call("stage_annotation_evidence", {"evidence_summary": ev}, a)
     r = json.loads(res)
     assert r["ready_to_finalize"] is False

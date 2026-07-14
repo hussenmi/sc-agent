@@ -152,6 +152,39 @@ def _resolve_n_devices(n_devices: int | None) -> int:
     return value if value != 0 else 1
 
 
+def _count_visible_gpus() -> int:
+    """Number of CUDA-visible GPUs, honoring ``CUDA_VISIBLE_DEVICES``.
+
+    Reports how many physical GPUs scVI (and the RAPIDS path) can actually see,
+    so the UI can show a real count instead of a vague "multi-GPU". Counts via
+    NVML (``pynvml``), which queries the driver **without** allocating a CUDA
+    context — the same context-free rationale as :func:`_select_gpu_device`, so
+    this is safe to call from the main process. Returns 0 when no GPU is visible
+    or NVML is unavailable (e.g. the CPU-only dev env). When
+    ``CUDA_VISIBLE_DEVICES`` restricts the set, its entry count wins over NVML's
+    physical total.
+    """
+    import os
+
+    visible = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if visible:
+        tokens = [tok for tok in visible.split(",") if tok.strip()]
+        # An explicit empty mask or "-1" hides every GPU.
+        if not tokens or tokens == ["-1"]:
+            return 0
+        return len(tokens)
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            return int(pynvml.nvmlDeviceGetCount())
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return 0
+
+
 def run_scvi(
     adata: AnnData,
     batch_key: str,

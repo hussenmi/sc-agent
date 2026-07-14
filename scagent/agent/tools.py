@@ -1649,7 +1649,16 @@ def _build_annotation_evidence_scaffold(
 
         entry: Dict[str, Any] = {
             "label": label,
-            "deg_derived_label": label,
+            # deg_derived_label is deliberately NOT pre-filled. The scaffold's
+            # proposed `label` is reference-/score-derived, so seeding
+            # deg_derived_label from it would let a cluster pass the DEG-first
+            # floor without the model ever reading its own markers — the exact
+            # failure in run_2026_07_13_172738, where Sst-topped (delta) and
+            # Gcg-topped (alpha) clusters were finalized as beta because the
+            # prefilled "DEG-derived" label silently agreed with Scimilarity.
+            # Leaving it blank forces an explicit, independent per-cluster call;
+            # the validator (Floor 2) blocks finalize until it is supplied.
+            "deg_derived_label": "",
             "supporting_genes": genes,
             "panglaodb_queried": False,
             "confidence": _ANNOTATION_TIER_CONFIDENCE.get(tier, "low"),
@@ -3298,11 +3307,16 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "submitted DEG support for high confidence; broad-parent PanglaoDB labels cap confidence to "
                 "`medium`; QC-derived caps "
                 "(high MT, doublet enrichment, low complexity, structure-QC review) auto-lower confidence too. "
-                "(4) `reasoning`: ≥20 chars explaining the chosen label. "
-                "(5) `source_synthesis`: `{agreement, final_decision_basis}` required when CellTypist/Scimilarity "
+                "(4) `deg_derived_label` (REQUIRED, per cluster): the cell type this cluster's OWN top DEGs "
+                "indicate, read independently of CellTypist/Scimilarity — it is NOT pre-filled, you must state it. "
+                "The DEGs are authoritative: if `deg_derived_label` differs from `label` you must either change "
+                "`label` to match it or supply a `deg_override_justification` (≥20 chars) naming the specific DEGs "
+                "that outweigh the cluster's own markers. `reasoning` must show that DEG-first logic. "
+                "(5) `reasoning`: ≥20 chars explaining the chosen label. "
+                "(6) `source_synthesis`: `{agreement, final_decision_basis}` required when CellTypist/Scimilarity "
                 "reference columns were used or QC caveats apply. "
-                "(6) `competing_labels_considered`: required for clusters that prepare_annotation flagged ambiguous. "
-                "(7) If CellTypist and Scimilarity agree on a lineage, the final label must stay compatible "
+                "(7) `competing_labels_considered`: required for clusters that prepare_annotation flagged ambiguous. "
+                "(8) If CellTypist and Scimilarity agree on a lineage, the final label must stay compatible "
                 "with that consensus unless the evidence clears the cross-lineage override gate: exact/reverse "
                 "PanglaoDB support, at least three discriminating non-broad DEG markers, the consensus label "
                 "listed as a competitor/conflict, and source_synthesis explicitly explaining why the consensus lost."
@@ -3313,12 +3327,16 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "evidence_summary": {
                         "type": ["object", "string"],
                         "description": (
-                            "Dict mapping cluster_id to annotation evidence. Send `reasoning` + OVERRIDES ONLY: "
-                            "prepare_annotation already pre-filled label, supporting_genes, confidence, "
-                            "competing_labels_considered, reference_annotation_support and source_synthesis in the "
-                            "scaffold, and this tool MERGES your submission on top of it — any field you omit is kept "
-                            "from the scaffold, not lost. So a cluster you agree with is just "
-                            "{'<cid>': {'reasoning': '...'}}. Do NOT re-type label/supporting_genes/confidence that "
+                            "Dict mapping cluster_id to annotation evidence. Send `deg_derived_label` + `reasoning` "
+                            "+ OVERRIDES ONLY: prepare_annotation already pre-filled label, supporting_genes, "
+                            "confidence, competing_labels_considered, reference_annotation_support and source_synthesis "
+                            "in the scaffold, and this tool MERGES your submission on top of it — any field you omit is "
+                            "kept from the scaffold, not lost. BUT `deg_derived_label` is deliberately NOT pre-filled "
+                            "(the scaffold's proposed label is reference-derived, not your independent DEG read), so "
+                            "you MUST supply it for every cluster. A cluster whose DEGs agree with the proposed label "
+                            "is `{'<cid>': {'deg_derived_label': '<same type>', 'reasoning': '...'}}`; where they "
+                            "disagree, correct `label` too (or add `deg_override_justification`). Do NOT re-type "
+                            "label/supporting_genes/confidence that "
                             "already match the scaffold — re-sending the full dict for every cluster bloats the payload "
                             "and truncates the call. Only include a field when you are CHANGING it: a corrected `label` "
                             "(with `deg_derived_label` + `deg_override_justification` naming the genes) where the "
@@ -3911,7 +3929,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on the flagged/ambiguous (or baseline) clusters — gene-gene covariance modules, clustered correlation heatmaps, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`), a cluster-colored UMAP of this clustering to figures/cluster_qc/<cluster_key>/umap_<cluster_key>_pass_NNN.png (in `cluster_umap_figure`, auto-titled with the resolution — this is the Leiden/cluster UMAP for the clustering, generated for you so you do not need a separate generate_figure call for it), and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite all three in the QC reasoning report.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on every cluster — gene-gene covariance modules, one clustered correlation heatmap per cluster, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`), a cluster-colored UMAP of this clustering to figures/cluster_qc/<cluster_key>/umap_<cluster_key>_pass_NNN.png (in `cluster_umap_figure`, auto-titled with the resolution — this is the Leiden/cluster UMAP for the clustering, generated for you so you do not need a separate generate_figure call for it), and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite all three in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -3921,7 +3939,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "ribo_threshold": {"type": "number", "description": "Mean ribosomal% above which a cluster is flagged for structure-QC review (default: 50). Only applied when pct_counts_ribo is present in obs."},
                     "low_lib_fraction": {"type": "number", "description": "Fraction of global median library size below which lib size is considered low (default: 0.5)"},
                     "low_genes_fraction": {"type": "number", "description": "Fraction of global median n_genes below which gene count is considered low (default: 0.5)"},
-                    "auto_structure_qc": {"type": "boolean", "description": "Auto-run cluster structure QC on the flagged/ambiguous/baseline clusters within this call (default: true). Set false only to run structure QC separately with custom parameters."},
+                    "auto_structure_qc": {"type": "boolean", "description": "Auto-run cluster structure QC on every cluster within this call (default: true). Set false only to run structure QC separately with custom parameters."},
                     "save_checkpoint": {"type": "boolean", "description": "Save an h5ad checkpoint before any removal (default: true)"},
                     "checkpoint_path": {"type": "string", "description": "Path for checkpoint file (default: <output_dir>/checkpoint_pre_cleanup.h5ad)"}
                 },
@@ -3932,10 +3950,11 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             "name": "run_cluster_structure_qc",
             "description": (
                 "Adjudicate proposed/ambiguous cluster-level QC calls with covariance-structure evidence. "
-                "For flagged clusters, selects top informative HVGs, computes gene-gene Pearson correlation "
-                "module metrics, saves clustered correlation heatmaps, and computes technical Moran's I for "
-                "MT% and library size on the existing KNN graph. Does NOT remove cells; returns synthesized "
-                "cleanup recommendations for evidence-based reporting and cleanup decisions."
+                "For each analyzed cluster (all clusters by default when auto-chained from run_cluster_qc), "
+                "selects top informative HVGs, computes gene-gene Pearson correlation "
+                "module metrics, saves one clustered correlation heatmap per cluster, and computes technical "
+                "Moran's I for MT% and library size on the existing KNN graph. Does NOT remove cells; returns "
+                "synthesized cleanup recommendations for evidence-based reporting and cleanup decisions."
             ),
             "input_schema": {
                 "type": "object",
@@ -3950,6 +3969,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "min_cells": {"type": "integer", "description": "Minimum cells required for correlation structure analysis (default: 15)."},
                     "moran_min_cells": {"type": "integer", "description": "Minimum cells required for technical Moran's I summaries (default: 40)."},
                     "corr_threshold": {"type": "number", "description": "Absolute correlation threshold for high-correlation pair fraction (default: 0.3)."},
+                    "max_heatmaps": {"type": "integer", "description": "Cap on the number of correlation heatmaps rendered. Default: unset (no cap) — one heatmap per analyzed cluster. Set this only to bound output for pathologically high cluster counts."},
                     "figure_dir": {
                         "type": "string",
                         "description": (
@@ -13121,9 +13141,10 @@ def process_tool_call(
             # was skipped there is no doublet signal at all — the case where a
             # coherence check matters MOST). So whenever nothing is metric-flagged
             # or ambiguous, nominate a baseline structure-QC pass over ALL clusters
-            # to confirm coherence. structure QC filters clusters below its
-            # min_cells and caps how many heatmaps it renders, so nominating all is
-            # safe and bounded. See prompts.py cluster-QC.
+            # to confirm coherence. (The auto-chained structure QC below analyzes
+            # every cluster regardless, so a coherence verdict + covariance heatmap
+            # is produced for the whole clustering; this field only drives the
+            # "nothing metric-flagged" narration.) See prompts.py cluster-QC.
             doublet_signal_missing = not has_doublet
             structure_qc_baseline_clusters = (
                 sorted(set(cluster_labels))
@@ -13285,10 +13306,22 @@ def process_tool_call(
             # Embedded in this result so world_state records structure QC from the
             # same call. Disable only with auto_structure_qc=false.
             auto_structure_qc = bool(tool_input.get("auto_structure_qc", True))
+            # Analyze EVERY cluster for structure, not just the metric-flagged /
+            # ambiguous / baseline subset, so the covariance heatmaps cover the
+            # whole clustering. Metric flags still drive the cleanup recommendation
+            # (a metric-clean cluster is never leaned "remove" by _synthesize); the
+            # extra coherent clusters just add negative-control verdicts + figures
+            # that make a suspected doublet/noise mixture obvious by contrast.
+            # Flagged/ambiguous clusters lead so an explicit max_heatmaps (if ever
+            # set) plots the ones that matter first.
+            _all_clusters = sorted(
+                set(str(c) for c in cluster_labels.unique()),
+                key=lambda c: (len(c), c),
+            )
             structure_targets = list(dict.fromkeys(
                 [str(c) for c in (metric_flagged_clusters or [])]
                 + [str(c) for c in (ambiguous or [])]
-                + [str(c) for c in (structure_qc_baseline_clusters or [])]
+                + _all_clusters
             ))
             result["structure_qc_ran"] = False
             if auto_structure_qc and structure_targets:
@@ -13408,13 +13441,14 @@ def process_tool_call(
             min_cells = max(2, int(tool_input.get("min_cells", 15)))
             moran_min_cells = max(2, int(tool_input.get("moran_min_cells", 40)))
             corr_threshold = float(tool_input.get("corr_threshold", 0.3))
-            # Coherence metrics are computed for EVERY analyzed cluster; heatmap
-            # figures are capped so a baseline pass over many clusters doesn't emit
-            # dozens of PNGs. Originally metric-flagged/ambiguous clusters always get
-            # a heatmap; among the remaining (baseline) clusters, only the least
-            # coherent — the ones actually worth eyeballing — are plotted, up to the
-            # cap. Coherent clusters get a recorded verdict but no figure.
-            max_heatmaps = int(tool_input.get("max_heatmaps", 20))
+            # A gene-gene correlation heatmap is rendered for EVERY analyzed
+            # cluster (coherent ones included — they are the visual baseline that
+            # makes an incoherent doublet/noise mixture obvious by contrast), so the
+            # covariance structure of the whole clustering is inspectable. An
+            # explicit max_heatmaps caps the count for pathologically high cluster
+            # counts; unset (the default) means no cap — one figure per cluster.
+            _max_hm_raw = tool_input.get("max_heatmaps")
+            max_heatmaps = int(_max_hm_raw) if _max_hm_raw is not None else None
 
             latest_cluster_qc = {}
             if world_state is not None:
@@ -13775,19 +13809,12 @@ def process_tool_call(
                 reordered = corr_matrix[_np.ix_(order, order)]
                 structure_interp = _structure_interpretation(mean_abs_corr, frac_pairs)
 
-                # Cap heatmap figures (b): always plot originally metric-flagged /
-                # ambiguous clusters; among baseline clusters plot only the
-                # non-coherent ones (unstructured/weak/inconclusive) worth eyeballing,
-                # up to max_heatmaps. Coherent clusters get a recorded verdict, no
-                # figure. Metrics above are computed for EVERY cluster regardless.
-                _orig_flagged = (
-                    str(metric_action) in {"propose_removal", "review"}
-                    or str(metric_severity) in {"obvious", "ambiguous"}
-                )
-                _render_heatmap = _orig_flagged or (
-                    structure_interp in {"unstructured", "weak", "inconclusive"}
-                    and heatmaps_rendered < max_heatmaps
-                )
+                # Render a heatmap for every analyzed cluster so the covariance
+                # structure of the whole clustering is inspectable — coherent
+                # clusters included, since they are the negative controls that make
+                # an incoherent mixture obvious by contrast. Bounded only by an
+                # explicit max_heatmaps (None = no cap, one figure per cluster).
+                _render_heatmap = max_heatmaps is None or heatmaps_rendered < max_heatmaps
                 heatmap_path_str = None
                 if _render_heatmap:
                     safe_cluster_id = _safe_path_component(cluster_id)
@@ -13946,8 +13973,8 @@ def process_tool_call(
                 f"{n_coherent} coherent (well-structured), {n_noncoherent} non-coherent "
                 f"(unstructured/weak — possible doublet/noise mixtures), "
                 f"{n_skipped_or_inconclusive} inconclusive/too-small. "
-                f"{heatmaps_rendered} correlation heatmap(s) saved (coherent clusters assessed "
-                f"but not plotted); synthesized removal set: {synthesized_removal or 'none'}."
+                f"{heatmaps_rendered} correlation heatmap(s) saved (one per analyzed cluster); "
+                f"synthesized removal set: {synthesized_removal or 'none'}."
             )
 
             result = {
@@ -14136,10 +14163,11 @@ def process_tool_call(
                         title="Cluster structure QC — how to read these heatmaps",
                         overview=(
                             "Gene-gene correlation heatmaps that adjudicate whether each analyzed "
-                            "cluster is a coherent cell population or a doublet/noise mixture. Only "
-                            "metric-flagged/ambiguous clusters and the least-coherent baseline "
-                            f"clusters are plotted (cap {max_heatmaps}); coherent clusters are "
-                            "assessed but not plotted. Dataset-specific findings and the per-cluster "
+                            "cluster is a coherent cell population or a doublet/noise mixture. One "
+                            "heatmap is plotted per analyzed cluster (coherent clusters included, as "
+                            "the visual baseline)"
+                            + (f", capped at {max_heatmaps}" if max_heatmaps is not None else "")
+                            + ". Dataset-specific findings and the per-cluster "
                             f"verdicts live in the companion report "
                             f"`reports/cluster_structure_qc_{structure_qc_run_id}_summary.md` "
                             "(and the JSON alongside it)."
@@ -15503,13 +15531,13 @@ def process_tool_call(
                 "n_stale_evidence_entries_cleared": n_evidence_cleared,
                 "prior_evidence_fingerprint": prior_fp,
                 "next_steps": [
-                    "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] with every derivable field pre-filled per cluster (label←proposed_label, supporting_genes←suggested_supporting_genes, confidence←validation_tier, reference_annotation_support, competing_labels_considered, source_synthesis). Do NOT rebuild this by hand in run_code — that reverse-engineering is exactly what the scaffold removes.",
-                    "To annotate: call stage_annotation_evidence (or finalize_annotation directly) with evidence_summary containing ONLY the fields you are adding or changing per cluster. At minimum supply a `reasoning` string (>=20 chars) for every cluster; all other fields fall back to the scaffold. Reviewing each cluster and writing its reasoning IS the required judgment step.",
-                    "Change a cluster's `label` (and `deg_derived_label`) only where your reading of the DEGs/references disagrees with the scaffold's proposed_label; cite genes from suggested_supporting_genes / discriminating_degs — never broad_context_degs (MHC-II like HLA-DRA/CD74, housekeeping) or nuisance_degs (MT/ribosomal/hemoglobin/MALAT1).",
+                    "A ready-to-edit evidence scaffold is in adata.uns['annotation_evidence_scaffold'] with every DERIVABLE field pre-filled per cluster (label←proposed_label, supporting_genes←suggested_supporting_genes, confidence←validation_tier, reference_annotation_support, competing_labels_considered, source_synthesis). `deg_derived_label` is deliberately LEFT BLANK — it is your independent read of the cluster's own top DEGs, not something the scaffold can derive from the reference-based proposed_label. Do NOT rebuild the scaffold by hand in run_code — that reverse-engineering is exactly what the scaffold removes.",
+                    "To annotate: call stage_annotation_evidence (or finalize_annotation directly) with evidence_summary containing the fields you are adding or changing per cluster. For EVERY cluster you must supply (a) `deg_derived_label` — the cell type this cluster's own top DEGs indicate, read before/independent of the reference labels — and (b) a `reasoning` string (>=20 chars) whose logic is DEG-first. All other fields fall back to the scaffold. Deriving the DEG label and writing the reasoning IS the required judgment step.",
+                    "The DEGs are authoritative. Where your `deg_derived_label` disagrees with the scaffold's proposed_label (which is reference-derived), CHANGE `label` to the DEG-derived call — overriding the DEGs the other way requires an explicit `deg_override_justification` citing genes from suggested_supporting_genes / discriminating_degs (never broad_context_degs like MHC-II HLA-DRA/CD74 or housekeeping, never nuisance_degs like MT/ribosomal/hemoglobin/MALAT1). If you cannot justify it from the DEGs, the reference does not win.",
                     "PanglaoDB is OPTIONAL — no cluster requires it and leaving panglaodb_queried=false never lowers confidence. Only if you choose to cross-check a hard cluster, set panglaodb_queried=true and panglaodb_label_used for that cluster (aggregate reverse hits across multiple DEGs; never infer a label from a single gene). Everything else keeps panglaodb_queried=false.",
                     "A cluster the references/Cytopus don't resolve rests on its DEGs (deg_primary tier, up to medium confidence) — a valid call. Don't consult PanglaoDB just to satisfy a rule, and never loop on it.",
                     "If CellTypist or Scimilarity is compatible but absent from reference_annotation_keys, run the missing reference annotation before finalizing, or record the concrete unavailability reason in submitted evidence.",
-                    "stage_annotation_evidence runs the finalize validator and returns ready_to_finalize + clusters_failing + auto_fixes; correct only the flagged clusters and re-submit. Or skip staging and call finalize_annotation once every cluster has reasoning.",
+                    "stage_annotation_evidence runs the finalize validator and returns ready_to_finalize + clusters_failing + auto_fixes; correct only the flagged clusters and re-submit. Or skip staging and call finalize_annotation once every cluster has a deg_derived_label and reasoning.",
                 ],
                 "state": make_state(adata),
             }
@@ -15993,8 +16021,8 @@ def process_tool_call(
                     ),
                     adata_obj=adata,
                     recovery_options=[
-                        "Call finalize_annotation (or stage_annotation_evidence) with evidence_summary={cluster_id: {reasoning: '...'}} for every cluster. label, supporting_genes, confidence, reference_annotation_support, competing_labels_considered and source_synthesis are already filled from the proposal.",
-                        "Override `label` (and deg_derived_label) only for clusters where your reading of the DEGs/references differs from the scaffold's proposed_label.",
+                        "Call finalize_annotation (or stage_annotation_evidence) with evidence_summary={cluster_id: {deg_derived_label: '...', reasoning: '...'}} for every cluster. label, supporting_genes, confidence, reference_annotation_support, competing_labels_considered and source_synthesis are already filled from the proposal; deg_derived_label is NOT — it is your independent DEG read and is required per cluster.",
+                        "Where your deg_derived_label differs from the scaffold's (reference-derived) proposed_label, change `label` to the DEG-derived call; overriding the DEGs the other way needs a deg_override_justification citing genes.",
                         "For panglaodb_required_clusters, add panglaodb_queried=true and panglaodb_label_used after querying bc_get_panglaodb_marker_genes.",
                     ],
                 )

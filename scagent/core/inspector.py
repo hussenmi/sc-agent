@@ -1237,11 +1237,20 @@ def default_cluster_key_for_method(method: str) -> str:
 
 
 def format_resolution_token(resolution: float) -> str:
-    """Create a deterministic, filesystem-safe resolution token."""
+    """Create a deterministic, filesystem-safe resolution token.
+
+    Always carries at least one decimal place so the token is UNIFORM across the
+    ladder: 2.0 -> "2_0", 1.5 -> "1_5", 1.0 -> "1_0". Previously an integer-valued
+    resolution dropped its decimal ("2", "1"), so res-1.0 spelled inconsistently as
+    ``leiden_res_1`` (harness auto-key) vs ``leiden_res_1_0`` (the spelling a model
+    naturally picks to match ``leiden_res_1_5``) — the same clustering under two
+    names across runs. Non-integer resolutions keep their own precision (0.75 ->
+    "0_75").
+    """
     numeric = float(resolution)
-    if numeric.is_integer():
-        return str(int(numeric))
     text = f"{numeric:.6g}"
+    if "." not in text:
+        text += ".0"
     return text.replace(".", "_").replace("-", "neg_")
 
 

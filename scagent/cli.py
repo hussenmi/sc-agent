@@ -396,24 +396,37 @@ def run_start(args):
     )
     main_loc = "" if (not _main_base or any(h in _main_base for h in _cloud_hosts)) else f"  @ {_main_base}"
     # GPU line — surface the scVI training device config (resolved from env, the
-    # same way run_scvi resolves it) and which physical GPUs are eligible, so it's
-    # obvious at a glance whether training will fan out and onto which devices.
-    # Derived from env vars only — we deliberately do NOT import torch/cupy here, to
-    # keep a CUDA context out of the main process (scVI trains in a subprocess).
-    from scagent.batch.scvi import _resolve_n_devices
+    # same way run_scvi resolves it) and the actual number of physical GPUs scVI
+    # will use, so it's obvious at a glance whether training fans out and onto how
+    # many devices. The env var (SCAGENT_SCVI_DEVICES) chooses the *policy* (single
+    # / all / up-to-N); the physical count clamps it to reality — e.g. "-1" (all)
+    # is 1 GPU on the Spark but several on Iris. Both torch and cupy are kept out
+    # of the main process to avoid a CUDA context; the count comes from NVML, which
+    # is context-free (see scvi._count_visible_gpus / _select_gpu_device).
+    from scagent.batch.scvi import _count_visible_gpus, _resolve_n_devices
 
     _cvd = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
-    _visible = _cvd if _cvd else "all"
     _n_dev = _resolve_n_devices(None)
-    if _n_dev == 1:
-        _scvi_desc = "scVI single GPU (auto least-busy)"
+    _phys = _count_visible_gpus()
+    _visible = _cvd if _cvd else f"all ({_phys})"
+    if _phys == 0:
+        # No GPU visible — scVI falls back to CPU regardless of the device policy.
+        _scvi_desc = "scVI CPU (no GPU detected)"
+        gpu_style = "yellow"
+    elif _n_dev == 1:
+        _picker = f" (auto least-busy of {_phys})" if _phys > 1 else ""
+        _scvi_desc = f"scVI single GPU{_picker}"
         gpu_style = "white"
-    elif _n_dev < 0:
-        _scvi_desc = "scVI all GPUs (DDP, multi-GPU)"
-        gpu_style = "green"
     else:
-        _scvi_desc = f"scVI up to {_n_dev} GPUs (DDP, multi-GPU)"
-        gpu_style = "green"
+        # Multi-GPU policy: "-1"/all -> every visible GPU; N -> up to N. DDP
+        # collapses to a single GPU when only one is visible (matches _plan_devices).
+        _want = _phys if _n_dev < 0 else min(_n_dev, _phys)
+        if _want <= 1:
+            _scvi_desc = "scVI single GPU (1 visible)"
+            gpu_style = "white"
+        else:
+            _scvi_desc = f"scVI {_want} GPUs (DDP, multi-GPU)"
+            gpu_style = "green"
     gpu_desc = f"{_scvi_desc}  ·  visible: {_visible}"
     if (os.environ.get("SCAGENT_GPU") or "").strip().lower() in ("1", "true", "yes", "on"):
         gpu_desc += "  ·  RAPIDS accel: on"

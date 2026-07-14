@@ -250,6 +250,53 @@ def test_select_gpu_device_defaults_to_zero_on_error(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# visible-GPU count (_count_visible_gpus) — drives the startup card's device line
+# --------------------------------------------------------------------------- #
+
+
+def _fake_pynvml_count(n):
+    mod = types.ModuleType("pynvml")
+    mod.nvmlInit = lambda: None
+    mod.nvmlShutdown = lambda: None
+    mod.nvmlDeviceGetCount = lambda: n
+    return mod
+
+
+def test_count_visible_gpus_uses_nvml_total(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setitem(sys.modules, "pynvml", _fake_pynvml_count(4))
+    assert scvi_mod._count_visible_gpus() == 4
+
+
+def test_count_visible_gpus_honors_cuda_visible_devices(monkeypatch):
+    # An explicit mask wins over NVML's physical total (no NVML call needed).
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+    monkeypatch.setitem(sys.modules, "pynvml", _fake_pynvml_count(8))
+    assert scvi_mod._count_visible_gpus() == 2
+
+
+def test_count_visible_gpus_single_device_mask(monkeypatch):
+    # The Spark case: one visible GPU even if the policy asks for "all".
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert scvi_mod._count_visible_gpus() == 1
+
+
+def test_count_visible_gpus_empty_mask_hides_all(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setitem(sys.modules, "pynvml", _fake_pynvml_count(8))
+    assert scvi_mod._count_visible_gpus() == 8  # empty env string -> falls through to NVML
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    assert scvi_mod._count_visible_gpus() == 0
+
+
+def test_count_visible_gpus_zero_without_nvml(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setitem(sys.modules, "pynvml", None)  # import pynvml -> ImportError
+    assert scvi_mod._count_visible_gpus() == 0
+
+
+# --------------------------------------------------------------------------- #
 # worker-side device planning (_plan_devices) — pure decision logic
 # --------------------------------------------------------------------------- #
 
