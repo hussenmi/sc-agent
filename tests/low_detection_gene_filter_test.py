@@ -75,6 +75,33 @@ def test_threshold_scales_with_dataset_size():
     assert m_big["n_removed"] == 2
 
 
+def test_large_dataset_threshold_is_capped():
+    # At n=10000, 2% = 200, but the default cap is 100 -> threshold clamps to 100
+    # so rare-cell markers (genes in 100-199 cells) survive on big datasets.
+    a = _adata_with_detection(10000, [50, 100, 150, 5000])
+    rj, _ = process_tool_call("normalize_and_hvg", {"n_hvg": 20}, a)
+    meta = json.loads(rj)["feature_removals"]["low_detection_genes"]
+    assert meta["threshold_basis"] == "fraction_of_cells_capped"
+    assert meta["min_cells"] == 100          # capped, not 200
+    assert meta["max_cells_cap"] == 100
+    assert meta["fraction_capped"] is True
+    # gene in 50 cells dropped; genes in 100/150/5000 kept
+    assert meta["n_removed"] == 1
+
+
+def test_cap_can_be_raised_or_removed():
+    # max_cells_per_gene=0 removes the cap -> pure 2% (=200 at n=10000)
+    a = _adata_with_detection(10000, [50, 100, 150, 5000])
+    rj, _ = process_tool_call(
+        "normalize_and_hvg", {"n_hvg": 20, "max_cells_per_gene": 0}, a
+    )
+    meta = json.loads(rj)["feature_removals"]["low_detection_genes"]
+    assert meta["threshold_basis"] == "fraction_of_cells"
+    assert meta["min_cells"] == 200          # uncapped 2%
+    # genes in 50, 100, 150 (< 200) all dropped
+    assert meta["n_removed"] == 3
+
+
 def test_fraction_zero_disables_the_filter():
     a = _adata_with_detection(200, [1, 2, 50])
     before = a.n_vars

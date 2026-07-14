@@ -1738,6 +1738,8 @@ class AgentWorldState:
                         "min_cells": low_detection_removal.get("min_cells"),
                         "threshold_basis": low_detection_removal.get("threshold_basis"),
                         "min_cell_fraction": low_detection_removal.get("min_cell_fraction"),
+                        "max_cells_cap": low_detection_removal.get("max_cells_cap"),
+                        "fraction_capped": low_detection_removal.get("fraction_capped"),
                         "n_removed": low_detection_removal.get("n_removed"),
                         "source": low_detection_removal.get("source"),
                     },

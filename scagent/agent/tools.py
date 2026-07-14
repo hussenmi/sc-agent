@@ -1065,9 +1065,15 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
         removals = s.get("feature_removals") or {}
         low_det = removals.get("low_detection_genes") if isinstance(removals, dict) else None
         if isinstance(low_det, dict) and low_det.get("enabled"):
+            _basis = low_det.get("threshold_basis")
             _thr = f"fewer than {low_det.get('min_cells')} cells"
-            if low_det.get("threshold_basis") == "fraction_of_cells" and low_det.get("min_cell_fraction"):
+            if _basis == "fraction_of_cells" and low_det.get("min_cell_fraction"):
                 _thr += f" = {float(low_det['min_cell_fraction']):.1%} of the dataset"
+            elif _basis == "fraction_of_cells_capped":
+                _thr += (
+                    f" — {float(low_det.get('min_cell_fraction') or 0):.1%} of the dataset "
+                    f"capped at {low_det.get('max_cells_cap')}"
+                )
             lines.append(
                 f"- Low-detection genes removed: n={low_det.get('n_removed', 0)} "
                 f"(genes detected in {_thr})"
@@ -3047,15 +3053,16 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "normalize_and_hvg",
-            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in a layer. Before normalization/HVG it applies two standard, guaranteed feature filters so you do NOT need a run_code block for them: (1) drops low-detection genes seen in fewer than min_cell_fraction_per_gene of cells (default 0.02 = 2% of the dataset; scales with dataset size), and (2) removes ribosomal genes so they cannot drive embedding or marker interpretation. Set remove_ribosomal_genes=false to keep ribosomal genes, min_cell_fraction_per_gene=0 to keep all genes, or min_cells_per_gene=N to use an absolute cell-count threshold instead of the fraction (e.g. strict source replication).",
+            "description": "Normalize, log-transform, and select highly variable genes. Preserves raw counts in a layer. Before normalization/HVG it applies two standard, guaranteed feature filters so you do NOT need a run_code block for them: (1) drops low-detection genes — kept if detected in at least min_cell_fraction_per_gene of cells (default 0.02 = 2%), capped at max_cells_per_gene absolute cells (default 100) so large datasets don't demand a huge count and delete rare-cell-type markers; and (2) removes ribosomal genes so they cannot drive embedding or marker interpretation. Set remove_ribosomal_genes=false to keep ribosomal genes, min_cell_fraction_per_gene=0 to keep all genes, or min_cells_per_gene=N to force an exact absolute threshold (e.g. strict source replication).",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "data_path": {"type": "string", "description": "Path to input h5ad (optional - uses in-memory data)"},
                     "output_path": {"type": "string", "description": "Path to save processed h5ad (optional - data persists in memory)"},
                     "n_hvg": {"type": "integer", "description": "Number of HVGs (default: 4000)"},
-                    "min_cell_fraction_per_gene": {"type": "number", "description": "Drop genes detected (nonzero counts) in fewer than this FRACTION of cells before normalization/HVG (default: 0.02 = 2% of the dataset). Scales the low-detection filter with dataset size and runs automatically — do not issue a separate run_code sc.pp.filter_genes call. Set to 0 to keep all genes (e.g. strict source/paper replication)."},
-                    "min_cells_per_gene": {"type": "integer", "description": "Absolute-count override for the low-detection filter: drop genes detected in fewer than this many cells. When provided it takes precedence over min_cell_fraction_per_gene (use for exact-count reproduction of a source pipeline). Leave unset to use the fraction-based default."},
+                    "min_cell_fraction_per_gene": {"type": "number", "description": "Keep genes detected (nonzero counts) in at least this FRACTION of cells; drop the rest before normalization/HVG (default: 0.02 = 2% of the dataset). Scales the low-detection filter with dataset size and runs automatically — do not issue a separate run_code sc.pp.filter_genes call. Set to 0 to keep all genes (e.g. strict source/paper replication)."},
+                    "max_cells_per_gene": {"type": "integer", "description": "Cap (in absolute cells) on the fraction-derived low-detection threshold (default: 100). On large datasets 2% would be a huge cell count that deletes rare-cell-type markers; this cap keeps the effective threshold sane (2% governs small datasets, the cap governs big ones). Set to 0 to remove the cap (pure fraction)."},
+                    "min_cells_per_gene": {"type": "integer", "description": "Absolute-count override for the low-detection filter: keep genes detected in at least this many cells. When provided it takes precedence over the fraction+cap (use for exact-count reproduction of a source pipeline). Leave unset to use the fraction-with-cap default."},
                     "target_sum": {"type": "number", "description": "Target counts per cell for normalize_total (default: 10000). Use source/paper value when reproducing a workflow."},
                     "log_transform": {"type": "boolean", "description": "Apply log1p after normalize_total (default: true)."},
                     "raw_layer_name": {"type": "string", "description": "Layer used to preserve/reset raw integer counts (default: raw_counts)."},
@@ -9407,9 +9414,13 @@ def process_tool_call(
             batch_key = tool_input.get("batch_key")
             # Standard low-detection gene filter (applied below, before norm/HVG).
             # The threshold scales with dataset size: keep genes detected in at
-            # least min_cell_fraction_per_gene of cells (default 0.02 = 2%). An
-            # absolute min_cells_per_gene overrides the fraction when provided
-            # (e.g. strict source replication). Set the active knob to 0 to disable.
+            # least min_cell_fraction_per_gene of cells (default 0.02 = 2%), but
+            # CAPPED at max_cells_per_gene absolute cells (default 100) so large
+            # datasets don't demand a huge cell count and delete rare-cell-type
+            # markers — 2% governs small datasets, the cap takes over on big ones,
+            # shrinking the effective fraction. An absolute min_cells_per_gene
+            # overrides both (e.g. strict source replication). Set the active knob
+            # to 0 to disable.
             _frac_raw = tool_input.get("min_cell_fraction_per_gene", 0.02)
             try:
                 min_cell_fraction = float(_frac_raw) if _frac_raw is not None else 0.0
@@ -9417,6 +9428,13 @@ def process_tool_call(
                 min_cell_fraction = 0.02
             if min_cell_fraction < 0:
                 min_cell_fraction = 0.0
+            _cap_raw = tool_input.get("max_cells_per_gene", 100)
+            try:
+                max_cells_per_gene = int(_cap_raw) if _cap_raw is not None else 0
+            except (TypeError, ValueError):
+                max_cells_per_gene = 100
+            if max_cells_per_gene < 0:
+                max_cells_per_gene = 0
             _abs_raw = tool_input.get("min_cells_per_gene")
             min_cells_abs_override = None
             if _abs_raw is not None:
@@ -9519,12 +9537,22 @@ def process_tool_call(
             # left misaligned.
             import math as _math_ld
             n_cells_total = int(adata.n_obs)
+            fraction_capped = False
             if min_cells_abs_override is not None:
                 min_cells_per_gene = min_cells_abs_override
                 threshold_basis = "absolute_min_cells"
             elif min_cell_fraction > 0:
-                min_cells_per_gene = int(_math_ld.ceil(min_cell_fraction * n_cells_total))
-                threshold_basis = "fraction_of_cells"
+                _from_fraction = int(_math_ld.ceil(min_cell_fraction * n_cells_total))
+                # Cap the absolute threshold so large datasets don't demand a huge
+                # cell count (which would delete rare-cell-type markers). 2% governs
+                # small datasets; the cap takes over on big ones.
+                if max_cells_per_gene > 0 and _from_fraction > max_cells_per_gene:
+                    min_cells_per_gene = max_cells_per_gene
+                    fraction_capped = True
+                    threshold_basis = "fraction_of_cells_capped"
+                else:
+                    min_cells_per_gene = _from_fraction
+                    threshold_basis = "fraction_of_cells"
             else:
                 min_cells_per_gene = 0
                 threshold_basis = "disabled"
@@ -9532,7 +9560,9 @@ def process_tool_call(
                 "enabled": bool(min_cells_per_gene > 0),
                 "min_cells": int(min_cells_per_gene),
                 "threshold_basis": threshold_basis,
-                "min_cell_fraction": min_cell_fraction if threshold_basis == "fraction_of_cells" else None,
+                "min_cell_fraction": min_cell_fraction if threshold_basis.startswith("fraction_of_cells") else None,
+                "max_cells_cap": max_cells_per_gene if threshold_basis.startswith("fraction_of_cells") else None,
+                "fraction_capped": fraction_capped,
                 "n_cells_total": n_cells_total,
                 "n_removed": 0,
             }
@@ -9552,15 +9582,19 @@ def process_tool_call(
                 if _n_low:
                     adata = adata[:, _keep_gene].copy()
                 low_detection_meta["n_genes_after"] = int(adata.n_vars)
+                if threshold_basis == "fraction_of_cells":
+                    _basis_txt = f" = {min_cell_fraction:.1%} of {n_cells_total}"
+                elif threshold_basis == "fraction_of_cells_capped":
+                    _basis_txt = (
+                        f", capped at {max_cells_per_gene} "
+                        f"({min_cell_fraction:.1%} of {n_cells_total} would be "
+                        f"{int(_math_ld.ceil(min_cell_fraction * n_cells_total))})"
+                    )
+                else:
+                    _basis_txt = ""
                 low_detection_meta["source"] = (
                     f"scagent standard low-detection gene filter before normalization/HVG "
-                    f"(≥{min_cells_per_gene} cells"
-                    + (
-                        f" = {min_cell_fraction:.1%} of {n_cells_total}"
-                        if threshold_basis == "fraction_of_cells"
-                        else ""
-                    )
-                    + ")"
+                    f"(≥{min_cells_per_gene} cells{_basis_txt})"
                 )
             _fr = dict(adata.uns.get("feature_removals", {}))
             _fr["low_detection_genes"] = low_detection_meta
