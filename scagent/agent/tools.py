@@ -11724,8 +11724,9 @@ def process_tool_call(
                 adata,
                 dataset_changed=False,
                 summary=(
-                    f"Batch-effect diagnostic verdict: {diagnostic.get('verdict')}. "
-                    f"{diagnostic.get('recommendation')}"
+                    f"Batch-effect diagnostic: gene evidence={diagnostic.get('gene_evidence')}, "
+                    f"design={diagnostic.get('design_interpretation')} → "
+                    f"{diagnostic.get('recommendation')}. {diagnostic.get('recommendation_reason', '')}"
                 ),
                 artifacts_created=artifacts_created,
                 verification=_build_verification(

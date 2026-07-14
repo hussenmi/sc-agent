@@ -163,20 +163,19 @@ def test_batch_diagnostic_write_outputs_emits_readme_and_metadata(tmp_path):
 
     df = pd.DataFrame(
         {
-            "cluster": ["0", "1"],
-            "n_cells": [10, 20],
-            "dominant_batch": ["A", "B"],
-            "dominant_fraction": [0.9, 0.5],
-            "normalized_sample_entropy": [0.1, 0.9],
-            "sample_exclusive": [False, False],
-            "sample_dominated": [True, False],
-            "batch_counts": ["{}", "{}"],
+            "cluster": ["7", "12"],
+            "sample": ["G8", "G3"],
+            "n_cells": [200, 180],
+            "n_cluster": [900, 850],
+            "frac_of_cluster": [0.30, 0.28],
+            "sample_baseline_frac": [0.10, 0.14],
+            "enrichment": [3.0, 2.0],
         }
     )
     doc = _batch_diagnostic_group_doc({"batch_key": "dataset", "cluster_key": "leiden"})
     arts = _write_outputs(
         str(tmp_path),
-        {"batch_diagnostic_cluster_sample_composition": df},
+        {"batch_diagnostic_sample_enriched_regions": df},
         group_doc=doc,
     )
 
@@ -185,13 +184,13 @@ def test_batch_diagnostic_write_outputs_emits_readme_and_metadata(tmp_path):
 
     csv_art = next(a for a in arts if a["role"] == "artifact")
     assert "columns" in csv_art["metadata"]
-    assert any(c["name"] == "dominant_fraction" for c in csv_art["metadata"]["columns"])
+    assert any(c["name"] == "enrichment" for c in csv_art["metadata"]["columns"])
 
     readme = tmp_path / "README.md"
     assert readme.exists()
     text = readme.read_text()
     assert ad.DOC_MARKER in text
-    assert "dominant_fraction" in text
+    assert "enrichment" in text
     assert ad.interpretation_is_empty(text) is True
 
 
@@ -295,18 +294,17 @@ def test_annotate_artifact_group_errors_when_unresolvable(tmp_path):
     assert json.loads(rj)["status"] == "error"
 
 
-def test_batch_diagnostic_group_doc_documents_all_six_files():
+def test_batch_diagnostic_group_doc_documents_all_five_files():
     doc = __import__(
         "scagent.analysis.batch_diagnostic", fromlist=["_batch_diagnostic_group_doc"]
     )._batch_diagnostic_group_doc({})
     names = {f.filename for f in doc.files}
     assert names == {
-        "batch_diagnostic_cluster_sample_composition.csv",
-        "batch_diagnostic_broad_cluster_labels.csv",
-        "batch_diagnostic_condition_confounding.csv",
-        "batch_diagnostic_shared_signatures.csv",
-        "batch_diagnostic_neighborhood_entropy.csv",
-        "batch_diagnostic_cross_sample_identity_deg.csv",
+        "batch_diagnostic_sample_enriched_regions.csv",
+        "batch_diagnostic_within_sample_degs.csv",
+        "batch_diagnostic_population_pairs.csv",
+        "batch_diagnostic_direct_pair_degs.csv",
+        "batch_diagnostic_design_check.csv",
     }
     # every file has a purpose and at least one documented column
     for f in doc.files:

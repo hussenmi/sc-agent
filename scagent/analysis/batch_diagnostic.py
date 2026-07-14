@@ -1,53 +1,28 @@
-"""Descriptive batch-effect diagnostics for multi-sample single-cell data.
+"""Batch-effect diagnostic for multi-sample single-cell data.
 
-This module deliberately avoids heavy integration benchmarks.  It summarizes
-whether uncorrected clusters/states separate by sample, whether sample-linked
-expression shifts recur across broad cell types, and whether sample is
-confounded with condition-like metadata.
+The core is a **gene-first investigation** (``batch_gene_investigation``): find
+sample-enriched cluster regions, characterize each with a within-sample identity
+DEG, match the same population across samples by shared identity genes, and — as
+secondary support — compare matched regions directly and look for a program that
+recurs across populations. Sample composition, neighborhood-mixing entropy and
+cluster/sample ARI-NMI are kept only as *context*; they never drive the verdict.
+The verdict is derived from two independent axes (gene evidence x experimental
+design) and is never labeled "conclusive".
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
-from itertools import combinations
-from pathlib import Path
 import math
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from collections.abc import Iterable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 
-
-NUISANCE_PATTERNS = [
-    r"^MT-",
-    r"^mt-",
-    r"^RPL",
-    r"^RPS",
-    r"^MRPL",
-    r"^MRPS",
-    r"^MALAT1$",
-    r"^HBA",
-    r"^HBB",
-    r"^HB[ABDEGMQZ]",
-    r"\.\d+$",
-]
-
-BROAD_MARKER_MODULES: Dict[str, set[str]] = {
-    "T cell": {"CD3D", "CD3E", "TRAC", "IL7R", "CD4", "CD8A", "CD8B", "LTB"},
-    "B cell": {"MS4A1", "CD79A", "CD79B", "BANK1", "CD74"},
-    "Plasma cell": {"MZB1", "XBP1", "JCHAIN", "SDC1", "IGHG1", "IGKC"},
-    "NK cell": {"NKG7", "GNLY", "KLRD1", "PRF1", "GZMB", "KLRF1"},
-    "Myeloid": {"LYZ", "LST1", "S100A8", "S100A9", "FCGR3A", "CD14", "CTSS"},
-    "Dendritic cell": {"FCER1A", "CLEC10A", "CST3", "IRF8", "LILRA4", "CLEC4C"},
-    "Epithelial": {"EPCAM", "KRT8", "KRT18", "KRT19", "KRT5", "KRT17"},
-    "Endothelial": {"PECAM1", "VWF", "KDR", "CLDN5", "ESAM"},
-    "Fibroblast": {"COL1A1", "COL1A2", "COL3A1", "DCN", "LUM", "TAGLN"},
-    "Cycling": {"MKI67", "TOP2A", "PCLAF", "STMN1", "UBE2C"},
-    "Mast cell": {"TPSAB1", "TPSB2", "CPA3", "KIT", "MS4A2"},
-    "Platelet": {"PPBP", "PF4", "GP9", "ITGA2B", "NRGN"},
-    "Erythroid": {"HBA1", "HBA2", "HBB", "GYPA", "ALAS2"},
-}
+if TYPE_CHECKING:
+    from ..core.artifact_docs import ArtifactGroupDoc
 
 # Neighborhood batch-mixing entropy thresholds. Entropy is normalized against the
 # *global* batch-proportion ceiling (the value a neighborhood would have if it
@@ -71,28 +46,26 @@ CLUSTER_BATCH_ARI_HIGH = 0.5
 CLUSTER_BATCH_NMI_HIGH = 0.6
 
 
-def _is_nuisance_gene(gene: str) -> bool:
-    return any(re.search(pattern, gene) for pattern in NUISANCE_PATTERNS)
-
-
-def _to_dense_1d(values: Any) -> np.ndarray:
-    if hasattr(values, "toarray"):
-        values = values.toarray()
-    arr = np.asarray(values)
-    return np.ravel(arr)
-
-
-def _mean_expression(matrix: Any) -> np.ndarray:
-    if matrix.shape[0] == 0:
-        return np.array([])
-    means = matrix.mean(axis=0)
-    return _to_dense_1d(means)
-
-
 def _expression_view(adata):
+    """The expression matrix + gene names used for DEGs.
+
+    Prefers ``adata.raw`` (the full-gene log-normalized matrix scanpy stores
+    before HVG subsetting), else ``adata.X``.
+    """
     if getattr(adata, "raw", None) is not None:
         return adata.raw.X, list(map(str, adata.raw.var_names))
     return adata.X, list(map(str, adata.var_names))
+
+
+def _matrix_source_label(matrix: Any) -> str:
+    """Best-effort label for the expression scale, for provenance ('lognorm'/'counts')."""
+    if hasattr(matrix, "data"):
+        sample = np.asarray(matrix.data[:100000], dtype=np.float64)
+    else:
+        sample = np.asarray(matrix, dtype=np.float64).ravel()[:100000]
+    if sample.size == 0:
+        return "unknown"
+    return "counts" if np.allclose(sample, np.round(sample)) else "lognorm"
 
 
 def _safe_entropy(fractions: Iterable[float]) -> float:
@@ -105,14 +78,14 @@ def _safe_entropy(fractions: Iterable[float]) -> float:
     return -sum(v * math.log(v) for v in vals) / denom
 
 
-def _candidate_condition_keys(adata, batch_key: str, explicit: Optional[List[str]]) -> List[str]:
+def _candidate_condition_keys(adata, batch_key: str, explicit: list[str] | None) -> list[str]:
     if explicit:
         return [key for key in explicit if key in adata.obs.columns and key != batch_key]
     patterns = re.compile(
         r"(condition|group|disease|diagnosis|treatment|stim|status|phenotype|time|tissue|organ|sex|genotype)",
         re.I,
     )
-    keys: List[str] = []
+    keys: list[str] = []
     for key in adata.obs.columns:
         if key == batch_key:
             continue
@@ -125,8 +98,8 @@ def _candidate_condition_keys(adata, batch_key: str, explicit: Optional[List[str
     return keys[:8]
 
 
-def _confounding_summary(adata, batch_key: str, condition_keys: List[str]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _confounding_summary(adata, batch_key: str, condition_keys: list[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     batch = adata.obs[batch_key].astype(str)
     for key in condition_keys:
         condition = adata.obs[key].astype(str)
@@ -159,54 +132,9 @@ def _confounding_summary(adata, batch_key: str, condition_keys: List[str]) -> Li
     return rows
 
 
-def _compute_cluster_markers(adata, cluster_key: str, key_added: str, n_top_genes: int) -> Dict[str, List[str]]:
-    import scanpy as sc
-
-    if key_added not in adata.uns:
-        sc.tl.rank_genes_groups(
-            adata,
-            groupby=cluster_key,
-            method="wilcoxon",
-            use_raw=getattr(adata, "raw", None) is not None,
-            n_genes=max(n_top_genes, 50),
-            key_added=key_added,
-        )
-    markers: Dict[str, List[str]] = {}
-    clusters = list(adata.obs[cluster_key].astype(str).unique())
-    for cluster in clusters:
-        try:
-            df = sc.get.rank_genes_groups_df(adata, group=cluster, key=key_added)
-        except Exception:
-            markers[cluster] = []
-            continue
-        genes = [str(g) for g in df.get("names", pd.Series(dtype=str)).head(n_top_genes).tolist()]
-        markers[cluster] = [gene for gene in genes if gene and gene.lower() != "nan"]
-    return markers
-
-
-def _broad_label_from_markers(markers: List[str]) -> Dict[str, Any]:
-    upper = [gene.upper() for gene in markers if not _is_nuisance_gene(gene)]
-    ranked = {gene: rank for rank, gene in enumerate(upper[:50])}
-    scores = []
-    for label, module in BROAD_MARKER_MODULES.items():
-        overlap = sorted(set(ranked) & module, key=lambda gene: ranked[gene])
-        if overlap:
-            rank_weight = sum(1.0 / (ranked[gene] + 1.0) for gene in overlap)
-            scores.append((len(overlap), rank_weight, label, overlap))
-    scores.sort(reverse=True)
-    if not scores or scores[0][0] < 2:
-        return {"label": "Unknown", "confidence": "low", "supporting_markers": []}
-    confidence = "high" if scores[0][0] >= 4 else "medium"
-    return {
-        "label": scores[0][2],
-        "confidence": confidence,
-        "supporting_markers": scores[0][3],
-    }
-
-
-def _cluster_sample_composition(adata, batch_key: str, cluster_key: str) -> List[Dict[str, Any]]:
+def _cluster_sample_composition(adata, batch_key: str, cluster_key: str) -> list[dict[str, Any]]:
     table = pd.crosstab(adata.obs[cluster_key].astype(str), adata.obs[batch_key].astype(str))
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for cluster, counts in table.iterrows():
         total = int(counts.sum())
         if total <= 0:
@@ -229,50 +157,16 @@ def _cluster_sample_composition(adata, batch_key: str, cluster_key: str) -> List
     return rows
 
 
-def _umap_state_separation(adata, state_by_cluster: Dict[str, str], batch_key: str, cluster_key: str) -> List[Dict[str, Any]]:
-    if "X_umap" not in adata.obsm:
-        return []
-    coords = np.asarray(adata.obsm["X_umap"])
-    if coords.ndim != 2 or coords.shape[1] < 2:
-        return []
-    obs = adata.obs[[batch_key, cluster_key]].copy()
-    obs["_state"] = obs[cluster_key].astype(str).map(state_by_cluster).fillna("Unknown")
-    obs["_x"] = coords[:, 0]
-    obs["_y"] = coords[:, 1]
-    global_scale = float(np.sqrt(np.var(coords[:, 0]) + np.var(coords[:, 1]))) or 1.0
-    rows: List[Dict[str, Any]] = []
-    for state, sub in obs.groupby("_state", observed=False):
-        if state == "Unknown":
-            continue
-        centroids = sub.groupby(batch_key, observed=False)[["_x", "_y"]].mean()
-        if len(centroids) < 2:
-            continue
-        distances = [
-            float(np.linalg.norm(centroids.loc[a].values - centroids.loc[b].values))
-            for a, b in combinations(centroids.index, 2)
-        ]
-        rows.append(
-            {
-                "broad_label": str(state),
-                "n_batches_present": int(len(centroids)),
-                "mean_batch_centroid_distance": round(float(np.mean(distances)), 4),
-                "max_batch_centroid_distance": round(float(np.max(distances)), 4),
-                "mean_distance_over_global_umap_scale": round(float(np.mean(distances)) / global_scale, 4),
-            }
-        )
-    return rows
-
-
 def _neighborhood_batch_mixing(
     adata,
     batch_key: str,
     cluster_key: str,
-    state_by_cluster: Dict[str, str],
+    state_by_cluster: dict[str, str],
     *,
     use_rep: str,
     n_neighbors: int,
     obs_key: str = "batch_diagnostic_neighborhood_entropy",
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Per-cell neighborhood batch-mixing entropy on a low-dimensional embedding.
 
     This is the *continuous* complement to the cluster-composition and UMAP
@@ -334,7 +228,7 @@ def _neighborhood_batch_mixing(
     # that is both centroid-separated and low-entropy is segregating by sample.
     states = adata.obs[cluster_key].astype(str).map(state_by_cluster).fillna("Unknown")
     batch_series = adata.obs[batch_key].astype(str)
-    per_label: List[Dict[str, Any]] = []
+    per_label: list[dict[str, Any]] = []
     for state in sorted(set(states) - {"Unknown"}):
         mask = (states == state).values
         if not mask.any():
@@ -367,7 +261,7 @@ def _neighborhood_batch_mixing(
     }
 
 
-def _cluster_batch_concordance(adata, batch_key: str, cluster_key: str) -> Dict[str, Any]:
+def _cluster_batch_concordance(adata, batch_key: str, cluster_key: str) -> dict[str, Any]:
     """Global agreement between the clustering and the sample labels (ARI + NMI).
 
     ARI and NMI compress, into a single number, how strongly the uncorrected clusters
@@ -408,203 +302,11 @@ def _cluster_batch_concordance(adata, batch_key: str, cluster_key: str) -> Dict[
     }
 
 
-def _state_expression_shifts(
-    adata,
-    batch_key: str,
-    cluster_key: str,
-    state_by_cluster: Dict[str, str],
-    *,
-    min_cells_per_cluster_sample: int,
-    n_top_genes: int,
-) -> Dict[str, Any]:
-    matrix, genes = _expression_view(adata)
-    gene_array = np.asarray(genes)
-    usable_gene_mask = np.array([not _is_nuisance_gene(g) for g in genes], dtype=bool)
-    obs = adata.obs[[batch_key, cluster_key]].copy()
-    obs["_state"] = obs[cluster_key].astype(str).map(state_by_cluster).fillna("Unknown")
-    shifts: List[Dict[str, Any]] = []
-    recurring: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+def _batch_diagnostic_group_doc(params: dict[str, Any]) -> ArtifactGroupDoc:
+    """Static documentation for the five batch-diagnostic CSVs.
 
-    for state, state_obs in obs.groupby("_state", observed=False):
-        if state == "Unknown":
-            continue
-        state_idx = np.flatnonzero(obs["_state"].values == state)
-        if len(state_idx) < 2 * min_cells_per_cluster_sample:
-            continue
-        for batch in sorted(state_obs[batch_key].astype(str).unique()):
-            in_batch = np.flatnonzero((obs["_state"].values == state) & (obs[batch_key].astype(str).values == batch))
-            out_batch = np.setdiff1d(state_idx, in_batch, assume_unique=False)
-            if len(in_batch) < min_cells_per_cluster_sample or len(out_batch) < min_cells_per_cluster_sample:
-                continue
-            mean_in = _mean_expression(matrix[in_batch, :])
-            mean_out = _mean_expression(matrix[out_batch, :])
-            if mean_in.size == 0 or mean_out.size == 0:
-                continue
-            delta = mean_in - mean_out
-            delta = np.where(usable_gene_mask, delta, 0.0)
-            order_up = np.argsort(delta)[::-1]
-            order_down = np.argsort(delta)
-            top_up = [
-                {"gene": str(gene_array[i]), "delta": round(float(delta[i]), 4)}
-                for i in order_up[:n_top_genes]
-                if delta[i] > 0
-            ][:n_top_genes]
-            top_down = [
-                {"gene": str(gene_array[i]), "delta": round(float(delta[i]), 4)}
-                for i in order_down[:n_top_genes]
-                if delta[i] < 0
-            ][:n_top_genes]
-            shifts.append(
-                {
-                    "broad_label": str(state),
-                    "batch": str(batch),
-                    "n_cells_in_batch": int(len(in_batch)),
-                    "n_cells_other_batches": int(len(out_batch)),
-                    "top_up": top_up[:10],
-                    "top_down": top_down[:10],
-                }
-            )
-            for direction, geneset in (("up", top_up), ("down", top_down)):
-                for entry in geneset[:15]:
-                    key = (str(batch), direction, entry["gene"])
-                    rec = recurring.setdefault(
-                        key,
-                        {
-                            "batch": str(batch),
-                            "direction": direction,
-                            "gene": entry["gene"],
-                            "broad_labels": set(),
-                            "max_abs_delta": 0.0,
-                        },
-                    )
-                    rec["broad_labels"].add(str(state))
-                    rec["max_abs_delta"] = max(rec["max_abs_delta"], abs(float(entry["delta"])))
-
-    shared = []
-    for rec in recurring.values():
-        if len(rec["broad_labels"]) < 2:
-            continue
-        shared.append(
-            {
-                "batch": rec["batch"],
-                "direction": rec["direction"],
-                "gene": rec["gene"],
-                "n_broad_labels": int(len(rec["broad_labels"])),
-                "broad_labels": sorted(rec["broad_labels"]),
-                "max_abs_delta": round(float(rec["max_abs_delta"]), 4),
-            }
-        )
-    shared.sort(key=lambda r: (r["n_broad_labels"], r["max_abs_delta"]), reverse=True)
-    return {"state_sample_expression_shifts": shifts, "shared_cross_cell_type_signatures": shared[:50]}
-
-
-def _cross_sample_identity_deg(
-    adata,
-    batch_key: str,
-    cluster_key: str,
-    composition: List[Dict[str, Any]],
-    cluster_markers: Dict[str, List[str]],
-    *,
-    min_cells: int,
-    n_top_genes: int,
-    max_pairs: int = 12,
-    marker_overlap_min: float = 0.15,
-    signature_similarity_min: float = 0.30,
-) -> Dict[str, Any]:
-    """Paired within-sample identity DEG — the clean control for a batch effect.
-
-    For two clusters dominated by DIFFERENT samples that nonetheless look like the
-    same cell type (their one-vs-all markers overlap), compute each cluster's DEG
-    against the rest of ITS OWN sample, then compare the two identity signatures.
-
-    Because each DEG is computed entirely *within one sample*, no batch signal can
-    contaminate it. So if the two within-sample "what makes me distinct"
-    signatures match, the clusters are the same biological population separated
-    only by sample — i.e. a batch effect, and they should merge under integration.
-    This is the clean control that comparing the same state ACROSS samples cannot
-    give (that conflates biology and batch); here the batch is held constant
-    inside each DEG, so a match is conclusive.
-    """
-    matrix, genes = _expression_view(adata)
-    gene_array = np.asarray(genes)
-    usable = np.array([not _is_nuisance_gene(g) for g in genes], dtype=bool)
-    cluster_vals = adata.obs[cluster_key].astype(str).values
-    batch_vals = adata.obs[batch_key].astype(str).values
-
-    # Dominant sample per sample-dominated cluster (the batch-split candidates).
-    dom = {row["cluster"]: row["dominant_batch"] for row in composition if row.get("sample_dominated")}
-
-    def _markers(cluster_id: str) -> set:
-        return {g for g in (cluster_markers.get(cluster_id) or [])[:n_top_genes] if not _is_nuisance_gene(g)}
-
-    # Candidate cross-sample same-type pairs, nominated by marker overlap.
-    candidates: List[tuple] = []
-    dom_clusters = sorted(dom)
-    for a_i in range(len(dom_clusters)):
-        for b_i in range(a_i + 1, len(dom_clusters)):
-            ca, cb = dom_clusters[a_i], dom_clusters[b_i]
-            if dom[ca] == dom[cb]:
-                continue  # same dominant sample → not a cross-sample pair
-            ma, mb = _markers(ca), _markers(cb)
-            if not ma or not mb:
-                continue
-            jac = len(ma & mb) / len(ma | mb)
-            if jac >= marker_overlap_min:
-                candidates.append((jac, ca, cb))
-    candidates.sort(reverse=True)
-    candidates = candidates[:max_pairs]
-
-    def _within_sample_signature(cluster_id: str, sample: str):
-        in_mask = (cluster_vals == cluster_id) & (batch_vals == sample)
-        out_mask = (cluster_vals != cluster_id) & (batch_vals == sample)
-        n_in, n_out = int(in_mask.sum()), int(out_mask.sum())
-        if n_in < min_cells or n_out < min_cells:
-            return None, n_in, n_out
-        delta = _mean_expression(matrix[in_mask, :]) - _mean_expression(matrix[out_mask, :])
-        if delta.size == 0:
-            return None, n_in, n_out
-        # Exclude nuisance genes from the identity signature.
-        delta = np.where(usable, delta, -np.inf)
-        top_idx = np.argsort(delta)[::-1][:n_top_genes]
-        sig = [str(gene_array[k]) for k in top_idx if np.isfinite(delta[k]) and delta[k] > 0]
-        return sig, n_in, n_out
-
-    pairs_out: List[Dict[str, Any]] = []
-    for jac, ca, cb in candidates:
-        sig_a, na_in, _ = _within_sample_signature(ca, dom[ca])
-        sig_b, nb_in, _ = _within_sample_signature(cb, dom[cb])
-        if not sig_a or not sig_b:
-            continue
-        set_a, set_b = set(sig_a), set(sig_b)
-        shared_genes = [g for g in sig_a if g in set_b]  # keep sig_a ordering
-        similarity = len(set_a & set_b) / len(set_a | set_b)
-        pairs_out.append({
-            "cluster_a": ca, "sample_a": dom[ca], "n_cells_a": na_in,
-            "cluster_b": cb, "sample_b": dom[cb], "n_cells_b": nb_in,
-            "marker_overlap_jaccard": round(jac, 3),
-            "within_sample_signature_a": sig_a[:15],
-            "within_sample_signature_b": sig_b[:15],
-            "shared_identity_genes": shared_genes[:20],
-            "signature_similarity": round(similarity, 3),
-            "conclusive_batch_effect": bool(similarity >= signature_similarity_min),
-        })
-
-    pairs_out.sort(key=lambda e: e["signature_similarity"], reverse=True)
-    conclusive = [p for p in pairs_out if p["conclusive_batch_effect"]]
-    return {
-        "cross_sample_identity_pairs": pairs_out[:max_pairs],
-        "conclusive_pairs": conclusive,
-        "n_conclusive": len(conclusive),
-        "signature_similarity_min": signature_similarity_min,
-    }
-
-
-def _batch_diagnostic_group_doc(params: Dict[str, Any]) -> "ArtifactGroupDoc":
-    """Static documentation for the batch-diagnostic CSVs.
-
-    Describes what each table computes and what its columns mean — authored next
-    to the tool (not the harness) because it documents this tool's own output.
-    The dataset-specific interpretation is left to the model.
+    Authored next to the tool because it documents this tool's own output; the
+    dataset-specific interpretation is left to the model.
     """
     from ..core.artifact_docs import ArtifactGroupDoc, FileDoc
 
@@ -612,134 +314,149 @@ def _batch_diagnostic_group_doc(params: Dict[str, Any]) -> "ArtifactGroupDoc":
         group="diagnose_batch_effect",
         title="Batch-effect diagnostic — how to read these files",
         overview=(
-            "Descriptive diagnostic for whether an uncorrected multi-sample dataset "
-            "separates by sample/batch. Each CSV captures one line of evidence; "
-            "together they inform whether to integrate, keep unintegrated, or analyze "
-            "samples separately. None of these tables prove a difference is technical "
-            "rather than real per-sample biology — they are evidence, not proof."
+            "A gene-first check of whether an uncorrected multi-sample dataset carries "
+            "sample-associated expression differences, and if so whether they recur across "
+            "cell populations. The primary evidence is the within-sample DEGs; the direct "
+            "cross-sample comparison and recurrence are secondary. None of these tables prove "
+            "a difference is technical rather than real per-sample biology — only the "
+            "experimental design can separate those, and q-values here rank cell-level "
+            "separation, not replicate-level biology (cells are not independent replicates)."
         ),
         params=params,
         files=[
             FileDoc(
-                filename="batch_diagnostic_cluster_sample_composition.csv",
+                filename="batch_diagnostic_sample_enriched_regions.csv",
                 purpose=(
-                    "How each cluster's cells split across samples/batches — the primary "
-                    "signal for sample-private clusters."
+                    "Which cluster-sample regions hold far more of a sample than its overall "
+                    "size predicts — where to look. Enrichment over baseline, not raw purity."
                 ),
                 computation=(
-                    "Cross-tabulation of cluster x batch; per cluster the dominant batch and "
-                    "its fraction, plus a normalized entropy of the sample mixture."
-                ),
-                columns={
-                    "cluster": "Cluster id from the clustering used.",
-                    "n_cells": "Total cells in the cluster.",
-                    "dominant_batch": "Sample/batch contributing the most cells to the cluster.",
-                    "dominant_fraction": "Fraction of the cluster's cells from dominant_batch (1.0 = one sample).",
-                    "normalized_sample_entropy": "Evenness of the sample mixture, 0 (one sample) to 1 (even split).",
-                    "sample_exclusive": "True if dominant_fraction >= 0.98 (essentially one sample).",
-                    "sample_dominated": "True if dominant_fraction >= 0.80 (mostly one sample).",
-                    "batch_counts": "Per-batch cell counts (dict serialized as text).",
-                },
-            ),
-            FileDoc(
-                filename="batch_diagnostic_broad_cluster_labels.csv",
-                purpose=(
-                    "Provisional broad lineage label per cluster, used only to group clusters "
-                    "for this diagnostic — NOT a final annotation."
-                ),
-                computation=(
-                    "Per-cluster marker genes (rank_genes_groups) matched against a small "
-                    "built-in broad-lineage marker set; highest-scoring lineage wins."
+                    "For each cluster and sample: the fraction of the cluster made of that "
+                    "sample, divided by the sample's fraction of the whole dataset. Kept when "
+                    "the region has enough cells and enrichment above the threshold."
                 ),
                 columns={
                     "cluster": "Cluster id.",
-                    "broad_label": "Provisional broad lineage (e.g. epithelial, myeloid) — do not reuse as annotation.",
-                    "confidence": "Confidence of the broad-label assignment.",
-                    "supporting_markers": "Markers that drove the label.",
-                    "top_markers": "Top marker genes for the cluster.",
+                    "sample": "Sample/batch.",
+                    "n_cells": "Cells of this sample in this cluster.",
+                    "n_cluster": "Total cells in the cluster.",
+                    "frac_of_cluster": "Fraction of the cluster that is this sample.",
+                    "sample_baseline_frac": "This sample's fraction of the whole dataset.",
+                    "enrichment": "frac_of_cluster / sample_baseline_frac (2 = twice expected).",
                 },
             ),
             FileDoc(
-                filename="batch_diagnostic_condition_confounding.csv",
+                filename="batch_diagnostic_within_sample_degs.csv",
                 purpose=(
-                    "Whether each supplied condition/covariate is confounded with the "
-                    "batch/sample variable — if so, batch and biology cannot be separated."
+                    "PRIMARY evidence: within each sample, the genes that identify a region "
+                    "compared with the rest of that same sample (batch held constant)."
                 ),
                 computation=(
-                    "Cross-tabulation of batch x condition; purity of batches within conditions "
-                    "and vice versa; flagged confounded above a purity threshold."
-                ),
-                columns={
-                    "condition_key": "The obs column tested against batch.",
-                    "n_conditions": "Number of distinct condition values.",
-                    "max_batch_purity": "How cleanly the purest condition maps to a single batch.",
-                    "median_batch_purity": "Median of that batch-purity across conditions.",
-                    "max_condition_purity": "How cleanly the purest batch maps to a single condition.",
-                    "median_condition_purity": "Median of that condition-purity across batches.",
-                    "confounded_with_batch": "True if the two variables are largely redundant (confounded).",
-                },
-            ),
-            FileDoc(
-                filename="batch_diagnostic_shared_signatures.csv",
-                purpose=(
-                    "Genes that shift the same way with a given sample across MULTIPLE cell "
-                    "types — a hallmark of a technical (batch-wide) effect, not one cell type's biology."
-                ),
-                computation=(
-                    "Per broad label, per-sample expression deltas vs the other samples; genes "
-                    "recurring in the same direction across >=2 broad labels are retained."
-                ),
-                columns={
-                    "batch": "Sample/batch the shift is associated with.",
-                    "direction": "'up' or 'down' in that batch.",
-                    "gene": "Gene symbol.",
-                    "n_broad_labels": "Number of distinct broad cell types showing this shift.",
-                    "broad_labels": "Which broad labels show it.",
-                    "max_abs_delta": "Largest absolute expression delta observed.",
-                },
-            ),
-            FileDoc(
-                filename="batch_diagnostic_neighborhood_entropy.csv",
-                purpose=(
-                    "Per broad-label batch-mixing entropy in the chosen embedding — low entropy "
-                    "where a cell type spans several samples means it segregates by sample (batch-like)."
-                ),
-                computation=(
-                    "kNN graph in the chosen representation; per cell, entropy of its neighbors' "
-                    "batch labels; averaged per broad label."
-                ),
-                columns={
-                    "broad_label": "Provisional broad lineage.",
-                    "n_cells": "Cells with this label.",
-                    "n_batches_present": "How many batches contribute cells to this label.",
-                    "mean_entropy": "Mean neighborhood batch entropy (higher = better mixed; lower = more segregated).",
-                },
-            ),
-            FileDoc(
-                filename="batch_diagnostic_cross_sample_identity_deg.csv",
-                purpose=(
-                    "The most conclusive test — pairs of sample-private clusters that are the same "
-                    "cell population separated only by sample (a batch split integration should merge)."
-                ),
-                computation=(
-                    "Candidate pairs nominated by one-vs-all marker overlap; each cluster is then "
-                    "DEG'd against the rest of its OWN sample (batch held constant) and the two "
-                    "within-sample signatures compared."
+                    "For each enriched region, a differential-expression test of that cluster's "
+                    "cells against all other cells of the SAME sample. Because both sides are "
+                    "one sample, the genes describe the population's identity, not batch."
                 ),
                 how_to_read=(
-                    "High signature_similarity with conclusive_batch_effect=True means the split is "
-                    "technical (integrate to merge); low similarity means genuinely different "
-                    "populations, and the separation may be real biology."
+                    "expression_effect is the primary effect (mean_target - mean_reference on the "
+                    "matrix_source scale); higher_in names the side. engine_log2fc is the test's "
+                    "raw fold-change, secondary. q_value ranks genes; it is not replicate evidence."
                 ),
                 columns={
-                    "cluster_a": "First cluster of the pair.",
-                    "sample_a": "Sample of cluster_a.",
-                    "cluster_b": "Second cluster of the pair.",
-                    "sample_b": "Sample of cluster_b.",
-                    "marker_overlap_jaccard": "Jaccard overlap of the two clusters' one-vs-all markers (nominates the pair).",
-                    "signature_similarity": "Similarity of the two within-sample identity signatures (higher = more likely same population).",
-                    "conclusive_batch_effect": "True when similarity exceeds the threshold — conclusive that the split is batch, not biology.",
-                    "shared_identity_genes": "Genes shared by both within-sample signatures.",
+                    "region": "cluster/sample being characterized.",
+                    "comparison": "Exactly what was compared (region vs rest of its sample).",
+                    "target_cells": "Cells in the region.",
+                    "reference_cells": "Other cells of the same sample.",
+                    "gene": "Gene symbol.",
+                    "higher_in": "Which side the gene is higher in (region or rest of sample).",
+                    "expression_effect": "mean_target - mean_reference (primary, oriented effect).",
+                    "q_value": "BH-adjusted p-value (ranking aid; small values in scientific notation).",
+                    "engine_log2fc": "The DE engine's raw log-fold-change (secondary).",
+                    "pct_expressed_target": "Fraction of region cells expressing the gene.",
+                    "pct_expressed_reference": "Fraction of the same-sample reference expressing it.",
+                    "de_engine": "diffxpy or scanpy (the engine that actually ran).",
+                    "de_test": "rank / wilcoxon / wald.",
+                    "matrix_source": "Expression scale used (lognorm or counts).",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_population_pairs.csv",
+                purpose=(
+                    "The cross-sample region pairs we investigated: nominated as looking like the "
+                    "same cell type, then confirmed (or not) by their within-sample identity genes."
+                ),
+                computation=(
+                    "Candidate pairs are first nominated cheaply by mean-expression profile "
+                    "similarity (profile_correlation) between regions from DIFFERENT samples; the "
+                    "top few non-redundant candidates are then given within-sample identity DEGs, "
+                    "and the overlap of their top identity genes is reported. Housekeeping genes "
+                    "are excluded from the numerical overlap only."
+                ),
+                how_to_read=(
+                    "identity_match_supported=True means the shared identity genes are enough to "
+                    "treat the pair as the same population worth comparing directly — NOT that the "
+                    "two populations are definitively identical."
+                ),
+                columns={
+                    "cluster_a": "First region's cluster.", "sample_a": "First region's sample.",
+                    "cluster_b": "Second region's cluster.", "sample_b": "Second region's sample.",
+                    "profile_correlation": "How similar the two regions' mean-expression profiles are (nomination signal).",
+                    "n_shared_top25": "Shared genes among the top-25 identity genes.",
+                    "n_shared_top50": "Shared genes among the top-50 identity genes.",
+                    "jaccard_top50": "Jaccard overlap of the top-50 identity genes.",
+                    "identity_match_supported": "Whether the identity-gene overlap confirms them as one population.",
+                    "shared_top25_genes": "The actual shared top-25 identity genes.",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_direct_pair_degs.csv",
+                purpose=(
+                    "SECONDARY: for each matched pair, how the two regions differ across samples, "
+                    "gene by gene. Characterizes the difference; does not outrank the within-sample "
+                    "evidence and is not proof of a technical cause."
+                ),
+                computation=(
+                    "A differential-expression test of region A's cells vs region B's cells "
+                    "directly. ALL genes are kept (stress / mitochondrial / ribosomal / ambient "
+                    "genes may be the informative ones)."
+                ),
+                columns={
+                    "cluster_a": "Region A cluster.", "sample_a": "Region A sample.",
+                    "cluster_b": "Region B cluster.", "sample_b": "Region B sample.",
+                    "gene": "Gene symbol.",
+                    "higher_in": "The sample the gene is higher in.",
+                    "expression_effect": "mean(sample_a) - mean(sample_b) (oriented effect).",
+                    "q_value": "BH-adjusted p-value (ranking aid, not replicate evidence).",
+                    "pct_expressed_sample_a": "Fraction of region-A cells expressing the gene.",
+                    "pct_expressed_sample_b": "Fraction of region-B cells expressing the gene.",
+                    "de_engine": "diffxpy or scanpy.",
+                    "de_test": "rank / wilcoxon / wald.",
+                    "matrix_source": "Expression scale used.",
+                },
+            ),
+            FileDoc(
+                filename="batch_diagnostic_design_check.csv",
+                purpose=(
+                    "Whether the sample variable can be separated from condition/donor/treatment. "
+                    "If not, technical and biological effects cannot be told apart."
+                ),
+                computation=(
+                    "Cross-tabulation of sample against each candidate condition column; how "
+                    "cleanly each maps to the other. Missing metadata is recorded as status "
+                    "'unknown' rather than as 'not confounded'."
+                ),
+                how_to_read=(
+                    "status: 'unknown' = no design metadata to test; 'confounded' = sample and "
+                    "condition are largely redundant (cannot separate technical from biology); "
+                    "'orthogonal' = a condition column exists and is not confounded (but that alone "
+                    "does not make sample-wide differences technical — donor effects can remain)."
+                ),
+                columns={
+                    "condition_key": "The obs column tested against sample (or '(none available)').",
+                    "n_conditions": "Number of distinct condition values.",
+                    "median_batch_purity": "How cleanly conditions map to a single sample.",
+                    "median_condition_purity": "How cleanly samples map to a single condition.",
+                    "confounded_with_batch": "True if redundant with sample (blank when unknown).",
+                    "status": "unknown / confounded / orthogonal.",
                 },
             ),
         ],
@@ -747,18 +464,18 @@ def _batch_diagnostic_group_doc(params: Dict[str, Any]) -> "ArtifactGroupDoc":
 
 
 def _write_outputs(
-    output_dir: Optional[str],
-    tables: Dict[str, pd.DataFrame],
-    group_doc: Optional["ArtifactGroupDoc"] = None,
-) -> List[Dict[str, Any]]:
-    artifacts: List[Dict[str, Any]] = []
+    output_dir: str | None,
+    tables: dict[str, pd.DataFrame],
+    group_doc: ArtifactGroupDoc | None = None,
+) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
     if not output_dir:
         return artifacts
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
 
     # Per-file authored docs keyed by both full filename and stem.
-    file_docs: Dict[str, Any] = {}
+    file_docs: dict[str, Any] = {}
     if group_doc is not None:
         for fdoc in group_doc.files:
             file_docs[fdoc.filename] = fdoc
@@ -767,12 +484,12 @@ def _write_outputs(
     for stem, df in tables.items():
         path = root / f"{stem}.csv"
         df.to_csv(path, index=False)
-        metadata: Dict[str, Any] = {"kind": stem}
-        fdoc = file_docs.get(stem) or file_docs.get(f"{stem}.csv")
-        if fdoc is not None:
+        metadata: dict[str, Any] = {"kind": stem}
+        doc_for_stem = file_docs.get(stem) or file_docs.get(f"{stem}.csv")
+        if doc_for_stem is not None:
             from ..core.artifact_docs import artifact_column_metadata
 
-            metadata.update(artifact_column_metadata(fdoc, df))
+            metadata.update(artifact_column_metadata(doc_for_stem, df))
         artifacts.append({"path": str(path), "role": "artifact", "metadata": metadata})
 
     # A single README documenting every file, plus a placeholder Interpretation
@@ -792,309 +509,399 @@ def _write_outputs(
     return artifacts
 
 
+# ---------------------------------------------------------------------------
+# Artifact tables — each answers one distinct question (see the group doc)
+# ---------------------------------------------------------------------------
+
+def _engine_test(engine: str) -> tuple[str, str]:
+    """Split an engine tag into (engine, test).
+
+    Tags: 'diffxpy_<test>'; 'scanpy_wilcoxon'; or
+    'scanpy_wilcoxon_diffxpy_unavailable' (diffxpy was requested but the env was
+    not available, so it visibly fell back to Wilcoxon). The de_engine column
+    records the ran engine ('scanpy'); the full tag is preserved in
+    de_engines_used so the requested-but-unavailable fallback stays visible.
+    """
+    if engine and engine.startswith("diffxpy_"):
+        return "diffxpy", engine.split("_", 1)[1]
+    if engine and engine.startswith("scanpy_wilcoxon"):
+        return "scanpy", "wilcoxon"
+    return str(engine), ""
+
+
+def _regions_table(regions: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(regions)
+
+
+def _within_sample_deg_table(
+    investigation: dict[str, Any], matrix_source: str, *, top_per_region: int = 50
+) -> pd.DataFrame:
+    """Every selected region's top identity genes vs the rest of its own sample."""
+    from .batch_gene_investigation import top_positive_genes
+
+    rows: list[dict[str, Any]] = []
+    for (cluster, sample), deg in investigation["identity_degs"].items():
+        if deg is None:
+            continue
+        engine, test = _engine_test(str(deg.attrs.get("engine", "")))
+        n_t = int(deg.attrs.get("n_target", 0))
+        n_r = int(deg.attrs.get("n_reference", 0))
+        region = f"{cluster}/{sample}"
+        top_genes = top_positive_genes(deg, top_per_region, exclude_nuisance=False, min_effect=0.0)
+        sub = deg[deg["gene"].isin(top_genes)]
+        for _, g in sub.iterrows():
+            rows.append(
+                {
+                    "region": region,
+                    "comparison": f"{region} vs rest of {sample}",
+                    "target_cells": n_t,
+                    "reference_cells": n_r,
+                    "gene": g["gene"],
+                    "higher_in": region if g["expression_effect"] > 0 else f"rest of {sample}",
+                    "expression_effect": round(float(g["expression_effect"]), 4),
+                    "q_value": float(g["qval"]),
+                    "engine_log2fc": round(float(g.get("engine_log2fc", float("nan"))), 4),
+                    "pct_expressed_target": round(float(g["pct_target"]), 4),
+                    "pct_expressed_reference": round(float(g["pct_reference"]), 4),
+                    "de_engine": engine,
+                    "de_test": test,
+                    "matrix_source": matrix_source,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _population_pairs_table(pairs: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for p in pairs:
+        rows.append(
+            {
+                "cluster_a": p["cluster_a"], "sample_a": p["sample_a"],
+                "cluster_b": p["cluster_b"], "sample_b": p["sample_b"],
+                "profile_correlation": p.get("profile_correlation"),
+                "n_shared_top25": p["n_shared_top25"],
+                "n_shared_top50": p["n_shared_top50"],
+                "jaccard_top50": p["jaccard_top50"],
+                "identity_match_supported": p["identity_match_supported"],
+                "shared_top25_genes": ", ".join(p["shared_top25_genes"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _direct_pair_table(
+    direct_results: list[dict[str, Any]], matrix_source: str, *, top_each: int = 25
+) -> pd.DataFrame:
+    """Genes separating each matched pair across samples (secondary evidence)."""
+    rows: list[dict[str, Any]] = []
+    for r in direct_results:
+        engine, test = _engine_test(str(r.get("engine", "")))
+        deg = r["deg"]
+        up_a = deg[deg["expression_effect"] > 0].sort_values("expression_effect", ascending=False).head(top_each)
+        up_b = deg[deg["expression_effect"] < 0].sort_values("expression_effect").head(top_each)
+        for side, g in [("a", row) for _, row in up_a.iterrows()] + [("b", row) for _, row in up_b.iterrows()]:
+            higher = r["sample_a"] if side == "a" else r["sample_b"]
+            rows.append(
+                {
+                    "cluster_a": r["cluster_a"], "sample_a": r["sample_a"],
+                    "cluster_b": r["cluster_b"], "sample_b": r["sample_b"],
+                    "gene": g["gene"],
+                    "higher_in": higher,
+                    "expression_effect": round(float(g["expression_effect"]), 4),
+                    "q_value": float(g["qval"]),
+                    "pct_expressed_sample_a": round(float(g["pct_target"]), 4),
+                    "pct_expressed_sample_b": round(float(g["pct_reference"]), 4),
+                    "de_engine": engine,
+                    "de_test": test,
+                    "matrix_source": matrix_source,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _design_check_table(
+    confounding: list[dict[str, Any]], condition_cols: list[str]
+) -> pd.DataFrame:
+    """Whether sample can be separated from each condition/covariate.
+
+    Missing metadata is recorded as an explicit ``status='unknown'`` row, never as
+    ``confounded=False`` (absence of a test is not evidence of no confounding).
+    """
+    if not condition_cols:
+        return pd.DataFrame(
+            [
+                {
+                    "condition_key": "(none available)",
+                    "n_conditions": 0,
+                    "median_batch_purity": None,
+                    "median_condition_purity": None,
+                    "confounded_with_batch": None,
+                    "status": "unknown",
+                }
+            ]
+        )
+    rows = []
+    for row in confounding:
+        status = "confounded" if row.get("confounded_with_batch") else "orthogonal"
+        rows.append(
+            {
+                "condition_key": row["condition_key"],
+                "n_conditions": row["n_conditions"],
+                "median_batch_purity": row["median_batch_purity"],
+                "median_condition_purity": row["median_condition_purity"],
+                "confounded_with_batch": row["confounded_with_batch"],
+                "status": status,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+_VERDICT_PLAIN = {
+    "cannot_determine_technical_vs_biological": (
+        "the technical-versus-biological origin of these differences cannot be "
+        "determined from the genes alone, so the dataset should not be integrated "
+        "automatically"
+    ),
+    "do_not_integrate_based_on_current_evidence": (
+        "the current gene evidence does not justify integrating the dataset"
+    ),
+    "integration_optional_if_replicates": (
+        "integration may be reasonable only if the samples are intended as "
+        "comparable replicates"
+    ),
+    "integration_supported": (
+        "the recurring, design-documented technical differences support integrating "
+        "the samples"
+    ),
+}
+
+
+def _deterministic_interpretation(
+    investigation: dict[str, Any],
+    gene_evidence: str,
+    design_interpretation: str,
+    verdict: dict[str, str],
+    batch_key: str,
+) -> str:
+    """Readable prose summary of the results, built from the structured evidence.
+
+    Written into the README so the artifact reads on its own; the model may still
+    expand it. No hardcoded biology — every gene name comes from the results.
+    """
+    pairs = investigation.get("selected_pairs") or []
+    direct_by = {
+        (d["cluster_a"], d["sample_a"], d["cluster_b"], d["sample_b"]): d
+        for d in investigation.get("direct_results") or []
+    }
+    n_regions = len(investigation.get("regions") or [])
+
+    paras: list[str] = []
+    paras.append(
+        f"This diagnostic examined {n_regions} sample-enriched cluster region(s) and "
+        f"investigated {len(pairs)} cross-sample population pair(s) whose mean-expression "
+        f"profiles looked alike. For each pair it compared the cluster against the rest of "
+        f"its own sample (holding {batch_key} constant) to describe the population, then "
+        f"compared the two matched regions directly."
+    )
+
+    for p in pairs:
+        key = (p["cluster_a"], p["sample_a"], p["cluster_b"], p["sample_b"])
+        d = direct_by.get(key)
+        shared = ", ".join(p.get("shared_top25_genes", [])[:8]) or "shared identity genes"
+        sent = (
+            f"Cluster {p['cluster_a']} in {p['sample_a']} and cluster {p['cluster_b']} in "
+            f"{p['sample_b']} share {p.get('n_shared_top25', 0)} of their top identity genes "
+            f"({shared}), so they appear to be the same population present in both samples."
+        )
+        if d is not None:
+            hi_a = ", ".join(d["higher_in_a"][:6]) or "n/a"
+            hi_b = ", ".join(d["higher_in_b"][:6]) or "n/a"
+            sent += (
+                f" Comparing them directly, {d['sample_a']} is higher for {hi_a}, while "
+                f"{d['sample_b']} is higher for {hi_b}. This describes how the regions differ; "
+                f"it does not by itself show the difference is technical."
+            )
+        paras.append(sent)
+
+    recurrent = investigation.get("recurrent_programs") or []
+    if recurrent:
+        by_group: dict[str, list[str]] = {}
+        for r in recurrent:
+            by_group.setdefault(r["associated_batch_group"], []).append(r["gene"])
+        bits = [
+            f"a {group}-associated program ({', '.join(gs[:8])})"
+            for group, gs in by_group.items()
+        ]
+        paras.append(
+            "The same sample-associated shift recurs across more than one population: "
+            + "; ".join(bits)
+            + ". A program that recurs across populations points to a sample-wide effect, "
+            "but sample-wide is not the same as technical — a real systemic biological "
+            "difference would look the same."
+        )
+    else:
+        paras.append(
+            "No sample-associated program recurred across more than one population, so any "
+            "differences appear localized rather than sample-wide."
+        )
+
+    design_plain = {
+        "unknown": "no experimental-design metadata is available to test whether sample is "
+                   "confounded with a biological condition",
+        "confounded_with_biology": "the sample variable is confounded with a biological "
+                                   "condition, so technical and biological effects cannot be separated",
+        "orthogonal_but_not_known_technical": "a condition column exists and is not confounded "
+                                              "with sample, but that alone does not make the differences technical",
+        "documented_technical_batch": "the design documents this as a technical batch variable "
+                                      "separable from biological condition",
+    }.get(design_interpretation, design_interpretation)
+    paras.append(
+        f"On the experimental design, {design_plain}. Taken together, "
+        f"{_VERDICT_PLAIN.get(verdict['recommendation'], verdict['recommendation'])}. "
+        "Note that the q-values here rank cell-level separation and are not replicate-level "
+        "evidence, because the cells are not independent replicates; weigh the expression "
+        "effects, percent-expressed, recurrence, and study design instead."
+    )
+    return "\n\n".join(paras)
+
+
+def _fill_readme_interpretation(artifacts: list[dict[str, Any]], interpretation: str) -> None:
+    """Replace the README's Interpretation section with deterministic prose."""
+    from ..core.artifact_docs import set_interpretation
+
+    readme = next(
+        (a["path"] for a in artifacts if a.get("role") == "artifact_readme"), None
+    )
+    if not readme:
+        return
+    p = Path(readme)
+    try:
+        p.write_text(set_interpretation(p.read_text(), interpretation))
+    except OSError:
+        pass
+
+
 def diagnose_batch_effect(
     adata,
     *,
     batch_key: str,
     cluster_key: str = "leiden",
-    condition_keys: Optional[List[str]] = None,
+    condition_keys: list[str] | None = None,
     min_cells_per_cluster_sample: int = 30,
     n_top_genes: int = 25,
     entropy_use_rep: str = ENTROPY_DEFAULT_USE_REP,
     entropy_n_neighbors: int = ENTROPY_DEFAULT_N_NEIGHBORS,
-    output_dir: Optional[str] = None,
-) -> Dict[str, Any]:
+    output_dir: str | None = None,
+    prefer_diffxpy: bool = False,
+    min_enrichment: float = 2.0,
+    technical_batch_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    """Gene-first batch-effect diagnostic with a two-axis, design-gated verdict.
+
+    The gene investigation (``batch_gene_investigation``) is the evidence; sample
+    composition, neighborhood entropy and cluster/sample ARI-NMI are secondary
+    context only. ``technical_batch_keys`` lets a caller assert which columns are
+    documented technical batch variables separable from biology; the verdict only
+    reaches ``integration_supported`` when ``batch_key`` itself is among them (a
+    non-empty list of unrelated keys does not count). The harness never infers
+    "technical" on its own.
+    """
+    from .batch_gene_investigation import (
+        build_terminal_summary,
+        derive_design_interpretation,
+        derive_gene_evidence,
+        derive_verdict,
+        run_gene_investigation,
+    )
+
     if batch_key not in adata.obs.columns:
         raise ValueError(f"batch_key '{batch_key}' not found in adata.obs.")
     if cluster_key not in adata.obs.columns:
         raise ValueError(f"cluster_key '{cluster_key}' not found in adata.obs. Run clustering first.")
-
     batches = list(map(str, adata.obs[batch_key].dropna().astype(str).unique()))
     if len(batches) < 2:
         raise ValueError(f"batch_key '{batch_key}' has fewer than two groups.")
 
-    marker_key = f"batch_diag_markers_{cluster_key}"
-    try:
-        cluster_markers = _compute_cluster_markers(adata, cluster_key, marker_key, n_top_genes)
-        marker_error = None
-    except Exception as exc:
-        cluster_markers = {str(c): [] for c in adata.obs[cluster_key].astype(str).unique()}
-        marker_error = str(exc)
+    matrix, genes = _expression_view(adata)
+    matrix_source = _matrix_source_label(matrix)
 
-    broad_by_cluster: Dict[str, Dict[str, Any]] = {}
-    state_by_cluster: Dict[str, str] = {}
-    for cluster, markers in cluster_markers.items():
-        label_info = _broad_label_from_markers(markers)
-        broad_by_cluster[str(cluster)] = {
-            "cluster": str(cluster),
-            "broad_label": label_info["label"],
-            "confidence": label_info["confidence"],
-            "supporting_markers": label_info["supporting_markers"],
-            "top_markers": markers[:10],
-        }
-        state_by_cluster[str(cluster)] = label_info["label"]
-
-    composition = _cluster_sample_composition(adata, batch_key, cluster_key)
-    n_clusters = len(composition)
-    sample_dominated = [row for row in composition if row["sample_dominated"]]
-    sample_exclusive = [row for row in composition if row["sample_exclusive"]]
-    cells_in_dominated = sum(row["n_cells"] for row in sample_dominated)
-    dominated_cell_fraction = cells_in_dominated / max(int(adata.n_obs), 1)
-
-    separation = _umap_state_separation(adata, state_by_cluster, batch_key, cluster_key)
-    entropy_mixing = _neighborhood_batch_mixing(
-        adata,
-        batch_key,
-        cluster_key,
-        state_by_cluster,
-        use_rep=entropy_use_rep,
-        n_neighbors=entropy_n_neighbors,
-    )
-    shift_payload = _state_expression_shifts(
-        adata,
-        batch_key,
-        cluster_key,
-        state_by_cluster,
-        min_cells_per_cluster_sample=min_cells_per_cluster_sample,
-        n_top_genes=n_top_genes,
-    )
-    shared = shift_payload["shared_cross_cell_type_signatures"]
-    max_shared_labels = max([entry["n_broad_labels"] for entry in shared], default=0)
-    n_shared_genes = len(shared)
-
-    # Paired within-sample identity DEG — the clean control (batch held constant
-    # inside each DEG). See _cross_sample_identity_deg.
-    identity_deg = _cross_sample_identity_deg(
-        adata,
-        batch_key,
-        cluster_key,
-        composition,
-        cluster_markers,
+    # --- gene evidence (steps 1-5) ---
+    investigation = run_gene_investigation(
+        adata, matrix, genes,
+        batch_key=batch_key, cluster_key=cluster_key,
+        prefer_diffxpy=prefer_diffxpy,
         min_cells=min_cells_per_cluster_sample,
-        n_top_genes=n_top_genes,
+        min_enrichment=min_enrichment,
     )
 
-    support_reasons: List[str] = []
-    caution_reasons: List[str] = []
+    # --- design gate ---
     condition_cols = _candidate_condition_keys(adata, batch_key, condition_keys)
     confounding = _confounding_summary(adata, batch_key, condition_cols)
-    any_confounded = any(row["confounded_with_batch"] for row in confounding)
-    if not condition_cols:
-        caution_reasons.append(
-            "no condition-like metadata columns were available, so sample-condition confounding was not tested"
-        )
+    # A documented technical batch requires the caller to name THIS batch variable
+    # specifically — not merely to pass some non-empty list of unrelated keys.
+    technical_documented = batch_key in (technical_batch_keys or [])
+    gene_evidence = derive_gene_evidence(investigation)
+    design_interpretation = derive_design_interpretation(
+        confounding,
+        condition_columns_present=bool(condition_cols),
+        technical_batch_documented=technical_documented,
+    )
+    verdict = derive_verdict(gene_evidence, design_interpretation)
 
-    sample_prefixes = sorted({str(batch).split("_", 1)[0] for batch in batches if "_" in str(batch)})
-    mixed_source_like_samples = len(sample_prefixes) >= 3
-    if mixed_source_like_samples:
-        caution_reasons.append(
-            "sample names suggest multiple source/procedure groups; sample effects may include real tissue or collection-method biology"
-        )
-
+    # --- secondary context (never drives the verdict) ---
+    composition = _cluster_sample_composition(adata, batch_key, cluster_key)
+    clusters = [str(c) for c in adata.obs[cluster_key].astype(str).unique()]
+    per_cluster_label = {c: f"cluster {c}" for c in clusters}
+    entropy_mixing = _neighborhood_batch_mixing(
+        adata, batch_key, cluster_key, per_cluster_label,
+        use_rep=entropy_use_rep, n_neighbors=entropy_n_neighbors,
+    )
     concordance = _cluster_batch_concordance(adata, batch_key, cluster_key)
 
-    if dominated_cell_fraction >= 0.30 or (n_clusters and len(sample_dominated) / n_clusters >= 0.30):
-        support_reasons.append("many clusters are sample-dominated")
-    if sample_exclusive:
-        support_reasons.append("some clusters are nearly sample-exclusive")
-    if max_shared_labels >= 3 or (max_shared_labels >= 2 and n_shared_genes >= 5):
-        support_reasons.append("sample-associated expression shifts recur across broad cell types")
-    if separation and max(row["mean_distance_over_global_umap_scale"] for row in separation) >= 0.35:
-        support_reasons.append("broad cell types have separated sample centroids on the UMAP")
-    if concordance["tracks_sample"]:
-        support_reasons.append(
-            f"clusters track sample labels (ARI {concordance['ari']:.2f}, NMI {concordance['nmi']:.2f} "
-            f"between {cluster_key} and {batch_key}): {cluster_key} clusters largely correspond to "
-            "individual samples rather than shared cell states"
-        )
-    if identity_deg["n_conclusive"]:
-        top = identity_deg["conclusive_pairs"][0]
-        shared_str = ", ".join(top["shared_identity_genes"][:8]) or "shared identity genes"
-        support_reasons.append(
-            f"the same cell type appears split across samples: cluster {top['cluster_a']} (sample "
-            f"{top['sample_a']}) and cluster {top['cluster_b']} (sample {top['sample_b']}) carry almost "
-            f"the same marker genes when each is compared against the rest of its OWN sample "
-            f"(similarity {top['signature_similarity']:.2f}; shared genes: {shared_str}). Because each "
-            f"comparison stays inside a single sample, batch is held constant — so the match means these "
-            f"are one cell population pulled apart only by sample, a batch effect that integration should merge"
-        )
-
-    # Name the markers behind sample-segregated Epithelial clusters and caveat them: the
-    # epithelial compartment is frequently donor/patient-private regardless of tissue
-    # (donor-specific epithelial states and genetic background in normal tissue; malignant
-    # clones and CNVs in tumors), so this pattern is often real biology rather than a
-    # technical batch effect — and integrating it across samples can erase genuine
-    # per-sample differences. Do not assume the tissue is a tumor.
-    segregated_clusters: Dict[str, Dict[str, Any]] = {row["cluster"]: row for row in sample_dominated}
-    for row in sample_exclusive:
-        segregated_clusters.setdefault(row["cluster"], row)
-    epithelial_private_markers: List[str] = []
-    epithelial_private_clusters: List[str] = []
-    for cluster_id in segregated_clusters:
-        info = broad_by_cluster.get(str(cluster_id))
-        if info and info.get("broad_label") == "Epithelial":
-            epithelial_private_clusters.append(str(cluster_id))
-            markers = info.get("supporting_markers") or info.get("top_markers") or []
-            epithelial_private_markers.extend(str(gene) for gene in markers[:4])
-    if epithelial_private_clusters:
-        marker_str = ", ".join(dict.fromkeys(epithelial_private_markers)) or "epithelial markers"
-        caution_reasons.append(
-            f"sample-segregated Epithelial cluster(s) {', '.join(epithelial_private_clusters)} "
-            f"(driven by {marker_str}) may be donor/patient-private epithelial biology rather than a "
-            "technical batch effect; epithelium is often sample-specific (donor-specific epithelial "
-            "states in normal tissue, or malignant clones/CNVs in tumors), and integrating it across "
-            "samples can erase real per-sample differences"
-        )
-    if entropy_mixing is None:
-        caution_reasons.append(
-            f"neighborhood batch-mixing entropy was skipped because '{entropy_use_rep}' is not in "
-            "adata.obsm — run the uncorrected PCA first to enable this continuous check"
-        )
-    elif entropy_mixing.get("skipped"):
-        caution_reasons.append(
-            "neighborhood batch-mixing entropy could not be computed "
-            f"({entropy_mixing.get('reason')})"
-        )
-    else:
-        ratio = entropy_mixing["mixing_ratio"]
-        if ratio is not None and ratio <= ENTROPY_LOW_MIXING_RATIO:
-            support_reasons.append(
-                f"neighborhood batch-mixing entropy in {entropy_mixing['use_rep']} is low "
-                f"(mean {entropy_mixing['mean_entropy']:.2f} vs achievable {entropy_mixing['global_ceiling']:.2f}, "
-                f"ratio {ratio:.2f}): cells tend to neighbor their own sample even within shared regions"
-            )
-    if marker_error:
-        caution_reasons.append(f"cluster marker calculation failed: {marker_error}")
-    if any_confounded:
-        caution_reasons.append("sample/batch is confounded with at least one condition-like metadata column")
-
-    if any_confounded and support_reasons:
-        verdict = "confounded_with_condition"
-        recommendation = (
-            "Ask the user whether the confounded sample/condition structure is expected before integration."
-        )
-    elif support_reasons:
-        verdict = "batch_effect_supported"
-        if mixed_source_like_samples or not condition_cols:
-            recommendation = (
-                "Offer scVI integration, but frame the evidence as sample/source/procedure effects "
-                "and ask the user to confirm whether to integrate all samples together or within comparable groups."
-            )
-        else:
-            recommendation = "Offer scVI integration, but wait for the user's confirmation."
-    elif n_clusters < 2 or not shift_payload["state_sample_expression_shifts"]:
-        verdict = "insufficient_evidence"
-        recommendation = "Ask the user; descriptive evidence is limited for this dataset."
-    else:
-        verdict = "no_correction_needed"
-        recommendation = "Proceed without integration unless the user has external design knowledge."
-
-    composition_df = pd.DataFrame(
-        [
-            {k: v for k, v in row.items() if k != "batch_counts"}
-            | {f"count_{k}": v for k, v in row["batch_counts"].items()}
-            for row in composition
-        ]
-    )
-    broad_df = pd.DataFrame(list(broad_by_cluster.values()))
-    confounding_df = pd.DataFrame(confounding)
-    shared_df = pd.DataFrame(shared)
-    # Narrow to a non-None dict only when entropy was actually computed, so the
-    # downstream summary/result blocks can index it safely.
-    entropy_ok: Optional[Dict[str, Any]] = (
-        entropy_mixing
-        if entropy_mixing is not None and not entropy_mixing.get("skipped")
-        else None
-    )
-    entropy_df = (
-        pd.DataFrame(entropy_ok["entropy_per_broad_label"])
-        if entropy_ok is not None
-        else pd.DataFrame()
-    )
-    identity_df = pd.DataFrame([
-        {
-            "cluster_a": p["cluster_a"], "sample_a": p["sample_a"],
-            "cluster_b": p["cluster_b"], "sample_b": p["sample_b"],
-            "marker_overlap_jaccard": p["marker_overlap_jaccard"],
-            "signature_similarity": p["signature_similarity"],
-            "conclusive_batch_effect": p["conclusive_batch_effect"],
-            "shared_identity_genes": ", ".join(p["shared_identity_genes"]),
-        }
-        for p in identity_deg["cross_sample_identity_pairs"]
-    ])
+    # --- artifact tables ---
+    tables = {
+        "batch_diagnostic_sample_enriched_regions": _regions_table(investigation["regions"]),
+        "batch_diagnostic_within_sample_degs": _within_sample_deg_table(investigation, matrix_source),
+        "batch_diagnostic_population_pairs": _population_pairs_table(investigation["population_pairs"]),
+        "batch_diagnostic_direct_pair_degs": _direct_pair_table(investigation["direct_results"], matrix_source),
+        "batch_diagnostic_design_check": _design_check_table(confounding, condition_cols),
+    }
     artifacts = _write_outputs(
-        output_dir,
-        {
-            "batch_diagnostic_cluster_sample_composition": composition_df,
-            "batch_diagnostic_broad_cluster_labels": broad_df,
-            "batch_diagnostic_condition_confounding": confounding_df,
-            "batch_diagnostic_shared_signatures": shared_df,
-            "batch_diagnostic_neighborhood_entropy": entropy_df,
-            "batch_diagnostic_cross_sample_identity_deg": identity_df,
-        },
+        output_dir, tables,
         group_doc=_batch_diagnostic_group_doc(
             {
-                "batch_key": batch_key,
-                "cluster_key": cluster_key,
-                "n_top_genes": n_top_genes,
-                "min_cells_per_cluster_sample": min_cells_per_cluster_sample,
-                "entropy_use_rep": entropy_use_rep,
-                "entropy_n_neighbors": entropy_n_neighbors,
-                "condition_keys": condition_keys or [],
+                "batch_key": batch_key, "cluster_key": cluster_key,
+                "de_engine": (
+                    "scanpy Wilcoxon (default, in-process). diffxpy is opt-in "
+                    "(prefer_diffxpy=True) and runs the same rank test through its engine; "
+                    "the diffxpy bridge also offers an NB Wald count model, not used here"
+                ),
+                "engines_used": ", ".join(investigation["engines_used"]) or "n/a",
+                "matrix_source": matrix_source,
+                "min_cells_per_region": min_cells_per_cluster_sample,
+                "min_enrichment": min_enrichment,
+                "condition_keys_tested": condition_cols or [],
             }
         ),
     )
-
-    # Human-readable findings shown in the terminal (the agent prints
-    # result["terminal_summary"] for reasoning tools). Keep it concise.
-    # Human-readable verdict label (the machine slug stays on result["verdict"]).
-    verdict_label = {
-        "confounded_with_condition": (
-            "Sample and experimental condition overlap, so a batch effect can't be "
-            "separated from real biology"
+    # Fill the README's Interpretation section with deterministic prose so the
+    # artifact reads without depending on the model (the model may still expand it).
+    _fill_readme_interpretation(
+        artifacts,
+        _deterministic_interpretation(
+            investigation, gene_evidence, design_interpretation, verdict, batch_key
         ),
-        "batch_effect_supported": "Evidence points to a technical batch effect across samples",
-        "insufficient_evidence": "Not enough evidence to call this a batch effect either way",
-        "no_correction_needed": "Samples look well mixed — no batch correction appears needed",
-    }.get(verdict, verdict)
-    terminal_summary = [f"Verdict: {verdict_label}"]
-    terminal_summary += [f"• {r}" for r in support_reasons]
-    terminal_summary += [f"⚠ {r}" for r in caution_reasons]
-    if sample_dominated:
-        terminal_summary.append(
-            f"{len(sample_dominated)} cluster(s) are made up almost entirely of one sample "
-            f"({dominated_cell_fraction * 100:.0f}% of all cells sit in them) — a sign cells are "
-            "grouping by which sample they came from rather than by cell type"
-        )
-    if entropy_ok is not None:
-        if entropy_ok["mixing_ratio"] is not None:
-            terminal_summary.append(
-                "Neighborhood mixing: on average each cell's nearest neighbors span "
-                f"{entropy_ok['mixing_ratio'] * 100:.0f}% of the sample variety you'd see if the "
-                "samples were perfectly intermixed — lower means cells tend to sit next to others "
-                "from their own sample (a batch signature)"
-            )
-        else:
-            terminal_summary.append(
-                "Neighborhood mixing across samples: entropy "
-                f"{entropy_ok['mean_entropy']:.2f} (higher = better intermixed)"
-            )
-    terminal_summary.append(
-        f"How closely clusters track samples: ARI {concordance['ari']:.2f}, NMI "
-        f"{concordance['nmi']:.2f} (0 = clusters unrelated to sample, 1 = clusters exactly follow "
-        f"sample; {concordance['interpretation']})"
     )
-    if identity_deg["n_conclusive"]:
-        top = identity_deg["conclusive_pairs"][0]
-        terminal_summary.append(
-            f"Same cell type split across samples: {identity_deg['n_conclusive']} clear case(s). "
-            f"For example, cluster {top['cluster_a']} (sample {top['sample_a']}) and cluster "
-            f"{top['cluster_b']} (sample {top['sample_b']}) carry almost the same marker genes when "
-            f"each is compared against the rest of its OWN sample (match "
-            f"{top['signature_similarity']:.2f}) — i.e. one population pulled apart by sample, "
-            "which is a batch effect integration should merge"
-        )
-    terminal_summary.append(f"→ {recommendation}")
+
+    # --- deterministic, already-readable terminal summary ---
+    terminal_summary = build_terminal_summary(
+        investigation, gene_evidence, design_interpretation, verdict
+    )
+    terminal_summary.append(
+        "Note: q-values rank cell-level separation and, because cells are not "
+        "independent replicates, are NOT sample-level replication evidence. Weigh "
+        "expression effect, percent-expressed, recurrence and study design instead."
+    )
 
     result = {
         "status": "ok",
@@ -1102,56 +909,48 @@ def diagnose_batch_effect(
         "batch_key": batch_key,
         "cluster_key": cluster_key,
         "n_batches": int(len(batches)),
-        "n_clusters": int(n_clusters),
-        "verdict": verdict,
-        "recommendation": recommendation,
-        "support_reasons": support_reasons,
-        "caution_reasons": caution_reasons,
+        "matrix_source": matrix_source,
+        "de_engines_used": investigation["engines_used"],
+        "gene_evidence": gene_evidence,
+        "design_interpretation": design_interpretation,
+        "recommendation": verdict["recommendation"],
+        "recommendation_reason": verdict["reason"],
         "terminal_summary": terminal_summary,
-        "cluster_sample_summary": {
-            "n_sample_dominated_clusters": int(len(sample_dominated)),
-            "n_sample_exclusive_clusters": int(len(sample_exclusive)),
-            "fraction_cells_in_sample_dominated_clusters": round(float(dominated_cell_fraction), 4),
-            "sample_dominated_clusters": sample_dominated[:20],
-            "sample_exclusive_clusters": sample_exclusive[:20],
-        },
-        "broad_cluster_labels": list(broad_by_cluster.values()),
-        "umap_broad_label_sample_separation": separation[:30],
-        "neighborhood_batch_entropy": entropy_mixing,
-        "cluster_batch_concordance": concordance,
-        "condition_confounding": confounding,
-        "state_sample_expression_shifts": shift_payload["state_sample_expression_shifts"][:50],
-        "shared_cross_cell_type_signatures": shared[:30],
-        "cross_sample_identity_deg": {
-            "n_conclusive": identity_deg["n_conclusive"],
-            "signature_similarity_min": identity_deg["signature_similarity_min"],
-            "conclusive_pairs": identity_deg["conclusive_pairs"][:10],
-            "candidate_pairs": identity_deg["cross_sample_identity_pairs"][:10],
-            "interpretation": (
-                "Each cluster in a pair was DEG'd against the rest of its OWN sample, so batch is held "
-                "constant inside each test. A high signature_similarity means the two sample-private "
-                "clusters are the same cell population separated only by sample — conclusive evidence "
-                "that the split is technical (batch) and integration should merge them. Low similarity "
-                "means they are genuinely different populations and the separation may be real biology. "
-                "Candidate pairs are nominated by one-vs-all marker overlap; the within-sample "
-                "signature match is the confirmation."
-            ),
+        "sample_enriched_regions": investigation["regions"][:50],
+        "population_pairs": [
+            {k: v for k, v in p.items() if k != "shared_top50_genes"}
+            for p in investigation["population_pairs"][:30]
+        ],
+        "selected_pairs": [
+            {"cluster_a": p["cluster_a"], "sample_a": p["sample_a"],
+             "cluster_b": p["cluster_b"], "sample_b": p["sample_b"],
+             "n_shared_top25": p["n_shared_top25"],
+             "shared_top25_genes": p["shared_top25_genes"][:15]}
+            for p in investigation["selected_pairs"]
+        ],
+        "direct_pair_summaries": [
+            {"cluster_a": r["cluster_a"], "sample_a": r["sample_a"],
+             "cluster_b": r["cluster_b"], "sample_b": r["sample_b"],
+             "engine": r["engine"],
+             "higher_in_a": r["higher_in_a"][:15], "higher_in_b": r["higher_in_b"][:15]}
+            for r in investigation["direct_results"]
+        ],
+        "recurrent_programs": investigation["recurrent_programs"][:50],
+        # secondary context
+        "context": {
+            "cluster_sample_composition": composition[:30],
+            "neighborhood_batch_entropy": entropy_mixing,
+            "cluster_batch_concordance": concordance,
+            "condition_confounding": confounding,
         },
         "evidence_limits": [
-            "This is a descriptive diagnostic, not proof that sample-associated differences are technical.",
-            "One-sample-per-condition or sample-condition confounding cannot distinguish batch from biology.",
-            "If sample names encode tissue, procedure, site, or disease state, sample-exclusive clusters may reflect real biology as well as technical effects.",
-            "Cluster–sample ARI/NMI measure how strongly clusters correspond to samples; high values can reflect donor/patient-private biology (e.g. donor-specific epithelial states, or malignant clones in tumors) as much as a technical batch effect.",
-            "Broad labels are provisional and must not be reused as final annotation.",
+            "This is a descriptive gene diagnostic, not proof a sample-associated difference is technical.",
+            "Matching within-sample identity genes support a candidate population match; they do not prove definitive identity.",
+            "A recurring program is sample-wide, which is not the same as technical; only experimental design separates the two.",
+            "q-values rank cell-level separation and are not replicate-level evidence (cells are not independent samples).",
+            "Context signals (composition, entropy, ARI/NMI) are advisory and do not drive the recommendation.",
         ],
         "artifacts_created": artifacts,
     }
-    if entropy_ok is not None:
-        result["evidence_limits"].append(
-            f"Neighborhood batch-mixing entropy reflects mixing in {entropy_ok['use_rep']} and, "
-            "like the cluster and centroid evidence, cannot prove a sample-associated difference is "
-            "technical rather than real per-sample biology; it is normalized against the batch-size "
-            "ceiling but very small or rare batches can still depress the score."
-        )
     adata.uns["batch_effect_diagnostic"] = result
     return result

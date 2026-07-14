@@ -1,10 +1,9 @@
-"""Within-sample paired-DEG batch check + per-cell-metric UMAP overlay hints.
+"""Cross-sample population matching + per-cell-metric UMAP overlay hints.
 
-The paired DEG is the clean control for a batch effect: for two clusters
-dominated by DIFFERENT samples that look like the same cell type, DEG each
-against the rest of its OWN sample and compare the signatures. Batch is held
-constant inside each test, so a match means the same population split by sample
-(a batch effect). And tools that write per-cell metrics now advertise
+For two clusters enriched for DIFFERENT samples that look like the same cell type
+(their within-sample identity genes overlap), the diagnostic records a supported
+identity match and compares them directly — a candidate match, never a
+"conclusive" batch call. And tools that write per-cell metrics advertise
 `suggested_umap_overlays` so the agent paints them on the UMAP.
 """
 
@@ -52,52 +51,55 @@ def _batch_split_adata(same_type_across_samples: bool):
     return a
 
 
-def test_paired_deg_flags_same_type_across_samples_as_conclusive():
+def test_same_type_across_samples_is_a_supported_identity_match():
     a = _batch_split_adata(same_type_across_samples=True)
     res = diagnose_batch_effect(a, batch_key="sample", cluster_key="leiden",
-                                min_cells_per_cluster_sample=5, n_top_genes=15)
-    idg = res["cross_sample_identity_deg"]
-    # the same-type cross-sample pair (1 in A, 3 in B) is found and conclusive
+                                min_cells_per_cluster_sample=5, min_enrichment=1.5,
+                                prefer_diffxpy=False)
+    # clusters 1 (A) and 3 (B) are the same population -> a supported identity match.
     pair = next(
-        (p for p in idg["conclusive_pairs"]
+        (p for p in res["population_pairs"]
          if {p["cluster_a"], p["cluster_b"]} == {"1", "3"}),
         None,
     )
-    assert pair is not None
-    assert pair["sample_a"] != pair["sample_b"]
-    # its shared within-sample identity is the planted identity genes
-    assert {"G0", "G1", "G2"}.issubset(set(pair["shared_identity_genes"]))
-    assert res["verdict"] == "batch_effect_supported"
-    # The support reason is phrased in plain language (no raw "DEG" jargon leak)
-    # but still conveys the same-cell-type-split-across-samples finding.
-    assert any(
-        "same cell type appears split across samples" in r for r in res["support_reasons"]
+    assert pair is not None and pair["sample_a"] != pair["sample_b"]
+    assert pair["identity_match_supported"]
+    assert any(g in pair["shared_top25_genes"] for g in ["G0", "G1", "G2"])
+    # The direct comparison surfaces the sample-B batch signature (G50-59) as higher in B.
+    ds = next(
+        d for d in res["direct_pair_summaries"]
+        if {d["cluster_a"], d["cluster_b"]} == {"1", "3"}
     )
+    higher_b = ds["higher_in_a"] if ds["sample_a"] == "B" else ds["higher_in_b"]
+    assert any(g in higher_b for g in ["G50", "G51", "G52"])
+    # A single split population does not recur -> localized -> do not integrate.
+    assert res["gene_evidence"] == "localized"
+    assert res["recommendation"] == "do_not_integrate_based_on_current_evidence"
 
 
-def test_paired_deg_does_not_flag_different_types():
-    # clusters 1 (A, genes G0-2) and 3 (B, genes G5-7) are different populations;
-    # their within-sample identity signatures should NOT match.
+def test_different_types_are_not_matched():
+    # clusters 1 (A, G0-9) and 3 (B, G100-109) are different populations;
+    # their within-sample identity signatures should NOT support a match.
     a = _batch_split_adata(same_type_across_samples=False)
     res = diagnose_batch_effect(a, batch_key="sample", cluster_key="leiden",
-                                min_cells_per_cluster_sample=5, n_top_genes=15)
-    idg = res["cross_sample_identity_deg"]
+                                min_cells_per_cluster_sample=5, min_enrichment=1.5,
+                                prefer_diffxpy=False)
     pair = next(
-        (p for p in idg["candidate_pairs"]
+        (p for p in res["population_pairs"]
          if {p["cluster_a"], p["cluster_b"]} == {"1", "3"}),
         None,
     )
-    # either not paired at all (markers don't overlap) or paired but not conclusive
-    assert pair is None or pair["conclusive_batch_effect"] is False
+    assert pair is None or pair["identity_match_supported"] is False
 
 
-def test_result_carries_identity_deg_and_artifact():
+def test_result_carries_structured_evidence_and_artifacts(tmp_path):
     a = _batch_split_adata(same_type_across_samples=True)
     res = diagnose_batch_effect(a, batch_key="sample", cluster_key="leiden",
-                                min_cells_per_cluster_sample=5, n_top_genes=15)
-    idg = res["cross_sample_identity_deg"]
-    assert "interpretation" in idg and "within-sample" in idg["interpretation"].lower()
-    assert "signature_similarity_min" in idg
+                                min_cells_per_cluster_sample=5, min_enrichment=1.5,
+                                prefer_diffxpy=False, output_dir=str(tmp_path))
+    assert "selected_pairs" in res and "population_pairs" in res
+    assert (tmp_path / "batch_diagnostic_within_sample_degs.csv").exists()
+    assert (tmp_path / "batch_diagnostic_population_pairs.csv").exists()
 
 
 # --- suggested_umap_overlays --------------------------------------------------

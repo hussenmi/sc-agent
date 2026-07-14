@@ -1,0 +1,29 @@
+# Verified diffxpy environment for scagent (see build_diffxpy_env.sh).
+#
+# diffxpy is a frozen 2020-era stack; these pins are the combination scagent has
+# verified to run the rank, t-test and Wald (NB count-GLM) two-group tests end to
+# end on Python 3.9. Do not "upgrade" casually — every pin below is load-bearing:
+#
+#   numpy 1.23.5 / scipy 1.9.3 / pandas 1.5.3 / anndata 0.8.0
+#       last versions in the anndata-0.8 / numpy-1.23 line that diffxpy 0.7.4 and
+#       batchglm 0.7.4 accept.
+#   tensorflow-cpu 2.10.1
+#       backing runtime for the Wald GLM; CPU build (these are small per-sample
+#       tests and we keep them off the GPU).
+#   dask 2.30.0 + toolz 0.11.1
+#       batchglm 0.7.4's numpy IRLS backend uses dask; newer dask returns
+#       read-only compute() arrays that crash its in-place update. (The worker
+#       also patches compute() to be writable as a belt-and-braces guard.)
+#   patsy 0.5.6
+#       patsy 1.0 changed design-matrix return types and breaks diffxpy's
+#       formula parsing.
+numpy==1.23.5
+scipy==1.9.3
+pandas==1.5.3
+anndata==0.8.0
+tensorflow-cpu==2.10.1
+diffxpy==0.7.4
+batchglm==0.7.4
+dask==2.30.0
+toolz==0.11.1
+patsy==0.5.6

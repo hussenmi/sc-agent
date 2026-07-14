@@ -791,13 +791,12 @@ def test_post_investigation_checkpoint_waits_for_diagnostic():
         "status": "ok",
         "batch_key": "sample",
         "n_batches": 2,
-        "verdict": "batch_effect_supported",
-        "recommendation": "Offer scVI integration.",
-        "support_reasons": ["sample-associated expression shifts recur across broad cell types"],
-        "cluster_sample_summary": {
-            "n_sample_dominated_clusters": 2,
-            "fraction_cells_in_sample_dominated_clusters": 0.75,
-        },
+        "gene_evidence": "recurring_sample_associated",
+        "design_interpretation": "unknown",
+        "recommendation": "cannot_determine_technical_vs_biological",
+        "recommendation_reason": "a sample-associated program recurs but design is unknown",
+        "selected_pairs": [],
+        "recurrent_programs": [],
     }
     checkpoint = agent._post_investigation_strategy_checkpoint()
     assert checkpoint["kind"] == "multi_sample_strategy"
@@ -807,7 +806,7 @@ def test_post_investigation_checkpoint_waits_for_diagnostic():
         "analyze_separately",
         "describe_experiment",
     ]
-    assert "Diagnostic verdict: batch_effect_supported" in checkpoint["context"]
+    assert "Gene evidence: recurring_sample_associated" in checkpoint["context"]
 
 
 def test_post_diagnostic_pause_is_normalized_to_runtime_checkpoint():
@@ -825,9 +824,12 @@ def test_post_diagnostic_pause_is_normalized_to_runtime_checkpoint():
         "status": "ok",
         "batch_key": "sample",
         "n_batches": 2,
-        "verdict": "batch_effect_supported",
-        "recommendation": "Offer scVI integration, but wait for confirmation.",
-        "support_reasons": ["many clusters are sample-dominated"],
+        "gene_evidence": "recurring_sample_associated",
+        "design_interpretation": "unknown",
+        "recommendation": "cannot_determine_technical_vs_biological",
+        "recommendation_reason": "a sample-associated program recurs but design is unknown",
+        "selected_pairs": [],
+        "recurrent_programs": [],
     }
 
     result = json.loads(agent._handle_pause_and_ask({

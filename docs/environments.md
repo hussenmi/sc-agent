@@ -118,15 +118,34 @@ These are worth knowing because each behaves differently across hosts.
 | **CellBender** | subprocess to a **separate env** via the `SCAGENT_CELLBENDER` binary path | ✅ (shared sail pixi env) | ⚠️ not set up yet (optional; only for ambient-RNA removal) |
 | **scimilarity** | in-process import; model at `SCIMILARITY_MODEL_PATH` | ✅ | ✅ annotation only — via a vendored `tiledb-vector-search` stub + `zarr<3` pin (CellQuery/cell-search unavailable on ARM) |
 | **CellTypist** | in-process import | ✅ | ✅ |
+| **diffxpy** | subprocess to a **separate env** via the `SCAGENT_DIFFXPY` python path (like CellBender) | ✅ (per-user build) | ⚠️ not set up yet (optional; falls back to Wilcoxon) |
 
 Notes:
 
 - **scVI** needs `scvi-tools` in the active env; the subprocess re-execs the same
   interpreter, so it works wherever the env has it (both GPU envs do).
-- **CellBender** is the only true cross-env subprocess — it lives in its own env
-  because its deps conflict with the RAPIDS/scanpy stack. To enable it on the
-  Spark, add a dedicated pixi env and export `SCAGENT_CELLBENDER` to its
-  `cellbender` binary (mirror the Iris shared env).
+- **CellBender** is a cross-env subprocess — it lives in its own env because its
+  deps conflict with the RAPIDS/scanpy stack (diffxpy, below, is the other one).
+  To enable it on the Spark, add a dedicated pixi env and export
+  `SCAGENT_CELLBENDER` to its `cellbender` binary (mirror the Iris shared env).
+- **diffxpy** is a second cross-env subprocess, for differential expression
+  (rank / Welch t-test / negative-binomial Wald GLM). It is a **frozen 2020-era
+  stack** (`diffxpy` + `batchglm` + TensorFlow, Python 3.9) that conflicts with
+  the modern scanpy/anndata/RAPIDS deps, so it lives in its own conda env and is
+  driven across a process boundary by `scagent/batch/diffxpy.py`. Build it with
+  `scagent/batch/diffxpy_env/build_diffxpy_env.sh` (exact pins in that folder's
+  `requirements.txt`); `setup.sh` / `setup_gpu.sh` then export `SCAGENT_DIFFXPY`
+  automatically. The batch diagnostic's DEFAULT DE engine is the in-env scanpy
+  Wilcoxon (`rank_genes_groups`) — instant, and the identical rank statistic.
+  diffxpy is opt-in (`prefer_diffxpy=True`): the investigation runs the same rank
+  test through diffxpy's engine as a cross-check (the bridge also offers an NB Wald
+  count model, not used by the investigation), and it cold-starts TensorFlow in a
+  subprocess per call, so it is not the default. When `SCAGENT_DIFFXPY` is unset,
+  an explicit diffxpy request visibly falls back to Wilcoxon.
+  Because the parent runs in another conda env, the driver launches the worker
+  **by file path** with a scrubbed environment (no inherited `PYTHONHOME`/
+  `PYTHONPATH`), and the worker strips its own dir from `sys.path` so the local
+  `diffxpy.py` module never shadows the installed `diffxpy` package.
 - **scimilarity** works on the Spark for **annotation** (`CellAnnotation`, which
   uses hnswlib). Its only ARM-less dependency, `tiledb-vector-search`, is imported
   unconditionally but only *used* for the tiledb `CellQuery` path — so a vendored

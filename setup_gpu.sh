@@ -70,6 +70,16 @@ _SCAGENT_CB="/data1/collab002/sail/shared/tools/cellbender/.pixi/envs/default/bi
 if [ -x "${_SCAGENT_CB}" ]; then
     export SCAGENT_CELLBENDER="${_SCAGENT_CB}"
 fi
+# diffxpy lives in its own env (frozen batchglm/TensorFlow stack) and is driven
+# across a process boundary, like CellBender. Point SCAGENT_DIFFXPY at that env's
+# python; when unset, the DEG steps fall back to the in-env Wilcoxon path.
+_SCAGENT_DXP="/usersoftware/peerd/${USER}/envs/scagent_diffxpy/bin/python"
+if [ ! -x "${_SCAGENT_DXP}" ]; then
+    _SCAGENT_DXP="/data1/collab002/sail/shared/tools/diffxpy/envs/scagent_diffxpy/bin/python"
+fi
+if [ -x "${_SCAGENT_DXP}" ]; then
+    export SCAGENT_DIFFXPY="${_SCAGENT_DXP}"
+fi
 export PYTHONPATH="${SCAGENT_DIR}:${PYTHONPATH}"
 
 # Enable GPU acceleration. Override with `export SCAGENT_GPU=0` before sourcing
@@ -95,6 +105,9 @@ echo "  SCAGENT_HOME=${SCAGENT_HOME}"
 echo "  SCAGENT_GPU=${SCAGENT_GPU}"
 echo "  SCIMILARITY_MODEL_PATH=${SCIMILARITY_MODEL_PATH}"
 echo "  SCIMILARITY_MODEL_PATH_MOUSE=${SCIMILARITY_MODEL_PATH_MOUSE}"
+if [ -n "${SCAGENT_DIFFXPY}" ]; then
+    echo "  SCAGENT_DIFFXPY=${SCAGENT_DIFFXPY}"
+fi
 echo ""
 echo "GPU env ready. (Use 'source setup.sh' for the CPU venv / tests.)"
 echo ""

@@ -1668,30 +1668,32 @@ class SCAgent:
             post_investigation=True,
         )
         evidence_bits = []
-        verdict = diagnostic.get("verdict")
-        if verdict:
-            evidence_bits.append(f"Diagnostic verdict: {verdict}.")
+        gene_evidence = diagnostic.get("gene_evidence")
+        design = diagnostic.get("design_interpretation")
         recommendation = diagnostic.get("recommendation")
+        if gene_evidence:
+            evidence_bits.append(f"Gene evidence: {gene_evidence}; design: {design}.")
         if recommendation:
-            evidence_bits.append(f"Recommendation: {recommendation}")
-        support = diagnostic.get("support_reasons") or []
-        if support:
-            evidence_bits.append("Support: " + "; ".join(map(str, support[:4])) + ".")
-        cautions = diagnostic.get("caution_reasons") or []
-        if cautions:
-            evidence_bits.append("Cautions: " + "; ".join(map(str, cautions[:4])) + ".")
-        shared = diagnostic.get("shared_cross_cell_type_signatures") or []
-        if shared:
             evidence_bits.append(
-                f"Shared sample-associated signatures: {len(shared)} recurring gene/direction entries."
+                f"Recommendation: {recommendation} — {diagnostic.get('recommendation_reason', '')}".strip()
             )
-        cluster_summary = diagnostic.get("cluster_sample_summary") or {}
-        if cluster_summary:
+        selected = diagnostic.get("selected_pairs") or []
+        for p in selected[:3]:
             evidence_bits.append(
-                "Sample-dominated clusters: "
-                f"{cluster_summary.get('n_sample_dominated_clusters', 0)} "
-                f"({cluster_summary.get('fraction_cells_in_sample_dominated_clusters', 0)} of cells)."
+                f"Pair {p['cluster_a']}/{p['sample_a']} vs {p['cluster_b']}/{p['sample_b']}: "
+                f"{p.get('n_shared_top25', 0)} shared identity genes "
+                f"({', '.join(p.get('shared_top25_genes', [])[:6])})."
             )
+        recurrent = diagnostic.get("recurrent_programs") or []
+        if recurrent:
+            by_group: dict[str, list[str]] = {}
+            for r in recurrent:
+                by_group.setdefault(r["associated_batch_group"], []).append(r["gene"])
+            for group, genes in by_group.items():
+                evidence_bits.append(
+                    f"Recurring {group}-associated program across >= 2 populations: "
+                    f"{', '.join(genes[:8])} (sample-wide; technical vs biological unresolved by genes)."
+                )
         if evidence_bits:
             context = checkpoint.get("context") or ""
             checkpoint["context"] = context + "\n\nBatch-effect diagnostic evidence:\n" + "\n".join(
@@ -1699,16 +1701,21 @@ class SCAgent:
             )
             checkpoint["summary"] = checkpoint["context"]
         checkpoint["diagnostic"] = {
-            "verdict": diagnostic.get("verdict"),
-            "recommendation": diagnostic.get("recommendation"),
-            "support_reasons": support[:6],
-            "caution_reasons": cautions[:6],
+            "gene_evidence": gene_evidence,
+            "design_interpretation": design,
+            "recommendation": recommendation,
+            "recommendation_reason": diagnostic.get("recommendation_reason"),
+            "selected_pairs": selected[:6],
+            "recurrent_programs": recurrent[:12],
             "evidence_limits": (diagnostic.get("evidence_limits") or [])[:6],
             "artifacts_created": diagnostic.get("artifacts_created") or [],
         }
-        if diagnostic.get("verdict") == "batch_effect_supported":
+        # The tool never auto-decides integration; the user chooses. Only pre-highlight
+        # the conservative "keep unintegrated" option unless a technical batch effect is
+        # actually supported.
+        if recommendation == "integration_supported":
             checkpoint["recommendation"] = checkpoint["options"][0]
-        elif diagnostic.get("verdict") == "no_correction_needed" and len(checkpoint["options"]) > 1:
+        elif len(checkpoint["options"]) > 1:
             checkpoint["recommendation"] = checkpoint["options"][1]
         else:
             checkpoint["recommendation"] = checkpoint["options"][0]

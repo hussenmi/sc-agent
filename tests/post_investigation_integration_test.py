@@ -32,14 +32,23 @@ class _FakeWorldState:
         return self._confirmed.get(key)
 
 
-def _diagnostic(status="ok", verdict="batch_effect_supported", batch_key="sample", n_batches=6):
+def _diagnostic(
+    status="ok", recommendation="integration_supported", batch_key="sample", n_batches=6
+):
     return {
         "status": status,
-        "verdict": verdict,
+        "recommendation": recommendation,
+        "recommendation_reason": "test reason",
+        "gene_evidence": "recurring_sample_associated",
+        "design_interpretation": (
+            "documented_technical_batch"
+            if recommendation == "integration_supported"
+            else "unknown"
+        ),
         "batch_key": batch_key,
         "n_batches": n_batches,
-        "support_reasons": ["clusters dominated by single samples"],
-        "caution_reasons": [],
+        "selected_pairs": [],
+        "recurrent_programs": [],
     }
 
 
@@ -90,19 +99,25 @@ def test_investigate_option_is_dropped_after_investigation():
         assert action in cp["option_actions"]
 
 
-def test_recommends_scvi_when_batch_effect_supported():
-    # Diagnostic says a batch effect is real -> highlight scVI (policy method,
+def test_recommends_scvi_when_integration_supported():
+    # Diagnostic supports a technical batch effect -> highlight scVI (policy method,
     # never Harmony) as the default.
-    agent = _agent(_investigating_ws(), diagnostic=_diagnostic(verdict="batch_effect_supported"))
+    agent = _agent(
+        _investigating_ws(), diagnostic=_diagnostic(recommendation="integration_supported")
+    )
     cp = agent._post_investigation_strategy_checkpoint()
     assert cp["option_actions"][0] == "integrate_scvi"
     assert cp["recommendation"] == cp["options"][0]
     assert "scVI" in cp["recommendation"]
 
 
-def test_recommends_keep_when_no_correction_needed():
-    # Diagnostic finds samples already mix -> highlight keeping them uncorrected.
-    agent = _agent(_investigating_ws(), diagnostic=_diagnostic(verdict="no_correction_needed"))
+def test_recommends_keep_when_not_supported():
+    # Any recommendation other than integration_supported -> highlight keeping
+    # samples uncorrected (the conservative default; the user decides).
+    agent = _agent(
+        _investigating_ws(),
+        diagnostic=_diagnostic(recommendation="do_not_integrate_based_on_current_evidence"),
+    )
     cp = agent._post_investigation_strategy_checkpoint()
     assert cp["recommendation"] == cp["options"][1]
     assert cp["option_actions"][1] == "keep_unintegrated"

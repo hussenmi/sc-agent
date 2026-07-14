@@ -106,6 +106,17 @@ _SCAGENT_CB="/data1/collab002/sail/shared/tools/cellbender/.pixi/envs/default/bi
 if [ -x "${_SCAGENT_CB}" ]; then
     export SCAGENT_CELLBENDER="${_SCAGENT_CB}"
 fi
+# diffxpy lives in its own env (frozen batchglm/TensorFlow stack that would break
+# this one) and is driven across a process boundary, like CellBender. Point
+# SCAGENT_DIFFXPY at that env's python; when unset, the DEG steps fall back to the
+# in-env Wilcoxon path. Prefer a per-user build, else the shared sail one.
+_SCAGENT_DXP="/usersoftware/peerd/${USER}/envs/scagent_diffxpy/bin/python"
+if [ ! -x "${_SCAGENT_DXP}" ]; then
+    _SCAGENT_DXP="/data1/collab002/sail/shared/tools/diffxpy/envs/scagent_diffxpy/bin/python"
+fi
+if [ -x "${_SCAGENT_DXP}" ]; then
+    export SCAGENT_DIFFXPY="${_SCAGENT_DXP}"
+fi
 export PYTHONPATH="${SCAGENT_DIR}:${PYTHONPATH}"
 
 # =============================================================================
@@ -146,5 +157,8 @@ echo "  SCIMILARITY_MODEL_PATH=${SCIMILARITY_MODEL_PATH}"
 echo "  SCIMILARITY_MODEL_PATH_MOUSE=${SCIMILARITY_MODEL_PATH_MOUSE}"
 if [ -n "${SCAGENT_CELLBENDER}" ]; then
     echo "  SCAGENT_CELLBENDER=${SCAGENT_CELLBENDER}"
+fi
+if [ -n "${SCAGENT_DIFFXPY}" ]; then
+    echo "  SCAGENT_DIFFXPY=${SCAGENT_DIFFXPY}"
 fi
 echo ""
