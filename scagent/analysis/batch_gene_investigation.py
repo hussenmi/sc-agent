@@ -37,6 +37,14 @@ never establish *why*. To reason about why, we look at genes, in four steps:
    than a single pair — but it establishes only "recurring / sample-wide", never
    "technical". Only the experimental design can say whether sample-wide means
    technical or real biology. Nothing here is ever labeled "conclusive".
+   Recurrence is measured **deterministically over ALL enriched regions**, not
+   just the handful of nominated pairs: for every co-clustered enriched region a
+   within-cluster cross-sample DEG isolates the sample shift, and a program higher
+   in the same sample across >= 2 populations recurs. This is unioned with a
+   pair-based scan (which covers the split geometry, where a population lands in a
+   different single-sample cluster per sample). The result no longer depends on
+   how many pairs the clustering surfaced — the same data gives the same
+   recurring/localized verdict across runs and models.
 
 The default DE engine is scanpy's in-process Wilcoxon (``rank_genes_groups``) —
 the identical Mann-Whitney statistic diffxpy's rank test computes, but instant,
@@ -423,6 +431,137 @@ def find_recurrent_programs(
     return recurrent
 
 
+def find_recurrent_programs_over_regions(
+    adata,
+    matrix: Any,
+    genes: list[str],
+    regions: list[dict[str, Any]],
+    *,
+    batch_key: str,
+    cluster_key: str,
+    prefer_diffxpy: bool = False,
+    min_populations: int = 2,
+    top_n: int = 25,
+    min_cells: int = 20,
+    max_regions: int = 60,
+    batch_group_map: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministic recurrence over ALL enriched regions (not the 2-3 nominated pairs).
+
+    The pair-based ``find_recurrent_programs`` can only observe the handful of
+    cross-sample pairs that got nominated, so whether a sample-wide program reads
+    as "recurring" or "localized" hinges on how many pairs the clustering happened
+    to surface — the same data gave different verdicts across models
+    (run_2026_07_14_234825 "recurring" vs _234827 "localized"). This function
+    removes that dependence for the CO-CLUSTERED geometry (the common case, where
+    the same cluster holds cells from several samples): for every enriched region
+    ``(C, S)`` whose cluster ``C`` also contains other-sample cells, it computes a
+    within-cluster cross-sample DEG — ``(C, S)`` vs the SAME cluster's cells in
+    other samples — isolating the sample-associated shift while holding cell
+    identity fixed. A gene higher in sample ``S`` across ``>= min_populations``
+    distinct clusters is a recurring ``S``-associated program.
+
+    It does NOT cover the SPLIT geometry (a population that lands in a different,
+    single-sample cluster per sample) — there is no within-cluster cross-sample
+    reference there. The caller unions this with the pair-based result so both
+    geometries are covered. Enumerates all (capped) enriched regions in a fixed
+    order, so the result is deterministic given the clustering. Concludes only
+    "recurring / sample-wide", never "technical".
+    """
+    def _group_of(sample: str) -> str:
+        return (batch_group_map or {}).get(sample, sample)
+
+    batch = adata.obs[batch_key].astype(str).to_numpy()
+    cluster = adata.obs[cluster_key].astype(str).to_numpy()
+
+    # Cap by enrichment (regions arrive sorted by enrichment desc), then iterate in
+    # a fixed (cluster, sample) order so the accumulation is reproducible.
+    capped = regions[:max_regions]
+    ordered = sorted(capped, key=lambda r: (str(r["cluster"]), str(r["sample"])))
+
+    # key = (associated group, gene) -> {"populations": set(cluster), "regions": set("C/S")}
+    acc: dict[tuple[str, str], dict[str, set]] = {}
+    for reg in ordered:
+        c, s = str(reg["cluster"]), str(reg["sample"])
+        in_cluster = cluster == c
+        target_idx = np.flatnonzero(in_cluster & (batch == s))
+        reference_idx = np.flatnonzero(in_cluster & (batch != s))
+        # A single-sample cluster has no within-cluster cross-sample reference —
+        # that is the split geometry, left to the pair-based path.
+        if len(target_idx) < min_cells or len(reference_idx) < min_cells:
+            continue
+        deg, _engine = two_group_deg(
+            matrix, genes, target_idx, reference_idx, test="rank", prefer_diffxpy=prefer_diffxpy
+        )
+        higher_in_s = deg[deg["expression_effect"] > 0].sort_values(
+            "expression_effect", ascending=False
+        )
+        group = _group_of(s)
+        region_label = f"{c}/{s}"
+        for gene in higher_in_s["gene"].head(top_n):
+            entry = acc.setdefault((group, str(gene)), {"populations": set(), "regions": set()})
+            entry["populations"].add(c)
+            entry["regions"].add(region_label)
+
+    recurrent: list[dict[str, Any]] = []
+    for (group, gene), entry in acc.items():
+        if len(entry["populations"]) < min_populations:
+            continue
+        recurrent.append(
+            {
+                "associated_batch_group": group,
+                "gene": gene,
+                "direction": f"higher in {group}",
+                "n_populations": int(len(entry["populations"])),
+                "contributing_populations": sorted(entry["populations"]),
+                "contributing_pairs": sorted(entry["regions"]),
+            }
+        )
+    recurrent.sort(key=lambda r: r["n_populations"], reverse=True)
+    return recurrent
+
+
+def _merge_recurrent_programs(
+    *lists: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Union recurrence entries from several sources by (associated group, gene).
+
+    Populations and contributing pairs/regions are unioned, so a program seen in
+    the co-clustered region scan AND in the pair-based scan counts every distinct
+    population once. n_populations is recomputed from the merged set.
+    """
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for lst in lists:
+        for r in lst or []:
+            key = (r["associated_batch_group"], r["gene"])
+            slot = merged.setdefault(
+                key,
+                {
+                    "associated_batch_group": r["associated_batch_group"],
+                    "gene": r["gene"],
+                    "direction": r.get("direction", f"higher in {r['associated_batch_group']}"),
+                    "_populations": set(),
+                    "_pairs": set(),
+                },
+            )
+            slot["_populations"].update(r.get("contributing_populations") or [])
+            slot["_pairs"].update(r.get("contributing_pairs") or [])
+    out: list[dict[str, Any]] = []
+    for slot in merged.values():
+        out.append(
+            {
+                "associated_batch_group": slot["associated_batch_group"],
+                "gene": slot["gene"],
+                "direction": slot["direction"],
+                "n_populations": int(len(slot["_populations"])),
+                "contributing_populations": sorted(slot["_populations"]),
+                "contributing_pairs": sorted(slot["_pairs"]),
+            }
+        )
+    out.sort(key=lambda r: r["n_populations"], reverse=True)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Orchestration — run the whole gene-first investigation
 # ---------------------------------------------------------------------------
@@ -613,9 +752,21 @@ def run_gene_investigation(
         )
         if res is not None:
             direct_results.append(res)
-    recurrent = find_recurrent_programs(
+    # Recurrence from TWO sources, unioned so both sample geometries are covered
+    # and the verdict no longer hinges on how many pairs were nominated:
+    #   (a) region-based — every enriched CO-CLUSTERED region, deterministic;
+    #   (b) pair-based    — the nominated matched pairs, which also cover the
+    #       SPLIT geometry (same cell type in a different single-sample cluster).
+    recurrent_regions = find_recurrent_programs_over_regions(
+        adata, matrix, genes, regions,
+        batch_key=batch_key, cluster_key=cluster_key, prefer_diffxpy=prefer_diffxpy,
+        min_populations=min_populations, min_cells=identity_min_cells,
+        batch_group_map=batch_group_map,
+    )
+    recurrent_pairs = find_recurrent_programs(
         direct_results, min_populations=min_populations, batch_group_map=batch_group_map
     )
+    recurrent = _merge_recurrent_programs(recurrent_regions, recurrent_pairs)
 
     engines = sorted(
         {str(v.attrs.get("engine")) for v in identity_degs.values() if v is not None}
@@ -630,6 +781,11 @@ def run_gene_investigation(
         "selected_pairs": selected_pairs,
         "direct_results": direct_results,
         "recurrent_programs": recurrent,
+        # Provenance: which scan contributed each recurring program. The
+        # region-based scan is deterministic over all enriched regions; the
+        # pair-based scan covers the split geometry. Union is `recurrent_programs`.
+        "recurrent_programs_region_scan": recurrent_regions,
+        "recurrent_programs_pair_scan": recurrent_pairs,
         "engines_used": engines,
     }
 
@@ -644,12 +800,17 @@ def derive_gene_evidence(investigation: dict[str, Any]) -> str:
     - ``none`` — no supported identity-match pairs / no direct gene evidence.
     - ``recurring_sample_associated`` — a program recurs across >= 2 populations.
     - ``localized`` — direct differences exist but do not recur.
+
+    Recurrence is checked FIRST: it is now computed deterministically over all
+    enriched regions (unioned with the pair scan), so it can fire even when a
+    co-clustered program never entered a nominated pair. ``localized`` then means
+    "matched pairs showed direct differences that did not recur anywhere".
     """
-    if not investigation["direct_results"]:
-        return "none"
     if investigation["recurrent_programs"]:
         return "recurring_sample_associated"
-    return "localized"
+    if investigation["direct_results"]:
+        return "localized"
+    return "none"
 
 
 def derive_design_interpretation(

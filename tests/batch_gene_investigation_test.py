@@ -161,3 +161,84 @@ def test_two_group_deg_orientation_self_consistent():
     # Orientation invariant: expression_effect sign == which side's mean is higher.
     for _, row in deg.iterrows():
         assert (row["expression_effect"] > 0) == (row["mean_target"] > row["mean_reference"])
+
+
+# ---------------------------------------------------------------------------
+# Determinism fix (run_2026_07_14_234825 "recurring" vs _234827 "localized"):
+# recurrence must be computed over ALL enriched regions, not just the 2-3
+# nominated pairs, so the "recurring vs localized" verdict no longer hinges on
+# how many pairs the pair budget happened to surface. This uses the CO-CLUSTERED
+# geometry (each cluster holds both samples), the real pancreas case.
+# ---------------------------------------------------------------------------
+
+def _synthetic_coclustered():
+    """Two samples; every cluster holds BOTH samples (co-clustered). S2 is
+    over-represented in cA/cB and under-represented in cC/cD (so cA/cB are
+    S2-enriched regions), and carries a sample-wide stress program in every
+    cluster. The same S2 program therefore recurs across >= 2 co-clustered
+    populations with NO cross-sample pair required."""
+    rng = np.random.default_rng(1)
+    n_genes = 30
+    ident = {"cA": range(0, 5), "cB": range(5, 10), "cC": range(10, 15), "cD": range(15, 20)}
+    STRESS = range(20, 25)
+    # (cluster, sample, n_cells) — cA/cB lean S2, cC/cD lean S1, all mixed.
+    blocks = [
+        ("cA", "S2", 140), ("cA", "S1", 60),
+        ("cB", "S2", 140), ("cB", "S1", 60),
+        ("cC", "S1", 140), ("cC", "S2", 60),
+        ("cD", "S1", 140), ("cD", "S2", 60),
+    ]
+    rows, obs_cluster, obs_sample = [], [], []
+    for cluster, sample, n in blocks:
+        counts = rng.poisson(0.5, size=(n, n_genes)).astype(np.float32)
+        for g in ident[cluster]:
+            counts[:, g] += rng.poisson(6.0, size=n)
+        if sample == "S2":  # sample-wide stress program in S2, every cluster
+            for g in STRESS:
+                counts[:, g] += rng.poisson(5.0, size=n)
+        rows.append(counts)
+        obs_cluster += [cluster] * n
+        obs_sample += [sample] * n
+    counts = np.vstack(rows)
+    lognorm = np.log1p(counts / counts.sum(axis=1, keepdims=True) * 1e4).astype(np.float32)
+    genes = [f"g{i}" for i in range(n_genes)]
+    a = ad.AnnData(
+        X=lognorm,
+        obs=pd.DataFrame({"leiden": obs_cluster, "sample": obs_sample}),
+        var=pd.DataFrame(index=genes),
+    )
+    return a, lognorm, genes
+
+
+def _run_coclustered(max_pairs):
+    a, X, genes = _synthetic_coclustered()
+    return run_gene_investigation(
+        a, X, genes, batch_key="sample", cluster_key="leiden",
+        min_cells=30, min_enrichment=1.3, identity_min_cells=20,
+        min_shared_top25=3, max_pairs=max_pairs,
+    )
+
+
+def test_region_scan_finds_recurrence_without_any_pair_budget():
+    from scagent.analysis.batch_gene_investigation import derive_gene_evidence
+    stress = {f"g{i}" for i in range(20, 25)}
+    inv = _run_coclustered(max_pairs=1)  # starve the pair budget
+    # Region scan alone establishes the S2-wide program across >= 2 clusters.
+    region_s2 = {r["gene"] for r in inv["recurrent_programs_region_scan"]
+                 if r["associated_batch_group"] == "S2"}
+    assert stress & region_s2, "region scan missed the co-clustered recurring program"
+    for r in inv["recurrent_programs_region_scan"]:
+        assert r["n_populations"] >= 2
+    # And the overall verdict is 'recurring', driven by the region scan, not pairs.
+    assert derive_gene_evidence(inv) == "recurring_sample_associated"
+
+
+def test_recurrence_verdict_is_invariant_to_pair_budget():
+    # The core determinism guarantee: same data -> same recurring-gene set whether
+    # the pair budget surfaced 1 pair or 3. (Was the source of the 234825/234827
+    # "recurring" vs "localized" disagreement.)
+    inv1 = _run_coclustered(max_pairs=1)
+    inv3 = _run_coclustered(max_pairs=3)
+    s2_1 = {r["gene"] for r in inv1["recurrent_programs"] if r["associated_batch_group"] == "S2"}
+    s2_3 = {r["gene"] for r in inv3["recurrent_programs"] if r["associated_batch_group"] == "S2"}
+    assert s2_1 == s2_3 and s2_1, "recurrence verdict changed with the pair budget"
