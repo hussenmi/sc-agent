@@ -390,3 +390,43 @@ def test_stage_reports_clusters_awaiting_reasoning():
     assert r["ready_to_finalize"] is False
     assert set(r["clusters_awaiting_reasoning"]) == {"1", "2"}
     assert r["coverage"]["n_with_reasoning"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# reference_source_unavailable at staging (run_2026_07_14_124627 loop fix):
+# staging runs the finalize validator, so it reports the same "missing reference
+# source lacks a concrete unavailable reason" issue — but the model had no
+# parameter to clear it and looped, jamming a fake "CellTypist" cluster into
+# evidence_summary. Fix: expose the parameter on staging + redirect the fake key.
+# --------------------------------------------------------------------------- #
+
+def test_stage_schema_exposes_reference_source_unavailable():
+    from scagent.agent.tools import get_tools
+    stage = next(t for t in get_tools() if t["name"] == "stage_annotation_evidence")
+    assert "reference_source_unavailable" in stage["input_schema"]["properties"]
+
+
+def test_stage_rejects_reference_source_name_as_cluster_key():
+    a = _integration_adata()
+    _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
+    ev = _agreeing_evidence(a)
+    # the mistake: a reference SOURCE name used as a cluster entry
+    ev["CellTypist"] = {"reason": "no_species_compatible_model"}
+    res, a = process_tool_call("stage_annotation_evidence", {"evidence_summary": ev}, a)
+    r = json.loads(res)
+    assert r["status"] == "error"
+    assert "reference_source_unavailable" in r["message"]
+    assert "cluster" in r["message"].lower()
+
+
+def test_stage_accepts_reference_source_unavailable_parameter():
+    # Passing it as a parameter (not a cluster) stages cleanly.
+    a = _integration_adata()
+    _, a = process_tool_call("prepare_annotation", {"cluster_key": "leiden"}, a)
+    res, a = process_tool_call("stage_annotation_evidence", {
+        "evidence_summary": _agreeing_evidence(a),
+        "reference_source_unavailable": {"celltypist": {"reason": "no_species_compatible_model"}},
+    }, a)
+    r = json.loads(res)
+    assert r["status"] != "error"
+    assert "CellTypist" not in a.uns.get("annotation_evidence_summary", {})

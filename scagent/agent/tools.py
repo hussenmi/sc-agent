@@ -2464,6 +2464,51 @@ def _validate_annotation_evidence(
                     f"justify the override from the DEGs, use the DEG-derived label."
                 )
 
+        # --- Floor 2b: local DEG-vs-marker-DB consistency (catch misreads) ------
+        # The DEG-first floor above only checks deg_derived_label vs the FINAL
+        # label, so it cannot catch a cluster where the model MISREAD its own
+        # DEGs such that deg_derived_label == final_label but BOTH disagree with
+        # what the cluster's top markers actually indicate — the
+        # run_2026_07_14_013156 cl2 failure (Sst-topped, called beta because the
+        # model claimed Ins1/Ins2 that were not in its top DEGs). We cross-check
+        # the DEG-derived label against the swappable Cytopus KB (local, fast; no
+        # biology in the engine). This fires ONLY where Cytopus COVERS the
+        # lineage and its markers match a different label by a clear margin —
+        # i.e. a likely misread the local DB can positively contradict. It does
+        # NOT fire on lineages Cytopus doesn't cover (e.g. pancreatic endocrine):
+        # forcing a check there would be indistinguishable from a legitimate
+        # DEG-over-reference override (which deliberately rests on its DEGs and
+        # is never flagged), so an uncovered misread stays a model-quality limit,
+        # not a harness gate. Cleared by fixing the label or a gene-level note.
+        if deg_derived_text and cluster_top_deg_genes:
+            deg_adj = {"available": False}
+            try:
+                from ..annotation import cytopus_markers as _cyto2
+                deg_adj = _cyto2.adjudicate(
+                    deg_derived_text, competing_for_cytopus, cluster_top_deg_genes, min_margin=2
+                )
+            except Exception:
+                deg_adj = {"available": False}
+            deg_best = deg_adj.get("best_label")
+            if (
+                deg_adj.get("available")
+                and deg_adj.get("candidate_covered")
+                and not deg_adj.get("candidate_is_best")
+                and deg_best
+                and (deg_adj.get("best_overlap") or 0) > 0
+                and (deg_adj.get("margin") or 0) >= 2
+                and not _annotation_labels_biologically_compatible(deg_best, deg_derived_text)
+                and len(str(ev.get("deg_override_justification") or "").strip()) < 20
+                and len(str(ev.get("deg_marker_crosscheck_note") or "").strip()) < 20
+            ):
+                validation_failures.append(
+                    f"Cluster {cid}: your deg_derived_label ({deg_derived_text!r}) does not best match "
+                    f"this cluster's top DEGs in the local marker DB — {deg_best!r} overlaps them more "
+                    f"(top DEGs: {cluster_top_deg_genes[:6]}). Re-read the markers: change the label to the "
+                    f"one the DEGs support, or add a short 'deg_marker_crosscheck_note' naming which top DEGs "
+                    f"justify keeping {deg_derived_text!r}."
+                )
+
         # A cross-lineage override of a TWO-SOURCE reference consensus keeps the
         # high bar (handled later) — Cytopus alone cannot rescue it.
         crosses_two_source_consensus = bool(
@@ -3312,6 +3357,10 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                 "The DEGs are authoritative: if `deg_derived_label` differs from `label` you must either change "
                 "`label` to match it or supply a `deg_override_justification` (≥20 chars) naming the specific DEGs "
                 "that outweigh the cluster's own markers. `reasoning` must show that DEG-first logic. "
+                "A second marker cross-check may fire when your `deg_derived_label` does not best match the "
+                "cluster's top DEGs in the local marker DB (Cytopus-covered lineages only) — clear it by "
+                "correcting the label or adding a `deg_marker_crosscheck_note` naming the specific top DEGs "
+                "that justify your call. "
                 "(5) `reasoning`: ≥20 chars explaining the chosen label. "
                 "(6) `source_synthesis`: `{agreement, final_decision_basis}` required when CellTypist/Scimilarity "
                 "reference columns were used or QC caveats apply. "
@@ -3356,6 +3405,17 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "replace": {
                         "type": "boolean",
                         "description": "If true, replace any previously staged annotation evidence. Default false merges entries.",
+                    },
+                    "reference_source_unavailable": {
+                        "type": "object",
+                        "description": (
+                            "Optional mapping of missing non-Scimilarity reference sources to concrete "
+                            "unavailable reasons, e.g. {'celltypist': {'reason': 'no_species_compatible_model'}}. "
+                            "Because staging runs the SAME validator as finalize, it reports the same "
+                            "'missing reference source lacks a concrete unavailable reason' issue — pass this "
+                            "parameter to clear it at staging (it is NOT a cluster; do NOT add a 'celltypist' or "
+                            "'scimilarity' key to evidence_summary). Carries through to finalize_annotation."
+                        ),
                     },
                 },
                 "required": [],
@@ -15699,6 +15759,32 @@ def process_tool_call(
                     message=f"Evidence entries must be objects. Invalid cluster ids: {invalid_entries[:10]}",
                     adata_obj=adata,
                     recovery_options=["Wrap each cluster's label, genes, confidence, and reasoning in a dict."],
+                )
+
+            # A reference-source name used as a cluster key is a common mistake:
+            # the model tries to record CellTypist/Scimilarity unavailability by
+            # adding a fake "CellTypist" cluster to evidence_summary, which the
+            # validator then rejects as a bogus cluster and the model loops
+            # (run_2026_07_14_124627). Redirect it to the real parameter.
+            _ref_source_keys = [
+                str(k) for k in incoming
+                if _annotation_reference_source_group(k) in {"celltypist", "scimilarity"}
+            ]
+            if _ref_source_keys:
+                return _error_result(
+                    tool="stage_annotation_evidence",
+                    message=(
+                        f"{_ref_source_keys} is a reference SOURCE, not a cluster — remove it from "
+                        f"evidence_summary. To record that a reference source is unavailable, pass the "
+                        f"`reference_source_unavailable` parameter instead, e.g. "
+                        f"reference_source_unavailable={{'celltypist': {{'reason': 'no_species_compatible_model'}}}}. "
+                        f"evidence_summary keys must be cluster ids only."
+                    ),
+                    adata_obj=adata,
+                    recovery_options=[
+                        "Re-call stage_annotation_evidence with only cluster-id keys in evidence_summary, plus "
+                        "reference_source_unavailable={'celltypist': {'reason': '<reason>'}} as a separate parameter.",
+                    ],
                 )
 
             replace = bool(tool_input.get("replace", False))

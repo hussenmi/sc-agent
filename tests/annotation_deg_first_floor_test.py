@@ -227,3 +227,113 @@ def test_delta_call_matching_degs_passes_floor():
         "deg_derived_label" in f or "deg_override_justification" in f
         for f in rep["validation_failures"]
     )
+
+
+# --------------------------------------------------------------------------- #
+# Floor 2b: local DEG-vs-marker-DB consistency — catches confident MISREADS
+# where deg_derived_label == final_label but both disagree with the cluster's
+# markers. Fires ONLY where the local Cytopus KB covers the lineage and its
+# markers positively contradict the declared label (immune/lung/etc.). It stays
+# silent on Cytopus-uncovered lineages (e.g. pancreatic endocrine), because a
+# forced check there is indistinguishable from a legitimate DEG-over-reference
+# override — see test_pancreas_uncovered_misread_not_gated. Cleared by a label
+# fix or a gene-level deg_marker_crosscheck_note.
+# --------------------------------------------------------------------------- #
+
+def _validate_case(proposal, evidence):
+    return _validate_annotation_evidence(
+        adata=_adata(), proposal=proposal, evidence=evidence,
+        world_state=None, apply_auto_fixes=True,
+    )
+
+
+def _pancreas_proposal(ref_label="pancreatic D cell"):
+    return {
+        "cluster_ids": ["2"],
+        "cluster_key": "leiden",
+        "annotation_key": "cell_type",
+        "ambiguous_clusters": [],
+        "reference_annotation_keys": ["scimilarity_predictions_unconstrained"],
+        "clusters": [{
+            "cluster_id": "2",
+            "top_degs": ["Sst", "Iapp", "Enho", "Fam159b", "Ly6h", "Pdyn"],
+            "discriminating_degs": ["Sst", "Enho", "Fam159b", "Ly6h", "Pdyn"],
+            "suggested_supporting_genes": ["Sst", "Fam159b", "Ly6h"],
+            "reference_annotations": [
+                {"annotation_key": "scimilarity_predictions_unconstrained",
+                 "top_label": ref_label, "top_fraction": 0.6},
+            ],
+            "competing_labels": [],
+        }],
+    }
+
+
+def _pancreas_ev(label="type B pancreatic cell", deg_derived="type B pancreatic cell", **extra):
+    e = {
+        "label": label,
+        "deg_derived_label": deg_derived,
+        "confidence": "medium",
+        "panglaodb_queried": False,
+        "supporting_genes": ["Sst", "Iapp"],
+        "reasoning": "Islet endocrine cluster annotated from its top DEGs.",
+    }
+    e.update(extra)
+    return {"2": e}
+
+
+def test_pancreas_uncovered_misread_not_gated():
+    # The honest limit: a Sst-topped cluster mislabeled beta on a Cytopus-uncovered
+    # lineage is NOT force-flagged. Gating it here is indistinguishable from a
+    # legitimate DEG-over-reference override, which deliberately rests on its DEGs.
+    rep = _validate_case(_pancreas_proposal(), _pancreas_ev())
+    assert not any(
+        "bc_get_panglaodb" in f.lower() or "local marker DB" in f
+        for f in rep["validation_failures"]
+    )
+
+
+# ---- Layer 1: covered tissue (immune) ----
+
+def _immune_proposal():
+    macs = ["C1QA", "C1QB", "MRC1", "APOE", "CD68", "LYZ", "CD163"]
+    return {
+        "cluster_ids": ["0"],
+        "cluster_key": "leiden",
+        "annotation_key": "cell_type",
+        "ambiguous_clusters": [],
+        "reference_annotation_keys": [],
+        "clusters": [{
+            "cluster_id": "0",
+            "top_degs": macs,
+            "discriminating_degs": macs,
+            "suggested_supporting_genes": macs[:3],
+            "reference_annotations": [],
+            "competing_labels": [{"label": "macrophage"}],
+        }],
+    }
+
+
+def test_layer1_covered_misread_flagged_by_local_db():
+    # Declared "T cell" but the top DEGs are macrophage markers Cytopus knows.
+    rep = _validate_case(_immune_proposal(), {"0": {
+        "label": "T cell",
+        "deg_derived_label": "T cell",
+        "confidence": "medium",
+        "panglaodb_queried": False,
+        "supporting_genes": ["C1QA", "MRC1"],
+        "reasoning": "Annotated from top DEGs of the cluster.",
+    }})
+    assert any("local marker DB" in f for f in rep["validation_failures"])
+
+
+def test_layer1_cleared_when_deg_label_matches_local_db():
+    # Correct call: declared macrophage, top DEGs are macrophage markers -> no flag.
+    rep = _validate_case(_immune_proposal(), {"0": {
+        "label": "macrophage",
+        "deg_derived_label": "macrophage",
+        "confidence": "medium",
+        "panglaodb_queried": False,
+        "supporting_genes": ["C1QA", "MRC1"],
+        "reasoning": "Macrophage markers C1QA/C1QB/MRC1 dominate the cluster.",
+    }})
+    assert not any("local marker DB" in f for f in rep["validation_failures"])
