@@ -120,3 +120,4 @@ LUNG_*
 
 # Local backup files (e.g. pixi.toml.bak_gpupreload, .mcp.json.bak_iris)
 *.bak*
+!docs/sdk_port/feedback.md
