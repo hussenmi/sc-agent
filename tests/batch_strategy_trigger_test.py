@@ -37,13 +37,26 @@ def _adata_with(col: str | None, n_groups: int = 2, n_cells: int = 20) -> ad.Ann
 
 
 class _FakeWorldState:
-    def __init__(self, confirmed=None, data_summary=None, metadata_candidates=None):
+    def __init__(self, confirmed=None, data_summary=None, metadata_candidates=None,
+                 group_count=None):
         self._confirmed = confirmed or {}
         self.data_summary = data_summary or {}
         self.metadata_candidates = metadata_candidates or []
+        self._group_count = group_count
 
     def get_confirmed_value(self, key):
         return self._confirmed.get(key)
+
+    def _multi_sample_group_count(self):
+        if self._group_count is not None:
+            return self._group_count
+        n = int(self.data_summary.get("n_batches") or 0)
+        for cand in self.metadata_candidates:
+            try:
+                n = max(n, int(cand.get("n_unique") or 0))
+            except (TypeError, ValueError):
+                continue
+        return n
 
 
 def _agent(adata, world_state) -> SCAgent:
@@ -81,77 +94,105 @@ def test_inspect_data_no_memory_and_empty_path_still_errors():
 
 
 # --------------------------------------------------------------------------- #
-# Fix 2: post-concat checkpoint derives the batch column without prior inspect
+# Fix 2: post-concat checkpoint is STATE-based (single->multi transition), not a
+# regex on the run_code source — so it fires however the combine was written.
 # --------------------------------------------------------------------------- #
 
 OK = {"status": "ok"}
 
 
-def test_checkpoint_from_anndata_concat_label_arg():
-    # The exact shape from the failing run: anndata.concat(..., label='replicate')
-    # with NO prior successful inspect_data (empty world_state).
-    agent = _agent(_adata_with("replicate"), _FakeWorldState())
-    code = "combined = anndata.concat(datasets, join='outer', label='replicate', keys=names)"
-    cp = agent._build_post_concatenation_strategy_checkpoint("run_code", {"code": code}, OK)
+def test_checkpoint_fires_on_multi_sample_transition_via_obs_sniff():
+    # No recorded batch key: the column is sniffed from the combined obs. The
+    # trigger is the single->multi transition, not any concat call in the code.
+    ws = _FakeWorldState(group_count=2)
+    agent = _agent(_adata_with("replicate"), ws)
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "run_code", {"code": "adata = build_from_frames(frames)"}, OK, before_group_count=1
+    )
     assert cp is not None
     assert cp["kind"] == "multi_sample_strategy"
     assert cp["partition"]["column"] == "replicate"
     assert cp["partition"]["n_groups"] == 2
 
 
-def test_checkpoint_from_concat_datasets_batch_key_arg():
-    agent = _agent(_adata_with("sample"), _FakeWorldState())
-    code = "combined = concat_datasets(datasets, batch_key='sample', join='outer')"
-    cp = agent._build_post_concatenation_strategy_checkpoint("run_code", {"code": code}, OK)
+def test_checkpoint_uses_recorded_batch_key_when_present():
+    ws = _FakeWorldState(confirmed={"batch_key": "sample"}, group_count=2)
+    agent = _agent(_adata_with("sample"), ws)
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "run_code", {"code": "x = 1"}, OK, before_group_count=1
+    )
     assert cp is not None
     assert cp["partition"]["column"] == "sample"
 
 
-def test_checkpoint_sniffs_default_batch_column_when_unnamed():
-    # ad.concat(...) with no label= falls back to anndata's default 'batch' col.
-    agent = _agent(_adata_with("batch"), _FakeWorldState())
-    code = "combined = ad.concat(datasets, join='outer')"
-    cp = agent._build_post_concatenation_strategy_checkpoint("run_code", {"code": code}, OK)
+def test_checkpoint_fires_for_hand_built_combine_with_no_concat_call():
+    # The run_2026_07_15_121111 bypass: a combine built from stacked frames with
+    # NO anndata.concat / concat_datasets call. The old regex missed this; the
+    # state-based transition catches it.
+    ws = _FakeWorldState(group_count=40)
+    agent = _agent(_adata_with("sample", n_groups=40, n_cells=80), ws)
+    manual = (
+        "mats = [pd.read_csv(f, index_col=0) for f in files]\n"
+        "adata = anndata.AnnData(scipy.sparse.vstack([m.T.values for m in mats]))"
+    )
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "run_code", {"code": manual}, OK, before_group_count=1
+    )
     assert cp is not None
-    assert cp["partition"]["column"] == "batch"
+    assert cp["partition"]["n_groups"] == 40
 
 
-def test_checkpoint_uses_live_group_count_over_stale_world_state():
-    # world_state says 5 groups; the live adata has 2. Live data wins.
-    ws = _FakeWorldState(data_summary={"batch_key": "replicate", "n_batches": 5})
-    agent = _agent(_adata_with("replicate", n_groups=2), ws)
-    code = "anndata.concat(datasets, label='replicate')"
-    cp = agent._build_post_concatenation_strategy_checkpoint("run_code", {"code": code}, OK)
+def test_load_data_also_triggers_the_transition_checkpoint():
+    ws = _FakeWorldState(group_count=2)
+    agent = _agent(_adata_with("replicate"), ws)
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "load_data", {}, OK, before_group_count=1
+    )
     assert cp is not None
-    assert cp["partition"]["n_groups"] == 2
+
+
+def test_no_checkpoint_without_transition_when_already_multi_sample():
+    # Data was already multi-sample before this tool ran — no transition, so the
+    # post-concat net does not re-fire (inspect_data / the enforcement own it).
+    ws = _FakeWorldState(group_count=2)
+    agent = _agent(_adata_with("replicate"), ws)
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "run_code", {"code": "x = 1"}, OK, before_group_count=2
+    )
+    assert cp is None
 
 
 def test_no_checkpoint_single_group():
-    agent = _agent(_adata_with("replicate", n_groups=1), _FakeWorldState())
-    code = "anndata.concat(datasets, label='replicate')"
-    cp = agent._build_post_concatenation_strategy_checkpoint("run_code", {"code": code}, OK)
+    ws = _FakeWorldState(group_count=1)
+    agent = _agent(_adata_with("replicate", n_groups=1), ws)
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "run_code", {"code": "x = 1"}, OK, before_group_count=0
+    )
     assert cp is None
 
 
 def test_no_checkpoint_when_strategy_already_confirmed():
-    ws = _FakeWorldState(confirmed={"multi_sample_strategy": "keep_unintegrated"})
+    ws = _FakeWorldState(confirmed={"multi_sample_strategy": "keep_unintegrated"}, group_count=2)
     agent = _agent(_adata_with("replicate"), ws)
-    code = "anndata.concat(datasets, label='replicate')"
-    cp = agent._build_post_concatenation_strategy_checkpoint("run_code", {"code": code}, OK)
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "run_code", {"code": "x = 1"}, OK, before_group_count=1
+    )
     assert cp is None
 
 
-def test_no_checkpoint_for_non_concat_code():
-    agent = _agent(_adata_with("replicate"), _FakeWorldState())
-    code = "adata.obs['foo'] = 1"
-    cp = agent._build_post_concatenation_strategy_checkpoint("run_code", {"code": code}, OK)
+def test_no_checkpoint_for_unrelated_tool():
+    ws = _FakeWorldState(group_count=2)
+    agent = _agent(_adata_with("replicate"), ws)
+    cp = agent._build_post_concatenation_strategy_checkpoint(
+        "run_pca", {}, OK, before_group_count=1
+    )
     assert cp is None
 
 
 def test_no_checkpoint_on_error_status():
-    agent = _agent(_adata_with("replicate"), _FakeWorldState())
-    code = "anndata.concat(datasets, label='replicate')"
+    ws = _FakeWorldState(group_count=2)
+    agent = _agent(_adata_with("replicate"), ws)
     cp = agent._build_post_concatenation_strategy_checkpoint(
-        "run_code", {"code": code}, {"status": "error"}
+        "run_code", {"code": "x = 1"}, {"status": "error"}, before_group_count=1
     )
     assert cp is None

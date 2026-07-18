@@ -361,13 +361,76 @@ def concat_datasets(
     return adata
 
 
+def _peek_tabular(candidate: Path) -> Optional[dict]:
+    """Cheaply classify a text file as a likely count matrix without loading it.
+
+    Reads only the header and the first data row (gzip-aware) and infers the
+    delimiter, column count, and whether the first column looks like a row label
+    (gene id / barcode). Returns None for files that do not look tabular (e.g.
+    binary, or a single-column list). This is what lets discovery recognize the
+    common "one CSV/TSV count matrix per sample" layout without us maintaining a
+    hard list of every extension a matrix might use.
+    """
+    import csv
+    import gzip
+    import io as _io
+
+    name = candidate.name.lower()
+    opener = gzip.open if name.endswith(".gz") else open
+    try:
+        with opener(candidate, "rt", errors="replace") as handle:  # type: ignore[operator]
+            header = handle.readline()
+            first_row = handle.readline()
+    except (OSError, UnicodeError):
+        return None
+    if not header:
+        return None
+    # Sniff the delimiter from the header; fall back to the delimiter that yields
+    # the most fields. A real matrix has many columns (cells), so a lone-column
+    # "matrix" is almost certainly a list/metadata file, not a count matrix.
+    sample = header + (first_row or "")
+    delimiter = None
+    try:
+        delimiter = csv.Sniffer().sniff(sample, delimiters=",\t;| ").delimiter
+    except csv.Error:
+        counts = {d: header.count(d) for d in (",", "\t", ";", "|")}
+        delimiter = max(counts, key=counts.get) if any(counts.values()) else None
+    if not delimiter:
+        return None
+    n_fields = len(next(csv.reader(_io.StringIO(header), delimiter=delimiter)))
+    if n_fields < 2:
+        return None
+    first_cell = ""
+    if first_row:
+        row_fields = next(csv.reader(_io.StringIO(first_row), delimiter=delimiter), [])
+        first_cell = row_fields[0] if row_fields else ""
+    return {
+        "delimiter": delimiter,
+        "n_header_fields": n_fields,
+        "first_cell": first_cell,
+    }
+
+
 def discover_data_inputs(path: Union[str, Path]) -> dict:
-    """Describe supported single-cell inputs without loading them."""
+    """Describe supported single-cell inputs without loading them.
+
+    Recognizes the binary/standard formats (h5ad, 10x h5, loom, mtx, 10x mtx
+    directories) and, via a cheap header peek, plain-text count matrices
+    (csv/tsv/txt, optionally gzipped). ``source_datasets`` — the set that drives
+    the ``multi_dataset_loading`` decision — is the largest group of files that
+    share a structural signature (same format, and for text the same delimiter
+    and comparable column count), i.e. a replicate set that plausibly combines
+    into one object. When no such group of >=2 exists, every recognized dataset
+    is returned so a single explicit input still loads. This is deliberately
+    structural rather than an extension whitelist: a folder of 40 per-sample CSVs
+    registers as 40 source datasets (so the combine decision fires) while a stray
+    ``metadata.csv`` sitting beside real matrices does not hijack the group.
+    """
     root = Path(path).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Input path does not exist: {root}")
 
-    def _format_for(candidate: Path) -> Optional[str]:
+    def _binary_format_for(candidate: Path) -> Optional[str]:
         lower = candidate.name.lower()
         if lower.endswith(".h5ad.gz"):
             return "h5ad_gz"
@@ -381,39 +444,105 @@ def discover_data_inputs(path: Union[str, Path]) -> dict:
             return "mtx"
         return None
 
+    def _tabular_format_for(candidate: Path) -> Optional[str]:
+        lower = candidate.name.lower()
+        for stem, fmt in ((".csv", "csv"), (".tsv", "tsv"), (".txt", "txt")):
+            if lower.endswith(stem) or lower.endswith(stem + ".gz"):
+                return fmt
+        return None
+
     def _likely_combined(candidate: Path) -> bool:
         name = candidate.name.lower()
         return any(token in name for token in ("combined", "concatenated", "merged"))
 
+    # A directory that IS a 10x mtx bundle is ONE dataset — its loose
+    # barcodes/features/matrix component files must not be mistaken for separate
+    # per-sample tables (the tsv/csv peek below would otherwise pick up
+    # features.tsv). Short-circuit to a single-dataset result.
+    if root.is_dir() and any(root.glob("matrix.mtx*")):
+        entry = {
+            "path": str(root),
+            "name": root.name,
+            "format": "10x_mtx_directory",
+            "size_bytes": None,
+            "likely_combined_output": _likely_combined(root),
+        }
+        return {
+            "path": str(root),
+            "datasets": [entry],
+            "source_datasets": [entry],
+            "likely_combined_outputs": [],
+            "excluded_datasets": [],
+            "n_datasets": 1,
+            "n_source_datasets": 1,
+        }
+
     candidates = [root] if root.is_file() else sorted(root.iterdir())
     datasets = []
     for candidate in candidates:
-        data_format = _format_for(candidate) if candidate.is_file() else None
-        if candidate.is_dir() and any(candidate.glob("matrix.mtx*")):
-            data_format = "10x_mtx_directory"
+        data_format: Optional[str] = None
+        tabular: Optional[dict] = None
+        if candidate.is_dir():
+            if any(candidate.glob("matrix.mtx*")):
+                data_format = "10x_mtx_directory"
+        elif candidate.is_file():
+            data_format = _binary_format_for(candidate)
+            if data_format is None and _tabular_format_for(candidate) is not None:
+                tabular = _peek_tabular(candidate)
+                if tabular is not None:
+                    data_format = _tabular_format_for(candidate)
         if data_format is None:
             continue
-        datasets.append({
+        entry = {
             "path": str(candidate),
             "name": candidate.name,
             "format": data_format,
             "size_bytes": candidate.stat().st_size if candidate.is_file() else None,
             "likely_combined_output": _likely_combined(candidate),
-        })
+        }
+        if tabular is not None:
+            # Load hints so a consumer knows how to read the matrix without
+            # re-sniffing (genes-as-rows is the common orientation for these).
+            entry["delimiter"] = tabular["delimiter"]
+            entry["n_header_fields"] = tabular["n_header_fields"]
+        datasets.append(entry)
 
-    source_datasets = [
-        dataset for dataset in datasets
-        if not dataset["likely_combined_output"]
-    ]
-    if not source_datasets:
-        source_datasets = list(datasets)
+    def _signature(dataset: dict) -> tuple:
+        # Files combine into one object only if they are structurally alike. For
+        # text matrices, bucket by column count (log2) so per-sample matrices with
+        # slightly different cell counts still group, while a metadata table with a
+        # handful of columns does not join a group of wide count matrices.
+        fmt = dataset["format"]
+        if "n_header_fields" in dataset:
+            import math
+            bucket = int(math.log2(max(dataset["n_header_fields"], 1)))
+            return (fmt, dataset.get("delimiter"), bucket)
+        return (fmt,)
+
+    non_combined = [d for d in datasets if not d["likely_combined_output"]]
+    groups: dict = {}
+    for dataset in non_combined:
+        groups.setdefault(_signature(dataset), []).append(dataset)
+    replicate_groups = [g for g in groups.values() if len(g) >= 2]
+    if replicate_groups:
+        # The largest structurally-consistent replicate set is the source group.
+        source_datasets = max(replicate_groups, key=len)
+    else:
+        source_datasets = non_combined if non_combined else list(datasets)
+
+    source_paths = {d["path"] for d in source_datasets}
     return {
         "path": str(root),
         "datasets": datasets,
         "source_datasets": source_datasets,
         "likely_combined_outputs": [
-            dataset for dataset in datasets
-            if dataset["likely_combined_output"]
+            dataset for dataset in datasets if dataset["likely_combined_output"]
+        ],
+        # Recognized datasets excluded from the source group (name-flagged combined
+        # outputs, or structural odd-ones-out like a stray metadata table beside a
+        # replicate set). Surfaced so a consumer can see what was set aside and why.
+        "excluded_datasets": [
+            dataset for dataset in datasets if dataset["path"] not in source_paths
         ],
         "n_datasets": len(datasets),
         "n_source_datasets": len(source_datasets),

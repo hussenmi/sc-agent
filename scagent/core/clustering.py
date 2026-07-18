@@ -15,7 +15,7 @@ import pandas as pd
 import logging
 
 from ..config.defaults import CLUSTERING_DEFAULTS
-from .gpu import on_gpu
+from .gpu import ensure_cpu, on_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +304,13 @@ def run_differential_expression(
     if groupby not in adata.obs.columns:
         raise ValueError(f"Groupby column '{groupby}' not found. Run clustering first.")
 
+    # rank_genes_groups is a scanpy CPU routine — it cannot consume a cupy matrix.
+    # If a GPU step upstream left adata on the device, scanpy fails deep inside with
+    # a misleading error ("truth value of an array is ambiguous", "ufunc 'log' not
+    # supported"). Move to host first so DEG just works. (The process_tool_call
+    # boundary normally does this already; this is the belt for direct callers.)
+    ensure_cpu(adata, context="run_differential_expression")
+
     logger.info(f"Running differential expression analysis by {groupby}")
 
     # Keep the analysis matrix for Wilcoxon; other methods may opt into a raw
@@ -316,14 +323,29 @@ def run_differential_expression(
                 logger.info(f"Using '{layer}' layer for DEG")
                 break
 
-    sc.tl.rank_genes_groups(
-        adata,
-        groupby=groupby,
-        method=method,
-        n_genes=n_genes,
-        key_added=key_added,
-        layer=layer,
-    )
+    try:
+        sc.tl.rank_genes_groups(
+            adata,
+            groupby=groupby,
+            method=method,
+            n_genes=n_genes,
+            key_added=key_added,
+            layer=layer,
+        )
+    except Exception as exc:
+        # Turn scanpy's opaque failures into an actionable message. The usual
+        # culprits are a non-float expression matrix or a residual GPU array that
+        # slipped past the host transfer above.
+        matrix = adata.layers[layer] if layer else adata.X
+        dtype = getattr(matrix, "dtype", None)
+        raise RuntimeError(
+            f"Differential expression (rank_genes_groups, method='{method}') failed on "
+            f"the {'layer ' + repr(layer) if layer else 'X'} matrix "
+            f"(type={type(matrix).__name__}, dtype={dtype}): {type(exc).__name__}: {exc}. "
+            "This is typically a non-floating-point matrix or one still resident on the "
+            "GPU. Ensure the DEG matrix is a host (CPU) float32/float64 array — "
+            "normalized+log1p for Wilcoxon."
+        ) from exc
 
     n_groups = adata.obs[groupby].nunique()
     logger.info(f"Differential expression analysis complete: {n_groups} groups analyzed")

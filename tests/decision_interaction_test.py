@@ -43,6 +43,15 @@ class FakeWorldState:
     def add_context_hint(self, hint, *, source="model"):
         self.context_hints.append(hint)
 
+    def _multi_sample_group_count(self):
+        n = int(self.data_summary.get("n_batches") or 0)
+        for cand in self.metadata_candidates:
+            try:
+                n = max(n, int(cand.get("n_unique") or 0))
+            except (TypeError, ValueError):
+                continue
+        return n
+
 
 def _bare_agent(checkpoint=None):
     agent = object.__new__(SCAgent)
@@ -50,6 +59,7 @@ def _bare_agent(checkpoint=None):
     agent._mcp_client = None
     agent.run_manager = None
     agent._active_cleanup_authorization = None
+    agent._multifile_source_datasets = []
     agent.world_state = FakeWorldState()
     return agent
 
@@ -345,31 +355,74 @@ def test_loading_choice_is_persisted_independently_from_integration_choice():
     assert agent.world_state.get_confirmed_value("multi_sample_strategy") is None
 
 
-def test_concatenation_guard_requires_and_enforces_loading_choice():
+def test_loading_guard_is_state_based_not_code_based():
+    # The guard keys on discovered state (>=2 source datasets), NOT on matching a
+    # concat call in the code. A hand-built combine with no concat() call — the
+    # exact run_2026_07_15_121111 bypass — is blocked all the same.
     agent = _bare_agent()
-    outer_code = (
-        "from scagent.core import concat_datasets\n"
-        "adata = concat_datasets(items, batch_names=names, join='outer')"
+    agent._multifile_source_datasets = []
+    manual_build = (
+        "mats = [pd.read_csv(f, index_col=0) for f in files]\n"
+        "adata = anndata.AnnData(scipy.sparse.vstack([m.T.values for m in mats]))"
     )
-    blocked = json.loads(agent._multi_dataset_loading_guard(
-        "run_code", {"code": outer_code}
-    ))
+    # Not armed yet → the guard does not fire (nothing discovered).
+    assert agent._multi_dataset_loading_guard("run_code", {"code": manual_build}) is None
+
+    # Arm with a discovered multi-file source set; now the manual build is blocked
+    # even though it contains no anndata.concat / concat_datasets call.
+    agent._multifile_source_datasets = [{"name": f"s{i}.csv"} for i in range(40)]
+    blocked = json.loads(agent._multi_dataset_loading_guard("run_code", {"code": manual_build}))
     assert blocked["requires_user_decision"] is True
+    assert blocked["decision_key"] == "multi_dataset_loading_strategy"
+    # load_data is guarded too, not only run_code.
+    assert json.loads(
+        agent._multi_dataset_loading_guard("load_data", {"data_path": "/x"})
+    )["requires_user_decision"] is True
 
+    # Once the strategy is resolved (any action), the combine proceeds.
+    agent.world_state.user_preferences["multi_dataset_loading_strategy"] = "concatenate_outer"
+    assert agent._multi_dataset_loading_guard("run_code", {"code": manual_build}) is None
+
+
+def test_load_data_on_directory_auto_arms_and_raises_checkpoint(tmp_path):
+    # A load_data pointed at a directory of matrices — the model skipped
+    # inspect_data_inputs — still arms the guard and raises the loading checkpoint,
+    # by reading the declared path (not by scanning code).
+    for i in range(3):
+        header = "gene," + ",".join(f"c{j}" for j in range(8))
+        (tmp_path / f"s{i}.csv").write_text(header + "\nG1," + ",".join("1" for _ in range(8)) + "\n")
+    agent = _bare_agent()
+    agent._maybe_arm_multifile_from_path(str(tmp_path))
+    assert len(agent._multifile_source_datasets) == 3
+    assert agent._pending_checkpoint is not None
+    assert agent._pending_checkpoint["kind"] == "multi_dataset_loading"
+
+    # A single-file path arms nothing.
+    agent2 = _bare_agent()
+    agent2._maybe_arm_multifile_from_path(str(tmp_path / "s0.csv"))
+    assert agent2._multifile_source_datasets == []
+    assert agent2._pending_checkpoint is None
+
+
+def test_analyze_separately_violation_flagged_post_hoc():
+    # outer/inner joins aren't verifiable from code; analyze_separately-then-combine
+    # IS — and it's caught on the resulting object's state, no code inspection.
+    agent = _bare_agent()
+    agent._multifile_source_datasets = [{"name": "a.csv"}, {"name": "b.csv"}]
+    agent.adata = object()  # non-None; group count comes from world_state
+
+    class _WS(FakeWorldState):
+        def _multi_sample_group_count(self):
+            return 4
+
+    agent.world_state = _WS()
     agent.world_state.user_preferences["multi_dataset_loading_strategy"] = "analyze_separately"
-    separate_block = json.loads(agent._multi_dataset_loading_guard(
-        "run_code", {"code": outer_code}
-    ))
-    assert "not allowed" in separate_block["message"]
+    viol = agent._multi_dataset_consistency_after()
+    assert viol is not None and "separately" in viol.lower()
 
-    agent.world_state.user_preferences["multi_dataset_loading_strategy"] = "concatenate_inner"
-    mismatch = json.loads(agent._multi_dataset_loading_guard(
-        "run_code", {"code": outer_code}
-    ))
-    assert mismatch["required_join"] == "inner"
-
-    inner_code = outer_code.replace("join='outer'", "join='inner'")
-    assert agent._multi_dataset_loading_guard("run_code", {"code": inner_code}) is None
+    # No violation when the chosen strategy is a combine.
+    agent.world_state.user_preferences["multi_dataset_loading_strategy"] = "concatenate_outer"
+    assert agent._multi_dataset_consistency_after() is None
 
 
 def test_pending_loading_checkpoint_blocks_run_code_before_selector_resolution():
@@ -392,7 +445,9 @@ def test_pending_loading_checkpoint_blocks_run_code_before_selector_resolution()
     assert result["pending_checkpoint"]["kind"] == "multi_dataset_loading"
 
 
-def test_successful_concatenation_opens_sample_strategy_checkpoint():
+def test_multi_sample_transition_opens_sample_strategy_checkpoint():
+    # State-based: the data became multi-sample as a result of this run_code
+    # (before 1 group, now 2). The code text is irrelevant.
     agent = _bare_agent()
     agent.world_state.data_summary = {
         "recommended_batch_key": "sample",
@@ -403,21 +458,18 @@ def test_successful_concatenation_opens_sample_strategy_checkpoint():
     ]
     checkpoint = agent._build_post_concatenation_strategy_checkpoint(
         "run_code",
-        {
-            "code": (
-                "adata = concat_datasets("
-                "items, batch_names=names, join='outer')"
-            )
-        },
+        {"code": "adata = build_combined(items)"},
         {"status": "ok"},
+        before_group_count=1,
     )
-
     assert checkpoint["kind"] == "multi_sample_strategy"
     assert checkpoint["partition"]["column"] == "sample"
     assert checkpoint["partition"]["n_groups"] == 2
 
 
-def test_non_concatenation_code_does_not_open_sample_strategy_checkpoint():
+def test_no_transition_does_not_open_sample_strategy_checkpoint():
+    # Data was already multi-sample before this run_code — no single->multi
+    # transition, so the post-concat net does not re-fire.
     agent = _bare_agent()
     agent.world_state.data_summary = {
         "recommended_batch_key": "sample",
@@ -427,6 +479,7 @@ def test_non_concatenation_code_does_not_open_sample_strategy_checkpoint():
         "run_code",
         {"code": "adata.obs['total'] = 1"},
         {"status": "ok"},
+        before_group_count=2,
     )
     assert checkpoint is None
 

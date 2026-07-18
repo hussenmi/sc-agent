@@ -79,12 +79,23 @@ def test_recurring_no_design_cannot_determine(tmp_path):
         assert (tmp_path / f"{name}.csv").exists()
     design = pd.read_csv(tmp_path / "batch_diagnostic_design_check.csv")
     assert design.iloc[0]["status"] == "unknown"
-    # The README's Interpretation is deterministic prose, not a "Pending" placeholder.
+    # The README's Interpretation is deterministic, human prose, not a "Pending"
+    # placeholder: it walks through the analysis, explains the mixing metrics, and
+    # ends with a concrete suggestion.
     from scagent.core import artifact_docs as _ad
     readme_text = (tmp_path / "README.md").read_text()
     assert not _ad.interpretation_is_empty(readme_text)
-    assert "Pending" not in readme_text.split("## Interpretation")[1]
-    assert "This diagnostic examined" in readme_text
+    interp = readme_text.split("## Interpretation")[1]
+    assert "Pending" not in interp
+    assert "This check asks one question" in interp
+    assert "**What we suggest.**" in interp
+    assert "ARI" in interp  # plain-language mixing (ARI/NMI) explanation is present
+    # Internal enum code words are translated for the user, never shown raw.
+    for codeword in (
+        "recurring_sample_associated", "cannot_determine_technical_vs_biological",
+        "gene_evidence", "design_interpretation",
+    ):
+        assert codeword not in interp
 
 
 def test_recurring_confounded_condition_cannot_determine(tmp_path):

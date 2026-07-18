@@ -114,3 +114,65 @@ def test_discover_data_inputs_separates_source_files_from_combined_outputs(tmp_p
     assert [item["name"] for item in result["likely_combined_outputs"]] == [
         "combined_replicates.h5ad"
     ]
+
+
+def _write_matrix_csv(path, n_cells, sep=","):
+    header = sep.join(["gene"] + [f"cell{i}" for i in range(n_cells)])
+    row = sep.join(["GENE1"] + ["1"] * n_cells)
+    path.write_text(header + "\n" + row + "\n")
+
+
+def test_discover_data_inputs_recognizes_csv_count_matrices(tmp_path):
+    # The run_2026_07_15_121111 shape: a folder of per-sample CSV count matrices.
+    # These were previously invisible to discovery (only h5ad/h5/mtx were), so the
+    # multi_dataset_loading checkpoint never fired for them.
+    for i in range(4):
+        _write_matrix_csv(tmp_path / f"GSM55734{i:02d}_sample{i}.csv", n_cells=8)
+    result = discover_data_inputs(tmp_path)
+    assert result["n_source_datasets"] == 4
+    assert all(d["format"] == "csv" for d in result["source_datasets"])
+    assert all(d["delimiter"] == "," for d in result["source_datasets"])
+
+
+def test_discover_data_inputs_recognizes_gzipped_tsv(tmp_path):
+    import gzip
+
+    for i in range(2):
+        with gzip.open(tmp_path / f"s{i}.tsv.gz", "wt") as handle:
+            handle.write("gene\t" + "\t".join(f"c{j}" for j in range(6)) + "\n")
+            handle.write("G1\t" + "\t".join("1" for _ in range(6)) + "\n")
+    result = discover_data_inputs(tmp_path)
+    assert result["n_source_datasets"] == 2
+    assert result["source_datasets"][0]["delimiter"] == "\t"
+
+
+def test_discover_data_inputs_excludes_stray_metadata_table(tmp_path):
+    # A metadata table beside real matrices must not join the replicate group: it
+    # has a different column count, so structural grouping sets it aside.
+    for i in range(3):
+        _write_matrix_csv(tmp_path / f"sample{i}.csv", n_cells=40)
+    (tmp_path / "metadata.csv").write_text("sample_id,condition,age\nsample0,tumor,55\n")
+    result = discover_data_inputs(tmp_path)
+    assert sorted(d["name"] for d in result["source_datasets"]) == [
+        "sample0.csv",
+        "sample1.csv",
+        "sample2.csv",
+    ]
+    assert [d["name"] for d in result["excluded_datasets"]] == ["metadata.csv"]
+
+
+def test_discover_data_inputs_single_csv_is_one_source(tmp_path):
+    _write_matrix_csv(tmp_path / "only.csv", n_cells=10)
+    result = discover_data_inputs(tmp_path / "only.csv")
+    assert result["n_source_datasets"] == 1
+
+
+def test_discover_data_inputs_treats_10x_directory_as_single_dataset(tmp_path):
+    # A 10x bundle's loose barcodes/features tsv files must not be counted as
+    # separate per-sample tables now that tsv is recognized.
+    (tmp_path / "matrix.mtx").write_text("%%MatrixMarket\n1 1 1\n1 1 1\n")
+    (tmp_path / "features.tsv").write_text("ENSG1\tGENE1\tGene Expression\n")
+    (tmp_path / "barcodes.tsv").write_text("AAAA-1\n")
+    result = discover_data_inputs(tmp_path)
+    assert result["n_source_datasets"] == 1
+    assert result["source_datasets"][0]["format"] == "10x_mtx_directory"

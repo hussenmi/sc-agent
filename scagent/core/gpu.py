@@ -192,10 +192,117 @@ def backends_used() -> list[str]:
     return sorted(_backends_used)
 
 
+def _is_gpu_array(obj: object) -> bool:
+    """True if ``obj`` is a cupy ndarray or cupyx sparse matrix (GPU-resident)."""
+    top = type(obj).__module__.split(".", 1)[0]
+    return top in ("cupy", "cupyx")
+
+
 def is_on_gpu(adata: AnnData) -> bool:
     """True if ``adata.X`` currently lives on the GPU (a cupy array/matrix)."""
-    top = type(adata.X).__module__.split(".", 1)[0]
-    return top in ("cupy", "cupyx")
+    return _is_gpu_array(adata.X)
+
+
+def _iter_gpu_slots(adata: AnnData):
+    """Yield ``(container, key)`` for every AnnData slot holding a GPU array.
+
+    Covers ``.X`` plus the aligned mappings (layers/obsm/obsp/varm) — the places a
+    rapids_singlecell op leaves cupy arrays. ``.raw`` is checked separately because
+    it is immutable and must be rebuilt, not reassigned in place.
+    """
+    if _is_gpu_array(adata.X):
+        yield adata, "X"
+    for mapping in (adata.layers, adata.obsm, adata.obsp, adata.varm):
+        for key in list(mapping.keys()):
+            if _is_gpu_array(mapping[key]):
+                yield mapping, key
+
+
+def has_gpu_arrays(adata: AnnData) -> bool:
+    """True if ANY component of ``adata`` (X/layers/obsm/obsp/varm/raw.X) is on GPU.
+
+    Broader than :func:`is_on_gpu`, which only inspects ``.X``. A leaked GPU context
+    can leave the neighbor graph (``obsp``) or an embedding (``obsm``) on the device
+    while ``.X`` looks host-resident, so the CPU consumer still breaks. This gate is
+    cheap: it only walks the (small) keys of the aligned mappings and checks types.
+    """
+    if next(_iter_gpu_slots(adata), None) is not None:
+        return True
+    raw = getattr(adata, "raw", None)
+    return raw is not None and _is_gpu_array(getattr(raw, "X", None))
+
+
+def _to_host(obj: object) -> object:
+    """Move a single cupy array / cupyx sparse matrix to host, else return as-is.
+
+    ``cupy.ndarray.get()`` -> ``numpy.ndarray`` and ``cupyx.scipy.sparse.*.get()`` ->
+    the matching ``scipy.sparse`` matrix, so this needs only cupy (never the heavy
+    rapids_singlecell import) and is a no-op for anything already host-resident.
+    """
+    if _is_gpu_array(obj) and hasattr(obj, "get"):
+        return obj.get()
+    return obj
+
+
+def _manual_anndata_to_cpu(adata: AnnData) -> None:
+    """Fallback host transfer using only cupy's ``.get()`` — no rapids dependency.
+
+    Used when ``rapids_singlecell.get.anndata_to_CPU`` is unavailable or left arrays
+    behind. Converts ``.X``, every layer/obsm/obsp/varm entry, and rebuilds ``.raw``
+    if its matrix is on the device.
+    """
+    for container, key in list(_iter_gpu_slots(adata)):
+        if container is adata and key == "X":
+            adata.X = _to_host(adata.X)
+        else:
+            container[key] = _to_host(container[key])
+    raw = getattr(adata, "raw", None)
+    if raw is not None and _is_gpu_array(getattr(raw, "X", None)):
+        try:
+            raw_adata = raw.to_adata()
+            raw_adata.X = _to_host(raw_adata.X)
+            adata.raw = raw_adata
+        except Exception:  # pragma: no cover - raw is best-effort
+            logger.warning("ensure_cpu: could not move adata.raw off the GPU.")
+
+
+def ensure_cpu(adata: AnnData | None, *, context: str = "") -> bool:
+    """Guarantee ``adata`` is fully host-resident. Idempotent; cheap no-op on CPU.
+
+    GPU compute steps are supposed to move data back to the host on exit, but a
+    leaked ``on_gpu`` context — or an ``on_gpu`` that saw data already on the device
+    and therefore declined ownership of the round-trip — can leave cupy arrays on
+    ``.X`` (and the neighbor graph, embeddings, layers). Every CPU consumer then
+    fails with cryptic errors: scanpy DEG ("truth value of an array is ambiguous",
+    "ufunc 'log' not supported"), scipy structure-QC ("NumPy array conversion"),
+    h5ad writes, and the run_code sandbox. This converts everything back, robustly,
+    so the CPU path always sees CPU arrays.
+
+    Returns True if a conversion actually happened (i.e. a leak was contained) so the
+    caller can log/trace it. Safe to call on ``None`` or on a CPU-only host (returns
+    False without importing any GPU library).
+    """
+    if adata is None or not has_gpu_arrays(adata):
+        return False
+    # Prefer the rapids helper (handles obsp graph structure, raw, dtypes); fall
+    # back to a manual cupy .get() sweep, then verify nothing remains on the device.
+    try:
+        from rapids_singlecell.get import anndata_to_CPU
+
+        anndata_to_CPU(adata, convert_all=True)
+    except Exception as exc:  # pragma: no cover - depends on GPU stack
+        logger.debug("ensure_cpu: anndata_to_CPU unavailable/failed (%s); manual sweep.", exc)
+    if has_gpu_arrays(adata):
+        _manual_anndata_to_cpu(adata)
+    still_gpu = has_gpu_arrays(adata)
+    record_backend(BACKEND_CPU)
+    logger.warning(
+        "ensure_cpu: moved a GPU-resident AnnData back to host%s%s. This indicates a "
+        "GPU→CPU handoff leak upstream (a compute step left cupy arrays on the object).",
+        f" [{context}]" if context else "",
+        " — WARNING: cupy arrays still present after conversion" if still_gpu else "",
+    )
+    return True
 
 
 @contextmanager

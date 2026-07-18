@@ -893,6 +893,48 @@ def derive_verdict(gene_evidence: str, design_interpretation: str) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# Plain-language translations of the internal enums
+# ---------------------------------------------------------------------------
+# The verdict axes above use short machine-readable enum values so the structured
+# result and the tests stay stable. Those strings are internal: a user should never
+# see "recurring_sample_associated" or "integration_supported". Everything shown to
+# a user (terminal summary, README interpretation) is rendered through these maps
+# and through ``verdict['reason']`` (already plain prose), so no code word leaks out.
+
+GENE_EVIDENCE_PLAIN = {
+    "none": "no sample-linked expression differences were established",
+    "localized": (
+        "sample-linked differences turned up in individual cell populations but did "
+        "not repeat across the dataset"
+    ),
+    "recurring_sample_associated": (
+        "the same sample-linked expression shift showed up in several different cell "
+        "populations — a pattern that spans the dataset rather than one cell type"
+    ),
+}
+
+DESIGN_PLAIN = {
+    "unknown": (
+        "no experimental-design information was provided, so we cannot tell whether "
+        "the samples are meant to be comparable replicates or are different "
+        "patients/conditions"
+    ),
+    "confounded_with_biology": (
+        "each sample lines up with one biological condition, so technical and "
+        "biological differences cannot be told apart"
+    ),
+    "orthogonal_but_not_known_technical": (
+        "a condition label exists and is not redundant with sample, but that alone "
+        "does not make the differences technical (per-donor biology can remain)"
+    ),
+    "documented_technical_batch": (
+        "the design flags this as a purely technical batch variable, separate from "
+        "biological condition"
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Readable, deterministic narrative — built from structured results only
 # ---------------------------------------------------------------------------
 
@@ -1015,10 +1057,16 @@ def build_terminal_summary(
             by_group.setdefault(r["associated_batch_group"], []).append(r["gene"])
         for group, gs in by_group.items():
             lines.append(
-                f"Recurring {group}-associated program across >= 2 populations: "
-                f"{', '.join(gs[:10])} (sample-wide signal; technical vs biological unresolved by genes alone)."
+                f"A group of genes ({', '.join(gs[:10])}) was consistently higher in "
+                f"{group} across several different cell populations — a sample-linked "
+                "pattern that spans the dataset. That makes it sample-wide, but sample-wide "
+                "is not the same as technical: a real biological difference between samples "
+                "would look identical."
             )
-    lines.append(f"Gene evidence: {gene_evidence}. Design: {design_interpretation}.")
-    lines.append(f"Recommendation: {verdict['recommendation']} — {verdict['reason']}")
+    lines.append(f"What the genes show: {GENE_EVIDENCE_PLAIN.get(gene_evidence, gene_evidence)}.")
+    lines.append(
+        f"Experimental design: {DESIGN_PLAIN.get(design_interpretation, design_interpretation)}."
+    )
+    lines.append(f"Bottom line: {verdict['reason']}")
     return lines
 

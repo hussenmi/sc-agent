@@ -314,26 +314,39 @@ def _batch_diagnostic_group_doc(params: dict[str, Any]) -> ArtifactGroupDoc:
         group="diagnose_batch_effect",
         title="Batch-effect diagnostic — how to read these files",
         overview=(
-            "A gene-first check of whether an uncorrected multi-sample dataset carries "
-            "sample-associated expression differences, and if so whether they recur across "
-            "cell populations. The primary evidence is the within-sample DEGs; the direct "
-            "cross-sample comparison and recurrence are secondary. None of these tables prove "
-            "a difference is technical rather than real per-sample biology — only the "
-            "experimental design can separate those, and q-values here rank cell-level "
-            "separation, not replicate-level biology (cells are not independent replicates)."
+            "These files investigate one question: when a dataset is made of several samples, "
+            "are the differences between those samples a technical batch effect worth "
+            "correcting, or real biology that should be kept? The approach is gene-first. "
+            "Rather than trusting that samples separating in a plot means a batch effect (real "
+            "biological differences separate too), it finds the same cell type in more than one "
+            "sample and reads the actual genes to see how — and whether — that cell type differs "
+            "from sample to sample. The strongest evidence here is the within-sample gene lists "
+            "(they describe each cell type cleanly, with the sample held constant); the direct "
+            "cross-sample comparison and the recurrence check are supporting detail. Read with "
+            "one limit in mind: no gene table can prove a difference is technical rather than "
+            "real per-sample biology — only the experimental design can settle that. The "
+            "**Interpretation** section at the end walks through what was actually found here "
+            "and what we suggest."
         ),
         params=params,
         files=[
             FileDoc(
                 filename="batch_diagnostic_sample_enriched_regions.csv",
                 purpose=(
-                    "Which cluster-sample regions hold far more of a sample than its overall "
-                    "size predicts — where to look. Enrichment over baseline, not raw purity."
+                    "The starting point: the places worth investigating. Each row is a "
+                    "(cluster, sample) region that holds far more of one sample's cells than "
+                    "you'd expect from that sample's overall size — a sign the sample is "
+                    "concentrated somewhere and worth a closer look. It measures concentration "
+                    "relative to what's expected, not raw purity, so a region that is 42% "
+                    "sample-8 counts when sample-8 is only 9% of all cells, even though it is "
+                    "nowhere near '80% one sample'."
                 ),
                 computation=(
-                    "For each cluster and sample: the fraction of the cluster made of that "
-                    "sample, divided by the sample's fraction of the whole dataset. Kept when "
-                    "the region has enough cells and enrichment above the threshold."
+                    "For every cluster and sample we take the fraction of the cluster that is "
+                    "this sample and divide it by that sample's fraction of the whole dataset. "
+                    "A value of 2 means the sample is twice as concentrated here as expected. A "
+                    "region is kept when it has enough cells to be trustworthy and clears the "
+                    "enrichment threshold."
                 ),
                 columns={
                     "cluster": "Cluster id.",
@@ -348,18 +361,27 @@ def _batch_diagnostic_group_doc(params: dict[str, Any]) -> ArtifactGroupDoc:
             FileDoc(
                 filename="batch_diagnostic_within_sample_degs.csv",
                 purpose=(
-                    "PRIMARY evidence: within each sample, the genes that identify a region "
-                    "compared with the rest of that same sample (batch held constant)."
+                    "The main evidence, and the clever part. For each region above, this lists "
+                    "the genes that set that cell type apart — but the comparison is made "
+                    "entirely inside one sample (this cluster vs. all other cells of the SAME "
+                    "sample). Keeping to one sample means these genes describe what the cell "
+                    "type IS (its identity: e.g. CD8A/CD3E for a T cell), with no sample "
+                    "differences mixed in. When the same cell type is found in two samples, "
+                    "matching these two gene lists is how we confirm they really are the same "
+                    "cell type before comparing them across samples."
                 ),
                 computation=(
                     "For each enriched region, a differential-expression test of that cluster's "
-                    "cells against all other cells of the SAME sample. Because both sides are "
-                    "one sample, the genes describe the population's identity, not batch."
+                    "cells against all the other cells of its own sample. Because both sides come "
+                    "from one sample, any batch effect cancels out and the genes that remain are "
+                    "the cell type's identity markers."
                 ),
                 how_to_read=(
-                    "expression_effect is the primary effect (mean_target - mean_reference on the "
-                    "matrix_source scale); higher_in names the side. engine_log2fc is the test's "
-                    "raw fold-change, secondary. q_value ranks genes; it is not replicate evidence."
+                    "Read `expression_effect` as the main number — how much higher (or lower) the "
+                    "gene is in this cell type versus the rest of the sample — and `higher_in` for "
+                    "which side it's higher on. `engine_log2fc` is the test's own fold-change "
+                    "(secondary). `q_value` is only a ranking aid for sorting genes; it is not "
+                    "evidence that the difference reproduces across samples."
                 ),
                 columns={
                     "region": "cluster/sample being characterized.",
@@ -381,20 +403,25 @@ def _batch_diagnostic_group_doc(params: dict[str, Any]) -> ArtifactGroupDoc:
             FileDoc(
                 filename="batch_diagnostic_population_pairs.csv",
                 purpose=(
-                    "The cross-sample region pairs we investigated: nominated as looking like the "
-                    "same cell type, then confirmed (or not) by their within-sample identity genes."
+                    "The cell-type matches across samples. Each row pairs a region in one sample "
+                    "with a region in another sample that looks like the same cell type, and "
+                    "reports how strongly their identity genes agree. This is the 'find the same "
+                    "cell type in two samples' step — the pairs that pass here are the ones the "
+                    "direct cross-sample comparison then runs on."
                 ),
                 computation=(
-                    "Candidate pairs are first nominated cheaply by mean-expression profile "
-                    "similarity (profile_correlation) between regions from DIFFERENT samples; the "
-                    "top few non-redundant candidates are then given within-sample identity DEGs, "
-                    "and the overlap of their top identity genes is reported. Housekeeping genes "
-                    "are excluded from the numerical overlap only."
+                    "Pairs are first proposed cheaply: regions from DIFFERENT samples whose "
+                    "average expression profiles look alike (`profile_correlation`). The most "
+                    "promising few are then checked properly by comparing their within-sample "
+                    "identity genes (from the file above) and counting how many of the top genes "
+                    "they share. Generic housekeeping genes are ignored in that count so two "
+                    "different cell types don't 'match' just because both are, say, stressed."
                 ),
                 how_to_read=(
-                    "identity_match_supported=True means the shared identity genes are enough to "
-                    "treat the pair as the same population worth comparing directly — NOT that the "
-                    "two populations are definitively identical."
+                    "`identity_match_supported = True` means the two regions share enough identity "
+                    "genes to treat them as the same cell type and compare them across samples — it "
+                    "does NOT claim the two are identical, only that comparing them is meaningful. "
+                    "`shared_top25_genes` lists the identity genes they agree on."
                 ),
                 columns={
                     "cluster_a": "First region's cluster.", "sample_a": "First region's sample.",
@@ -410,14 +437,17 @@ def _batch_diagnostic_group_doc(params: dict[str, Any]) -> ArtifactGroupDoc:
             FileDoc(
                 filename="batch_diagnostic_direct_pair_degs.csv",
                 purpose=(
-                    "SECONDARY: for each matched pair, how the two regions differ across samples, "
-                    "gene by gene. Characterizes the difference; does not outrank the within-sample "
-                    "evidence and is not proof of a technical cause."
+                    "Supporting detail: for each matched pair, exactly how the same cell type "
+                    "differs between the two samples, gene by gene. This is where you can see the "
+                    "sample-linked shift itself. It supports the picture but does not outrank the "
+                    "within-sample evidence, and — on its own — it is not proof the difference is "
+                    "technical, because comparing across samples mixes any batch effect back in."
                 ),
                 computation=(
-                    "A differential-expression test of region A's cells vs region B's cells "
-                    "directly. ALL genes are kept (stress / mitochondrial / ribosomal / ambient "
-                    "genes may be the informative ones)."
+                    "A differential-expression test of region A's cells directly against region "
+                    "B's cells. Unlike the identity file, ALL genes are kept here — stress, "
+                    "mitochondrial, ribosomal and ambient genes are often the most telling sign "
+                    "of a sample-linked (possibly technical) program, so nothing is filtered out."
                 ),
                 columns={
                     "cluster_a": "Region A cluster.", "sample_a": "Region A sample.",
@@ -436,19 +466,25 @@ def _batch_diagnostic_group_doc(params: dict[str, Any]) -> ArtifactGroupDoc:
             FileDoc(
                 filename="batch_diagnostic_design_check.csv",
                 purpose=(
-                    "Whether the sample variable can be separated from condition/donor/treatment. "
-                    "If not, technical and biological effects cannot be told apart."
+                    "The piece the genes can't supply: whether the study design lets us separate "
+                    "'which sample' from 'which biological condition' (treatment, donor, tissue). "
+                    "If every sample is one condition, a technical batch and a real biological "
+                    "difference are impossible to tell apart from the data — which is exactly the "
+                    "situation where we can't recommend integration outright."
                 ),
                 computation=(
-                    "Cross-tabulation of sample against each candidate condition column; how "
-                    "cleanly each maps to the other. Missing metadata is recorded as status "
-                    "'unknown' rather than as 'not confounded'."
+                    "We cross-tabulate the sample label against each candidate condition column in "
+                    "the metadata and measure how cleanly one maps to the other. If there is no "
+                    "such metadata, the status is recorded honestly as 'unknown' — not as "
+                    "'not confounded'."
                 ),
                 how_to_read=(
-                    "status: 'unknown' = no design metadata to test; 'confounded' = sample and "
-                    "condition are largely redundant (cannot separate technical from biology); "
-                    "'orthogonal' = a condition column exists and is not confounded (but that alone "
-                    "does not make sample-wide differences technical — donor effects can remain)."
+                    "`status = unknown` means no design metadata was available to test (the common "
+                    "case). `confounded` means sample and condition are essentially the same "
+                    "split, so technical vs. biological cannot be separated. `orthogonal` means a "
+                    "condition label exists and is not redundant with sample — helpful, but it "
+                    "still does not by itself make sample-wide differences technical, since "
+                    "per-donor biology can remain."
                 ),
                 columns={
                     "condition_key": "The obs column tested against sample (or '(none available)').",
@@ -675,6 +711,82 @@ _VERDICT_PLAIN = {
     ),
 }
 
+# A closing, plainly-worded suggestion for the user — what to actually do next.
+# Keyed on the internal recommendation enum; the enum itself is never shown.
+_SUGGESTION_PLAIN = {
+    "do_not_integrate_based_on_current_evidence": (
+        "Based on this dataset, we did not find clear evidence that batch integration "
+        "is required. It is reasonable to proceed without integrating; revisit only if "
+        "you have a specific reason to expect a technical batch effect."
+    ),
+    "cannot_determine_technical_vs_biological": (
+        "Based on the genes alone there is no clear evidence that this dataset must be "
+        "integrated. We did see sample-linked differences, but they are equally "
+        "consistent with a technical batch or with real differences between the samples, "
+        "and without design information we cannot tell which. Before integrating, confirm "
+        "whether these samples are meant to be comparable replicates — if they are, "
+        "integration is reasonable; if they are different patients or conditions, "
+        "integrating risks erasing real biology."
+    ),
+    "integration_optional_if_replicates": (
+        "There is no clear evidence forcing integration. The sample-linked differences "
+        "recur across the dataset and the condition metadata is not confounded with "
+        "sample, so integration is reasonable IF these samples are intended as comparable "
+        "replicates — otherwise it may remove real per-sample biology."
+    ),
+    "integration_supported": (
+        "The design documents a technical batch and the recurring, sample-wide "
+        "differences line up with it, so integrating these samples is reasonable here."
+    ),
+}
+
+
+def _mixing_plain(concordance: dict[str, Any] | None,
+                  entropy_mixing: dict[str, Any] | None) -> str:
+    """Plain-language paragraph on how the samples sit in the data (ARI/NMI/entropy).
+
+    This is the "where do samples separate" evidence. It is deliberately framed as
+    a necessary-but-not-sufficient signal: both a technical batch and real biology
+    push these numbers the same way, so they can locate separation but never explain
+    it. That framing is the whole reason the gene investigation exists.
+    """
+    if not concordance:
+        return (
+            "We first looked at how the samples sit in the data, but the mixing metrics "
+            "were not available for this run."
+        )
+    ari = concordance.get("ari")
+    nmi = concordance.get("nmi")
+    interp = concordance.get("interpretation", "")
+    sent = (
+        f"First, how the samples sit together in the data. {interp.capitalize()} "
+        f"(cluster-vs-sample agreement ARI = {ari}, NMI = {nmi}; 0 means samples are "
+        "fully blended across clusters, and higher values mean clusters increasingly "
+        "correspond to individual samples)."
+    )
+    if entropy_mixing and not entropy_mixing.get("skipped"):
+        ratio = entropy_mixing.get("mixing_ratio")
+        frac_seg = entropy_mixing.get("fraction_segregated_cells")
+        if ratio is not None:
+            mixed_word = (
+                "fairly well mixed across samples" if ratio >= ENTROPY_LOW_MIXING_RATIO
+                else "tending to sit next to cells from their own sample"
+            )
+            sent += (
+                f" Looking cell by cell, a typical cell's nearest neighbours were "
+                f"{mixed_word} (mixing score {ratio}, where 1 is perfectly mixed"
+            )
+            if frac_seg is not None:
+                sent += f"; {round(float(frac_seg) * 100)}% of cells sat in a same-sample pocket"
+            sent += ")."
+    sent += (
+        " These numbers only tell us WHERE samples separate, never WHY: a genuine "
+        "biological difference between samples and a technical batch effect push them "
+        "in exactly the same direction, so on their own they cannot decide whether to "
+        "correct anything. That is why the rest of the check looks directly at genes."
+    )
+    return sent
+
 
 def _deterministic_interpretation(
     investigation: dict[str, Any],
@@ -682,12 +794,21 @@ def _deterministic_interpretation(
     design_interpretation: str,
     verdict: dict[str, str],
     batch_key: str,
+    *,
+    concordance: dict[str, Any] | None = None,
+    entropy_mixing: dict[str, Any] | None = None,
 ) -> str:
-    """Readable prose summary of the results, built from the structured evidence.
+    """Readable, human prose summary of the results, built from the structured evidence.
 
     Written into the README so the artifact reads on its own; the model may still
-    expand it. No hardcoded biology — every gene name comes from the results.
+    expand it. No hardcoded biology — every gene name comes from the results. It walks
+    the reader through what was done in order (mixing first, then the gene work), names
+    the clusters/samples/genes involved, points to the file that holds each piece of
+    evidence, and ends with a plain bottom line and a concrete suggestion. Internal
+    enum values are never shown — only their plain-language translations.
     """
+    from .batch_gene_investigation import DESIGN_PLAIN, GENE_EVIDENCE_PLAIN
+
     pairs = investigation.get("selected_pairs") or []
     direct_by = {
         (d["cluster_a"], d["sample_a"], d["cluster_b"], d["sample_b"]): d
@@ -697,11 +818,26 @@ def _deterministic_interpretation(
 
     paras: list[str] = []
     paras.append(
-        f"This diagnostic examined {n_regions} sample-enriched cluster region(s) and "
-        f"investigated {len(pairs)} cross-sample population pair(s) whose mean-expression "
-        f"profiles looked alike. For each pair it compared the cluster against the rest of "
-        f"its own sample (holding {batch_key} constant) to describe the population, then "
-        f"compared the two matched regions directly."
+        "This check asks one question: do the differences between samples look like a "
+        "technical batch effect that should be corrected, or like real biology that "
+        "should be left alone? It answers in two stages — a quick look at how the "
+        "samples sit in the data, then a gene-level investigation."
+    )
+
+    # Stage 1 — where samples separate (ARI/NMI/entropy), in plain words.
+    paras.append(_mixing_plain(concordance, entropy_mixing))
+
+    # Stage 2 — the gene investigation, with file pointers.
+    paras.append(
+        f"Next, the genes. Looking at each cell type in each sample, the diagnostic found "
+        f"{n_regions} cluster-and-sample regions that held far more of one sample than its "
+        f"size would predict (listed in `batch_diagnostic_sample_enriched_regions.csv`) and "
+        f"then examined {len(pairs)} cross-sample pair(s) that looked like the same cell type "
+        f"(`batch_diagnostic_population_pairs.csv`). For each pair it identified the cell type "
+        f"from within a single sample — comparing the cluster against the rest of that same "
+        f"sample so {batch_key} is held constant (`batch_diagnostic_within_sample_degs.csv`) — "
+        f"and then compared the two samples' versions of it head to head "
+        f"(`batch_diagnostic_direct_pair_degs.csv`)."
     )
 
     for p in pairs:
@@ -711,15 +847,16 @@ def _deterministic_interpretation(
         sent = (
             f"Cluster {p['cluster_a']} in {p['sample_a']} and cluster {p['cluster_b']} in "
             f"{p['sample_b']} share {p.get('n_shared_top25', 0)} of their top identity genes "
-            f"({shared}), so they appear to be the same population present in both samples."
+            f"({shared}), so they look like the same cell type present in both samples."
         )
         if d is not None:
             hi_a = ", ".join(d["higher_in_a"][:6]) or "n/a"
             hi_b = ", ".join(d["higher_in_b"][:6]) or "n/a"
             sent += (
-                f" Comparing them directly, {d['sample_a']} is higher for {hi_a}, while "
-                f"{d['sample_b']} is higher for {hi_b}. This describes how the regions differ; "
-                f"it does not by itself show the difference is technical."
+                f" Comparing that cell type across the two samples directly, {d['sample_a']} "
+                f"is higher for {hi_a}, while {d['sample_b']} is higher for {hi_b}. This "
+                "describes how the two versions differ; it does not, by itself, show the "
+                "difference is technical rather than real."
             )
         paras.append(sent)
 
@@ -729,38 +866,40 @@ def _deterministic_interpretation(
         for r in recurrent:
             by_group.setdefault(r["associated_batch_group"], []).append(r["gene"])
         bits = [
-            f"a {group}-associated program ({', '.join(gs[:8])})"
+            f"in {group} ({', '.join(gs[:8])})"
             for group, gs in by_group.items()
         ]
         paras.append(
-            "The same sample-associated shift recurs across more than one population: "
-            + "; ".join(bits)
-            + ". A program that recurs across populations points to a sample-wide effect, "
-            "but sample-wide is not the same as technical — a real systemic biological "
-            "difference would look the same."
+            "Crucially, the same sample-linked shift shows up in more than one cell type — "
+            "the same genes are consistently higher " + "; ".join(bits)
+            + ". A shift that repeats across several cell types is a dataset-wide, "
+            "sample-linked pattern rather than a one-off. But dataset-wide still is not the "
+            "same as technical: a real, systemic biological difference between samples (a "
+            "different patient, treatment, or tissue state) would produce exactly this "
+            "picture too."
         )
     else:
         paras.append(
-            "No sample-associated program recurred across more than one population, so any "
-            "differences appear localized rather than sample-wide."
+            "This sample-linked difference did not repeat across other cell types, so it "
+            "looks localized to a few populations rather than being a dataset-wide pattern."
         )
 
-    design_plain = {
-        "unknown": "no experimental-design metadata is available to test whether sample is "
-                   "confounded with a biological condition",
-        "confounded_with_biology": "the sample variable is confounded with a biological "
-                                   "condition, so technical and biological effects cannot be separated",
-        "orthogonal_but_not_known_technical": "a condition column exists and is not confounded "
-                                              "with sample, but that alone does not make the differences technical",
-        "documented_technical_batch": "the design documents this as a technical batch variable "
-                                      "separable from biological condition",
-    }.get(design_interpretation, design_interpretation)
+    # Stage 3 — design + bottom line + concrete suggestion, all in plain words.
+    design_plain = DESIGN_PLAIN.get(design_interpretation, design_interpretation)
+    what_genes = GENE_EVIDENCE_PLAIN.get(gene_evidence, gene_evidence)
     paras.append(
-        f"On the experimental design, {design_plain}. Taken together, "
-        f"{_VERDICT_PLAIN.get(verdict['recommendation'], verdict['recommendation'])}. "
-        "Note that the q-values here rank cell-level separation and are not replicate-level "
-        "evidence, because the cells are not independent replicates; weigh the expression "
-        "effects, percent-expressed, recurrence, and study design instead."
+        f"On the study design, {design_plain}. In short: {what_genes}; and "
+        f"{_VERDICT_PLAIN.get(verdict['recommendation'], verdict['recommendation'])}."
+    )
+    paras.append(
+        "**What we suggest.** "
+        + _SUGGESTION_PLAIN.get(verdict["recommendation"], verdict["reason"])
+    )
+    paras.append(
+        "One caveat on reading the tables: the q-values rank how cleanly cells separate, "
+        "not how reproducible a difference is across samples — cells are not independent "
+        "replicates. Weigh the expression effect, the percent of cells expressing each gene, "
+        "whether the pattern recurs, and the study design, rather than the q-values alone."
     )
     return "\n\n".join(paras)
 
@@ -889,7 +1028,8 @@ def diagnose_batch_effect(
     _fill_readme_interpretation(
         artifacts,
         _deterministic_interpretation(
-            investigation, gene_evidence, design_interpretation, verdict, batch_key
+            investigation, gene_evidence, design_interpretation, verdict, batch_key,
+            concordance=concordance, entropy_mixing=entropy_mixing,
         ),
     )
 

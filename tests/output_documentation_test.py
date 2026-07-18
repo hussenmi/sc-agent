@@ -70,9 +70,11 @@ def test_analysis_record_has_intro_and_legends():
     assert "**resolution**" in out
     # Per-table column guides
     assert out.count("_Column guide:_") == 2  # QC table + annotation table
-    assert "**Tier**" in out
-    assert "**Confidence**" in out
-    assert "**Severity**" in out
+    # Annotation table legend: independent evidence columns (Tier/Confidence removed)
+    assert "**Scimilarity prediction**" in out
+    assert "**Celltypist prediction**" in out
+    assert "**DEG prediction**" in out
+    assert "**Severity**" in out  # QC table legend
 
 
 def test_analysis_record_empty_when_no_state():

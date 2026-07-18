@@ -843,14 +843,42 @@ _QC_TABLE_LEGEND: List[tuple] = [
 
 # Legend rendered beneath the per-cluster annotation table.
 _ANNOTATION_TABLE_LEGEND: List[tuple] = [
-    ("Label", "The cell-type name assigned to the cluster."),
-    ("Confidence", "How strong the evidence is (**high** / **medium** / **low**). Weak single-source support, broad-only external matches, and QC caveats automatically cap it."),
-    ("Tier", "Which evidence combination drove the call. Reads as a recipe: *reference_consensus* = the reference tools (CellTypist, Scimilarity) agreed; *reference_partial* = only one agreed; *cytopus* / *panglaodb* = an external marker database supported it; *deg_primary* = driven mainly by this cluster's own differentially-expressed genes; *_plus_deg* = additionally backed by those DE genes."),
+    ("Label", "The final cell-type name assigned to the cluster."),
+    ("Scimilarity prediction", "The cell type Scimilarity's embedding transfer assigned this cluster (the tissue-aware reference)."),
+    ("Celltypist prediction", "The cell type the chosen CellTypist model assigned this cluster (majority-voted over the cluster)."),
     ("Supporting genes", "The marker genes (from this cluster's differential expression) that justify the label."),
-    ("PanglaoDB", "The external marker-database label used, and whether PanglaoDB was actually queried for this cluster ('not queried' means the call did not need database adjudication)."),
-    ("Competing", "Other cell types the reference tools also proposed — the alternatives that were weighed and set aside."),
-    ("Reasoning", "The narrative justification the analysis wrote for this cluster."),
+    ("DEG prediction", "The label read independently from this cluster's own top differentially-expressed genes."),
+    ("Reasoning", "The narrative justification the analysis wrote for this cluster — how the predictions and DEGs were reconciled into the final label."),
 ]
+
+
+def _split_reference_predictions(ev: Dict[str, Any]) -> tuple:
+    """(scimilarity_label, celltypist_label) from a per-cluster evidence dict.
+
+    ``reference_annotation_support`` is ``{annotation_key: top_label}``; pull the
+    per-source prediction so Scimilarity and CellTypist each get their own report
+    column. Prefer the representative / majority-voted key over the raw per-cell one.
+    ``"not run"`` when a source produced no label for the cluster.
+    """
+    support = ev.get("reference_annotation_support") if isinstance(ev, dict) else None
+    if not isinstance(support, dict):
+        return "not run", "not run"
+
+    def _pick(primary_sub: str, fallback_sub: str):
+        primary = fallback = None
+        for key, label in support.items():
+            kl = str(key).lower()
+            if not label:
+                continue
+            if primary_sub in kl:
+                primary = label
+            elif fallback_sub in kl:
+                fallback = label
+        return primary or fallback
+
+    scim = _pick("scimilarity_representative", "scimilarity")
+    ctyp = _pick("celltypist_majority", "celltypist")
+    return (scim or "not run", ctyp or "not run")
 
 
 def _render_glossary(pairs: List[tuple]) -> List[str]:
@@ -1145,24 +1173,20 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
         if isinstance(per_cluster, dict) and per_cluster:
             lines.append("")
             lines.append(
-                "| Cluster | Label | Confidence | Tier | Supporting genes | "
-                "PanglaoDB | Competing | Reasoning |"
+                "| Cluster | Label | Scimilarity prediction | Celltypist prediction | "
+                "Supporting genes | DEG prediction | Reasoning |"
             )
-            lines.append("|---|---|---|---|---|---|---|---|")
+            lines.append("|---|---|---|---|---|---|---|")
             for cid, ev in per_cluster.items():
                 if not isinstance(ev, dict):
                     continue
-                pdb = (
-                    f"{ev.get('panglaodb_label_used') or '—'} "
-                    f"({'queried' if ev.get('panglaodb_queried') else 'not queried'})"
-                )
+                scim_pred, ctyp_pred = _split_reference_predictions(ev)
                 lines.append(
                     f"| {cid} | {_report_fmt(ev.get('label'))} | "
-                    f"{_report_fmt(ev.get('confidence'))} | "
-                    f"{_report_fmt(ev.get('validation_tier'))} | "
+                    f"{_report_fmt(scim_pred)} | "
+                    f"{_report_fmt(ctyp_pred)} | "
                     f"{_report_fmt(ev.get('supporting_genes'))} | "
-                    f"{_report_fmt(pdb)} | "
-                    f"{_report_fmt(ev.get('competing_labels_considered'))} | "
+                    f"{_report_fmt(ev.get('deg_derived_label') or '—')} | "
                     f"{_report_fmt(ev.get('reasoning'), limit=300)} |"
                 )
             lines.append("")
@@ -1340,6 +1364,51 @@ def _suggested_umap_overlays(adata: Any) -> List[str]:
     return out
 
 
+# obs metrics that are right-skewed magnitude counts spanning orders of
+# magnitude. A linear colormap collapses almost every cell into the darkest bin
+# while a few ultra-high-count cells own the whole scale, so the embedding reads
+# as uniformly dark. Painting these on a LOG color scale is the only way the
+# spatial gradient shows. Expression (gene) colorings are excluded — adata.X is
+# already log-normalized for plotting — as are bounded fractions (pct_*).
+_LOG_COLOR_OBS_KEYS = {
+    "total_counts",
+    "n_counts",
+    "n_genes_by_counts",
+    "n_genes",
+}
+
+
+def _log_color_norm(adata: Any, key: Any):
+    """Return ``(norm, title)`` for coloring ``key`` — a matplotlib LogNorm for a
+    right-skewed count metric, else ``(None, None)`` for linear coloring.
+
+    Shared by every plot path (per-cell overlays, generate_figure) so a UMAP or
+    any color map of library-size counts uses logged values consistently rather
+    than raw counts. LogNorm requires strictly-positive data, so a column with a
+    zero/negative value falls back to linear. Keeps the colorbar in the metric's
+    native units (log-spaced ticks), unlike pre-logging the obs column.
+    """
+    try:
+        if key not in _LOG_COLOR_OBS_KEYS:
+            return None, None
+        if adata is None or key not in getattr(adata, "obs", {}):
+            return None, None
+        import pandas as _pd
+
+        col = adata.obs[key]
+        if not _pd.api.types.is_numeric_dtype(col):
+            return None, None
+        vmin = float(col.min())
+        vmax = float(col.max())
+        if vmin <= 0 or not (vmax > vmin):
+            return None, None
+        from matplotlib.colors import LogNorm as _LogNorm
+
+        return _LogNorm(vmin=vmin, vmax=vmax), f"{key} (log scale)"
+    except Exception:
+        return None, None
+
+
 def _plot_umap_overlays(adata: Any, keys, figure_dir: Any, run_manager=None,
                         prefix: str = "umap") -> List[str]:
     """Paint each per-cell metric in ``keys`` on the UMAP and save one figure each.
@@ -1351,6 +1420,13 @@ def _plot_umap_overlays(adata: Any, keys, figure_dir: Any, run_manager=None,
     rather than relying on the model to plot it. No-op without a UMAP. Robust: a
     failed panel is skipped, never breaks the caller. Returns the saved file paths;
     the caller (inside process_tool_call) wraps them into artifact payloads.
+
+    Library-size counts (``total_counts``, ``n_genes_by_counts``) span orders of
+    magnitude and are heavily right-skewed, so a linear colormap collapses almost
+    every cell into the darkest bin while a handful of ultra-high-count cells own
+    the whole scale — the map reads as uniformly dark and shows nothing. These
+    magnitude metrics are painted on a log color scale so the spatial gradient is
+    actually visible; all other metrics stay linear.
     """
     saved: List[str] = []
     if adata is None or "X_umap" not in getattr(adata, "obsm", {}):
@@ -1373,7 +1449,21 @@ def _plot_umap_overlays(adata: Any, keys, figure_dir: Any, run_manager=None,
         try:
             safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key))
             out_path = unique_output_path(str(fig_dir / f"{prefix}_{safe}.png"))
-            ax = _sc.pl.umap(adata, color=key, show=False)
+            _umap_kwargs: Dict[str, Any] = {"color": key, "show": False}
+            # Right-skewed magnitude counts: paint on a log color scale (shared with
+            # generate_figure via _log_color_norm) so raw counts never wash flat.
+            _norm, _log_title = _log_color_norm(adata, key)
+            if _norm is not None:
+                _umap_kwargs["norm"] = _norm
+                _umap_kwargs["title"] = _log_title
+            try:
+                ax = _sc.pl.umap(adata, **_umap_kwargs)
+            except TypeError:
+                # Older scanpy without a `norm` kwarg: fall back to a linear paint
+                # rather than failing the panel outright.
+                _umap_kwargs.pop("norm", None)
+                _umap_kwargs.pop("title", None)
+                ax = _sc.pl.umap(adata, **_umap_kwargs)
             fig = ax.figure if hasattr(ax, "figure") else _plt.gcf()
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
             _plt.close(fig)
@@ -4629,6 +4719,47 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
             },
         })
 
+    tools.append({
+        "name": "record_cluster_qc_visual_review",
+        "description": (
+            "Record your VISUAL read of the per-cluster QC box plot that run_cluster_qc "
+            "produced (qc_metrics_figure). The box plot shows the full per-cluster "
+            "distribution of every metric at once — library size, genes/cell, %MT, "
+            "%ribosomal, doublet score — so a suspicious cluster is often obvious to the "
+            "eye even when it crossed no numeric threshold. LOOK at the figure and report "
+            "any cluster that stands out as an outlier on one or more panels, especially a "
+            "cluster that is worst-in-class or that stacks several concerns at once (e.g. "
+            "lowest library AND lowest genes AND highest %MT — a classic dying/stressed "
+            "population). Do not just re-state the numeric flags; add what the PLOT shows. "
+            "Clusters you list are merged into the review set (structure QC + the cleanup "
+            "decision will consider them) and persisted so annotation can connect a "
+            "cluster's identity back to its QC concern. Call this once per run_cluster_qc "
+            "pass, after you have seen the box plot. If nothing looks suspicious, call it "
+            "with an empty suspicious_clusters list and say so in overall_note."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cluster_key": {"type": "string", "description": "The clustering the box plot is for (e.g. 'leiden'). Defaults to the active clustering."},
+                "suspicious_clusters": {
+                    "type": "array",
+                    "description": "Clusters that look like outliers/low-quality on the box plot. Empty if none stand out.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "cluster": {"type": "string", "description": "Cluster id as shown on the box-plot x-axis."},
+                            "concern": {"type": "string", "description": "What the plot shows for this cluster, in plain terms (e.g. 'lowest library and genes of all clusters with the highest MT% ~17%')."},
+                            "panels": {"type": "array", "items": {"type": "string"}, "description": "Which panels it stands out on, e.g. ['library','genes','mt']."},
+                        },
+                        "required": ["cluster"],
+                    },
+                },
+                "overall_note": {"type": "string", "description": "One or two sentences on what the box plot shows overall (spread, any patterns, or that all clusters look comparable)."},
+            },
+            "required": [],
+        },
+    })
+
     return tools
 
 
@@ -4872,8 +5003,23 @@ def process_tool_call(
     run_manager=None,
     sandbox=None,
 ) -> tuple:
-    """
-    Process a tool call and return structured JSON result.
+    """Dispatch a tool call, then guarantee the returned AnnData is host-resident.
+
+    Thin wrapper over :func:`_process_tool_call_impl`. GPU compute steps round-trip
+    data to the host on exit, but a leaked ``on_gpu`` context — or one that saw data
+    already on the device and declined ownership of the round-trip — can leave cupy
+    arrays on the object (``.X``, the neighbor graph, embeddings). The very next CPU
+    consumer then fails cryptically: scanpy DEG, scipy structure-QC, h5ad writes, the
+    run_code sandbox. Worse, ``on_gpu``'s re-entrancy makes it a *cascade* — once one
+    tool leaks, every later ``on_gpu`` thinks someone else owns the transfer and never
+    moves data back.
+
+    Enforcing CPU residency at THIS boundary — the single entry point every tool goes
+    through, including internal tool→tool chaining — breaks that cascade: each tool
+    receives a CPU AnnData, so its own ``on_gpu`` correctly owns and undoes its
+    transfer. The check is a cheap no-op on the healthy path (nothing is on the GPU)
+    and only does work — plus a warning that flags the upstream leak — when it must.
+    See :func:`scagent.core.gpu.ensure_cpu`.
 
     Parameters
     ----------
@@ -4887,6 +5033,36 @@ def process_tool_call(
     -------
     tuple
         (json_result_string, updated_adata)
+    """
+    result_json, out_adata = _process_tool_call_impl(
+        tool_name,
+        tool_input,
+        adata,
+        world_state=world_state,
+        run_manager=run_manager,
+        sandbox=sandbox,
+    )
+    try:
+        from ..core.gpu import ensure_cpu
+
+        ensure_cpu(out_adata, context=f"after {tool_name}")
+    except Exception as _cpu_exc:  # never let cleanup mask the tool's real result
+        logger.warning("ensure_cpu failed after %s: %s", tool_name, _cpu_exc)
+    return result_json, out_adata
+
+
+def _process_tool_call_impl(
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    adata=None,
+    world_state=None,
+    run_manager=None,
+    sandbox=None,
+) -> tuple:
+    """Process a tool call and return ``(json_result_string, updated_adata)``.
+
+    The real dispatcher. Wrapped by :func:`process_tool_call`, which enforces CPU
+    residency on the returned AnnData — always call the wrapper, not this directly.
     """
     import numpy as np
 
@@ -5714,7 +5890,20 @@ def process_tool_call(
                 plotfn(adata_obj, color=color_by, legend_loc="none", **kwargs)
                 added_outside_legend = _add_outside_categorical_legend(ax, adata_obj, color_by)
             else:
-                plotfn(adata_obj, color=color_by, **kwargs)
+                # Continuous coloring: a right-skewed count metric (total_counts,
+                # n_genes_by_counts) must use a LOG color scale or the map washes
+                # flat — same rule and helper as the per-cell overlays.
+                _c_norm, _c_title = _log_color_norm(adata_obj, color_by)
+                if _c_norm is not None:
+                    try:
+                        plotfn(adata_obj, color=color_by, norm=_c_norm, **kwargs)
+                        # A count metric is never a clustering key, so the
+                        # resolution-title block below won't overwrite this.
+                        ax.set_title(_c_title)
+                    except TypeError:
+                        plotfn(adata_obj, color=color_by, **kwargs)
+                else:
+                    plotfn(adata_obj, color=color_by, **kwargs)
         elif plot_type == "violin":
             sc.pl.violin(adata_obj, keys=genes or [color_by], groupby=color_by, ax=ax, show=False)
         elif plot_type == "dotplot" and genes:
@@ -5799,10 +5988,17 @@ def process_tool_call(
             unique_clusters = sorted(labels.unique())
 
         n_clusters = len(unique_clusters)
-        if n_clusters < 2 or n_clusters > 50:
+        # The grid is MOST useful precisely when there are many clusters: a single
+        # overlaid UMAP with 60+ near-identical colors is unreadable, so cap only at
+        # the point where individual panels themselves become too small to inform.
+        # (Fine-resolution clusterings — the ladder starts at Leiden 2.0 — routinely
+        # yield 60+ clusters, which the old 50 cap silently dropped.)
+        if n_clusters < 2 or n_clusters > 150:
             return None
 
-        n_cols = min(5, n_clusters)
+        # Widen the grid as the cluster count grows so a large partition stays a
+        # reasonably-proportioned figure instead of a very tall 5-wide strip.
+        n_cols = 6 if n_clusters > 30 else min(5, n_clusters)
         n_rows = int(_np.ceil(n_clusters / n_cols))
 
         # Palette: tab20 → tab20b → tab20c, cycling every 20
@@ -7961,6 +8157,62 @@ def process_tool_call(
                 adata,
                 dataset_changed=False,
                 summary="Recorded inspection interpretation (column roles + species).",
+            )
+
+        elif tool_name == "record_cluster_qc_visual_review":
+            if world_state is None:
+                return _finalize_result(
+                    {
+                        "status": "error",
+                        "tool": "record_cluster_qc_visual_review",
+                        "message": "No world_state available to record the visual review.",
+                    },
+                    adata,
+                    dataset_changed=False,
+                    summary="record_cluster_qc_visual_review failed: no world_state.",
+                )
+            outcome = world_state.record_cluster_qc_visual_review(tool_input, adata=adata)
+            if outcome.get("status") != "ok":
+                return _finalize_result(
+                    {
+                        "status": "error",
+                        "tool": "record_cluster_qc_visual_review",
+                        "message": outcome.get("message", "Could not record the visual review."),
+                    },
+                    adata,
+                    dataset_changed=False,
+                    summary="record_cluster_qc_visual_review rejected.",
+                )
+            newly = outcome.get("newly_flagged_for_review", [])
+            n_susp = len(outcome["visual_review"].get("suspicious_clusters", []))
+            if n_susp:
+                msg = (
+                    f"Recorded a visual review flagging {n_susp} cluster(s). "
+                    + (
+                        f"Newly added to the review set: {', '.join(newly)}. "
+                        if newly else ""
+                    )
+                    + "Structure QC and the cleanup decision will consider these; the concern "
+                    "is persisted to adata.uns so annotation can connect a cluster's identity "
+                    "back to its QC signal."
+                )
+            else:
+                msg = (
+                    "Recorded a visual review: no clusters stood out on the box plot beyond "
+                    "the numeric assessment."
+                )
+            return _finalize_result(
+                {
+                    "status": "ok",
+                    "tool": "record_cluster_qc_visual_review",
+                    "visual_review": outcome["visual_review"],
+                    "newly_flagged_for_review": newly,
+                    "warnings": outcome.get("warnings", []),
+                    "message": msg,
+                },
+                adata,
+                dataset_changed=False,
+                summary=f"Recorded per-cluster QC box-plot visual review ({n_susp} flagged).",
             )
 
         elif tool_name == "inspect_session":
@@ -11814,9 +12066,61 @@ def process_tool_call(
                     )
                     if _pl:
                         artifacts_created.append(_pl)
+                    # The overlaid UMAP is unreadable when the uncorrected clustering
+                    # has dozens of (often sample-segregated) clusters — emit the
+                    # per-cluster highlight grid next to it so each is locatable.
+                    try:
+                        _grid = _generate_cluster_highlight_grid(
+                            adata, cluster_key, cluster_umap_path or str(_pre_dir / f"umap_{_safe_ck}{_res_tag}_clusters.png")
+                        )
+                        if _grid and run_manager is not None:
+                            run_manager.add_output(_grid)
+                        _gpl = _artifact_payload(
+                            _grid,
+                            role="figure",
+                            metadata={"kind": "pre_integration_cluster_umap_grid", "cluster_key": cluster_key},
+                        )
+                        if _gpl:
+                            artifacts_created.append(_gpl)
+                        diagnostic["cluster_umap_grid_figure"] = _grid
+                    except Exception:
+                        pass
                 except Exception:
                     cluster_umap_path = None
             diagnostic["cluster_umap_figure"] = cluster_umap_path
+            # Paint the pre-integration UMAP colored by the batch key itself. This is
+            # THE canonical batch-effect view — it shows directly whether samples/donors
+            # segregate in the embedding, which the entropy overlay only summarizes as a
+            # scalar. batch_key is categorical, so _suggested_umap_overlays (numeric-only)
+            # never auto-paints it; generate it here so it always exists rather than
+            # relying on the model to remember (run_2026_07_15_121111 never made one).
+            batch_umap_path = None
+            if "X_umap" in adata.obsm and batch_key in adata.obs.columns:
+                _safe_bk = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(batch_key))
+                _pre_dir = (
+                    Path(run_manager.run_dir) if run_manager is not None else Path(".")
+                ) / "figures" / "pre_integration"
+                try:
+                    _bu = _render_figure(
+                        adata,
+                        plot_type="umap",
+                        output_path=str(_pre_dir / f"umap_{_safe_bk}.png"),
+                        color_by=batch_key,
+                        include_image=False,
+                    )
+                    batch_umap_path = _bu.get("output_path")
+                    if batch_umap_path and run_manager is not None:
+                        run_manager.add_output(batch_umap_path)
+                    _pl = _artifact_payload(
+                        batch_umap_path,
+                        role="figure",
+                        metadata={"kind": "pre_integration_batch_umap", "batch_key": batch_key},
+                    )
+                    if _pl:
+                        artifacts_created.append(_pl)
+                except Exception:
+                    batch_umap_path = None
+            diagnostic["batch_umap_figure"] = batch_umap_path
             diagnostic["artifacts_created"] = artifacts_created
             # Point the model at the auto-written README so it records the
             # dataset-specific interpretation via annotate_artifact_group.
@@ -13099,6 +13403,48 @@ def process_tool_call(
             global_lib = float(adata.obs["total_counts"].median())
             global_genes = float(adata.obs["n_genes_by_counts"].median())
 
+            # Holistic, distribution-relative flagging. A fixed per-metric cutoff
+            # (MT>25%, lib<0.5x median, ...) misses the cluster that is the WORST on
+            # several metrics at once without crossing any single hard line — the
+            # whole reason we cluster before QC. run_2026_07_15_121111 cluster 36 was
+            # the lowest library, lowest genes, and highest MT (~17%) of all 61
+            # clusters, yet slipped under every absolute gate and went unflagged.
+            #
+            # So we also score each cluster by WHERE IT SITS in the distribution of
+            # clusters for every metric — robust-z = 0.6745*(x - median)/MAD — and
+            # combine the evidence: a cluster that is an outlier in the bad direction
+            # on >=2 metrics is routed to review even if no metric is individually
+            # extreme. This is statistics over the clusters, scale-free, not a baked
+            # biological threshold; it only proposes REVIEW (never auto-removal) so
+            # the model / structure QC adjudicate.
+            def _robust_stats(series):
+                vals = series.astype(float)
+                med = float(vals.median())
+                mad = float((vals - med).abs().median())
+                return med, mad
+
+            def _rz(x, med, mad):
+                return 0.6745 * (x - med) / mad if mad > 0 else 0.0
+
+            _lib_med, _lib_mad = _robust_stats(cluster_qc["mean_lib_size"])
+            _genes_med, _genes_mad = _robust_stats(cluster_qc["mean_n_genes"])
+            _mt_med, _mt_mad = _robust_stats(cluster_qc["mean_mt"])
+            _ribo_med = _ribo_mad = 0.0
+            if "mean_ribo" in cluster_qc.columns:
+                _ribo_med, _ribo_mad = _robust_stats(cluster_qc["mean_ribo"])
+            _dbl_med = _dbl_mad = 0.0
+            if "mean_doublet" in cluster_qc.columns:
+                _dbl_med, _dbl_mad = _robust_stats(cluster_qc["mean_doublet"])
+
+            # A metric is "concerning" only when the cluster is BOTH a distribution
+            # outlier (robust-z past the concern threshold, in the bad direction) AND
+            # meaningfully off the dataset's own level (a multiple of the median). The
+            # second guard keeps a uniformly-clean dataset from flagging its merely
+            # least-good cluster. _Z_STRONG marks a single-metric extreme worth review
+            # on its own.
+            _Z_CONCERN = 2.5
+            _Z_STRONG = 3.5
+
             cluster_decisions = {}
             proposed_removal = []
             ambiguous = []
@@ -13113,28 +13459,76 @@ def process_tool_call(
                 has_ribo_metric = "mean_ribo" in row.index
                 mean_ribo = float(row.get("mean_ribo", 0.0))
 
+                # Absolute hard gates (unchanged) — the "obviously dying" lines.
                 lib_low = mean_lib < low_lib_frac * global_lib
                 genes_low = mean_genes < low_genes_frac * global_genes
                 mt_high = mean_mt > mt_threshold
                 doublet_high = mean_doublet > doublet_threshold and "mean_doublet" in row.index
                 high_library = mean_lib > 1.5 * global_lib
-                # Elevated ribosomal fraction flags low-complexity / stressed cells.
-                # Alone it is suggestive, not definitive, so it routes to structure-QC
-                # review rather than auto-removal.
                 ribo_high = has_ribo_metric and mean_ribo > ribo_threshold
+
+                # Where the cluster sits in the per-cluster distribution of each metric.
+                z_lib = _rz(mean_lib, _lib_med, _lib_mad)
+                z_genes = _rz(mean_genes, _genes_med, _genes_mad)
+                z_mt = _rz(mean_mt, _mt_med, _mt_mad)
+                z_ribo = _rz(mean_ribo, _ribo_med, _ribo_mad) if has_ribo_metric else 0.0
+                _has_dbl = "mean_doublet" in row.index
+                z_dbl = _rz(mean_doublet, _dbl_med, _dbl_mad) if _has_dbl else 0.0
+
+                # Distribution-relative "concerning" signals (outlier in the bad
+                # direction AND off the dataset's own level). These catch the cluster
+                # that is consistently worst-in-class without tripping any hard gate.
+                lib_concern = z_lib < -_Z_CONCERN and mean_lib <= 0.66 * global_lib
+                genes_concern = z_genes < -_Z_CONCERN and mean_genes <= 0.66 * global_genes
+                mt_concern = z_mt > _Z_CONCERN and mean_mt >= 1.5 * _mt_med
+                ribo_concern = (
+                    has_ribo_metric and z_ribo > _Z_CONCERN and mean_ribo >= 1.5 * _ribo_med
+                )
+                dbl_concern = ("mean_doublet" in row.index) and (
+                    doublet_high or z_dbl > _Z_STRONG
+                )
+                concerning = [
+                    name for name, flag in (
+                        ("low_library", lib_concern),
+                        ("low_genes", genes_concern),
+                        ("high_mt", mt_concern),
+                        ("high_ribo", ribo_concern),
+                        ("high_doublet", dbl_concern),
+                    ) if flag
+                ]
+                n_concern = len(concerning)
+                # A single metric extreme enough to warrant review on its own.
+                mt_outlier = not mt_high and z_mt > _Z_STRONG and mean_mt >= 2.0 * _mt_med
 
                 evidence = {
                     "low_library": bool(lib_low),
                     "low_genes": bool(genes_low),
                     "high_mt": bool(mt_high),
+                    "mt_outlier": bool(mt_outlier),
                     "high_ribo": bool(ribo_high),
                     "high_doublet_score": bool(doublet_high),
                     "high_library": bool(high_library),
+                    "concerning_metrics": concerning,
+                    "n_concerning_metrics": n_concern,
                     "mean_mt_pct": round(mean_mt, 2),
+                    "robust_z": {
+                        "library": round(z_lib, 2),
+                        "genes": round(z_genes, 2),
+                        "mt": round(z_mt, 2),
+                        "ribo": round(z_ribo, 2) if has_ribo_metric else None,
+                        "doublet": round(z_dbl, 2) if "mean_doublet" in row.index else None,
+                    },
                     "mean_ribo_pct": round(mean_ribo, 2) if has_ribo_metric else None,
                     "mean_doublet_score": round(mean_doublet, 3) if "mean_doublet" in row.index else None,
                     "mean_library_fraction_of_global_median": round(mean_lib / global_lib, 2) if global_lib else None,
                     "mean_genes_fraction_of_global_median": round(mean_genes / global_genes, 2) if global_genes else None,
+                }
+                _concern_label = {
+                    "low_library": "low library size",
+                    "low_genes": "few detected genes",
+                    "high_mt": "elevated MT%",
+                    "high_ribo": "elevated ribosomal%",
+                    "high_doublet": "elevated doublet score",
                 }
                 reasons = []
                 if lib_low:
@@ -13147,6 +13541,20 @@ def process_tool_call(
                     )
                 if mt_high:
                     reasons.append(f"mean MT% is above {mt_threshold:g}%")
+                if n_concern >= 2:
+                    reasons.append(
+                        "outlier vs the per-cluster distribution on "
+                        f"{n_concern} metrics jointly ("
+                        + ", ".join(_concern_label[c] for c in concerning)
+                        + ") — consistent with a low-quality/stressed population even though "
+                        "no single metric crosses its hard threshold"
+                    )
+                elif mt_outlier:
+                    reasons.append(
+                        f"mean MT% ({mean_mt:.1f}%) is a strong upper outlier vs the "
+                        f"per-cluster distribution (median {_mt_med:.1f}%, robust-z "
+                        f"{z_mt:.1f}) — likely a stressed/dying population"
+                    )
                 if ribo_high:
                     reasons.append(f"mean ribosomal% is above {ribo_threshold:g}%")
                 if doublet_high:
@@ -13158,10 +13566,6 @@ def process_tool_call(
                     recommended_action = "propose_removal"
                     severity = "obvious"
                     proposed_removal.append(str(cluster))
-                elif mt_high and not lib_low:
-                    recommended_action = "review"
-                    severity = "ambiguous"
-                    ambiguous.append(str(cluster))
                 elif doublet_high and high_library:
                     recommended_action = "propose_removal"
                     severity = "obvious"
@@ -13170,7 +13574,20 @@ def process_tool_call(
                     recommended_action = "propose_removal"
                     severity = "obvious"
                     proposed_removal.append(str(cluster))
-                elif ribo_high:
+                elif n_concern >= 2:
+                    # Holistic multi-metric outlier — flag for review, do not auto-remove.
+                    recommended_action = "review"
+                    severity = "ambiguous"
+                    ambiguous.append(str(cluster))
+                elif mt_high and not lib_low:
+                    recommended_action = "review"
+                    severity = "ambiguous"
+                    ambiguous.append(str(cluster))
+                elif mt_outlier:
+                    recommended_action = "review"
+                    severity = "ambiguous"
+                    ambiguous.append(str(cluster))
+                elif ribo_high or ribo_concern:
                     recommended_action = "review"
                     severity = "ambiguous"
                     ambiguous.append(str(cluster))
@@ -13226,6 +13643,7 @@ def process_tool_call(
             # with a pass number so re-runs on the same key don't overwrite.
             qc_metrics_figure = None
             cluster_umap_figure = None
+            cluster_grid_figure = None
             try:
                 safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(cluster_key))
                 if run_manager is not None:
@@ -13292,6 +13710,18 @@ def process_tool_call(
                         cluster_umap_figure = _umap_res.get("output_path")
                         if cluster_umap_figure and run_manager is not None:
                             run_manager.add_output(cluster_umap_figure)
+                        # A single overlaid UMAP with dozens of clusters is
+                        # unreadable — emit the per-cluster highlight grid alongside
+                        # it so each cluster is locatable. Keyed off the same file so
+                        # the grid lands next to the UMAP it belongs to.
+                        try:
+                            cluster_grid_figure = _generate_cluster_highlight_grid(
+                                adata, cluster_key, cluster_umap_figure or _umap_out
+                            )
+                            if cluster_grid_figure and run_manager is not None:
+                                run_manager.add_output(cluster_grid_figure)
+                        except Exception:
+                            cluster_grid_figure = None
                     except Exception:
                         cluster_umap_figure = None
             except Exception:
@@ -13350,10 +13780,46 @@ def process_tool_call(
                     "doublet_threshold": doublet_threshold,
                     "low_lib_fraction": low_lib_frac,
                     "low_genes_fraction": low_genes_frac,
+                    # Holistic distribution-relative flagging (scale-free, no baked %):
+                    "relative_concern_robust_z": _Z_CONCERN,
+                    "relative_strong_robust_z": _Z_STRONG,
+                    "holistic_flag_min_concerning_metrics": 2,
+                    "cluster_mt_median_pct": round(_mt_med, 2),
+                    "cluster_mt_mad_pct": round(_mt_mad, 2),
                 },
                 "ribo_signal_available": bool("pct_counts_ribo" in adata.obs.columns),
                 "state": make_state(adata),
             }
+
+            # Direct the model to VISUALLY inspect the box plot — the numeric screen
+            # and the eye are two independent nets. Surface the clusters that sit just
+            # inside a gate (near-misses) so the model's visual scan has somewhere to
+            # start, but ask it to judge the whole plot, not only this list.
+            _near_miss = []
+            for _cid, _dec in cluster_decisions.items():
+                _ev = _dec.get("evidence", {})
+                if _dec.get("recommended_action") == "keep" and (
+                    (_ev.get("n_concerning_metrics") or 0) >= 1
+                    or (_ev.get("mean_library_fraction_of_global_median") or 1.0) <= 0.7
+                    or (_ev.get("mean_genes_fraction_of_global_median") or 1.0) <= 0.7
+                ):
+                    _near_miss.append(_cid)
+            if qc_metrics_figure:
+                result["visual_review"] = {
+                    "required": True,
+                    "figure": qc_metrics_figure,
+                    "instruction": (
+                        "Look at the per-cluster QC box plot now (it is attached). Scan every "
+                        "panel — library size, genes/cell, %MT, %ribosomal, doublet score — for "
+                        "any cluster that stands out as an outlier, especially one that is "
+                        "worst-in-class or stacks several concerns at once, EVEN IF it was not "
+                        "numerically flagged. Then call record_cluster_qc_visual_review with what "
+                        "you saw. This is a required, independent check — the numbers and the plot "
+                        "catch different things."
+                    ),
+                    "watch_clusters": sorted(_near_miss, key=lambda x: (len(x), x))[:12],
+                    "next_tool": "record_cluster_qc_visual_review",
+                }
 
             # --- Auto-chain structure QC: nominate + adjudicate in ONE step ---
             # Structure QC is not a separate, skippable checkbox — its gene-gene
@@ -13462,6 +13928,13 @@ def process_tool_call(
                     role="figure",
                     metadata={"kind": "cluster_umap", "cluster_key": cluster_key},
                 ))
+            if cluster_grid_figure:
+                artifacts.append(_artifact_payload(
+                    cluster_grid_figure,
+                    role="figure",
+                    metadata={"kind": "cluster_umap_grid", "cluster_key": cluster_key},
+                ))
+            result["cluster_grid_figure"] = cluster_grid_figure
             return _finalize_result(
                 result, adata,
                 dataset_changed=False,
@@ -14670,14 +15143,32 @@ def process_tool_call(
                     need_recompute = True
 
             if need_recompute:
-                sc.tl.rank_genes_groups(
-                    adata,
-                    groupby=cluster_key,
-                    method=deg_method,
-                    key_added=deg_key,
-                    use_raw=False,
-                    n_genes=max(n_deg_genes, 50),
-                )
+                # rank_genes_groups is scanpy/CPU — a residual GPU (cupy) matrix
+                # makes it fail deep inside with an opaque error (this is what made
+                # prepare_annotation surface a bare NotImplementedError). Move to
+                # host first (no-op on the healthy path), then translate any
+                # remaining failure into an actionable message.
+                from ..core.gpu import ensure_cpu as _ensure_cpu
+
+                _ensure_cpu(adata, context="prepare_annotation:deg")
+                try:
+                    sc.tl.rank_genes_groups(
+                        adata,
+                        groupby=cluster_key,
+                        method=deg_method,
+                        key_added=deg_key,
+                        use_raw=False,
+                        n_genes=max(n_deg_genes, 50),
+                    )
+                except Exception as _deg_exc:
+                    raise RuntimeError(
+                        f"Marker DE for annotation (rank_genes_groups, method='{deg_method}') "
+                        f"failed on adata.X (type={type(adata.X).__name__}, "
+                        f"dtype={getattr(adata.X, 'dtype', None)}): "
+                        f"{type(_deg_exc).__name__}: {_deg_exc}. The expression matrix must be "
+                        "a host (CPU) float32/float64 array (normalized+log1p); a non-float or "
+                        "GPU-resident matrix is the usual cause."
+                    ) from _deg_exc
 
             rgg = adata.uns.get(deg_key, {})
             names = rgg.get("names") if isinstance(rgg, dict) else None
@@ -16465,29 +16956,26 @@ def process_tool_call(
                     "",
                     "## Per-Cluster Annotation Evidence",
                     "",
-                    "| Cluster | Final label | Confidence | Validation tier | Support level | QC cap | Supporting genes | PanglaoDB label used | Competing labels considered | Reference support/conflict |",
-                    "|---|---|---|---|---|---|---|---|---|---|",
+                    "Each row shows the independent evidence side by side — what Scimilarity and "
+                    "CellTypist predicted, this cluster's supporting DEGs, and the DEG-derived read — "
+                    "then the final label the reasoning settled on.",
+                    "",
+                    "| Cluster | Final label | Scimilarity prediction | Celltypist prediction | Supporting genes | DEG prediction | Reasoning |",
+                    "|---|---|---|---|---|---|---|",
                 ])
                 for cid in proposal_clusters:
                     ev = per_cluster_validation.get(cid, {})
-                    ref_bits = []
-                    if ev.get("reference_annotation_support"):
-                        ref_bits.append("support: " + _fmt_report_value(ev.get("reference_annotation_support"), limit=90))
-                    if ev.get("reference_annotation_conflicts"):
-                        ref_bits.append("conflict: " + _fmt_report_value(ev.get("reference_annotation_conflicts"), limit=90))
+                    scim_pred, ctyp_pred = _split_reference_predictions(ev)
                     md_lines.append(
                         "| "
                         + " | ".join([
                             _fmt_report_value(cid),
                             _fmt_report_value(ev.get("label")),
-                            _fmt_report_value(ev.get("confidence")),
-                            _fmt_report_value(ev.get("validation_tier")),
-                            _fmt_report_value(ev.get("panglaodb_support_level")),
-                            _fmt_report_value(ev.get("qc_confidence_cap", "none")),
-                            _fmt_report_value(ev.get("supporting_genes"), limit=80),
-                            _fmt_report_value(ev.get("panglaodb_label_used", "same/as stated")),
-                            _fmt_report_value(ev.get("competing_labels_considered"), limit=90),
-                            _fmt_report_value("; ".join(ref_bits) if ref_bits else "not recorded", limit=140),
+                            _fmt_report_value(scim_pred),
+                            _fmt_report_value(ctyp_pred),
+                            _fmt_report_value(ev.get("supporting_genes")),
+                            _fmt_report_value(ev.get("deg_derived_label") or "not recorded"),
+                            _fmt_report_value(ev.get("reasoning") or "not recorded"),
                         ])
                         + " |"
                     )
@@ -16528,7 +17016,8 @@ def process_tool_call(
                     "## Reporting Notes",
                     "",
                     "- CellTypist majority-voted cluster labels are not the same as raw per-cell unanimity; use raw prediction fractions when claiming agreement strength.",
-                    "- If `panglaodb_label_used` is broader than the final label, the report should say the broad lineage was externally validated and the fine subtype was resolved from DEGs/reference labels.",
+                    "- The Scimilarity and CellTypist columns are independent candidates, not the final call; where they disagree with the DEG-derived read, the Reasoning column explains which won and why.",
+                    "- Final labels are kept at the granularity the evidence supports: when the subtype is ambiguous, the label generalizes to the confident parent (e.g. `CD4 T cell` rather than guessing `Th1` vs `Th17`).",
                     "- This Markdown report is derived from `adata.uns['annotation_validation']`; the companion JSON preserves the full machine-readable evidence.",
                     "",
                 ])

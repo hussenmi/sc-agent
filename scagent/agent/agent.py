@@ -83,7 +83,7 @@ Use it — and only use it — when:
 2. **Results are surprising in a consequential way.** Doublet rate >15%. QC removes >30% of cells at any reasonable threshold. Clustering reveals clear batch structure rather than biology. Anything that changes what should happen next in a non-obvious way.
 3. **A genuine fork with large downstream consequences.** Not "which resolution?" — try one and explain. But "should I integrate across disease and control, or analyze them separately?" — that requires the user's scientific intent.
 
-After calling `pause_and_ask`, write the question clearly in your response and end your turn. Do not call any more tools.
+After calling `pause_and_ask`, write the question clearly in your response and end your turn. Do not call any more tools. The runtime enforces this: once a decision is pending it hands control to the user (or, headless, the recommended default) and you get no further tool-calling turn until it is answered — so never try to answer your own pause or work around a guard that is waiting on it.
 
 ### Automatic checkpoints
 
@@ -233,6 +233,7 @@ INSPECTION_TOOL_NAMES = {
     "research_findings",
     "describe_image",
     "record_inspection",
+    "record_cluster_qc_visual_review",
 }
 
 # Analysis steps that should follow a recorded inspection when model-driven
@@ -473,7 +474,18 @@ class SCAgent:
         # still skips, fall back to the heuristic (logged once).
         self._inspection_nudged: bool = False
         self._inspection_fallback_logged: bool = False
+        # Bounded nudge toward a recorded visual read of the per-cluster QC box plot
+        # before annotation (see _cluster_qc_visual_review_gate_action). Nudge once,
+        # then fall back so it never deadlocks a run.
+        self._visual_review_nudged: bool = False
+        self._visual_review_fallback_logged: bool = False
         self._active_cleanup_authorization: Optional[Dict[str, Any]] = None
+        # Armed when discovery finds >=2 source datasets (a folder of per-sample
+        # files to combine). Drives the state-based multi-dataset loading guard —
+        # it blocks a combine while the loading strategy is unresolved regardless
+        # of HOW the combine is written, so a hand-built AnnData can't slip past a
+        # code-text pattern the way it did in run_2026_07_15_121111.
+        self._multifile_source_datasets: List[Dict[str, Any]] = []
         self._context_limit: int = 128_000  # overwritten by _init_* below
         self._vertex_key_file: Optional[str] = None
         self._vertex_project: Optional[str] = None
@@ -1726,67 +1738,57 @@ class SCAgent:
         tool_name: str,
         tool_input: Dict[str, Any],
         result_data: Dict[str, Any],
+        *,
+        before_group_count: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        """Open the integration decision immediately after a successful concat."""
-        if tool_name != "run_code" or result_data.get("status") != "ok":
-            return None
-        code = str(tool_input.get("code") or "")
-        if not re.search(r"\b(?:anndata|ad)\.concat\s*\(|\bconcat_datasets\s*\(", code):
+        """Open the integration decision when a tool just turned the data multi-sample.
+
+        State-based, NOT code-regex: the old version pattern-matched
+        ``anndata.concat`` / ``concat_datasets`` in the run_code source, which a
+        hand-built combine walked straight past (run_2026_07_15_121111). This keys
+        on the observed transition instead — the data went from single-sample to
+        >=2 sample-like groups as a result of THIS run_code/load_data — so it fires
+        however the combine was written. The transition guard (``before < 2``) also
+        stops it re-firing on every later run_code once the data is already
+        multi-sample. Column and group count come from the freshly synced world
+        state (post-combine inspect_data set the batch key), with an obs sniff as a
+        fallback. Skipped once a multi_sample_strategy is confirmed.
+        """
+        if tool_name not in {"run_code", "load_data"} or result_data.get("status") != "ok":
             return None
         if self.world_state.get_confirmed_value("multi_sample_strategy"):
             return None
+        after_group_count = int(self.world_state._multi_sample_group_count() or 0)
+        # Require the single->multi transition: multi-sample NOW, but not before.
+        if after_group_count < 2 or int(before_group_count) >= 2:
+            return None
 
-        summary = self.world_state.data_summary or {}
-        candidates = self.world_state.metadata_candidates or []
-        candidate = candidates[0] if candidates else {}
-
-        # Prefer the batch column the concat code itself named (anndata.concat
-        # uses label=, concat_datasets uses batch_key=), then fall back to
-        # anything a prior inspect_data recorded in world_state. Relying only on
-        # world_state fails when the concat runs before any successful
-        # inspect_data — which is exactly the case this safety net must cover.
-        column = None
-        m = re.search(r"\b(?:label|batch_key)\s*=\s*['\"]([^'\"]+)['\"]", code)
-        if m:
-            column = m.group(1)
-        column = (
-            column
-            or summary.get("batch_key")
-            or summary.get("recommended_batch_key")
-            or candidate.get("column")
-        )
-
-        # Resolve the group count from the live concatenated AnnData (the source
-        # of truth right after the concat), falling back to recorded metadata.
-        # If we still have no column, sniff obs for a sample-like column the
-        # concat may have created (e.g. anndata.concat's default 'batch' label).
-        n_groups = 0
-        obs = getattr(getattr(self, "adata", None), "obs", None)
-        if obs is not None:
-            if not column:
+        partition = self._multi_sample_partition_from_state()
+        if partition is None:
+            # world_state has no recorded batch key yet — sniff obs for the column
+            # the combine created (e.g. anndata.concat's default 'batch' label).
+            obs = getattr(getattr(self, "adata", None), "obs", None)
+            column = None
+            if obs is not None:
                 for cand_col in ("batch", "sample", "replicate", "donor", "library", "dataset"):
                     if cand_col in obs.columns:
-                        column = cand_col
-                        break
-            if column and column in obs.columns:
-                try:
-                    n_groups = int(obs[column].nunique())
-                except Exception:
-                    n_groups = 0
-        if not n_groups:
-            n_groups = int(summary.get("n_batches") or candidate.get("n_unique") or 0)
-
-        if not column or n_groups < 2:
-            return None
-        return self._multi_sample_strategy_checkpoint({
-            "column": str(column),
-            "n_groups": n_groups,
-            "role": candidate.get("role") or "sample",
-            "status": "post_concatenation",
-            "needs_key_confirmation": False,
-            "reason": candidate.get("rationale") or "",
-            "examples": candidate.get("examples") or [],
-        })
+                        try:
+                            if int(obs[cand_col].nunique()) >= 2:
+                                column = cand_col
+                                break
+                        except Exception:
+                            continue
+            if column is None:
+                return None
+            partition = {
+                "column": str(column),
+                "n_groups": after_group_count,
+                "role": "sample",
+                "needs_key_confirmation": False,
+            }
+        partition = dict(partition)
+        partition["status"] = "post_concatenation"
+        return self._multi_sample_strategy_checkpoint(partition)
 
     def _multi_dataset_loading_checkpoint(
         self,
@@ -2267,6 +2269,7 @@ class SCAgent:
         "run_code",  # Flexible fallback - always allow
         "inspect_data",
         "record_inspection",  # Read-only judgment record; never mutates adata.
+        "record_cluster_qc_visual_review",  # Records a visual QC judgment; no matrix change.
         "inspect_data_inputs",
         "inspect_session",
         "list_artifacts",
@@ -2295,55 +2298,116 @@ class SCAgent:
         tool_name: str,
         tool_input: Dict[str, Any],
     ) -> Optional[str]:
-        """Prevent silent concatenation or a join that differs from the user's choice."""
-        if tool_name != "run_code":
-            return None
-        code = str(tool_input.get("code") or "")
-        concatenates = bool(re.search(
-            r"\b(?:anndata|ad)\.concat\s*\(|\bconcat_datasets\s*\(",
-            code,
-        ))
-        if not concatenates:
+        """Block a combine while the loading strategy is unresolved — by STATE, not code text.
+
+        The old guard regex-matched ``anndata.concat`` / ``concat_datasets`` in the
+        run_code source. run_2026_07_15_121111 walked straight past it by building
+        the combined AnnData from stacked DataFrames — no ``concat`` call, no match.
+        Guessing intent from code is a losing game.
+
+        Instead this keys on observable state: once discovery has found >=2 source
+        datasets (``_multifile_source_datasets``, armed from inspect_data_inputs or
+        an auto-discovered directory ``load_data``), a data-entry tool (run_code /
+        load_data) is refused until ``multi_dataset_loading_strategy`` is resolved —
+        no matter how the code is written. After the choice is made the combine
+        proceeds; honoring the specific join is verified post-hoc
+        (see _multi_dataset_consistency_after). Returns an error JSON to block, or
+        None to allow.
+        """
+        if tool_name not in {"run_code", "load_data"}:
             return None
 
+        # Auto-arm: a load_data pointed at a directory (or glob) is a multi-file
+        # load the model didn't route through inspect_data_inputs. Discover it here
+        # so the guard is armed even when the model skips the inspection step —
+        # reading the tool's own declared path, not scanning code for intent.
+        if tool_name == "load_data" and not self._multifile_source_datasets:
+            self._maybe_arm_multifile_from_path(tool_input.get("data_path"))
+
+        if not self._multifile_source_datasets:
+            return None
         strategy = self.world_state.get_confirmed_value("multi_dataset_loading_strategy")
         action = strategy.get("action") if isinstance(strategy, dict) else strategy
-        if not action:
-            return json.dumps({
-                "status": "error",
-                "tool": "run_code",
-                "message": (
-                    "Multiple datasets cannot be concatenated before the user chooses how "
-                    "to handle them. Run inspect_data_inputs on the input directory first."
-                ),
-                "requires_user_decision": True,
-                "decision_key": "multi_dataset_loading_strategy",
-            }, indent=2)
-        if action == "analyze_separately":
-            return json.dumps({
-                "status": "error",
-                "tool": "run_code",
-                "message": "The user selected separate analyses, so concatenation is not allowed.",
-                "selected_strategy": action,
-            }, indent=2)
+        if action:
+            return None
+        n = len(self._multifile_source_datasets)
+        return json.dumps({
+            "status": "error",
+            "tool": tool_name,
+            "message": (
+                f"{n} source datasets were found but the user has not chosen how to combine "
+                "them (outer join / inner join / analyze separately). Loading or combining is "
+                "blocked until that decision is resolved — do not attempt to build the combined "
+                "object yourself. End your turn; the runtime presents the choice."
+            ),
+            "requires_user_decision": True,
+            "decision_key": "multi_dataset_loading_strategy",
+        }, indent=2)
 
-        expected_join = {
-            "concatenate_outer": "outer",
-            "concatenate_inner": "inner",
-        }.get(action)
-        if expected_join:
-            join_pattern = rf"\bjoin\s*=\s*['\"]{expected_join}['\"]"
-            if not re.search(join_pattern, code):
-                return json.dumps({
-                    "status": "error",
-                    "tool": "run_code",
-                    "message": (
-                        f"The user selected a {expected_join} join. The concatenation code "
-                        f"must explicitly pass join='{expected_join}'."
-                    ),
-                    "selected_strategy": action,
-                    "required_join": expected_join,
-                }, indent=2)
+    def _maybe_arm_multifile_from_path(self, data_path: Any) -> None:
+        """Arm the multi-file guard by discovering datasets under a directory path.
+
+        Only fires for a directory (or a path that does not resolve to a single
+        existing file). Reads the declared ``load_data`` argument — never scans
+        code — so a directory load the model didn't inspect still trips the guard.
+        """
+        if not data_path:
+            return
+        try:
+            from pathlib import Path as _Path
+            p = _Path(str(data_path)).expanduser()
+            if p.is_file():
+                return
+            from ..core.io import discover_data_inputs
+            discovery = discover_data_inputs(str(data_path))
+        except Exception:
+            return
+        if int(discovery.get("n_source_datasets") or 0) >= 2:
+            self._arm_multifile_source_datasets(discovery.get("source_datasets") or [])
+            # Raise the loading-strategy checkpoint so the block the guard is about
+            # to return corresponds to a decision the runtime actually presents —
+            # the model skipped inspect_data_inputs, so nothing else raised it.
+            if (
+                not self._pending_checkpoint
+                and not self.world_state.get_confirmed_value("multi_dataset_loading_strategy")
+            ):
+                checkpoint = self._multi_dataset_loading_checkpoint(discovery)
+                if checkpoint is not None:
+                    self._set_pending_checkpoint(checkpoint)
+
+    def _arm_multifile_source_datasets(self, source_datasets: List[Dict[str, Any]]) -> None:
+        """Record a discovered multi-file source set (>=2) for the loading guard."""
+        if source_datasets and len(source_datasets) >= 2:
+            self._multifile_source_datasets = list(source_datasets)
+
+    def _multi_dataset_consistency_after(self) -> Optional[str]:
+        """Post-execution check that a resolved loading strategy was honored.
+
+        The pre-guard cannot verify an outer-vs-inner join from code text, and it
+        should not try. What IS reliably checkable on the resulting object is the
+        one unambiguous violation: the user chose ``analyze_separately`` yet the
+        data was combined into a single multi-sample object anyway. Returns a
+        warning string in that case (surfaced on the tool result), else None.
+        Armed only when a multi-file source set was discovered, so it never fires
+        on a legitimately multi-sample single file.
+        """
+        if not self._multifile_source_datasets:
+            return None
+        strategy = self.world_state.get_confirmed_value("multi_dataset_loading_strategy")
+        action = strategy.get("action") if isinstance(strategy, dict) else strategy
+        if action != "analyze_separately":
+            return None
+        try:
+            groups = self.world_state._multi_sample_group_count()
+        except Exception:
+            groups = 0
+        if self.adata is not None and groups >= 2:
+            return (
+                "Strategy violation: the user chose to analyze the datasets SEPARATELY, but the "
+                "current object combines "
+                f"{groups} samples. Do not proceed on the combined object — load and analyze each "
+                "dataset independently."
+            )
         return None
 
     def _checkpoint_context_for_tool(self, tool_name: str) -> Optional[Dict[str, Any]]:
@@ -2371,6 +2435,40 @@ class SCAgent:
             },
             indent=2,
         )
+
+    def _yield_for_pending_decision(self, messages: List[Dict[str, Any]]) -> str:
+        """End the model's turn and hand control to the decision resolver.
+
+        A pending checkpoint is a decision only the user can make (or, in a
+        headless run, the recommended default). The tool loop used to rely on
+        the model *voluntarily* stopping after it surfaced the decision — a
+        cooperative contract, not an enforced one. A model that kept calling
+        tools never yielded, so the checkpoint was never resolved: in
+        run_2026_07_15_121111 a weak model ignored its own ``pause_and_ask``,
+        misread its own option label as the user's answer, and hand-rolled a
+        concatenation to get around the guard — all without ever ending its
+        turn, so the CLI never got to ask the human.
+
+        Yielding here makes the pause *enforced*: once any checkpoint is
+        pending, the model gets no further tool-calling turn. Control returns to
+        the caller (``_analyze_with_decisions``), which renders the selector or,
+        with no TTY, auto-selects the recommended default — both committing the
+        choice through the same ``resolve_pending_decision`` path. This is the
+        single mechanism every decision now flows through, regardless of whether
+        the checkpoint was raised by the runtime or by the model's own
+        ``pause_and_ask``. Returns the user-facing question text; the run is
+        deliberately NOT completed (a decision is still open).
+        """
+        self._conversation_history = messages
+        checkpoint = self._pending_checkpoint or {}
+        context = str(checkpoint.get("context") or checkpoint.get("summary") or "").strip()
+        question = str(
+            checkpoint.get("question") or "A decision is required before I can continue."
+        ).strip()
+        message = f"{context}\n\n{question}" if context else question
+        self._print("\n" + "-" * 50)
+        self._print(message)
+        return message
 
     def _inspection_gate_action(self, tool_name: str) -> Optional[str]:
         """Model-inspection safety-net decision for an about-to-run tool.
@@ -2409,6 +2507,52 @@ class SCAgent:
                     "inspect_data yet, do that first."
                 ),
                 "required_next_action": "record_inspection",
+            },
+            indent=2,
+        )
+
+    def _cluster_qc_visual_review_gate_action(self, tool_name: str) -> Optional[str]:
+        """Nudge the model to visually review the QC box plot before annotation.
+
+        Metric cluster QC produces a per-cluster box plot that is auto-loaded into
+        the model's view; a suspicious cluster is often obvious there even when it
+        crossed no numeric threshold (run_2026_07_15_121111 cluster 36). This gate
+        makes the visual read an actual step, not an optional one: when the active
+        clustering has a cluster-QC record but no recorded visual review, the first
+        move toward annotation is bounced once to record_cluster_qc_visual_review.
+        Nudge-then-fallback (never a hard block) — same safe shape as the inspection
+        gate; disabled with SCAGENT_CLUSTER_QC_VISUAL_REVIEW=0. Freshness is per
+        clustering: run_cluster_qc rebuilds the registry entry (dropping the review
+        marker), so the gate re-arms after a removal+recluster.
+        """
+        if os.environ.get("SCAGENT_CLUSTER_QC_VISUAL_REVIEW", "1") == "0":
+            return None
+        if tool_name != "prepare_annotation" or self.adata is None:
+            return None
+        reg = getattr(self.world_state, "cluster_qc_registry", None) or {}
+        active = getattr(self.world_state, "active_cluster_key", None)
+        entry = reg.get(str(active)) if active else None
+        if not isinstance(entry, dict) or not entry.get("checked_at"):
+            return None  # cluster QC hasn't run on the active clustering; not our gate
+        if entry.get("visual_review_recorded_at"):
+            return None  # already reviewed this clustering
+        return "nudge" if not self._visual_review_nudged else "fallback"
+
+    def _cluster_qc_visual_review_nudge_result(self, tool_name: str) -> str:
+        """One-time steer: record the QC box-plot visual review before annotation."""
+        return json.dumps(
+            {
+                "status": "error",
+                "tool": tool_name,
+                "message": (
+                    "Before annotation, record your visual read of the per-cluster QC box plot. "
+                    "Look at the qc_metrics_figure from run_cluster_qc and call "
+                    "record_cluster_qc_visual_review — report any cluster that looks like an "
+                    "outlier on any panel (library size, genes/cell, %MT, %ribo, doublet), even "
+                    "if the numbers did not flag it, or an empty list if none stand out. Then "
+                    "re-run this step."
+                ),
+                "required_next_action": "record_cluster_qc_visual_review",
             },
             indent=2,
         )
@@ -4563,6 +4707,10 @@ class SCAgent:
                                 ),
                             })
                         self._pending_images = []
+                    # Yield to the decision resolver if a checkpoint is now pending
+                    # (see _yield_for_pending_decision).
+                    if self._pending_checkpoint is not None:
+                        return self._yield_for_pending_decision(messages)
                     continue
 
                 if kind == "final":
@@ -4732,6 +4880,12 @@ class SCAgent:
                                 "content": f"Figure(s) saved at {paths}.",
                             })
                         self._pending_images = []
+
+                    # Yield to the decision resolver if a checkpoint is now pending
+                    # (see _yield_for_pending_decision) — the pause is enforced, not
+                    # left to the model to honor by ending its turn.
+                    if self._pending_checkpoint is not None:
+                        return self._yield_for_pending_decision(messages)
 
                 elif response.stop_reason == "end_turn":
                     # Add final assistant message to history
@@ -5749,6 +5903,13 @@ class SCAgent:
                             messages.append({"role": "user", "content": f"Figure(s) saved at {paths}."})
                         self._pending_images = []
 
+                    # A decision checkpoint became pending during this turn. Do not
+                    # grant the model another tool-calling turn — yield so the user
+                    # (or the headless default) resolves it first. See
+                    # _yield_for_pending_decision.
+                    if self._pending_checkpoint is not None:
+                        return self._yield_for_pending_decision(messages)
+
                 elif choice.finish_reason == "stop":
                     # Check for XML tool calls in text (local models like Qwen2.5-Coder
                     # emit <tool_call> or <tools> tags instead of structured tool_calls)
@@ -5918,6 +6079,7 @@ class SCAgent:
         "generate_figure":      "Generating figure",
         "inspect_data":         "Inspecting data",
         "record_inspection":    "Recording data interpretation",
+        "record_cluster_qc_visual_review": "Recording cluster QC visual review",
         "inspect_data_inputs":  "Inspecting data inputs",
         "search_papers":        "Searching papers",
         "research_findings":    "Searching literature",
@@ -6106,14 +6268,17 @@ class SCAgent:
         # Only block truly pipeline-progressing tools when checkpoint pending
         # Allow flexible tools (run_code, inspection, visualization) to proceed
         if self._pending_checkpoint and self._is_action_tool(tool_name):
+            _cp_kind = self._pending_checkpoint.get("kind")
+            # run_code is otherwise exempt (it's the flexible fallback), but while
+            # a data-shaping decision is open it is exactly the escape hatch a model
+            # reaches for — hand-building an AnnData to sidestep the concat guard
+            # (run_2026_07_15_121111), or preprocessing before the sample strategy is
+            # chosen. llm_pause is the model's own pause_and_ask: if it paused to ask,
+            # it must not then act via run_code/load_data in the same batch. Block the
+            # data-entry tools for every genuine data decision, not just two kinds.
             if (
-                self._pending_checkpoint.get("kind") == "multi_dataset_loading"
+                _cp_kind in {"multi_dataset_loading", "multi_sample_strategy", "llm_pause"}
                 and tool_name in {"run_code", "load_data"}
-            ):
-                return self._blocked_by_checkpoint_result(tool_name)
-            if (
-                self._pending_checkpoint.get("kind") == "multi_sample_strategy"
-                and tool_name == "run_code"
             ):
                 return self._blocked_by_checkpoint_result(tool_name)
             if tool_name not in self.CHECKPOINT_EXEMPT_TOOLS:
@@ -6131,6 +6296,22 @@ class SCAgent:
         if _insp_action == "fallback" and not self._inspection_fallback_logged:
             self._inspection_fallback_logged = True
             self.world_state.note_spine_intervention(["model_inspection"], "heuristic_fallback")
+
+        # Visual QC-review safety net (see _cluster_qc_visual_review_gate_action):
+        # steer once toward record_cluster_qc_visual_review before annotation, then
+        # fall back so a stubborn model never deadlocks the run.
+        _vr_action = self._cluster_qc_visual_review_gate_action(tool_name)
+        if _vr_action == "nudge":
+            self._visual_review_nudged = True
+            return self._cluster_qc_visual_review_nudge_result(tool_name)
+        if _vr_action == "fallback" and not self._visual_review_fallback_logged:
+            self._visual_review_fallback_logged = True
+            try:
+                self.world_state.note_spine_intervention(
+                    ["cluster_qc_visual_review"], "skipped_fallback"
+                )
+            except Exception:
+                pass
 
         def _sanitize_name(value: str) -> str:
             value = value or tool_name
@@ -6254,6 +6435,13 @@ class SCAgent:
         # the previous tool call. Re-syncing before execution hits adata.X on every
         # tool call without any adata change having occurred.
         before_snapshot = self.world_state.snapshot()
+        # Sample-group count BEFORE this tool runs (world_state still reflects the
+        # prior adata). The post-concatenation checkpoint uses the single->multi
+        # transition to detect a combine without inspecting the code.
+        try:
+            before_group_count = int(self.world_state._multi_sample_group_count() or 0)
+        except Exception:
+            before_group_count = 0
         if self.run_manager:
             self.run_manager.append_log(f"START {tool_name} {json.dumps(tool_input, default=str)}")
 
@@ -6363,6 +6551,26 @@ class SCAgent:
             if self._is_action_tool(tool_name):
                 self.world_state.invalidate_inspect_cache()
                 self._sync_world_state()
+
+            # Arm the multi-file loading guard from a successful discovery: >=2
+            # source datasets means "a folder of files to combine", and the
+            # combine must wait for the user's strategy (see
+            # _multi_dataset_loading_guard). Keyed on the discovery RESULT, not on
+            # any code the model might write.
+            if (
+                tool_name == "inspect_data_inputs"
+                and result_data.get("status") == "ok"
+            ):
+                self._arm_multifile_source_datasets(result_data.get("source_datasets") or [])
+
+            # Post-execution consistency: after a data-entry tool, flag a resolved
+            # analyze_separately strategy that was violated by a combine.
+            if tool_name in {"run_code", "load_data"}:
+                _viol = self._multi_dataset_consistency_after()
+                if _viol:
+                    result_data.setdefault("warnings", []).append(_viol)
+                    result_data["strategy_violation"] = _viol
+                    result_json = json.dumps(result_data, indent=2)
 
             # If there's an image directly embedded in the result, queue it
             if "image_base64" in result_data:
@@ -6520,6 +6728,7 @@ class SCAgent:
                     tool_name,
                     tool_input,
                     result_data,
+                    before_group_count=before_group_count,
                 )
             if checkpoint is None:
                 checkpoint = self._build_multi_sample_strategy_checkpoint(
@@ -7249,8 +7458,10 @@ class SCAgent:
             "option_actions": option_actions,
             "decision_key": checkpoint["decision_key"],
             "message": (
-                "Analysis paused. Explain why input is needed and end the turn; "
-                "the runtime renders the choices."
+                "Analysis paused for a user decision. Briefly explain why input is needed. "
+                "The runtime now takes over: it renders the choices and resolves them before "
+                "you act again — you will not get another tool-calling turn until it is answered, "
+                "so do not attempt to answer it yourself or work around it."
             ),
         }, indent=2)
 

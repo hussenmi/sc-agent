@@ -962,6 +962,112 @@ class AgentWorldState:
             self.sync_from_adata(adata, request_text=self.active_request)
         return {"status": "ok", "inspection": inspection, "warnings": warnings}
 
+    def record_cluster_qc_visual_review(
+        self, payload: Dict[str, Any], adata=None
+    ) -> Dict[str, Any]:
+        """Record the model's VISUAL read of the per-cluster QC box plot.
+
+        The numeric screen (run_cluster_qc) and this visual review are two
+        independent nets. The box plot shows the full per-cluster distribution of
+        every metric at once, so a cluster that is the worst-in-class outlier — or
+        that stacks several moderate concerns — is obvious to the eye even when it
+        crosses no single numeric threshold (run_2026_07_15_121111 cluster 36).
+        This records what the model SAW: which clusters look suspicious and why.
+
+        The visually-flagged clusters are merged into the active clustering's
+        review (``ambiguous``) set and stored under ``visual_flagged`` on the
+        registry entry, and mirrored to ``adata.uns['cluster_qc_visual_review']``
+        so a later step (structure QC, the cleanup decision, or annotation — where
+        a MT-heavy DEG can be tied back to a QC-flagged cluster) can connect to it.
+        Cluster ids that don't exist in the clustering are dropped with a warning
+        rather than failing the call.
+
+        Returns ``{"status": "ok", "visual_review": {...}, "warnings": [...]}``.
+        """
+        cluster_key = str(payload.get("cluster_key") or self.active_cluster_key or "leiden")
+        entry = self.cluster_qc_registry.get(cluster_key)
+        warnings: List[str] = []
+        if entry is None:
+            return {
+                "status": "error",
+                "message": (
+                    f"No cluster-QC record for '{cluster_key}'. Run run_cluster_qc on this "
+                    "clustering before recording a visual review."
+                ),
+            }
+        valid_ids = set()
+        if adata is not None and cluster_key in adata.obs.columns:
+            valid_ids = {str(c) for c in adata.obs[cluster_key].unique()}
+
+        raw = payload.get("suspicious_clusters") or []
+        cleaned: List[Dict[str, Any]] = []
+        dropped: List[str] = []
+        for item in raw:
+            if isinstance(item, dict):
+                cid = str(item.get("cluster"))
+                concern = item.get("concern") or item.get("note") or ""
+                panels = item.get("panels") or item.get("metrics") or []
+            else:
+                cid, concern, panels = str(item), "", []
+            if valid_ids and cid not in valid_ids:
+                dropped.append(cid)
+                continue
+            cleaned.append({"cluster": cid, "concern": str(concern), "panels": list(panels)})
+        if dropped:
+            warnings.append(
+                "Dropped cluster id(s) not present in the clustering: "
+                + ", ".join(sorted(set(dropped)))
+            )
+
+        flagged_ids = [c["cluster"] for c in cleaned]
+        # Merge into the review set so structure QC / the cleanup decision see them.
+        existing_ambiguous = [str(c) for c in entry.get("ambiguous", []) or []]
+        merged_ambiguous = list(dict.fromkeys(existing_ambiguous + flagged_ids))
+        newly_added = [c for c in flagged_ids if c not in existing_ambiguous]
+        entry["ambiguous"] = merged_ambiguous
+        entry["visual_flagged"] = cleaned
+        entry["visual_review_recorded_at"] = _utc_now_iso()
+        entry["visual_review_note"] = str(payload.get("overall_note", "") or "")
+        # Mark each visually-flagged cluster in the per-cluster decisions so the
+        # concern is carried in the same structure downstream steps already read.
+        decisions = entry.get("cluster_decisions") or {}
+        for item in cleaned:
+            dec = decisions.get(item["cluster"])
+            if isinstance(dec, dict):
+                ev = dec.setdefault("evidence", {})
+                ev["visual_flag"] = True
+                ev["visual_concern"] = item["concern"]
+                if dec.get("recommended_action") == "keep":
+                    dec["recommended_action"] = "review"
+                    dec["severity"] = "ambiguous"
+                reasons = dec.setdefault("reasons", [])
+                reasons.append(
+                    "visually flagged on the per-cluster QC box plot"
+                    + (f": {item['concern']}" if item["concern"] else "")
+                )
+        entry["cluster_decisions"] = decisions
+        self.cluster_qc_registry[cluster_key] = entry
+
+        review_record = {
+            "cluster_key": cluster_key,
+            "suspicious_clusters": cleaned,
+            "overall_note": str(payload.get("overall_note", "") or ""),
+            "recorded_at": entry["visual_review_recorded_at"],
+        }
+        if adata is not None:
+            try:
+                store = dict(adata.uns.get("cluster_qc_visual_review", {}))
+                store[cluster_key] = review_record
+                adata.uns["cluster_qc_visual_review"] = store
+            except Exception:
+                pass
+        return {
+            "status": "ok",
+            "visual_review": review_record,
+            "newly_flagged_for_review": newly_added,
+            "warnings": warnings,
+        }
+
     def apply_tool_result(self, tool_name: str, result: Dict[str, Any], adata=None) -> None:
         if adata is not None:
             self.sync_from_adata(adata, request_text=self.active_request)
