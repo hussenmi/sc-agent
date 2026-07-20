@@ -1187,7 +1187,21 @@ class AgentWorldState:
                     entry["structure_qc_json"] = embedded_sq.get("structure_qc_json")
                     entry["structure_qc_markdown"] = embedded_sq.get("structure_qc_markdown")
                     entry["synthesized_removal"] = embedded_sq.get("synthesized_removal", [])
+                    entry["qc_decision_table"] = embedded_sq.get("qc_decision_table", [])
+                    entry["deg_verdict_breakdown"] = embedded_sq.get("deg_verdict_breakdown", {})
                     self.cluster_qc_registry[str(cluster_key)] = entry
+
+                # Record the decisive removal run_cluster_qc actually applied in this
+                # call (DEG-junk + unstructured covariance agreement), so the analysis
+                # record and downstream gates know these cells are already gone.
+                entry = self.cluster_qc_registry.get(str(cluster_key), {})
+                entry["auto_removed_clusters"] = [
+                    str(c) for c in result.get("auto_removed_clusters", []) or []
+                ]
+                entry["cells_auto_removed"] = result.get("cells_auto_removed", 0)
+                if result.get("auto_removal_skipped_reason"):
+                    entry["auto_removal_skipped_reason"] = result.get("auto_removal_skipped_reason")
+                self.cluster_qc_registry[str(cluster_key)] = entry
 
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(
                     adata,

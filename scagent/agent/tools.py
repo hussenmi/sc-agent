@@ -449,6 +449,161 @@ def _annotation_nuisance_reason(gene: Any) -> Optional[str]:
     return None
 
 
+# --- Cluster-QC DEG marker check ---------------------------------------------
+# When metric QC nominates a problematic cluster, its one-vs-rest differential
+# markers are the IDENTITY axis of the adjudication: a real cell population is
+# defined by a handful of specific, strongly up-regulated genes. A cluster whose
+# top markers are dominated by mitochondrial / ribosomal / generic housekeeping
+# genes, or that has only a few (or weak) significant markers, has no
+# distinguishing identity program — the "junk marker" signature of a low-quality,
+# ambient, or doublet cluster. This reuses the SAME gene-pattern buckets the
+# annotation validator uses so "junk" means the same thing in QC and annotation.
+# These are technical gene-name patterns, not a curated biological marker table.
+_QC_DEG_MT_PATTERNS = [re.compile(r"^MT-"), re.compile(r"^mt-")]
+_QC_DEG_RIBO_PATTERNS = [
+    re.compile(p)
+    for p in (r"^RPL", r"^RPS", r"^MRPL", r"^MRPS", r"^Rpl", r"^Rps", r"^Mrpl", r"^Mrps")
+]
+_QC_DEG_HOUSEKEEPING_PATTERNS = (
+    [re.compile(p) for p in ANNOTATION_BROAD_SUPPORT_GENE_PATTERNS]
+    + [re.compile(r"^MALAT1$"), re.compile(r"^Malat1$")]
+)
+
+
+def _qc_deg_gene_bucket(gene: Any) -> str:
+    """Bucket a marker gene name: 'mt' | 'ribo' | 'housekeeping' | 'specific'."""
+    g = str(gene or "").strip()
+    if not g:
+        return "specific"
+    for rx in _QC_DEG_MT_PATTERNS:
+        if rx.search(g):
+            return "mt"
+    for rx in _QC_DEG_RIBO_PATTERNS:
+        if rx.search(g):
+            return "ribo"
+    for rx in _QC_DEG_HOUSEKEEPING_PATTERNS:
+        if rx.search(g):
+            return "housekeeping"
+    return "specific"
+
+
+def _classify_cluster_deg(
+    markers: List[Dict[str, Any]],
+    *,
+    top_k: int = 25,
+    min_logfc: float = 1.0,
+    max_padj: float = 0.05,
+    min_significant: int = 5,
+    min_specific: int = 3,
+    weak_logfc: float = 1.0,
+) -> Dict[str, Any]:
+    """Classify a cluster's one-vs-rest DEG markers as a real identity program or
+    'junk' (technical / generic / too-few / weak effect).
+
+    ``markers`` is a rank-ordered (strongest first) list of dicts with a gene name
+    under ``gene``/``name`` and, when available, ``logfc``, ``padj``, ``score``.
+    Returns a dict whose ``deg_verdict`` is one of ``"junk_markers"``,
+    ``"identity_supported"``, or ``"inconclusive"``, plus the supporting counts /
+    fractions and human-readable ``junk_reasons``.
+    """
+    def _name(m: Dict[str, Any]) -> str:
+        return str(m.get("gene", m.get("name", "")) or "")
+
+    def _num(m: Dict[str, Any], *keys: str) -> Optional[float]:
+        for k in keys:
+            v = m.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+        return None
+
+    empty = {
+        "deg_verdict": "inconclusive",
+        "n_significant_markers": 0,
+        "n_specific_markers": 0,
+        "n_mt_markers": 0,
+        "n_ribo_markers": 0,
+        "n_housekeeping_markers": 0,
+        "mt_fraction": None,
+        "ribo_housekeeping_fraction": None,
+        "top_specific_logfc": None,
+        "top_markers": [],
+        "top_specific_markers": [],
+        "junk_reasons": ["no DEG markers available"],
+    }
+    if not markers:
+        return empty
+
+    ranked = markers[:top_k]
+    # Significant one-vs-rest UP-markers: adjusted p under the cut and up-regulated
+    # by at least min_logfc (log2). padj may be missing for some methods; when it
+    # is, effect size alone gates.
+    significant: List[tuple] = []
+    for m in ranked:
+        lfc = _num(m, "logfc", "logfoldchange", "logfoldchanges")
+        padj = _num(m, "padj", "pval_adj", "pvals_adj")
+        if lfc is None or lfc < min_logfc:
+            continue
+        if padj is not None and padj > max_padj:
+            continue
+        significant.append((_name(m), lfc))
+
+    n_sig = len(significant)
+    buckets = [_qc_deg_gene_bucket(nm) for nm, _ in significant]
+    n_mt = buckets.count("mt")
+    n_ribo = buckets.count("ribo")
+    n_hk = buckets.count("housekeeping")
+    specific = [(nm, lfc) for (nm, lfc), b in zip(significant, buckets) if b == "specific"]
+    n_specific = len(specific)
+    mt_frac = (n_mt / n_sig) if n_sig else None
+    ribo_hk_frac = ((n_ribo + n_hk) / n_sig) if n_sig else None
+    top_specific_logfc = max((lfc for _, lfc in specific), default=None)
+
+    junk_reasons: List[str] = []
+    if n_sig < min_significant:
+        junk_reasons.append(
+            f"only {n_sig} significant one-vs-rest marker(s) "
+            f"(padj<{max_padj:g}, log2FC>={min_logfc:g}) — too few genes define this cluster"
+        )
+    if n_specific < min_specific:
+        junk_reasons.append(
+            f"only {n_specific} cell-identity marker(s) after removing MT/ribosomal/"
+            "housekeeping genes — no specific transcriptional identity"
+        )
+    if mt_frac is not None and mt_frac >= 0.4:
+        junk_reasons.append(
+            f"{mt_frac * 100:.0f}% of top markers are mitochondrial — stressed/dying signature"
+        )
+    if ribo_hk_frac is not None and ribo_hk_frac >= 0.5:
+        junk_reasons.append(
+            f"{ribo_hk_frac * 100:.0f}% of top markers are ribosomal/housekeeping — no lineage identity"
+        )
+    if top_specific_logfc is not None and top_specific_logfc < weak_logfc:
+        junk_reasons.append(
+            f"strongest identity marker is weak (log2FC={top_specific_logfc:.2f} < {weak_logfc:g})"
+        )
+    elif top_specific_logfc is None and n_sig:
+        junk_reasons.append("no up-regulated identity marker among the significant genes")
+
+    verdict = "junk_markers" if junk_reasons else "identity_supported"
+    return {
+        "deg_verdict": verdict,
+        "n_significant_markers": n_sig,
+        "n_specific_markers": n_specific,
+        "n_mt_markers": n_mt,
+        "n_ribo_markers": n_ribo,
+        "n_housekeeping_markers": n_hk,
+        "mt_fraction": round(mt_frac, 2) if mt_frac is not None else None,
+        "ribo_housekeeping_fraction": round(ribo_hk_frac, 2) if ribo_hk_frac is not None else None,
+        "top_specific_logfc": round(top_specific_logfc, 2) if top_specific_logfc is not None else None,
+        "top_markers": [_name(m) for m in ranked[:10]],
+        "top_specific_markers": [nm for nm, _ in specific[:10]],
+        "junk_reasons": junk_reasons,
+    }
+
+
 def _annotation_broad_support_reason(gene: Any) -> Optional[str]:
     """Return why a gene is broad/non-discriminating annotation support.
 
@@ -841,6 +996,16 @@ _QC_TABLE_LEGEND: List[tuple] = [
     ("Reasons", "Plain-language evidence behind the action — e.g. low library size, elevated %MT/%ribosomal, high doublet score, or 'within expected ranges'."),
 ]
 
+# Legend rendered beneath the per-cluster QC *decision* (DEG + covariance) table.
+_QC_DECISION_TABLE_LEGEND: List[tuple] = [
+    ("Metric QC", "Severity from the multi-metric screen (library size, genes, %MT, %ribosomal, doublet score): clean / ambiguous / obvious."),
+    ("DEG markers", "The cluster's top one-vs-rest cell-identity markers (after dropping MT/ribosomal/housekeeping genes); '—' when none are specific."),
+    ("DEG verdict", "**junk_markers** = no real identity program (only MT/ribo/housekeeping, too few, or weak markers); **identity_supported** = specific markers present; **inconclusive** = DEG not usable."),
+    ("Covariance", "Gene-gene correlation coherence within the cluster: unstructured/weak (possible doublet/noise mixture) vs moderate/strong (a real transcriptional program)."),
+    ("Decision", "**remove** = auto-applied here because DEG-junk AND unstructured covariance AND metric-flagged all agreed; **review** = flagged but KEPT (e.g. covariance looked coherent); **keep** = clean."),
+    ("Why", "The decisive evidence lines behind the call."),
+]
+
 # Legend rendered beneath the per-cluster annotation table.
 _ANNOTATION_TABLE_LEGEND: List[tuple] = [
     ("Label", "The final cell-type name assigned to the cluster."),
@@ -1055,6 +1220,37 @@ def _assemble_analysis_record(world_state: Any = None, adata: Any = None) -> str
                 f"confirmed junk: {_report_fmt(confirmed)}; "
                 f"conflicting: {_report_fmt(conflicting)}"
             )
+        auto_removed = rec.get("auto_removed_clusters") or []
+        if auto_removed:
+            lines.append(
+                f"- **Auto-removed this pass** (DEG-junk + unstructured covariance agreed): "
+                f"{_report_fmt(auto_removed)} "
+                f"({_report_fmt(rec.get('cells_auto_removed'))} cells)."
+            )
+        if rec.get("auto_removal_skipped_reason"):
+            lines.append(f"- Auto-removal held back: {rec.get('auto_removal_skipped_reason')}")
+
+        # DEG + covariance consensus decision table — the QC analogue of the
+        # cell-type consensus table, one row per adjudicated cluster.
+        decision_table = rec.get("qc_decision_table") or []
+        if isinstance(decision_table, list) and decision_table:
+            lines.append("")
+            lines.append("| Cluster | Cells | Metric QC | DEG markers | DEG verdict | Covariance | Decision | Why |")
+            lines.append("|---|---|---|---|---|---|---|---|")
+            for row in decision_table:
+                if not isinstance(row, dict):
+                    continue
+                _markers = row.get("deg_top_specific_markers") or []
+                _markers_txt = ", ".join(str(g) for g in _markers[:4]) if _markers else "—"
+                _why = "; ".join(str(w) for w in (row.get("why") or [])[:2]) or "—"
+                lines.append(
+                    f"| {_report_fmt(row.get('cluster'))} | {_report_fmt(row.get('n_cells'))} | "
+                    f"{_report_fmt(row.get('metric_severity'))} | {_markers_txt} | "
+                    f"{_report_fmt(row.get('deg_verdict'))} | {_report_fmt(row.get('covariance'))} | "
+                    f"{_report_fmt(row.get('decision'))} | {_why} |"
+                )
+            lines.append("")
+            lines.extend(_render_glossary(_QC_DECISION_TABLE_LEGEND))
         decisions = rec.get("cluster_decisions") or {}
         if isinstance(decisions, dict) and decisions:
             lines.append("")
@@ -4079,7 +4275,7 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         },
         {
             "name": "run_cluster_qc",
-            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). Does NOT remove any cells. **It AUTO-RUNS cluster structure QC in the same call** on every cluster — gene-gene covariance modules, one clustered correlation heatmap per cluster, technical Moran's I — so metric nomination and structure adjudication happen together and produce one combined cleanup recommendation (`structure_qc.synthesized_removal`); you do not need a separate run_cluster_structure_qc call. Call this after EACH clustering (including after a removal+recluster). Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`), a cluster-colored UMAP of this clustering to figures/cluster_qc/<cluster_key>/umap_<cluster_key>_pass_NNN.png (in `cluster_umap_figure`, auto-titled with the resolution — this is the Leiden/cluster UMAP for the clustering, generated for you so you do not need a separate generate_figure call for it), and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite all three in the QC reasoning report.",
+            "description": "Compute a per-cluster QC summary table and classify each cluster by quality using multi-metric assessment (MT%, ribosomal%, library size, n_genes, doublet score — every metric present in obs is used; missing signals like doublet score are simply skipped, and when doublet detection was not run a baseline set over all clusters is used so problematic clusters are not missed). **It AUTO-RUNS cluster structure QC in the same call** on every cluster — a one-vs-rest DEG marker check (does the cluster have a real cell-identity program, or only MT/ribosomal/housekeeping/too-few markers = 'junk markers'), gene-gene covariance modules, one clustered correlation heatmap per cluster, technical Moran's I — so metric nomination, DEG identity, and covariance coherence are adjudicated together into ONE decision per cluster (`structure_qc.qc_decision_table`). **A cluster is AUTO-REMOVED in this same call only when its DEG markers are junk AND its covariance is unstructured AND metric QC flagged it (all three agree)**; a pre-cleanup checkpoint is written first, and a removal touching >50% of cells is never auto-applied. Clusters whose covariance looks coherent, or that have a real identity program, are flagged and KEPT (`decision`=review/keep). After an auto-removal, re-cluster the cleaned data and call this again. You do not need a separate run_cluster_structure_qc call. Saves the per-cluster QC box-plot to figures/cluster_qc/<cluster_key>/qc_metrics_by_cluster_pass_NNN.png (in `qc_metrics_figure`), a cluster-colored UMAP of this clustering to figures/cluster_qc/<cluster_key>/umap_<cluster_key>_pass_NNN.png (in `cluster_umap_figure`, auto-titled with the resolution), and structure heatmaps under figures/cluster_qc/<cluster_key>/pass_NNN/ — cite them in the QC reasoning report.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -4089,7 +4285,9 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
                     "ribo_threshold": {"type": "number", "description": "Mean ribosomal% above which a cluster is flagged for structure-QC review (default: 50). Only applied when pct_counts_ribo is present in obs."},
                     "low_lib_fraction": {"type": "number", "description": "Fraction of global median library size below which lib size is considered low (default: 0.5)"},
                     "low_genes_fraction": {"type": "number", "description": "Fraction of global median n_genes below which gene count is considered low (default: 0.5)"},
-                    "auto_structure_qc": {"type": "boolean", "description": "Auto-run cluster structure QC on every cluster within this call (default: true). Set false only to run structure QC separately with custom parameters."},
+                    "auto_structure_qc": {"type": "boolean", "description": "Auto-run cluster structure QC (DEG marker check + gene-gene covariance + Moran's I) on every cluster within this call (default: true). Set false only to run structure QC separately with custom parameters."},
+                    "auto_apply_removal": {"type": "boolean", "description": "Auto-remove the confirmed-junk clusters (DEG-junk AND unstructured covariance AND metric-flagged) in this same call, after writing the pre-cleanup checkpoint (default: true). A removal at or above auto_apply_max_fraction of cells is never auto-applied — it is proposed and left for review. Set false to only propose the removal set and leave cells in place."},
+                    "auto_apply_max_fraction": {"type": "number", "description": "Upper bound on the fraction of cells an auto-removal may drop in one call (default: 0.2). At or above this, the confirmed-junk set is proposed but NOT auto-removed, so a large cleanup goes through human review."},
                     "save_checkpoint": {"type": "boolean", "description": "Save an h5ad checkpoint before any removal (default: true)"},
                     "checkpoint_path": {"type": "string", "description": "Path for checkpoint file (default: <output_dir>/checkpoint_pre_cleanup.h5ad)"}
                 },
@@ -4099,12 +4297,15 @@ def get_tools(include_describe_image: bool = False) -> List[Dict[str, Any]]:
         {
             "name": "run_cluster_structure_qc",
             "description": (
-                "Adjudicate proposed/ambiguous cluster-level QC calls with covariance-structure evidence. "
+                "Adjudicate proposed/ambiguous cluster-level QC calls with DEG-identity + covariance-structure evidence. "
                 "For each analyzed cluster (all clusters by default when auto-chained from run_cluster_qc), "
+                "runs a one-vs-rest DEG marker check (classifies the cluster as having a real cell-identity "
+                "program vs 'junk markers' = MT/ribosomal/housekeeping-dominated or too-few/weak markers), "
                 "selects top informative HVGs, computes gene-gene Pearson correlation "
                 "module metrics, saves one clustered correlation heatmap per cluster, and computes technical "
-                "Moran's I for MT% and library size on the existing KNN graph. Does NOT remove cells; returns "
-                "synthesized cleanup recommendations for evidence-based reporting and cleanup decisions."
+                "Moran's I for MT% and library size on the existing KNN graph. Does NOT itself remove cells "
+                "(run_cluster_qc applies the removal); returns a per-cluster `qc_decision_table` and a "
+                "synthesized cleanup set for evidence-based reporting and cleanup decisions."
             ),
             "input_schema": {
                 "type": "object",
@@ -13854,7 +14055,15 @@ def _process_tool_call_impl(
                 try:
                     _sq_json, adata = process_tool_call(
                         "run_cluster_structure_qc",
-                        {"cluster_key": cluster_key, "clusters_to_analyze": structure_targets},
+                        {
+                            "cluster_key": cluster_key,
+                            "clusters_to_analyze": structure_targets,
+                            # This pass's metric verdicts, so structure QC sees each
+                            # cluster's severity (world_state is only updated after
+                            # run_cluster_qc returns).
+                            "_metric_decisions": cluster_decisions,
+                            "_metric_table": cluster_table,
+                        },
                         adata,
                         world_state=world_state,
                         run_manager=run_manager,
@@ -13880,6 +14089,8 @@ def _process_tool_call_impl(
                             "rescued_clusters": _sq.get("rescued_clusters"),
                             "conflicting": _sq.get("conflicting"),
                             "requires_review": _sq.get("requires_review"),
+                            "qc_decision_table": _sq.get("qc_decision_table"),
+                            "deg_verdict_breakdown": _sq.get("deg_verdict_breakdown"),
                             "heatmap_paths": _sq.get("heatmap_paths"),
                             "figure_dir": _sq.get("figure_dir"),
                             "structure_qc_markdown": _sq.get("structure_qc_markdown"),
@@ -13891,6 +14102,48 @@ def _process_tool_call_impl(
                 except Exception as _sq_err:  # pragma: no cover - defensive
                     result["structure_qc_error"] = str(_sq_err)
 
+            # --- Auto-apply the decisive-removal set -------------------------------
+            # A cluster reaches synthesized_removal only when DEG shows no real
+            # cell-identity program AND covariance shows no coherent structure for a
+            # metric-flagged cluster (confirmed_junk → lean "remove"). When both
+            # independent axes agree, drop those cells now rather than deferring to a
+            # manual cleanup step — the pre-cleanup checkpoint written above makes it
+            # reversible. "review"/"keep" clusters (covariance okay, or a real
+            # identity) are flagged and KEPT. A large removal (>= the 20% review
+            # threshold) is never auto-applied — it is proposed and left for a
+            # human-in-the-loop decision, matching the cleanup governance rule.
+            auto_apply = bool(tool_input.get("auto_apply_removal", True))
+            _auto_apply_max_frac = float(tool_input.get("auto_apply_max_fraction", 0.2))
+            result["auto_removed_clusters"] = []
+            result["cells_auto_removed"] = 0
+            result["auto_removal_skipped_reason"] = None
+            _sq_removal = list((result.get("structure_qc") or {}).get("synthesized_removal") or [])
+            _removed_note = ""
+            if auto_apply and result.get("structure_qc_ran") and _sq_removal:
+                _labels_now = adata.obs[cluster_key].astype(str)
+                _present_now = set(_labels_now.unique())
+                _to_drop = [c for c in _sq_removal if str(c) in _present_now]
+                _drop_mask = _labels_now.isin(_to_drop)
+                _n_drop = int(_drop_mask.sum())
+                if _to_drop and 0 < _n_drop < _auto_apply_max_frac * adata.n_obs:
+                    adata = adata[(~_drop_mask).values].copy()
+                    result["auto_removed_clusters"] = _to_drop
+                    result["cells_auto_removed"] = _n_drop
+                    result["cells_remaining_after_removal"] = adata.n_obs
+                    result["state"] = make_state(adata)
+                    _removed_note = (
+                        f" Auto-removed {len(_to_drop)} confirmed-junk cluster(s) "
+                        f"({_n_drop} cells; DEG-junk + unstructured covariance agree) — "
+                        f"re-cluster the cleaned data and re-run cluster QC."
+                    )
+                elif _to_drop and _n_drop >= _auto_apply_max_frac * adata.n_obs:
+                    result["auto_removal_skipped_reason"] = (
+                        f"decisive-removal set would drop {_n_drop} cells "
+                        f"(>= {_auto_apply_max_frac:.0%} of the data); not auto-applied — "
+                        "present the DEG + covariance evidence and pause for review before removing."
+                    )
+                    _removed_note = f" {result['auto_removal_skipped_reason']}"
+
             _sq_note = ""
             if result.get("structure_qc_ran"):
                 _sq_note = " " + str((result.get("structure_qc") or {}).get("structure_summary") or "")
@@ -13899,6 +14152,7 @@ def _process_tool_call_impl(
                     f" Structure QC could not run automatically ({result['structure_qc_error']}); "
                     "run run_cluster_structure_qc manually before annotation."
                 )
+            _sq_note += _removed_note
 
             if structure_qc_baseline_clusters:
                 _no_dbl = " (doublet detection was not run, so a coherence check matters even more)" if doublet_signal_missing else ""
@@ -13937,7 +14191,7 @@ def _process_tool_call_impl(
             result["cluster_grid_figure"] = cluster_grid_figure
             return _finalize_result(
                 result, adata,
-                dataset_changed=False,
+                dataset_changed=bool(result.get("cells_auto_removed")),
                 summary=summary,
                 artifacts_created=artifacts,
             )
@@ -14138,10 +14392,24 @@ def _process_tool_call_impl(
                 if "total_counts" in adata.obs.columns:
                     local_lib, global_moran_lib = _local_moran(adata.obs["total_counts"].values, graph)
 
-            metric_decisions = latest_cluster_qc.get("cluster_decisions") or {}
+            # Prefer metric decisions passed in-line from the SAME run_cluster_qc call
+            # (the auto-chain) over the world-state registry: on the current pass the
+            # registry is only updated AFTER run_cluster_qc returns, so relying on it
+            # would leave every cluster's metric severity blank during the auto-chain
+            # (structure QC would never see "obvious"/"ambiguous" and could not confirm
+            # a removal). The registry remains the fallback for a standalone call.
+            metric_decisions = (
+                tool_input.get("_metric_decisions")
+                or latest_cluster_qc.get("cluster_decisions")
+                or {}
+            )
             metric_table = {
                 str(row.get("cluster")): row
-                for row in (latest_cluster_qc.get("cluster_table") or [])
+                for row in (
+                    tool_input.get("_metric_table")
+                    or latest_cluster_qc.get("cluster_table")
+                    or []
+                )
                 if isinstance(row, dict) and row.get("cluster") is not None
             }
 
@@ -14208,7 +14476,10 @@ def _process_tool_call_impl(
                     return "moderate"
                 return "strong"
 
-            def _synthesize(metric_severity, structure_interp, moran_i_mt, mt_z, moran_i_lib, lib_z):
+            def _synthesize(
+                metric_severity, structure_interp, moran_i_mt, mt_z, moran_i_lib, lib_z,
+                deg_verdict="inconclusive",
+            ):
                 strong_structure = structure_interp in {"moderate", "strong"}
                 weak_structure = structure_interp in {"unstructured", "weak"}
                 mt_pocket = (
@@ -14225,9 +14496,37 @@ def _process_tool_call_impl(
                 )
                 bad_quality_pocket = bool(mt_pocket or low_lib_pocket)
                 metric = str(metric_severity or "unknown")
+                metric_flagged = metric in {"obvious", "ambiguous"}
+                deg_junk = deg_verdict == "junk_markers"
+                deg_identity = deg_verdict == "identity_supported"
 
                 if structure_interp in {"inconclusive", "skipped_small_cluster", "skipped_low_gene_count"}:
+                    # Covariance is unusable here; DEG can still confirm obvious junk.
+                    if deg_junk and metric == "obvious":
+                        return "confirmed_junk", "remove"
                     return "inconclusive", "review"
+
+                # --- DEG (identity) x covariance (coherence) adjudication ---
+                # DEG says whether the cluster has a real cell-identity program at
+                # all; covariance says whether it is a coherent one. A metric-flagged
+                # cluster with junk markers AND no covariance structure has neither an
+                # identity nor a coherent program: decisive removal. Junk markers WITH
+                # real structure, or a real identity, is a conflict/keep — never an
+                # auto-removal (this is the user's "if covariance looks okay, flag it
+                # and keep it" branch).
+                if deg_junk and weak_structure:
+                    if metric_flagged:
+                        return "confirmed_junk", "remove"
+                    return "unstructured_junk_markers", "review"
+                if deg_junk and strong_structure:
+                    return "junk_markers_but_structured", "review"
+                if deg_identity and strong_structure:
+                    return "structured_identity", "keep"
+                if deg_identity and weak_structure:
+                    # Real identity markers but flat covariance — unusual; keep + flag.
+                    return "identity_without_structure", "review"
+
+                # --- DEG inconclusive: fall back to metric x structure evidence ---
                 if metric == "obvious" and weak_structure:
                     return "confirmed_junk", "remove"
                 if metric == "obvious" and strong_structure:
@@ -14241,6 +14540,63 @@ def _process_tool_call_impl(
                 if strong_structure:
                     return "structured_ambiguous", "keep"
                 return "inconclusive", "review"
+
+            # --- One-vs-rest DEG marker check for each analyzed cluster ---
+            # The IDENTITY axis of the adjudication. Metric QC says a cluster looks
+            # bad; covariance says whether it is a coherent program; DEG says whether
+            # it has a real cell-identity signature at all. A cluster with no specific
+            # markers (only MT/ribosomal/housekeeping, or just a few weak genes) is
+            # "junk markers", which — together with unstructured covariance — upgrades
+            # a flag to a decisive removal. Computed ONCE for all analyzed clusters.
+            deg_by_cluster: Dict[str, Dict[str, Any]] = {}
+            deg_error = None
+            try:
+                from ..core.gpu import ensure_cpu as _ensure_cpu_deg
+
+                _ensure_cpu_deg(adata, context="cluster_qc:deg")
+                import scanpy as _sc_deg
+
+                _deg_key = "_cluster_qc_deg"
+                _valid_deg_groups = [c for c in clusters_to_analyze if c in present_clusters]
+                if _valid_deg_groups:
+                    _sc_deg.tl.rank_genes_groups(
+                        adata,
+                        groupby=cluster_key,
+                        groups=_valid_deg_groups,
+                        reference="rest",
+                        method="wilcoxon",
+                        key_added=_deg_key,
+                        use_raw=False,
+                        n_genes=40,
+                    )
+                    _rgg = adata.uns.get(_deg_key, {})
+                    _dn = _rgg.get("names") if isinstance(_rgg, dict) else None
+                    _ds = _rgg.get("scores") if isinstance(_rgg, dict) else None
+                    _dp = _rgg.get("pvals_adj") if isinstance(_rgg, dict) else None
+                    _dl = _rgg.get("logfoldchanges") if isinstance(_rgg, dict) else None
+                    if _dn is not None and getattr(_dn, "dtype", None) is not None and _dn.dtype.names:
+                        for _g in _dn.dtype.names:
+                            _markers = []
+                            for _i in range(len(_dn[_g])):
+                                try:
+                                    _m = {"gene": str(_dn[_g][_i])}
+                                    if _ds is not None:
+                                        _m["score"] = float(_ds[_g][_i])
+                                    if _dl is not None:
+                                        _m["logfc"] = float(_dl[_g][_i])
+                                    if _dp is not None:
+                                        _m["padj"] = float(_dp[_g][_i])
+                                    _markers.append(_m)
+                                except Exception:
+                                    continue
+                            deg_by_cluster[str(_g)] = _classify_cluster_deg(_markers)
+                    # Do not leave the scratch DEG result on adata.uns.
+                    try:
+                        del adata.uns[_deg_key]
+                    except Exception:
+                        pass
+            except Exception as _deg_e:  # pragma: no cover - defensive
+                deg_error = f"{type(_deg_e).__name__}: {_deg_e}"
 
             cluster_results = []
             structure_evidence = {}
@@ -14406,6 +14762,9 @@ def _process_tool_call_impl(
                         lib_mean, lib_z = _cluster_z(adata.obs["total_counts"].values, mask)
                     record["moran_computed"] = True
 
+                deg_class = deg_by_cluster.get(str(cluster_id), {}) or {}
+                deg_verdict = str(deg_class.get("deg_verdict") or "inconclusive")
+
                 synthesis, synthesis_lean = _synthesize(
                     metric_severity,
                     structure_interp,
@@ -14413,7 +14772,23 @@ def _process_tool_call_impl(
                     mt_z,
                     moran_i_lib,
                     lib_z,
+                    deg_verdict,
                 )
+
+                # DEG identity evidence, stated first — it is the reason a bad-looking
+                # cluster is confirmed junk (no identity) vs rescued (real markers).
+                if deg_verdict == "junk_markers":
+                    _jr = deg_class.get("junk_reasons") or []
+                    for _r in _jr[:3]:
+                        reasons_added.append(f"DEG markers: {_r}.")
+                elif deg_verdict == "identity_supported":
+                    _spec = deg_class.get("top_specific_markers") or []
+                    reasons_added.append(
+                        "DEG markers: cluster has a specific cell-identity program"
+                        + (f" ({', '.join(_spec[:6])})." if _spec else ".")
+                    )
+                elif deg_error:
+                    reasons_added.append(f"DEG marker check unavailable: {deg_error}.")
 
                 if structure_interp in {"unstructured", "weak"}:
                     reasons_added.append(
@@ -14467,6 +14842,8 @@ def _process_tool_call_impl(
                     "cluster_lib_z": lib_z,
                     "moran_skip_reason": moran_skip_reason,
                     "heatmap_path": heatmap_path_str,
+                    "deg_verdict": deg_verdict,
+                    "deg_evidence": deg_class,
                     "synthesis": synthesis,
                     "synthesis_lean": synthesis_lean,
                     "reasons_added": reasons_added,
@@ -14476,12 +14853,12 @@ def _process_tool_call_impl(
                     synthesized_removal.append(str(cluster_id))
                 if synthesis == "confirmed_junk":
                     confirmed_junk.append(str(cluster_id))
-                if synthesis == "structured_ambiguous":
+                if synthesis in ("structured_ambiguous", "structured_identity"):
                     structured_ambiguous.append(str(cluster_id))
                     rescued_clusters.append(str(cluster_id))
-                if synthesis == "unstructured_ambiguous":
+                if synthesis in ("unstructured_ambiguous", "unstructured_junk_markers"):
                     unstructured_ambiguous.append(str(cluster_id))
-                if synthesis == "conflicting":
+                if synthesis in ("conflicting", "junk_markers_but_structured", "identity_without_structure"):
                     conflicting_clusters.append(str(cluster_id))
 
                 cluster_results.append(record)
@@ -14510,6 +14887,33 @@ def _process_tool_call_impl(
                 f"synthesized removal set: {synthesized_removal or 'none'}."
             )
 
+            # Compact consensus-style decision table (one row per cluster, the
+            # keep/remove call plus every evidence axis and the reason) — bubbled up
+            # so run_cluster_qc and the analysis record can show it like the cell-type
+            # consensus table without re-reading the full per-cluster evidence.
+            qc_decision_table = []
+            for _r in cluster_results:
+                _ev = _r.get("deg_evidence") or {}
+                qc_decision_table.append({
+                    "cluster": _r.get("cluster_id"),
+                    "n_cells": _r.get("n_cells"),
+                    "metric_severity": _r.get("metric_severity_original"),
+                    "deg_verdict": _r.get("deg_verdict"),
+                    "deg_top_specific_markers": (_ev.get("top_specific_markers") or [])[:6],
+                    "deg_n_significant": _ev.get("n_significant_markers"),
+                    "deg_n_specific": _ev.get("n_specific_markers"),
+                    "covariance": _r.get("structure_interpretation"),
+                    "moran_i_mt": _r.get("moran_i_mt"),
+                    "cluster_mt_z": _r.get("cluster_mt_z"),
+                    "decision": _r.get("synthesis_lean"),
+                    "synthesis": _r.get("synthesis"),
+                    "why": [str(x) for x in (_r.get("reasons_added") or [])[:4]],
+                })
+            deg_verdict_breakdown: Dict[str, int] = {}
+            for _r in cluster_results:
+                _dv = str(_r.get("deg_verdict") or "inconclusive")
+                deg_verdict_breakdown[_dv] = deg_verdict_breakdown.get(_dv, 0) + 1
+
             result = {
                 "status": "ok",
                 "tool": "run_cluster_structure_qc",
@@ -14522,6 +14926,9 @@ def _process_tool_call_impl(
                 "n_coherent_clusters": n_coherent,
                 "n_noncoherent_clusters": n_noncoherent,
                 "structure_summary": structure_summary,
+                "qc_decision_table": qc_decision_table,
+                "deg_verdict_breakdown": deg_verdict_breakdown,
+                "deg_error": deg_error,
                 "cluster_structure_evidence": cluster_results,
                 "structure_evidence_by_cluster": structure_evidence,
                 "synthesized_removal": synthesized_removal,
@@ -14615,11 +15022,65 @@ def _process_tool_call_impl(
                     f"- Conflicting clusters for review: **{_fmt_list(conflicting_clusters, limit=12)}**",
                     f"- Heatmaps saved under: `{figure_dir}`",
                     "",
+                    "## QC Decision Table",
+                    "",
+                    "One row per analyzed cluster, showing every independent line of evidence "
+                    "that fed the keep/remove call and the reason it was made — the QC analogue "
+                    "of the cell-type consensus table. **Decision** is `remove` only when the "
+                    "cluster has junk DE markers AND no coherent covariance structure (and metric "
+                    "QC flagged it); otherwise it is `keep`/`review` (flagged but retained).",
+                    "",
+                    "| Cluster | Cells | Metric QC | DEG markers | DEG verdict | Covariance | MT Moran / z | Decision | Why |",
+                    "|---|---:|---|---|---|---|---|---|---|",
+                ]
+
+                def _deg_markers_cell(rec):
+                    ev = rec.get("deg_evidence") or {}
+                    verdict = rec.get("deg_verdict") or "inconclusive"
+                    top = ev.get("top_specific_markers") or ev.get("top_markers") or []
+                    n_sig = ev.get("n_significant_markers")
+                    n_spec = ev.get("n_specific_markers")
+                    if verdict == "junk_markers":
+                        shown = ", ".join(str(g) for g in top[:4]) if top else "none specific"
+                        return f"{shown} (spec={n_spec}, sig={n_sig})"
+                    if verdict == "identity_supported":
+                        return ", ".join(str(g) for g in top[:5]) if top else f"sig={n_sig}"
+                    return "not computed"
+
+                for rec in cluster_results:
+                    why = "; ".join(str(r) for r in (rec.get("reasons_added") or [])[:3]) or "NA"
+                    md_lines.append(
+                        "| "
+                        + " | ".join([
+                            _safe_cell(rec.get("cluster_id")),
+                            _safe_cell(rec.get("n_cells")),
+                            _safe_cell(rec.get("metric_severity_original")),
+                            _safe_cell(_deg_markers_cell(rec)),
+                            _safe_cell(rec.get("deg_verdict")),
+                            _safe_cell(rec.get("structure_interpretation")),
+                            f"{_fmt_num(rec.get('moran_i_mt'))} / {_fmt_num(rec.get('cluster_mt_z'), 2)}",
+                            _safe_cell(f"{rec.get('synthesis')} ({rec.get('synthesis_lean')})"),
+                            _safe_cell(why),
+                        ])
+                        + " |"
+                    )
+                md_lines.extend([
+                    "",
+                    "**Column legend** — "
+                    "*Metric QC*: severity from library/genes/%MT/%ribo/doublet screen. "
+                    "*DEG markers*: top one-vs-rest markers (specific ones when present; "
+                    "`spec`=cell-identity markers after dropping MT/ribo/housekeeping, "
+                    "`sig`=all significant markers). *DEG verdict*: `junk_markers` = no real "
+                    "identity program; `identity_supported` = specific markers present. "
+                    "*Covariance*: gene-gene correlation coherence (unstructured/weak vs "
+                    "moderate/strong). *MT Moran / z*: spatial MT% pocket / cluster MT z-score. "
+                    "*Decision*: `remove` (auto-applied), `review` (flagged, kept), `keep`.",
+                    "",
                     "## Per-Cluster Evidence",
                     "",
                     "| Cluster | Cells | Metric severity | Structure | Mean abs corr | Modules | MT Moran / z | Library Moran / z | Synthesis | Heatmap |",
                     "|---|---:|---|---|---:|---:|---|---|---|---|",
-                ]
+                ])
                 for rec in cluster_results:
                     heatmap = rec.get("heatmap_path")
                     heatmap_cell = f"`{heatmap}`" if heatmap else "not generated"
