@@ -625,7 +625,12 @@ class AgentWorldState:
         cell_set = self._cell_set_fingerprint(adata)
         n_clusters = int(adata.obs[cluster_key].nunique()) if cluster_key in adata.obs.columns else None
         record = self.cluster_qc_registry.get(str(cluster_key))
-        if record and record.get("cell_set") == cell_set and record.get("n_clusters") == n_clusters:
+        if (
+            record
+            and record.get("cell_set") == cell_set
+            and record.get("n_clusters") == n_clusters
+            and not record.get("requires_recluster")
+        ):
             status = "fresh_clean"
             if record.get("proposed_removal") or record.get("ambiguous"):
                 status = "fresh_review_required"
@@ -650,7 +655,15 @@ class AgentWorldState:
             }
 
         stale_reason = "no cluster-level QC has been run for the active clustering"
-        if record:
+        if record and record.get("requires_recluster"):
+            stale_reason = (
+                "cluster QC auto-removed confirmed-junk cluster(s) "
+                f"({record.get('auto_removed_clusters') or []}; "
+                f"{record.get('cells_auto_removed') or 0} cells), so the embedding and "
+                "clustering are stale — re-run normalize_and_hvg → PCA → neighbors → "
+                "UMAP → clustering on the cleaned cells, then re-run cluster QC"
+            )
+        elif record:
             stale_reason = "cluster-level QC is stale because the cell set or cluster count changed"
         return {
             "status": "needed",
@@ -1201,6 +1214,13 @@ class AgentWorldState:
                 entry["cells_auto_removed"] = result.get("cells_auto_removed", 0)
                 if result.get("auto_removal_skipped_reason"):
                     entry["auto_removal_skipped_reason"] = result.get("auto_removal_skipped_reason")
+                # Removing cells invalidates the embedding AND the clustering this QC
+                # pass ran on: the surviving `leiden` labels were computed on the
+                # pre-removal cells. Without this the registry would be recorded as
+                # fresh against the POST-removal cell set and the QC obligation would
+                # clear, letting the run proceed to annotation on a stale clustering.
+                # Mark it so the obligation re-fires until a recluster + re-QC.
+                entry["requires_recluster"] = bool(result.get("cells_auto_removed"))
                 self.cluster_qc_registry[str(cluster_key)] = entry
 
                 self.data_summary["cluster_qc"] = self._cluster_qc_summary(

@@ -129,6 +129,48 @@ def test_confirmed_junk_cluster_is_auto_removed(monkeypatch, tmp_path):
         assert table[c]["decision"] in ("keep", "review")
 
 
+def test_auto_removal_re_arms_the_qc_obligation(monkeypatch, tmp_path):
+    """Removing cells invalidates the embedding AND the clustering the QC ran on —
+    the surviving labels were computed on the pre-removal cells. The registry must
+    NOT read as fresh against the post-removal cell set, or the run could proceed
+    to annotation on a stale clustering. The obligation re-fires until recluster.
+    """
+    from scagent.agent.world_state import AgentWorldState
+
+    monkeypatch.chdir(tmp_path)
+    ws = AgentWorldState()
+    adata = _build_qc_adata()
+    ws.apply_tool_result("run_clustering", {"status": "ok", "cluster_key": "leiden"}, adata=adata)
+    ws.sync_from_adata(adata)
+
+    res, adata = process_tool_call(
+        "run_cluster_qc", {"cluster_key": "leiden", "save_checkpoint": False}, adata, world_state=ws
+    )
+    r = json.loads(res)
+    ws.apply_tool_result("run_cluster_qc", r, adata=adata)
+    assert r["cells_auto_removed"] == 70
+
+    # Cells were dropped -> QC is NOT satisfied; a recluster is demanded.
+    assert "cluster_qc" in [o["key"] for o in ws.unmet_obligations()]
+    summary = ws.data_summary["cluster_qc"]
+    assert summary["status"] == "needed"
+    assert "stale" in summary["reason"]
+    # ...and it stays unmet across a resync (not a transient blip).
+    ws.sync_from_adata(adata)
+    assert "cluster_qc" in [o["key"] for o in ws.unmet_obligations()]
+
+    # After a genuine recluster + a clean QC pass, the obligation clears.
+    adata.obs["leiden"] = pd.Categorical(
+        np.random.RandomState(1).choice(["0", "1", "2"], adata.n_obs)
+    )
+    ws.apply_tool_result("run_clustering", {"status": "ok", "cluster_key": "leiden"}, adata=adata)
+    res2, adata = process_tool_call(
+        "run_cluster_qc", {"cluster_key": "leiden", "save_checkpoint": False}, adata, world_state=ws
+    )
+    ws.apply_tool_result("run_cluster_qc", json.loads(res2), adata=adata)
+    assert "cluster_qc" not in [o["key"] for o in ws.unmet_obligations()]
+
+
 def test_auto_removal_can_be_disabled(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     adata = _build_qc_adata()
